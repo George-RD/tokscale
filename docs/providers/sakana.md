@@ -52,14 +52,29 @@ Provide the cookie string via **either** of these (env var takes precedence):
   export SAKANA_SESSION_COOKIE='__Secure-authjs.session-token.0=...; __Secure-authjs.session-token.1=...'
   ```
 
-- Or a file (raw cookie string, trimmed):
+- Or a file (raw cookie string, trimmed).
+
+  Tokscale resolves the config directory the same way for every provider:
+  `TOKSCALE_CONFIG_DIR` if set, otherwise `$XDG_CONFIG_HOME/tokscale` on
+  Linux, otherwise `~/.config/tokscale` (the common case on both macOS and
+  Linux). The session file lives at `<config-dir>/sakana-session`.
+
+  Because the cookie is a secret, create the file with mode `600` **from the
+  start** — don't write it world-readable and `chmod` it afterwards, which
+  leaves a brief window where any local user can read it. Run the write in a
+  subshell with `umask 077` so the new file is created `600` atomically:
 
   ```bash
   mkdir -p ~/.config/tokscale
-  printf '%s' '__Secure-authjs.session-token.0=...; __Secure-authjs.session-token.1=...' \
-    > ~/.config/tokscale/sakana-session
-  chmod 600 ~/.config/tokscale/sakana-session
+  ( umask 077
+    printf '%s' '__Secure-authjs.session-token.0=...; __Secure-authjs.session-token.1=...' \
+      > ~/.config/tokscale/sakana-session )
   ```
+
+  (Using a custom config dir? Replace `~/.config/tokscale` with
+  `"$TOKSCALE_CONFIG_DIR"`. An equivalent is to pre-create the empty file with
+  `install -m 600 /dev/null ~/.config/tokscale/sakana-session` before writing
+  to it.)
 
 Then:
 
@@ -80,5 +95,7 @@ repeat the steps above to copy a fresh cookie.
 ## Treat the cookie like a password
 
 The session cookie grants access to your Sakana account. Store it like a secret:
-keep `~/.config/tokscale/sakana-session` at mode `600`, and don't commit it or
-paste it into shared shell history.
+keep `<config-dir>/sakana-session` (commonly `~/.config/tokscale/sakana-session`)
+at mode `600` — create it `600` as shown above rather than tightening
+permissions after the fact — and don't commit it or paste it into shared shell
+history.
