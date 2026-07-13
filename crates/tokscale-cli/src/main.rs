@@ -431,6 +431,11 @@ enum CodexSubcommand {
         #[arg(long, help = "Output as JSON")]
         json: bool,
     },
+    #[command(about = "Show an opt-in Codex account-activity snapshot")]
+    Activity {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -5652,6 +5657,7 @@ fn run_codex_command(subcommand: CodexSubcommand) -> Result<()> {
         CodexSubcommand::Status { name, json } => {
             commands::usage::codex::run_codex_status(name, json)
         }
+        CodexSubcommand::Activity { json } => commands::codex_activity::run(json),
     }
 }
 
@@ -6794,6 +6800,17 @@ mod tests {
     fn test_delete_submitted_data_command_parses() {
         let cli = Cli::try_parse_from(["tokscale", "delete-submitted-data"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::DeleteSubmittedData)));
+    }
+
+    #[test]
+    fn test_codex_activity_command_parses() {
+        let cli = Cli::try_parse_from(["tokscale", "codex", "activity", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Codex {
+                subcommand: CodexSubcommand::Activity { json: true }
+            })
+        ));
     }
 
     #[test]

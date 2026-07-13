@@ -786,7 +786,7 @@ Tokscale can save multiple Codex OAuth accounts for subscription usage display. 
 
 To add an account without leaving the TUI, click `[Add Codex]` in the Usage tab. Tokscale starts `codex login` with a temporary `CODEX_HOME`, displays the login output in the Usage tab, imports the resulting auth into Tokscale's saved account store, and then refreshes usage. This keeps the login isolated and does not switch the current Codex auth; click `[Use]` on a saved account when you want Tokscale to write that account into the real Codex auth file.
 
-The CLI commands are still available for scripted or manual account management:
+The CLI commands are still available for scripted or manual account management, plus a separate opt-in account-activity snapshot:
 
 ```bash
 # Save the current Codex auth as a named Tokscale account
@@ -806,9 +806,15 @@ tokscale codex remove personal
 # Check subscription usage for the active or a named account
 tokscale codex status
 tokscale codex status --name personal --json
+
+# Fetch the active Codex app-server account activity separately from local totals
+tokscale codex activity
+tokscale codex activity --json
 ```
 
 When saved Codex accounts exist, `tokscale usage --json` includes structured account metadata for each Codex entry and the TUI displays those entries under one Codex group. Without saved accounts, Tokscale falls back to the current Codex auth discovery path (`CODEX_HOME/auth.json`, `~/.config/codex/auth.json`, `~/.codex/auth.json`, then macOS Keychain).
+
+`tokscale codex activity` uses only the installed Codex app-server's active authentication to fetch a timestamped, account-level snapshot. It is supplemental data: it is never included in local totals, reports, exports, submissions, or leaderboards.
 
 #### Example Output
 

@@ -806,6 +806,17 @@ fn test_codex_command_help() {
 }
 
 #[test]
+fn test_codex_activity_command_help() {
+    let mut cmd = cargo_bin_cmd!("tokscale");
+    cmd.args(["codex", "activity", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "opt-in Codex account-activity snapshot",
+        ));
+}
+
+#[test]
 fn test_graph_command_help() {
     let mut cmd = cargo_bin_cmd!("tokscale");
     cmd.arg("graph")
