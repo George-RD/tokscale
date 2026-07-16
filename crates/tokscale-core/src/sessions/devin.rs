@@ -4,7 +4,7 @@
 //! - Devin CLI SQLite database (`~/.local/share/devin/cli/sessions.db`)
 //! - Devin Desktop NDJSON event streams (`~/Library/Application Support/Devin/User/acp-events/*.ndjson`)
 
-use super::utils::{file_modified_timestamp_ms, open_readonly_sqlite};
+use super::utils::{back_anchor_timestamp, file_modified_timestamp_ms, open_readonly_sqlite};
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::{provider_identity, TokenBreakdown};
 use serde::Deserialize;
@@ -280,9 +280,16 @@ pub fn parse_devin_cli_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
         let duration_ms = metrics
             .and_then(|m| m.total_time_ms)
             .map(|total_time_ms| total_time_ms.max(0));
-        let timestamp = duration_ms
-            .map(|duration| recorded_timestamp.saturating_sub(duration))
-            .unwrap_or(recorded_timestamp);
+        // Only back-calculate when `created_at_ms` is this row's own recorded
+        // completion time: when it's absent, `recorded_timestamp` is
+        // `fallback_timestamp` (the database file's mtime), not this
+        // message's own end time, and subtracting `total_time_ms` from it
+        // would shift the message into the wrong day rather than anchor it
+        // correctly.
+        let timestamp = match (created_at_ms, duration_ms.filter(|duration| *duration > 0)) {
+            (Some(end), Some(duration)) => back_anchor_timestamp(end, duration),
+            _ => recorded_timestamp,
+        };
         let dedup_key = format!("devin-cli:{session_id}:{row_id}");
         let mut unified = UnifiedMessage::new_with_dedup(
             "devin-cli",

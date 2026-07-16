@@ -2,7 +2,7 @@
 //!
 //! Junie stores local sessions under `~/.junie/sessions/<session-id>/events.jsonl`.
 
-use super::utils::file_modified_timestamp_ms;
+use super::utils::{back_anchor_timestamp, file_modified_timestamp_ms};
 use super::UnifiedMessage;
 use crate::{pricing, provider_identity, TokenBreakdown};
 use chrono::{Local, LocalResult, NaiveDateTime, TimeZone};
@@ -67,9 +67,15 @@ pub fn parse_junie_file(path: &Path) -> Vec<UnifiedMessage> {
             continue;
         };
 
-        let timestamp = number_field(&value, "timestampMs")
-            .filter(|timestamp| *timestamp > 0)
-            .unwrap_or(default_timestamp);
+        // `explicit_timestamp` is the recorded `timestampMs` for this event, as
+        // opposed to `default_timestamp` (a session-derived or file-mtime
+        // fallback used when it's absent). Only an explicit end timestamp is a
+        // valid anchor to back-calculate from below — subtracting `usage.time`
+        // from the fallback would shift the message into the wrong
+        // day/session-window rather than the call's actual start.
+        let explicit_timestamp =
+            number_field(&value, "timestampMs").filter(|timestamp| *timestamp > 0);
+        let timestamp = explicit_timestamp.unwrap_or(default_timestamp);
         let agent = agent_name(agent_event);
         let Some(usages) = agent_event.get("modelUsage").and_then(Value::as_array) else {
             continue;
@@ -120,10 +126,17 @@ pub fn parse_junie_file(path: &Path) -> Vec<UnifiedMessage> {
             // project forward past the actual completion into phantom idle
             // time. Back-calculate the start anchor the same way #890 did for
             // Copilot's `endTime`-only records.
+            //
+            // Only do this when `explicit_timestamp` is a real recorded end
+            // timestamp: when it's absent, `timestamp` is `default_timestamp`
+            // (session-ID-derived or file mtime), not a per-event completion
+            // time, and subtracting `usage.time` from it would shift the
+            // message into the wrong day rather than anchor it correctly.
             let duration_ms = number_field(usage, "time").filter(|duration| *duration > 0);
-            let start_timestamp = duration_ms
-                .map(|duration| timestamp.saturating_sub(duration))
-                .unwrap_or(timestamp);
+            let start_timestamp = match (explicit_timestamp, duration_ms) {
+                (Some(end), Some(duration)) => back_anchor_timestamp(end, duration),
+                _ => timestamp,
+            };
 
             let mut message = UnifiedMessage::new_with_agent(
                 "junie",
@@ -464,5 +477,26 @@ mod tests {
             Some(2000),
             "duration_ms must still span from start to the logged end timestamp"
         );
+    }
+
+    #[test]
+    fn missing_timestamp_ms_does_not_subtract_from_session_fallback() {
+        // Second-round review fix: when `timestampMs` is absent (only
+        // `usage.time` latency is recorded), `timestamp` falls back to
+        // `default_timestamp` (session-ID-derived, or file mtime) — not a
+        // per-event recorded end time. Back-calculating
+        // `default_timestamp - usage.time` in that case would shift the
+        // message into the wrong day rather than anchor it correctly, since
+        // the fallback was never the call's actual completion time.
+        let content = r#"{"event":{"agentEvent":{"kind":"LlmResponseMetadataEvent","modelUsage":[{"model":"gpt-5","inputTokens":100,"outputTokens":50,"time":2000}]}}}"#;
+        let messages = parse_events(content);
+
+        assert_eq!(messages.len(), 1);
+        let expected_fallback = session_timestamp_from_id("session-250622-101010").unwrap();
+        assert_eq!(
+            messages[0].timestamp, expected_fallback,
+            "timestamp must stay at the session-derived fallback, not be back-calculated from it"
+        );
+        assert_eq!(messages[0].duration_ms, Some(2000));
     }
 }

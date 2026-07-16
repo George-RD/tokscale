@@ -815,12 +815,23 @@ fn parser_version(client: ClientId) -> u32 {
         // (end-anchored) timestampMs. Follow-up to #890.
         ClientId::Junie => 2,
         // zcode's model_usage timestamp now prefers `started_at` over
-        // `completed_at`. Follow-up to #890.
-        ClientId::Zcode => 2,
+        // `completed_at`. Follow-up to #890. v2->v3: rows with a NULL
+        // `started_at` now back-calculate `completed_at - duration_ms`
+        // instead of staying end-anchored at `completed_at`, and
+        // `is_turn_start` is now assigned to the earliest-STARTED request
+        // per turn instead of the first one seen in completed_at order.
+        // Second-round follow-up to #890.
+        ClientId::Zcode => 3,
         // opencodereview's llm_response timestamp is now back-calculated to
         // the call start (timestamp - duration_ms) instead of the recorded
         // (end-anchored) timestamp. Follow-up to #890.
         ClientId::OpenCodeReview => 2,
+        // Kiro's structured messages.jsonl turns now back-calculate the
+        // start anchor from `turn_end - elapsedTime` when the user prompt's
+        // own timestamp is missing/unparseable, instead of falling through
+        // to the (end-anchored) turn_end timestamp. Second-round follow-up
+        // to #890.
+        ClientId::Kiro => 2,
         _ => 1,
     }
 }
@@ -2029,15 +2040,21 @@ mod tests {
         // Follow-up to #890: junie, jcode, devin-cli, zcode, and
         // opencodereview were re-anchored to start-anchored duration
         // timestamps; their cache-invalidating parser versions must bump so
-        // stale end-anchored-timestamp cache entries are not reused. kiro was
-        // audited and found already start-anchored across all four of its
-        // data sources, so it is intentionally not bumped here.
+        // stale end-anchored-timestamp cache entries are not reused.
+        //
+        // Second-round review found gaps in that first pass: zcode's
+        // NULL-`started_at` fallback stayed end-anchored and its
+        // `is_turn_start` marking didn't follow the new start-anchored
+        // timestamps, and kiro's structured messages.jsonl turns stayed
+        // end-anchored when the prompt timestamp was missing. Both bump
+        // again here so those stale (start-anchored-but-still-wrong) v2/v1
+        // cache entries are also invalidated.
         assert_eq!(parser_version(ClientId::Junie), 2);
         assert_eq!(parser_version(ClientId::Jcode), 5);
         assert_eq!(parser_version(ClientId::DevinCli), 3);
-        assert_eq!(parser_version(ClientId::Zcode), 2);
+        assert_eq!(parser_version(ClientId::Zcode), 3);
         assert_eq!(parser_version(ClientId::OpenCodeReview), 2);
-        assert_eq!(parser_version(ClientId::Kiro), 1);
+        assert_eq!(parser_version(ClientId::Kiro), 2);
     }
 
     #[test]

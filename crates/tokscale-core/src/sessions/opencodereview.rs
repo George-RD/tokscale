@@ -3,7 +3,7 @@
 //! OpenCodeReview stores sessions as JSONL files under
 //! `~/.opencodereview/sessions/<encoded-repo-path>/<session-id>.jsonl`.
 
-use super::utils::{file_modified_timestamp_ms, parse_timestamp_value};
+use super::utils::{back_anchor_timestamp, file_modified_timestamp_ms, parse_timestamp_value};
 use super::UnifiedMessage;
 use crate::{pricing, provider_identity, TokenBreakdown};
 use serde_json::Value;
@@ -58,10 +58,11 @@ pub fn parse_opencodereview_file(path: &Path) -> Vec<UnifiedMessage> {
             continue;
         }
 
-        let recorded_timestamp = value
-            .get("timestamp")
-            .and_then(parse_timestamp_value)
-            .unwrap_or(fallback_timestamp);
+        // `explicit_timestamp` is this record's own recorded `timestamp`
+        // field, as opposed to `fallback_timestamp` (a file-mtime fallback
+        // used when it's absent or unparseable).
+        let explicit_timestamp = value.get("timestamp").and_then(parse_timestamp_value);
+        let recorded_timestamp = explicit_timestamp.unwrap_or(fallback_timestamp);
 
         let model_raw = value
             .get("model")
@@ -87,9 +88,16 @@ pub fn parse_opencodereview_file(path: &Path) -> Vec<UnifiedMessage> {
         // project forward past the actual completion into phantom idle time.
         // Back-calculate the start anchor the same way #890 did for
         // Copilot's `endTime`-only records.
-        let timestamp = duration_ms
-            .map(|duration| recorded_timestamp.saturating_sub(duration))
-            .unwrap_or(recorded_timestamp);
+        //
+        // Only do this when `explicit_timestamp` is a real recorded end
+        // timestamp: when it's absent, `recorded_timestamp` is
+        // `fallback_timestamp` (the file's mtime), not this record's own end
+        // time, and subtracting `duration_ms` from it would shift the
+        // message into the wrong day rather than anchor it correctly.
+        let timestamp = match (explicit_timestamp, duration_ms) {
+            (Some(end), Some(duration)) => back_anchor_timestamp(end, duration),
+            _ => recorded_timestamp,
+        };
 
         let dedup_key = format!(
             "opencodereview:{session_id}:{recorded_timestamp}:{model_id}:{}:{}:{}:{}",

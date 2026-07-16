@@ -4,7 +4,7 @@
 //! Jcode stores authoritative assistant token usage on messages under
 //! `token_usage`; user/tool messages without usage are skipped.
 
-use super::utils::{file_modified_timestamp_ms, parse_timestamp_str};
+use super::utils::{back_anchor_timestamp, file_modified_timestamp_ms, parse_timestamp_str};
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::{provider_identity, TokenBreakdown};
 use serde::Deserialize;
@@ -181,11 +181,11 @@ fn parse_jcode_messages(
             if tokens.total() <= 0 {
                 return None;
             }
-            let recorded_timestamp = message
-                .timestamp
-                .as_deref()
-                .and_then(parse_timestamp_str)
-                .unwrap_or(fallback_timestamp);
+            // `explicit_timestamp` is the message's own recorded `timestamp`
+            // field, as opposed to `fallback_timestamp` (a session/file-level
+            // fallback used when it's absent or unparseable).
+            let explicit_timestamp = message.timestamp.as_deref().and_then(parse_timestamp_str);
+            let recorded_timestamp = explicit_timestamp.unwrap_or(fallback_timestamp);
             // The assistant message's `timestamp` is written once the message
             // (including `token_usage`) is finalized, i.e. the turn's *end*,
             // not its start. `tool_duration_ms` is that turn's elapsed time,
@@ -193,10 +193,17 @@ fn parse_jcode_messages(
             // would otherwise project forward past completion into phantom
             // idle time. Back-calculate the start anchor the same way #890
             // did for Copilot's `endTime`-only records.
+            //
+            // Only do this when `explicit_timestamp` is a real recorded end
+            // timestamp: when it's absent, `recorded_timestamp` is the
+            // session/file-level fallback, not this message's own completion
+            // time, and subtracting `tool_duration_ms` from it would shift
+            // the message into the wrong day rather than anchor it correctly.
             let duration_ms = message.tool_duration_ms.filter(|duration| *duration > 0);
-            let timestamp = duration_ms
-                .map(|duration| recorded_timestamp.saturating_sub(duration))
-                .unwrap_or(recorded_timestamp);
+            let timestamp = match (explicit_timestamp, duration_ms) {
+                (Some(end), Some(duration)) => back_anchor_timestamp(end, duration),
+                _ => recorded_timestamp,
+            };
             let mut unified = UnifiedMessage::new_with_dedup(
                 "jcode",
                 context.model.clone(),
