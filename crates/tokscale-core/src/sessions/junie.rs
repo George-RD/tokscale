@@ -113,18 +113,30 @@ pub fn parse_junie_file(path: &Path) -> Vec<UnifiedMessage> {
                 continue;
             }
 
+            // `timestampMs` is recorded when the LlmResponseMetadataEvent (the
+            // response) is logged, i.e. the call's *end*, not its start.
+            // `usage.time` is that call's latency, so `sessionize()`'s
+            // `[timestamp, timestamp + duration_ms]` span would otherwise
+            // project forward past the actual completion into phantom idle
+            // time. Back-calculate the start anchor the same way #890 did for
+            // Copilot's `endTime`-only records.
+            let duration_ms = number_field(usage, "time").filter(|duration| *duration > 0);
+            let start_timestamp = duration_ms
+                .map(|duration| timestamp.saturating_sub(duration))
+                .unwrap_or(timestamp);
+
             let mut message = UnifiedMessage::new_with_agent(
                 "junie",
                 model_id,
                 provider_id,
                 &session_id,
-                timestamp,
+                start_timestamp,
                 tokens,
                 cost,
                 agent.clone(),
             );
             message.dedup_key = Some(dedup_key);
-            message.duration_ms = number_field(usage, "time").filter(|duration| *duration > 0);
+            message.duration_ms = duration_ms;
             if pending_turn_start && !turn_start_assigned {
                 message.is_turn_start = true;
                 turn_start_assigned = true;
@@ -428,5 +440,29 @@ mod tests {
         // Only the genuine usage event counts; the snapshot tagged with a
         // skipped top-level kind is ignored even though it embeds a usage shape.
         assert_eq!(messages.len(), 1);
+    }
+
+    #[test]
+    fn test_usage_timestamp_is_start_anchored() {
+        // Regression (follow-up to #890): `timestampMs` on a
+        // LlmResponseMetadataEvent is recorded when the response is logged
+        // (the call's *end*), and `usage.time` is that call's latency. If the
+        // message's timestamp were left at `timestampMs`, sessionize()'s
+        // `[timestamp, timestamp + duration_ms]` span would project forward
+        // past the actual completion into phantom idle time. The parser must
+        // back-calculate the start anchor instead.
+        let content = r#"{"timestampMs":1750000005000,"event":{"agentEvent":{"kind":"LlmResponseMetadataEvent","modelUsage":[{"model":"gpt-5","inputTokens":100,"outputTokens":50,"time":2000}]}}}"#;
+        let messages = parse_events(content);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].timestamp, 1_750_000_003_000,
+            "timestamp must be back-calculated to the call start (end - duration)"
+        );
+        assert_eq!(
+            messages[0].duration_ms,
+            Some(2000),
+            "duration_ms must still span from start to the logged end timestamp"
+        );
     }
 }

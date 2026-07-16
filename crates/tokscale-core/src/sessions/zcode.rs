@@ -409,9 +409,15 @@ pub fn parse_zcode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
             .as_deref()
             .map(canonicalize_model)
             .unwrap_or_else(|| UNKNOWN_MODEL.to_string());
+        // `model_usage` records both endpoints of the call: prefer
+        // `started_at` so the message timestamp anchors to the call's start,
+        // matching `duration_ms`'s own start-to-end span. Anchoring at
+        // `completed_at` instead would make sessionize()'s
+        // `[timestamp, timestamp + duration_ms]` span project forward past
+        // the actual completion into phantom idle time (see #890).
         let timestamp = row
-            .completed_at
-            .or(row.started_at)
+            .started_at
+            .or(row.completed_at)
             .unwrap_or(fallback_timestamp);
 
         let raw_input = row.input_tokens.unwrap_or(0);
@@ -866,7 +872,9 @@ mod tests {
         assert_eq!(msg.provider_id, "zhipu");
         assert_eq!(msg.model_id, "glm-5.2");
         assert_eq!(msg.session_id, "sess_1");
-        assert_eq!(msg.timestamp, 1_782_718_001_000_i64);
+        // Timestamp anchors to `started_at` (the call's start), not
+        // `completed_at` (the call's end). See #890 (follow-up).
+        assert_eq!(msg.timestamp, 1_782_718_000_000_i64);
         assert_eq!(msg.duration_ms, Some(1000));
         assert_eq!(msg.tokens.input, 90);
         assert_eq!(msg.tokens.output, 15);
@@ -911,6 +919,52 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert!(messages[0].is_turn_start);
         assert!(!messages[1].is_turn_start);
+    }
+
+    #[test]
+    fn test_model_usage_timestamp_is_start_anchored() {
+        // Regression (follow-up to #890): `model_usage` records both
+        // `started_at` and `completed_at` for a call, plus an explicit
+        // `duration_ms`. Anchoring the message timestamp at `completed_at`
+        // would make sessionize()'s `[timestamp, timestamp + duration_ms]`
+        // span project forward past the actual completion into phantom idle
+        // time. The parser must prefer `started_at`.
+        let dir = TempDir::new().unwrap();
+        let db_path = create_zcode_sqlite_db(&dir);
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO model_usage (
+                id, session_id, turn_id, model_id, started_at, completed_at,
+                duration_ms, input_tokens, output_tokens
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                "usage_1",
+                "sess_1",
+                "turn_1",
+                "glm-5.2",
+                1_782_718_000_000_i64,
+                1_782_718_005_000_i64,
+                5000_i64,
+                10_i64,
+                1_i64,
+            ],
+        )
+        .unwrap();
+
+        let messages = parse_zcode_sqlite(&db_path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].timestamp, 1_782_718_000_000_i64,
+            "timestamp must anchor at started_at, not completed_at"
+        );
+        assert_eq!(
+            messages[0].duration_ms,
+            Some(5000),
+            "duration_ms must still span from start to completion"
+        );
     }
 
     #[test]

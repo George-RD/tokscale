@@ -793,15 +793,34 @@ fn parser_version(client: ClientId) -> u32 {
         // global schema. Their independent counters start from those histories
         // so future changes have an obvious local version to increment.
         ClientId::Codex => 6,
-        ClientId::Jcode => 4,
+        // v4->v5: jcode's assistant-message timestamp is now back-calculated
+        // to the turn start (timestamp - tool_duration_ms) instead of using
+        // the recorded (end-anchored) timestamp directly. Follow-up to #890.
+        ClientId::Jcode => 5,
         ClientId::Copilot => 5,
         // Pi subagent sessions now derive agent attribution from session_info
         // names; version-1 caches carry those messages without agent metadata.
         ClientId::Pi => 2,
-        // Devin CLI v1 could stop at a malformed chat_message. Desktop v1
-        // parsed a non-ACP shape and did not track its CLI title lookup.
-        ClientId::DevinCli | ClientId::DevinDesktop => 2,
+        // Devin CLI v1 could stop at a malformed chat_message. v2->v3:
+        // message timestamp is now back-calculated to the turn start
+        // (created_at - total_time_ms) instead of the recorded (end-anchored)
+        // created_at. Follow-up to #890.
+        ClientId::DevinCli => 3,
+        // Desktop v1 parsed a non-ACP shape and did not track its CLI title
+        // lookup; its timestamp handling is unaffected by the #890 follow-up.
+        ClientId::DevinDesktop => 2,
         ClientId::Claude => 2,
+        // Junie's usage-event timestamp is now back-calculated to the call
+        // start (timestampMs - usage.time) instead of the recorded
+        // (end-anchored) timestampMs. Follow-up to #890.
+        ClientId::Junie => 2,
+        // zcode's model_usage timestamp now prefers `started_at` over
+        // `completed_at`. Follow-up to #890.
+        ClientId::Zcode => 2,
+        // opencodereview's llm_response timestamp is now back-calculated to
+        // the call start (timestamp - duration_ms) instead of the recorded
+        // (end-anchored) timestamp. Follow-up to #890.
+        ClientId::OpenCodeReview => 2,
         _ => 1,
     }
 }
@@ -1994,7 +2013,7 @@ mod tests {
 
     #[test]
     fn test_devin_parser_versions_invalidate_v1_entries() {
-        assert_eq!(parser_version(ClientId::DevinCli), 2);
+        assert_eq!(parser_version(ClientId::DevinCli), 3);
         assert_eq!(parser_version(ClientId::DevinDesktop), 2);
     }
 
@@ -2003,6 +2022,22 @@ mod tests {
         assert_eq!(parser_version(ClientId::Codex), 6);
         assert_eq!(parser_version(ClientId::Copilot), 5);
         assert_eq!(parser_version(ClientId::Claude), 2);
+    }
+
+    #[test]
+    fn test_duration_anchor_audit_remaining_parsers_bumps_versions() {
+        // Follow-up to #890: junie, jcode, devin-cli, zcode, and
+        // opencodereview were re-anchored to start-anchored duration
+        // timestamps; their cache-invalidating parser versions must bump so
+        // stale end-anchored-timestamp cache entries are not reused. kiro was
+        // audited and found already start-anchored across all four of its
+        // data sources, so it is intentionally not bumped here.
+        assert_eq!(parser_version(ClientId::Junie), 2);
+        assert_eq!(parser_version(ClientId::Jcode), 5);
+        assert_eq!(parser_version(ClientId::DevinCli), 3);
+        assert_eq!(parser_version(ClientId::Zcode), 2);
+        assert_eq!(parser_version(ClientId::OpenCodeReview), 2);
+        assert_eq!(parser_version(ClientId::Kiro), 1);
     }
 
     #[test]

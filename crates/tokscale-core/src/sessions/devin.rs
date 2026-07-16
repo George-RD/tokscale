@@ -268,7 +268,21 @@ pub fn parse_devin_cli_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
             continue;
         }
 
-        let timestamp = created_at_ms.unwrap_or(fallback_timestamp);
+        let recorded_timestamp = created_at_ms.unwrap_or(fallback_timestamp);
+        // `message_nodes.created_at` is stamped when the row is written, which
+        // happens once the assistant message (including `metrics`) is
+        // finalized, i.e. the turn's *end*, not its start. `total_time_ms` is
+        // that turn's elapsed generation time, so sessionize()'s
+        // `[timestamp, timestamp + duration_ms]` span would otherwise project
+        // forward past the actual completion into phantom idle time.
+        // Back-calculate the start anchor the same way #890 did for
+        // Copilot's `endTime`-only records.
+        let duration_ms = metrics
+            .and_then(|m| m.total_time_ms)
+            .map(|total_time_ms| total_time_ms.max(0));
+        let timestamp = duration_ms
+            .map(|duration| recorded_timestamp.saturating_sub(duration))
+            .unwrap_or(recorded_timestamp);
         let dedup_key = format!("devin-cli:{session_id}:{row_id}");
         let mut unified = UnifiedMessage::new_with_dedup(
             "devin-cli",
@@ -281,9 +295,7 @@ pub fn parse_devin_cli_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
             Some(dedup_key),
         );
 
-        if let Some(total_time_ms) = metrics.and_then(|m| m.total_time_ms) {
-            unified.duration_ms = Some(total_time_ms.max(0));
-        }
+        unified.duration_ms = duration_ms;
 
         if let Some(ws) = workspace {
             let workspace_key = normalize_workspace_key(&ws);
@@ -692,9 +704,47 @@ mod tests {
         assert_eq!(msg.tokens.output, 147);
         assert_eq!(msg.tokens.cache_read, 8);
         assert_eq!(msg.tokens.cache_write, 0);
-        assert_eq!(msg.timestamp, 1_700_000_000_000);
+        // `created_at` is the message row's write time (the turn's end), so
+        // the message timestamp is back-calculated to the turn start:
+        // created_at_ms - total_time_ms. See #890 (follow-up).
+        assert_eq!(msg.timestamp, 1_700_000_000_000 - 2846);
         assert_eq!(msg.duration_ms, Some(2846));
         assert_eq!(msg.workspace_key.as_deref(), Some("/Users/alice/project"));
+    }
+
+    #[test]
+    fn test_total_time_ms_timestamp_is_start_anchored() {
+        // Regression (follow-up to #890): `message_nodes.created_at` is
+        // stamped when the row is written, which happens once the assistant
+        // message (including `metrics`) is finalized, i.e. the turn's *end*,
+        // not its start. `total_time_ms` is that turn's elapsed generation
+        // time, so sessionize()'s `[timestamp, timestamp + duration_ms]` span
+        // would otherwise project forward past the actual completion into
+        // phantom idle time. The parser must back-calculate the start anchor
+        // instead.
+        let dir = TempDir::new().unwrap();
+        let db_path = create_devin_cli_db(&dir);
+        let conn = Connection::open(&db_path).unwrap();
+
+        insert_session(&conn, "sess-1", "/Users/alice/project", "claude-sonnet-4");
+        let chat = r#"{"role":"assistant","content":"hello","metadata":{"generation_model":"claude-sonnet-4","metrics":{"input_tokens":100,"output_tokens":50,"total_time_ms":5000}}}"#;
+        insert_message(&conn, "sess-1", chat, 1_700_000_010);
+        drop(conn);
+
+        let messages = parse_devin_cli_sqlite(&db_path);
+        assert_eq!(messages.len(), 1);
+
+        let msg = &messages[0];
+        assert_eq!(
+            msg.timestamp,
+            1_700_000_010_000 - 5000,
+            "timestamp must be back-calculated to the turn start (end - duration)"
+        );
+        assert_eq!(
+            msg.duration_ms,
+            Some(5000),
+            "duration_ms must still span from start to the recorded end timestamp"
+        );
     }
 
     #[test]

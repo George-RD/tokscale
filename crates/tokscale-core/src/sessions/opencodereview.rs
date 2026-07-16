@@ -58,7 +58,7 @@ pub fn parse_opencodereview_file(path: &Path) -> Vec<UnifiedMessage> {
             continue;
         }
 
-        let timestamp = value
+        let recorded_timestamp = value
             .get("timestamp")
             .and_then(parse_timestamp_value)
             .unwrap_or(fallback_timestamp);
@@ -80,8 +80,19 @@ pub fn parse_opencodereview_file(path: &Path) -> Vec<UnifiedMessage> {
             .and_then(Value::as_i64)
             .filter(|d| *d > 0);
 
+        // The `llm_response` record's `timestamp` is written when the
+        // response is logged, i.e. the call's *end*, not its start.
+        // `duration_ms` is that call's elapsed time, so sessionize()'s
+        // `[timestamp, timestamp + duration_ms]` span would otherwise
+        // project forward past the actual completion into phantom idle time.
+        // Back-calculate the start anchor the same way #890 did for
+        // Copilot's `endTime`-only records.
+        let timestamp = duration_ms
+            .map(|duration| recorded_timestamp.saturating_sub(duration))
+            .unwrap_or(recorded_timestamp);
+
         let dedup_key = format!(
-            "opencodereview:{session_id}:{timestamp}:{model_id}:{}:{}:{}:{}",
+            "opencodereview:{session_id}:{recorded_timestamp}:{model_id}:{}:{}:{}:{}",
             tokens.input, tokens.output, tokens.cache_read, tokens.cache_write,
         );
         if !seen.insert(dedup_key.clone()) {
@@ -288,5 +299,32 @@ mod tests {
         let msgs = parse_opencodereview_file(&path);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].session_id, "my-unique-session");
+    }
+
+    #[test]
+    fn test_llm_response_timestamp_is_start_anchored() {
+        // Regression (follow-up to #890): an `llm_response` record's
+        // `timestamp` is written when the response is logged, i.e. the
+        // call's *end*, not its start. `duration_ms` is that call's elapsed
+        // time, so sessionize()'s `[timestamp, timestamp + duration_ms]`
+        // span would otherwise project forward past the actual completion
+        // into phantom idle time. The parser must back-calculate the start
+        // anchor instead.
+        let content = llm_response("2026-01-15T10:00:05Z", "gpt-4o", 100, 50, 0, 0);
+        let msgs = parse_events(&format!("{content}\n"));
+
+        assert_eq!(msgs.len(), 1);
+        let expected_end =
+            parse_timestamp_value(&Value::String("2026-01-15T10:00:05Z".to_string())).unwrap();
+        assert_eq!(
+            msgs[0].timestamp,
+            expected_end - 1500,
+            "timestamp must be back-calculated to the call start (end - duration)"
+        );
+        assert_eq!(
+            msgs[0].duration_ms,
+            Some(1500),
+            "duration_ms must still span from start to the recorded end timestamp"
+        );
     }
 }
