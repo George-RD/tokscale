@@ -67,32 +67,51 @@ async function runMigrate(): Promise<{
   return { ok: false, retryable, reason, stderr };
 }
 
-let lockAcquired = false;
-
-try {
+// Acquire (or re-acquire) the session-scoped advisory lock that serializes
+// concurrent `drizzle-kit migrate` runs across overlapping builds. Loops on
+// two conditions so it survives a wobbly database:
+//   - the query itself fails (DB still unreachable, e.g. mid-outage): keep
+//     retrying so a transient blip doesn't abort a deploy;
+//   - the lock is held by another build: wait for that build to finish, then
+//     re-check -- we never run a migration without holding the lock.
+// Throws only after MAX_LOCK_ATTEMPTS. Safe to call again on the migrate-retry
+// path: a transient connection drop can sever the session and silently release
+// the lock (advisory locks die with their connection), so re-establishing it
+// before each retry is what prevents two builds from migrating at once.
+async function acquireAdvisoryLock(): Promise<void> {
   for (let attempt = 1; attempt <= MAX_LOCK_ATTEMPTS; attempt++) {
-    const [result] = await sql<{ acquired: boolean }[]>`
-      SELECT pg_try_advisory_lock(hashtext(${LOCK_KEY})) AS acquired
-    `;
-    if (result?.acquired) {
-      lockAcquired = true;
-      break;
+    let acquired = false;
+    try {
+      const [row] = await sql<{ acquired: boolean }[]>`
+        SELECT pg_try_advisory_lock(hashtext(${LOCK_KEY})) AS acquired
+      `;
+      acquired = row?.acquired ?? false;
+    } catch (error) {
+      if (attempt === MAX_LOCK_ATTEMPTS) throw error;
+      console.warn(
+        `warn - could not reach DB to acquire migration advisory lock (attempt ${attempt}/${MAX_LOCK_ATTEMPTS}); retrying in ${RETRY_DELAY_MS}ms`
+      );
+      await sleep(RETRY_DELAY_MS);
+      continue;
     }
-
+    if (acquired) return;
     if (attempt < MAX_LOCK_ATTEMPTS) {
       console.warn(
-        `warn - migration advisory lock unavailable (attempt ${attempt}/${MAX_LOCK_ATTEMPTS}); retrying in ${RETRY_DELAY_MS}ms`
+        `warn - migration advisory lock held by another build (attempt ${attempt}/${MAX_LOCK_ATTEMPTS}); retrying in ${RETRY_DELAY_MS}ms`
       );
       await sleep(RETRY_DELAY_MS);
     }
   }
+  throw new Error(
+    `could not acquire migration advisory lock after ${MAX_LOCK_ATTEMPTS} attempts -- a concurrent build may be stuck`
+  );
+}
 
-  if (!lockAcquired) {
-    throw new Error(
-      `could not acquire migration advisory lock after ${MAX_LOCK_ATTEMPTS} attempts -- a concurrent build may be stuck`
-    );
-  }
+let lockAcquired = false;
 
+try {
+  await acquireAdvisoryLock();
+  lockAcquired = true;
   console.log(`ok - acquired advisory lock (${LOCK_KEY})`);
 
   let lastResult: Awaited<ReturnType<typeof runMigrate>> | undefined;
@@ -117,24 +136,11 @@ try {
     }
     await sleep(RETRY_DELAY_MS);
 
-    // A retryable connection failure may have severed not just the child
-    // drizzle-kit connection but also the parent session that holds the
-    // advisory lock -- advisory locks are session-scoped and released the
-    // moment their connection closes. Without re-checking, we could launch
-    // the next migration attempt while believing we still hold the lock,
-    // racing a concurrent build. Re-acquire before retrying: postgres.js
-    // reconnects for this query and pg_try_advisory_lock re-grabs the lock if
-    // it was released (a harmless re-entrant grab if the session survived).
-    // If a concurrent build has taken it, bail rather than race -- that build
-    // will apply the pending migrations.
-    const [reacquired] = await sql<{ acquired: boolean }[]>`
-      SELECT pg_try_advisory_lock(hashtext(${LOCK_KEY})) AS acquired
-    `;
-    if (!reacquired?.acquired) {
-      throw new Error(
-        "lost the migration advisory lock during a transient failure and a concurrent build now holds it — aborting to avoid a racing migration"
-      );
-    }
+    // The retryable failure may have severed the parent session holding the
+    // advisory lock (see acquireAdvisoryLock). Re-establish it before the next
+    // attempt so we never migrate without the lock -- waiting through both a
+    // still-recovering DB and a concurrent holder rather than aborting.
+    await acquireAdvisoryLock();
   }
 } finally {
   if (lockAcquired) {
