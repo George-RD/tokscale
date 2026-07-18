@@ -51,4 +51,18 @@ describe("classifyFailure", () => {
       reason: "non-retryable error",
     });
   });
+
+  it("does NOT retry caller-initiated pool shutdowns", () => {
+    // postgres.js emits CONNECTION_ENDED / CONNECTION_DESTROYED when the pool is
+    // deliberately closed -- deterministic, not a transient outage. Pinned so a
+    // later regex edit can't silently start retrying shutdown errors.
+    expect(classifyFailure("Error: CONNECTION_ENDED")).toEqual({
+      retryable: false,
+      reason: "non-retryable error",
+    });
+    expect(classifyFailure("Error: CONNECTION_DESTROYED")).toEqual({
+      retryable: false,
+      reason: "non-retryable error",
+    });
+  });
 });

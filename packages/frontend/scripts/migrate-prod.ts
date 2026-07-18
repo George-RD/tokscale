@@ -87,7 +87,14 @@ async function acquireAdvisoryLock(): Promise<void> {
       `;
       acquired = row?.acquired ?? false;
     } catch (error) {
-      if (attempt === MAX_LOCK_ATTEMPTS) throw error;
+      // Only wait out a TRANSIENT connectivity failure (same classifier as the
+      // migrate retry). A permanent error -- bad credentials, unreachable host,
+      // a missing function -- won't fix itself, so fail the deploy immediately
+      // instead of burning ~MAX_LOCK_ATTEMPTS of pointless waits.
+      const errorText = `${error} ${(error as { code?: unknown })?.code ?? ""}`;
+      if (attempt === MAX_LOCK_ATTEMPTS || !classifyFailure(errorText).retryable) {
+        throw error;
+      }
       console.warn(
         `warn - could not reach DB to acquire migration advisory lock (attempt ${attempt}/${MAX_LOCK_ATTEMPTS}); retrying in ${RETRY_DELAY_MS}ms`
       );
