@@ -21,11 +21,13 @@ export function classifyFailure(stderr: string): { retryable: boolean; reason: s
     // Transient loss of connectivity worth reconnecting for: postgres.js
     // surfaces an unexpectedly dropped socket as CONNECTION_CLOSED and a
     // failed connect as CONNECT_TIMEOUT; Node reports socket-level failures
-    // via these errnos; the text variants are server-initiated terminations
-    // (restart / failover). Deliberately excluded are CONNECTION_ENDED /
-    // CONNECTION_DESTROYED -- postgres.js emits those on a caller-initiated
-    // pool shutdown, i.e. deterministic, not a transient outage.
-    /CONNECTION_CLOSED|CONNECT_TIMEOUT|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|connection terminated|terminating connection|server closed the connection/i.test(
+    // (ECONN* / ETIMEDOUT / EPIPE) and transient DNS failures (ENOTFOUND /
+    // EAI_AGAIN) via these errnos; the text variants are server-initiated
+    // terminations (restart / failover). Deliberately excluded are
+    // CONNECTION_ENDED / CONNECTION_DESTROYED -- postgres.js emits those on a
+    // caller-initiated pool shutdown, i.e. deterministic, not a transient
+    // outage.
+    /CONNECTION_CLOSED|CONNECT_TIMEOUT|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|connection terminated|terminating connection|server closed the connection/i.test(
       stderr
     )
   ) {

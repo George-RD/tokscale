@@ -36,6 +36,15 @@ describe("classifyFailure", () => {
       retryable: true,
       reason: "connection error",
     });
+    // Transient DNS failures (Node getaddrinfo errnos).
+    expect(classifyFailure("Error: getaddrinfo EAI_AGAIN db.host")).toEqual({
+      retryable: true,
+      reason: "connection error",
+    });
+    expect(classifyFailure("Error: getaddrinfo ENOTFOUND db.host")).toEqual({
+      retryable: true,
+      reason: "connection error",
+    });
   });
 
   it("does NOT retry a genuine SQL error", () => {
