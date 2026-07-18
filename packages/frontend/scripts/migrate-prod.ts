@@ -116,11 +116,33 @@ try {
       );
     }
     await sleep(RETRY_DELAY_MS);
+
+    // A retryable connection failure may have severed not just the child
+    // drizzle-kit connection but also the parent session that holds the
+    // advisory lock -- advisory locks are session-scoped and released the
+    // moment their connection closes. Without re-checking, we could launch
+    // the next migration attempt while believing we still hold the lock,
+    // racing a concurrent build. Re-acquire before retrying: postgres.js
+    // reconnects for this query and pg_try_advisory_lock re-grabs the lock if
+    // it was released (a harmless re-entrant grab if the session survived).
+    // If a concurrent build has taken it, bail rather than race -- that build
+    // will apply the pending migrations.
+    const [reacquired] = await sql<{ acquired: boolean }[]>`
+      SELECT pg_try_advisory_lock(hashtext(${LOCK_KEY})) AS acquired
+    `;
+    if (!reacquired?.acquired) {
+      throw new Error(
+        "lost the migration advisory lock during a transient failure and a concurrent build now holds it — aborting to avoid a racing migration"
+      );
+    }
   }
 } finally {
   if (lockAcquired) {
     try {
-      await sql`SELECT pg_advisory_unlock(hashtext(${LOCK_KEY}))`;
+      // Release every level held -- the retry path's re-acquire is re-entrant,
+      // so the session can hold the lock more than once. pg_advisory_unlock_all
+      // clears them all regardless of depth.
+      await sql`SELECT pg_advisory_unlock_all()`;
     } catch (error) {
       console.error("warn - failed to release migration advisory lock", error);
     }

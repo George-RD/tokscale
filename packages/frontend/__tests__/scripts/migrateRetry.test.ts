@@ -31,6 +31,11 @@ describe("classifyFailure", () => {
       retryable: true,
       reason: "connection error",
     });
+    // postgres.js connect/startup timeout is reported as CONNECT_TIMEOUT.
+    expect(classifyFailure("Error: CONNECT_TIMEOUT")).toEqual({
+      retryable: true,
+      reason: "connection error",
+    });
   });
 
   it("does NOT retry a genuine SQL error", () => {

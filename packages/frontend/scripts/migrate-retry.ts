@@ -18,7 +18,10 @@ export function classifyFailure(stderr: string): { retryable: boolean; reason: s
     return { retryable: true, reason: "deadlock" };
   }
   if (
-    /CONNECTION_CLOSED|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|connection closed|connection terminated|terminating connection|server closed the connection|Connection ended/i.test(
+    // postgres.js surfaces dropped/failed connections via these error codes
+    // (CONNECTION_* / CONNECT_TIMEOUT) and Node's socket errnos (ECONN* etc.);
+    // the text variants cover server-initiated terminations.
+    /CONNECTION_CLOSED|CONNECTION_ENDED|CONNECTION_DESTROYED|CONNECT_TIMEOUT|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|connection closed|connection terminated|terminating connection|server closed the connection|Connection ended/i.test(
       stderr
     )
   ) {
