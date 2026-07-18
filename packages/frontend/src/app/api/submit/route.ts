@@ -370,11 +370,11 @@ export async function POST(request: Request) {
         // Race note: two concurrent submits from the same user can both reach
         // this branch before either has committed. The second UPDATE will try
         // to re-stamp submitted_device_id on rows the first already claimed,
-        // which can violate the (submission_id, submitted_device_id, date)
-        // unique constraint. The ON CONFLICT DO NOTHING below makes the UPDATE
-        // skip conflicting rows rather than throw, and the outer try/catch falls
-        // through to the normal insert path if a unique violation still escapes
-        // (e.g. via a concurrent INSERT racing the UPDATE window).
+        // which can violate a daily_breakdown unique constraint. The UPDATE's
+        // own NOT EXISTS dup predicate below skips rows that would collide, and
+        // the savepoint + outer try/catch fall through to the normal insert
+        // path if a unique violation still escapes (e.g. via a concurrent
+        // INSERT racing the UPDATE window).
         try {
           // Wrap the UPDATE in a savepoint so a unique-constraint violation
           // from a concurrent submit does not poison the enclosing
