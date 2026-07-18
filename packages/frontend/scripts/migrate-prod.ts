@@ -1,5 +1,6 @@
 /// <reference types="bun-types" />
 import postgres from "postgres";
+import { classifyFailure } from "./migrate-retry";
 
 // This runs BEFORE `next build` in vercel.json's buildCommand
 // (`bun run scripts/migrate-prod.ts && next build`), intentionally — not after.
@@ -46,7 +47,12 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function runMigrate(): Promise<{ ok: boolean; deadlock: boolean; stderr: string }> {
+async function runMigrate(): Promise<{
+  ok: boolean;
+  retryable: boolean;
+  reason: string;
+  stderr: string;
+}> {
   const proc = Bun.spawn(["bunx", "drizzle-kit", "migrate"], {
     stdout: "inherit",
     stderr: "pipe",
@@ -55,11 +61,10 @@ async function runMigrate(): Promise<{ ok: boolean; deadlock: boolean; stderr: s
   process.stderr.write(stderr);
   const exitCode = await proc.exited;
   if (exitCode === 0) {
-    return { ok: true, deadlock: false, stderr };
+    return { ok: true, retryable: false, reason: "", stderr };
   }
-  // Postgres deadlock_detected is SQLSTATE 40P01.
-  const deadlock = /40P01|deadlock detected/i.test(stderr);
-  return { ok: false, deadlock, stderr };
+  const { retryable, reason } = classifyFailure(stderr);
+  return { ok: false, retryable, reason, stderr };
 }
 
 let lockAcquired = false;
@@ -97,16 +102,18 @@ try {
       console.log(`ok - drizzle-kit migrate succeeded (attempt ${attempt}/${MAX_ATTEMPTS})`);
       break;
     }
-    if (!lastResult.deadlock) {
+    if (!lastResult.retryable) {
       throw new Error(
-        `drizzle-kit migrate failed (attempt ${attempt}/${MAX_ATTEMPTS}, not a deadlock — not retrying)`
+        `drizzle-kit migrate failed (attempt ${attempt}/${MAX_ATTEMPTS}, ${lastResult.reason} — not retrying)`
       );
     }
     console.warn(
-      `warn - drizzle-kit migrate hit a deadlock (attempt ${attempt}/${MAX_ATTEMPTS})`
+      `warn - drizzle-kit migrate hit a transient ${lastResult.reason} (attempt ${attempt}/${MAX_ATTEMPTS})`
     );
     if (attempt === MAX_ATTEMPTS) {
-      throw new Error(`drizzle-kit migrate deadlocked ${MAX_ATTEMPTS} times in a row`);
+      throw new Error(
+        `drizzle-kit migrate failed with a transient ${lastResult.reason} ${MAX_ATTEMPTS} times in a row`
+      );
     }
     await sleep(RETRY_DELAY_MS);
   }
