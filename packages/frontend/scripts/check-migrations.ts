@@ -52,6 +52,41 @@ for (let i = 0; i < sortedIdx.length; i++) {
 }
 console.log(`ok - migration journal idx sequence is contiguous (0..${sortedIdx.length - 1})`);
 
+// Drizzle replays by timestamp, not by idx: it fetches the last applied
+// migration's created_at once and applies only entries whose `when` exceeds
+// it. An entry added with a `when` earlier than an already-applied migration
+// is therefore silently skipped on prod, while a fresh CI database (no prior
+// migrations) still applies everything — so only a static journal check can
+// catch it. Require array order, idx order, tag prefix, and `when` order to
+// all agree.
+for (let i = 0; i < migrationJournal.entries.length; i++) {
+  const entry = migrationJournal.entries[i];
+  if (entry.idx !== i) {
+    throw new Error(
+      `_journal.json entries must be listed in idx order: position ${i} has idx ${entry.idx}.`
+    );
+  }
+  const tagPrefix = Number.parseInt(entry.tag.split("_")[0], 10);
+  if (tagPrefix !== entry.idx) {
+    throw new Error(
+      `_journal.json entry idx ${entry.idx} does not match its tag prefix (${entry.tag}). ` +
+        `Rename the migration so the file number and idx agree.`
+    );
+  }
+  if (i > 0 && entry.when <= migrationJournal.entries[i - 1].when) {
+    throw new Error(
+      `_journal.json entry ${entry.tag} (when ${entry.when}) is not strictly newer than ` +
+        `${migrationJournal.entries[i - 1].tag} (when ${migrationJournal.entries[i - 1].when}). ` +
+        `Drizzle would silently skip it on databases that already applied the newer entry. ` +
+        `Append new migrations at the end with a fresh timestamp (re-run drizzle-kit generate); ` +
+        `never hand-edit or reorder existing entries.`
+    );
+  }
+}
+console.log(
+  "ok - migration journal `when` timestamps strictly increase in idx order"
+);
+
 const migrationsDir = resolve(import.meta.dir, "../src/lib/db/migrations");
 for (const entry of migrationJournal.entries) {
   const sqlPath = resolve(migrationsDir, `${entry.tag}.sql`);
