@@ -107,6 +107,34 @@ if (orphanSqlFiles.length > 0) {
 }
 console.log("ok - every migration .sql file has a journal entry");
 
+// drizzle-kit generates against the lexically newest meta/*_snapshot.json.
+// If the newest snapshot lags the journal tail (a migration merged without
+// its snapshot), the next generate re-emits DDL that is already applied —
+// e.g. a duplicate ADD COLUMN that fails on apply. Historical snapshot gaps
+// are fine (this repo has them); only the tail must be current.
+const snapshotIndexes = readdirSync(resolve(migrationsDir, "meta"))
+  .map((name) => /^(\d{4})_snapshot\.json$/.exec(name)?.[1])
+  .filter((idx): idx is string => idx !== undefined)
+  .map((idx) => Number.parseInt(idx, 10));
+const journalTailIdx =
+  migrationJournal.entries[migrationJournal.entries.length - 1]?.idx;
+if (journalTailIdx !== undefined) {
+  const newestSnapshotIdx =
+    snapshotIndexes.length > 0 ? Math.max(...snapshotIndexes) : undefined;
+  if (newestSnapshotIdx !== journalTailIdx) {
+    throw new Error(
+      `newest migration snapshot (${
+        newestSnapshotIdx === undefined
+          ? "none found"
+          : `${String(newestSnapshotIdx).padStart(4, "0")}_snapshot.json`
+      }) does not match the journal tail (idx ${journalTailIdx}). ` +
+        `drizzle-kit generate would re-emit already-applied DDL against the stale baseline. ` +
+        `Commit the meta/${String(journalTailIdx).padStart(4, "0")}_snapshot.json produced by drizzle-kit generate.`
+    );
+  }
+}
+console.log("ok - newest migration snapshot matches the journal tail");
+
 for (const entry of migrationJournal.entries) {
   const sqlPath = resolve(migrationsDir, `${entry.tag}.sql`);
   let sqlBody: string;
