@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import postgres from "postgres";
 
@@ -88,6 +88,25 @@ console.log(
 );
 
 const migrationsDir = resolve(import.meta.dir, "../src/lib/db/migrations");
+
+// The reverse of the missing-file check below: a .sql file on disk with no
+// journal entry is never applied anywhere — drizzle iterates only journal
+// entries — and the applied-count assertion still passes because it too
+// counts journal entries. Typically the residue of a botched conflict
+// resolution that kept the file but dropped the entry.
+const journalTags = new Set(migrationJournal.entries.map((entry) => entry.tag));
+const orphanSqlFiles = readdirSync(migrationsDir)
+  .filter((name) => name.endsWith(".sql"))
+  .filter((name) => !journalTags.has(name.slice(0, -".sql".length)))
+  .sort();
+if (orphanSqlFiles.length > 0) {
+  throw new Error(
+    `migration files exist on disk with no _journal.json entry (drizzle would never apply them): ` +
+      `${orphanSqlFiles.join(", ")}. Re-run drizzle-kit generate or restore the journal entry.`
+  );
+}
+console.log("ok - every migration .sql file has a journal entry");
+
 for (const entry of migrationJournal.entries) {
   const sqlPath = resolve(migrationsDir, `${entry.tag}.sql`);
   let sqlBody: string;
