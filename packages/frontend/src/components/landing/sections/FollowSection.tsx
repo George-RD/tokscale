@@ -7,72 +7,26 @@ const SPONSOR_URL = "https://github.com/sponsors/junhoyeo";
 
 export function SponsorSection() {
   return (
-    <PickerContents data-uidotsh-pick="Sponsor section style" className="contents">
-      <PickerOption data-uidotsh-option="Signal strip" className="contents">
-        <SponsorSectionShell>
-          <SignalPanel>
-            <SignalAccent aria-hidden="true" />
-            <SponsorCopy>
-              <SponsorEyebrow>Open source, sustained</SponsorEyebrow>
-              <SponsorTitle>Keep Tokscale independent.</SponsorTitle>
-              <SponsorDescription>
-                Sponsor ongoing releases, platform support, and the work that keeps token tracking open.
-              </SponsorDescription>
-            </SponsorCopy>
-            <SponsorAction href={SPONSOR_URL} target="_blank" rel="noopener noreferrer">
-              <SponsorActionText>Sponsor on GitHub</SponsorActionText>
-              <SponsorActionArrow aria-hidden="true">↗</SponsorActionArrow>
-            </SponsorAction>
-          </SignalPanel>
-        </SponsorSectionShell>
-      </PickerOption>
-
-      <PickerOption data-uidotsh-option="Blueprint split" className="contents" hidden>
-        <SponsorSectionShell>
-          <BlueprintPanel>
-            <BlueprintHeader>
-              <SponsorEyebrow>Back the project</SponsorEyebrow>
-              <BlueprintMeta>GitHub Sponsors</BlueprintMeta>
-            </BlueprintHeader>
-            <BlueprintBody>
-              <SponsorCopy>
-                <SponsorTitle>Help ship the next release.</SponsorTitle>
-                <SponsorDescription>
-                  Your support gives maintenance, integrations, and cross-platform builds more dedicated time.
-                </SponsorDescription>
-              </SponsorCopy>
-              <SponsorAction href={SPONSOR_URL} target="_blank" rel="noopener noreferrer">
-                <SponsorActionText>Sponsor on GitHub</SponsorActionText>
-                <SponsorActionArrow aria-hidden="true">↗</SponsorActionArrow>
-              </SponsorAction>
-            </BlueprintBody>
-          </BlueprintPanel>
-        </SponsorSectionShell>
-      </PickerOption>
-
-      <PickerOption data-uidotsh-option="Support ledger" className="contents" hidden>
-        <SponsorSectionShell>
-          <LedgerPanel>
-            <LedgerCopy>
-              <SponsorEyebrow>Fund the work</SponsorEyebrow>
-              <SponsorTitle>Make open-source time sustainable.</SponsorTitle>
-              <SponsorDescription>
-                Support the maintenance behind every Tokscale release.
-              </SponsorDescription>
-            </LedgerCopy>
-            <LedgerItems role="list" aria-label="Work supported by sponsorship">
-              <LedgerItem role="listitem">CLI maintenance</LedgerItem>
-              <LedgerItem role="listitem">Platform builds</LedgerItem>
-              <LedgerItem role="listitem">Community support</LedgerItem>
-            </LedgerItems>
-            <SponsorAction href={SPONSOR_URL} target="_blank" rel="noopener noreferrer">
-              <SponsorActionText>Sponsor on GitHub</SponsorActionText>
-              <SponsorActionArrow aria-hidden="true">↗</SponsorActionArrow>
-            </SponsorAction>
-          </LedgerPanel>
-        </SponsorSectionShell>
-      </PickerOption>
-    </PickerContents>
+    <SponsorSectionShell>
+      <BlueprintPanel>
+        <BlueprintHeader>
+          <SponsorEyebrow>Back the project</SponsorEyebrow>
+          <BlueprintMeta>GitHub Sponsors</BlueprintMeta>
+        </BlueprintHeader>
+        <BlueprintBody>
+          <SponsorCopy>
+            <SponsorTitle>Help ship the next release.</SponsorTitle>
+            <SponsorDescription>
+              Your support gives maintenance, integrations, and cross-platform builds more dedicated time.
+            </SponsorDescription>
+          </SponsorCopy>
+          <SponsorAction href={SPONSOR_URL} target="_blank" rel="noopener noreferrer">
+            <SponsorActionText>Sponsor on GitHub</SponsorActionText>
+            <SponsorActionArrow aria-hidden="true">↗</SponsorActionArrow>
+          </SponsorAction>
+        </BlueprintBody>
+      </BlueprintPanel>
+    </SponsorSectionShell>
   );
 }
 
@@ -125,23 +79,7 @@ export function FollowSection() {
   );
 }
 
-/* ── Sponsor Picker Styled Components ── */
-
-const PickerContents = styled.div`
-  display: contents;
-
-  &[hidden] {
-    display: none;
-  }
-`;
-
-const PickerOption = styled.div`
-  display: contents;
-
-  &[hidden] {
-    display: none;
-  }
-`;
+/* ── Sponsor Section Styled Components ── */
 
 const SponsorSectionShell = styled.section`
   width: 100%;
@@ -237,33 +175,6 @@ const SponsorActionArrow = styled.span`
   color: #87f0f2;
 `;
 
-const SignalPanel = styled.div`
-  position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 40px;
-  overflow: hidden;
-  padding: 40px 48px;
-  border: 1px solid rgba(0, 115, 255, 0.48);
-  border-radius: 16px;
-  background: #01070f;
-
-  @media (max-width: 768px) {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 28px;
-    padding: 32px 24px 32px 28px;
-  }
-`;
-
-const SignalAccent = styled.div`
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: 4px;
-  background: #0073ff;
-`;
-
 const BlueprintPanel = styled.div`
   overflow: hidden;
   border: 1px solid rgba(0, 115, 255, 0.48);
@@ -311,56 +222,6 @@ const BlueprintBody = styled.div`
     gap: 28px;
     padding: 32px 24px;
   }
-`;
-
-const LedgerPanel = styled.div`
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 40px;
-  padding: 40px 48px;
-  border-top: 1px solid rgba(0, 115, 255, 0.48);
-  border-bottom: 1px solid rgba(0, 115, 255, 0.48);
-  background: #01070f;
-
-  @media (max-width: 900px) {
-    grid-template-columns: minmax(0, 1fr) auto;
-  }
-
-  @media (max-width: 768px) {
-    grid-template-columns: 1fr;
-    align-items: stretch;
-    gap: 28px;
-    padding: 32px 24px;
-  }
-`;
-
-const LedgerCopy = styled(SponsorCopy)`
-  @media (min-width: 769px) and (max-width: 900px) {
-    grid-column: 1 / -1;
-  }
-`;
-
-const LedgerItems = styled.div`
-  display: flex;
-  flex-direction: column;
-  gap: 0;
-  min-width: 0;
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
-
-  @media (min-width: 769px) and (max-width: 900px) {
-    grid-column: 1;
-  }
-`;
-
-const LedgerItem = styled.div`
-  padding: 10px 0;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-  font-family: var(--font-mono), monospace;
-  font-weight: 500;
-  font-size: 14px;
-  line-height: 1.4em;
-  color: #b6c0d4;
 `;
 
 /* ── Follow Section Styled Components ── */
