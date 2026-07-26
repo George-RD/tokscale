@@ -153,6 +153,9 @@ pub struct SessionUsage {
     /// (e.g. OpenCode's `session.title` column). `None` for clients that
     /// don't record a title.
     pub title: Option<String>,
+    /// Distinct models used across messages in this session, in first-seen
+    /// order. Most sessions use a single model; a few switch mid-conversation.
+    pub models: Vec<SessionModel>,
     pub tokens: TokenBreakdown,
     pub cost: f64,
     pub message_count: u32,
@@ -163,6 +166,15 @@ pub struct SessionUsage {
     /// Unix-ms timestamp of the most recent message observed in this session.
     /// `0` when every message lacked a usable timestamp.
     pub last_active_ms: i64,
+}
+
+/// A model entry within a session, retaining the provider and color_key
+/// needed for correct family-shade color lookup alongside the display name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionModel {
+    pub display_name: String,
+    pub provider: String,
+    pub color_key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -912,6 +924,7 @@ impl DataLoader {
                             session_id: msg.session_id.clone(),
                             client: msg.client.clone(),
                             title: None,
+                            models: Vec::new(),
                             tokens: TokenBreakdown::default(),
                             cost: 0.0,
                             message_count: 0,
@@ -968,6 +981,20 @@ impl DataLoader {
                             session_entry.title = Some(trimmed.to_string());
                         }
                     }
+                }
+
+                // Track distinct models in first-seen order, retaining
+                // provider and color_key for correct shade-map lookups.
+                if !session_entry
+                    .models
+                    .iter()
+                    .any(|m| m.display_name == normalized_model)
+                {
+                    session_entry.models.push(SessionModel {
+                        display_name: normalized_model.clone(),
+                        provider: msg.provider_id.clone(),
+                        color_key: model_key.clone(),
+                    });
                 }
             }
         }
@@ -2788,6 +2815,85 @@ after"#,
             },
             cost,
         )
+    }
+
+    /// The Sessions tab's Model column reads `SessionUsage.models`. Each entry
+    /// keeps the provider and color key its family-shade lookup needs, and the
+    /// list is deduped by display name so a model reached under two spellings
+    /// (here a dated id and its normalized form) lands once, in first-seen order.
+    ///
+    /// The dedup below relies on `model_name_for_grouping` ignoring `provider_id`
+    /// for this input: it consults the provider only when `client == "opencode"`
+    /// (to apply an OpenCode-configured label), and every other client falls
+    /// through to `normalize_model_for_grouping`, which is a pure function of the
+    /// model id. That is why the third message can carry a different provider
+    /// (`github-copilot` vs `anthropic`) and still collapse onto the same display
+    /// name. If that scoping ever widens beyond OpenCode, this assertion is the
+    /// one that should start failing.
+    #[test]
+    fn test_session_models_dedup_by_display_name_and_retain_provider() {
+        let loader = DataLoader::new(None);
+        let base_ms = 1_735_689_600_000_i64;
+        let tokens = || tokscale_core::TokenBreakdown {
+            input: 10,
+            output: 5,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        };
+        let usage = loader
+            .aggregate_messages(
+                vec![
+                    UnifiedMessage::new(
+                        "claude",
+                        "claude-sonnet-4-5-20250929",
+                        "anthropic",
+                        "session-1",
+                        base_ms,
+                        tokens(),
+                        1.0,
+                    ),
+                    UnifiedMessage::new(
+                        "claude",
+                        "gpt-5",
+                        "openai",
+                        "session-1",
+                        base_ms + 1_000,
+                        tokens(),
+                        1.0,
+                    ),
+                    // Same model as the first message, spelled without the date
+                    // and served through a gateway: must not add a second entry.
+                    UnifiedMessage::new(
+                        "claude",
+                        "claude-sonnet-4-5",
+                        "github-copilot",
+                        "session-1",
+                        base_ms + 2_000,
+                        tokens(),
+                        1.0,
+                    ),
+                ],
+                &GroupBy::Model,
+            )
+            .unwrap();
+
+        assert_eq!(usage.sessions.len(), 1, "expected a single session bucket");
+        assert_eq!(
+            usage.sessions[0].models,
+            vec![
+                SessionModel {
+                    display_name: "claude-sonnet-4-5".to_string(),
+                    provider: "anthropic".to_string(),
+                    color_key: "claude-sonnet-4-5".to_string(),
+                },
+                SessionModel {
+                    display_name: "gpt-5".to_string(),
+                    provider: "openai".to_string(),
+                    color_key: "gpt-5".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]
