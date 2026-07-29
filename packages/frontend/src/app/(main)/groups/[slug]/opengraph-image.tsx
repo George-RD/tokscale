@@ -7,6 +7,7 @@ import {
   OgStat,
 } from "@/components/og/OgCard";
 import { getGroupBySlug, getGroupMemberCount } from "@/lib/groups/queries";
+import { loadOgFonts } from "@/lib/og/fonts";
 
 export const alt = "Group token usage on Tokscale";
 export const size = OG_SIZE;
@@ -34,6 +35,12 @@ export default async function Image({
     : null;
 
   const description = isPublic ? group.description?.trim() : null;
+
+  // Group names and descriptions are free text, so CJK is considerably more
+  // likely here than in a GitHub username.
+  const fonts = await loadOgFonts(
+    `${isPublic ? group.name : ""}${description ?? ""}`
+  );
 
   return new ImageResponse(
     (
@@ -82,6 +89,6 @@ export default async function Image({
         )}
       </OgCardShell>
     ),
-    { ...size }
+    { ...size, fonts }
   );
 }

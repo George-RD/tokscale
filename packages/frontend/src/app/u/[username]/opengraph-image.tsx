@@ -8,6 +8,7 @@ import {
   OgStat,
 } from "@/components/og/OgCard";
 import { getUserEmbedStats } from "@/lib/embed/getUserEmbedStats";
+import { loadOgFonts } from "@/lib/og/fonts";
 import { formatCompact } from "@/lib/format";
 
 export const alt = "AI token usage on Tokscale";
@@ -33,6 +34,10 @@ export default async function Image({
   const displayName = user?.displayName?.trim();
   const handle = user?.username ?? username;
   const rank = stats?.stats.rank;
+
+  // Only the dynamic strings need declaring: loadOgFonts adds the digits and
+  // symbols the stat tiles use. A CJK display name is what pulls in Pretendard.
+  const fonts = await loadOgFonts(`${handle}${displayName ?? ""}`);
 
   return new ImageResponse(
     (
@@ -91,6 +96,6 @@ export default async function Image({
         )}
       </OgCardShell>
     ),
-    { ...size }
+    { ...size, fonts }
   );
 }
