@@ -94,8 +94,15 @@ async function fetchUserEmbedStats(
     const rankRow = (
       rankResult as unknown as { rank: number; total: number }[]
     )[0];
-    rank = rankRow?.rank || null;
-    rankTotal = rankRow?.total || null;
+    // Coerced because RANK() is a Postgres bigint, which postgres-js hands
+    // back as a string — so without this the returned value is "1", not 1, and
+    // the `number | null` on UserEmbedStats is wrong. publicProfileData.ts
+    // compensates for the same thing at its call site.
+    //
+    // Number(undefined) is NaN and falls through to null, so a missing row
+    // behaves as before.
+    rank = Number(rankRow?.rank) || null;
+    rankTotal = Number(rankRow?.total) || null;
   }
 
   return {
