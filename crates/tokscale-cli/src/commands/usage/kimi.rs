@@ -366,10 +366,22 @@ mod tests {
             let _guard = EnvVarGuard::remove("KIMI_CODE_HOME");
             kimi_code_candidate()
         };
-        assert!(
-            unset.ends_with(".kimi-code/credentials/kimi-code.json"),
-            "unset lookup no longer defaults to ~/.kimi-code: {unset:?}"
-        );
+        // Pinning the baseline is what stops this test from passing if the
+        // fallback expression itself changes, but it only holds where a home
+        // directory resolves: with none, `credentials_paths` intentionally
+        // yields the relative `./credentials/kimi-code.json`. Asserting the
+        // `.kimi-code` shape unconditionally would fail on a machine with no
+        // HOME while the code under test behaved exactly as documented.
+        //
+        // The blank-equals-unset assertion below needs no such guard -- both
+        // sides take the same branch whichever it is, which is the property
+        // this test actually exists to prove.
+        if dirs::home_dir().is_some() {
+            assert!(
+                unset.ends_with(".kimi-code/credentials/kimi-code.json"),
+                "unset lookup no longer defaults to ~/.kimi-code: {unset:?}"
+            );
+        }
 
         for blank in ["", "   ", "\t\n"] {
             let _guard = EnvVarGuard::set("KIMI_CODE_HOME", blank);
