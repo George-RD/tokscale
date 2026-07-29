@@ -14,17 +14,46 @@ interface GroupPageProps {
 }
 
 /**
- * Built from the slug alone so it costs no extra query — the page's own
- * getGroupBySlug lookup is not React-cached, so touching the DB here would
- * double it on every request. Private groups notFound() below, and a 404 is
- * not indexed, so emitting a canonical for one is harmless.
+ * getGroupBySlug is React-cached, so this shares the page's lookup rather than
+ * issuing a second query.
+ *
+ * The name is only used when the group is public. A private group 404s for
+ * non-members below, but generateMetadata still runs — putting its name in the
+ * title would leak it to anyone who guessed the slug.
  */
 export async function generateMetadata({ params }: GroupPageProps): Promise<Metadata> {
   const { slug } = await params;
+  const group = await getGroupBySlug(slug);
+  const canonical = groupUrl(slug);
+
+  if (!group?.isPublic) {
+    return {
+      title: "Group | Tokscale",
+      alternates: { canonical },
+      robots: { index: false, follow: false },
+    };
+  }
+
+  const title = `${group.name} - Group Token Usage | Tokscale`;
+  const description =
+    group.description?.trim() ||
+    `Combined AI token usage and cost for the ${group.name} group on Tokscale.`;
 
   return {
-    alternates: {
-      canonical: groupUrl(slug),
+    title,
+    description,
+    alternates: { canonical },
+    openGraph: {
+      title,
+      description,
+      type: "website",
+      url: canonical,
+      siteName: "Tokscale",
+    },
+    twitter: {
+      card: "summary_large_image",
+      title,
+      description,
     },
   };
 }

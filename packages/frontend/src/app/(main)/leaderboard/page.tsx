@@ -63,10 +63,34 @@ interface PageProps {
  */
 export async function generateMetadata({ searchParams }: PageProps): Promise<Metadata> {
   const params = await searchParams;
+  const view = resolveView(params.view);
+  const canonical = leaderboardUrl(view);
+
+  const title =
+    view === "groups"
+      ? "Groups Leaderboard - Team AI Token Usage | Tokscale"
+      : "Leaderboard - Who Burns the Most AI Tokens | Tokscale";
+
+  const description =
+    view === "groups"
+      ? "Browse public groups and compare combined AI coding assistant token usage and spend across teams, companies, and communities."
+      : "Live ranking of developers by AI coding assistant token usage and cost, across Claude Code, Cursor, Codex, Copilot, Gemini, and more.";
 
   return {
-    alternates: {
-      canonical: leaderboardUrl(resolveView(params.view)),
+    title,
+    description,
+    alternates: { canonical },
+    openGraph: {
+      title,
+      description,
+      type: "website",
+      url: canonical,
+      siteName: "Tokscale",
+    },
+    twitter: {
+      card: "summary_large_image",
+      title,
+      description,
     },
   };
 }
