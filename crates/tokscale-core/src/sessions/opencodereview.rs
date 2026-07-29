@@ -340,10 +340,13 @@ mod tests {
 
     #[test]
     fn reparsing_a_timestampless_file_reproduces_the_same_dedup_keys() {
-        // The per-record discriminator must be derived from the file's own
-        // content: if it drifted between two parses of an unchanged file the
-        // caller's dedup sets would stop matching and the same usage would be
-        // counted twice instead of once.
+        // The discriminator must be a pure function of the file's bytes, not
+        // of parse order or wall-clock, so two parses of an unchanged file
+        // agree. Only this parser's own `seen` set reads the key today —
+        // unified_to_parsed drops the field — so this pins the property
+        // before a cross-parse consumer relies on it. Note the rest of the
+        // key still moves when the file grows: with no `timestamp` field
+        // `recorded_timestamp` is the mtime.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test-session-123.jsonl");
         std::fs::write(

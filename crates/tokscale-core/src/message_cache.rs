@@ -849,8 +849,10 @@ fn parser_version(client: ClientId) -> u32 {
         // (end-anchored) timestamp. Follow-up to #890. v2->v3: records without
         // their own `timestamp` now carry a line-number discriminator in the
         // dedup key, so distinct calls sharing a model and token counts no
-        // longer collapse into one under the shared file-mtime fallback; v2
-        // caches hold those undercounted messages.
+        // longer collapse into one under the shared file-mtime fallback.
+        // Both bumps are precautionary rather than corrective: opencodereview
+        // is parsed only by parse_local_clients, which does not go through
+        // this cache, so no entry has ever been written under this namespace.
         ClientId::OpenCodeReview => 3,
         // Kiro's structured messages.jsonl turns now back-calculate the
         // start anchor from `turn_end - elapsedTime` when the user prompt's
@@ -2094,15 +2096,6 @@ mod tests {
         assert_eq!(parser_version(ClientId::Zcode), 3);
         assert_eq!(parser_version(ClientId::OpenCodeReview), 3);
         assert_eq!(parser_version(ClientId::Kiro), 2);
-    }
-
-    #[test]
-    fn test_opencodereview_dedup_key_parser_version_invalidates_v2_entries() {
-        // #941 finding 2: timestampless llm_response records all shared the
-        // file-mtime fallback in their dedup key, so two distinct calls with
-        // the same model and token counts collapsed into one. v2 cache entries
-        // hold that undercount and must not be reused.
-        assert_eq!(parser_version(ClientId::OpenCodeReview), 3);
     }
 
     #[test]
