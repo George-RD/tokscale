@@ -21,11 +21,9 @@ describe("SITE_URL", () => {
 });
 
 describe("homeUrl", () => {
-  it("is the bare origin", () => {
-    // Next.js re-normalizes this on the way out — the served sitemap says
-    // "https://tokscale.ai/" and the served canonical tag says
-    // "https://tokscale.ai". Both spellings are the same URL, and neither
-    // normalization is ours to control, so this asserts the input only.
+  it("is the bare origin, which both consumers emit verbatim", () => {
+    // Verified against prod: the sitemap <loc> and the page's canonical tag
+    // both render exactly this, with no trailing slash added by either.
     expect(homeUrl()).toBe("https://tokscale.ai");
   });
 });

@@ -11,14 +11,13 @@
 export const SITE_URL = "https://tokscale.ai";
 
 /**
- * The one URL whose two consumers are out of our hands: whatever this returns,
- * Next.js normalizes the sitemap entry to `https://tokscale.ai/` and the
- * canonical tag to `https://tokscale.ai`. The framework applies those two
- * normalizations in opposite directions, so they cannot be made to agree here.
+ * The bare origin, with no trailing slash, which is what both consumers emit
+ * verbatim: prod serves `<loc>https://tokscale.ai</loc>` in the sitemap and
+ * `rel="canonical" href="https://tokscale.ai"` on the page.
  *
- * Harmless — an empty path and "/" are the same URL per RFC 3986, and Google
- * treats them as one. Noted only so the mismatch isn't mistaken for a bug.
- * Every other builder below round-trips through both consumers unchanged.
+ * Don't add a trailing slash back "for correctness" — it would desync the two.
+ * (A `next dev` server caches this route aggressively and can serve a stale
+ * `https://tokscale.ai/`; check prod, not dev, if the two ever look different.)
  */
 export function homeUrl(): string {
   return SITE_URL;
