@@ -2439,6 +2439,16 @@ mod tests {
         File::create(workspace.join("execution")).unwrap();
     }
 
+    fn setup_mock_senpi_dir(base: &std::path::Path) {
+        let senpi_path = base.join(".senpi/agent/sessions/--Users-someone-project--");
+        fs::create_dir_all(&senpi_path).unwrap();
+        let mut file = File::create(
+            senpi_path.join("2026-07-29T15-19-53-436Z_019fae75-f35c-7b20-8d6f-e6dea8f7d9f5.jsonl"),
+        )
+        .unwrap();
+        file.write_all(b"{}").unwrap();
+    }
+
     fn setup_mock_omp_dir(base: &std::path::Path) {
         let omp_path = base.join(".omp/agent/sessions/--omp-test--");
         fs::create_dir_all(&omp_path).unwrap();
@@ -3522,6 +3532,35 @@ mod tests {
         assert_eq!(result.get(ClientId::Pi).len(), 1);
         assert!(result.get(ClientId::OpenCode).is_empty());
         assert!(result.get(ClientId::Claude).is_empty());
+    }
+
+    #[test]
+    fn test_scan_all_clients_senpi() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_senpi_dir(home);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["senpi".to_string()],
+            false,
+        );
+        assert_eq!(result.get(ClientId::Senpi).len(), 1);
+        assert!(result.get(ClientId::Senpi)[0]
+            .ends_with("2026-07-29T15-19-53-436Z_019fae75-f35c-7b20-8d6f-e6dea8f7d9f5.jsonl"));
+        assert!(result.get(ClientId::Pi).is_empty());
+    }
+
+    #[test]
+    fn test_scan_all_clients_senpi_is_not_scanned_as_pi() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_senpi_dir(home);
+
+        let result =
+            scan_all_clients_with_env_strategy(home.to_str().unwrap(), &["pi".to_string()], false);
+        assert!(result.get(ClientId::Pi).is_empty());
+        assert!(result.get(ClientId::Senpi).is_empty());
     }
 
     #[test]
