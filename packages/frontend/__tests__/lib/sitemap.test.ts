@@ -1,22 +1,44 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  SITE_URL,
   SITEMAP_GROUP_LIMIT,
   SITEMAP_USER_LIMIT,
   buildCoreEntries,
   buildGroupEntries,
   buildUserEntries,
 } from "@/lib/seo/sitemap";
+import { SITE_URL, homeUrl, leaderboardUrl } from "@/lib/seo/urls";
 
 const NOW = new Date("2026-07-29T00:00:00.000Z");
 const SUBMITTED_AT = new Date("2026-07-01T12:34:56.000Z");
 
 describe("buildCoreEntries", () => {
-  it("lists the home and leaderboard pages as absolute canonical URLs", () => {
+  it("lists the home page and both leaderboard views as absolute canonical URLs", () => {
     const urls = buildCoreEntries(NOW).map((entry) => entry.url);
 
-    expect(urls).toEqual([SITE_URL, `${SITE_URL}/leaderboard`]);
+    expect(urls).toEqual([
+      SITE_URL,
+      `${SITE_URL}/leaderboard`,
+      `${SITE_URL}/leaderboard?view=groups`,
+    ]);
+  });
+
+  it("uses the same builders the pages canonicalize with", () => {
+    // If a sitemap URL and the page's own <link rel="canonical"> disagree,
+    // the page is dropped rather than arbitrated — so they share one source.
+    const urls = buildCoreEntries(NOW).map((entry) => entry.url);
+
+    expect(urls).toContain(homeUrl());
+    expect(urls).toContain(leaderboardUrl());
+    expect(urls).toContain(leaderboardUrl("groups"));
+  });
+
+  it("lists no filtered leaderboard URL, since those disclaim themselves", () => {
+    const urls = buildCoreEntries(NOW).map((entry) => entry.url);
+
+    for (const param of ["period=", "sortBy=", "page=", "search=", "from=", "to="]) {
+      expect(urls.some((url) => url.includes(param))).toBe(false);
+    }
   });
 
   it("omits auth-gated, redirect-only, and invite routes", () => {

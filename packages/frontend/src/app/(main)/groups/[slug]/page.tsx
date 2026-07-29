@@ -1,3 +1,4 @@
+import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { Navigation } from "@/components/layout/Navigation";
 import { ServiceFooter } from "@/components/layout/ServiceFooter";
@@ -5,10 +6,27 @@ import { getSession } from "@/lib/auth/session";
 import { getGroupLeaderboardData } from "@/lib/groups/getGroupLeaderboard";
 import { getGroupMembership } from "@/lib/groups/permissions";
 import { getGroupBySlug, getGroupMemberCount } from "@/lib/groups/queries";
+import { groupUrl } from "@/lib/seo/urls";
 import GroupDetailClient from "./GroupDetailClient";
 
 interface GroupPageProps {
   params: Promise<{ slug: string }>;
+}
+
+/**
+ * Built from the slug alone so it costs no extra query — the page's own
+ * getGroupBySlug lookup is not React-cached, so touching the DB here would
+ * double it on every request. Private groups notFound() below, and a 404 is
+ * not indexed, so emitting a canonical for one is harmless.
+ */
+export async function generateMetadata({ params }: GroupPageProps): Promise<Metadata> {
+  const { slug } = await params;
+
+  return {
+    alternates: {
+      canonical: groupUrl(slug),
+    },
+  };
 }
 
 function PageShell({ children }: { children: React.ReactNode }) {

@@ -1,14 +1,5 @@
 import type { MetadataRoute } from "next";
-
-/**
- * Canonical origin for every absolute URL we hand to crawlers.
- *
- * Must stay in sync with `metadataBase` in app/layout.tsx: Search Console
- * rejects sitemap entries whose host differs from the property being verified,
- * and a mismatch between the sitemap and the page's canonical tag silently
- * drops the URL from the index.
- */
-export const SITE_URL = "https://tokscale.ai";
+import { groupUrl, homeUrl, leaderboardUrl, profileUrl } from "./urls";
 
 /**
  * sitemaps.org caps one sitemap file at 50,000 URLs / 50 MB uncompressed, and
@@ -48,20 +39,30 @@ export interface SitemapGroupRow {
  * - /local                        — client-only viewer; renders empty to a
  *                                   crawler, so listing it would just add a
  *                                   thin-content URL to the index
+ *
+ * The leaderboard is listed once, bare. Its filter params (period, sortBy,
+ * page, from/to, search) all canonicalize back to this URL, so listing any of
+ * them would point crawlers at pages that disclaim themselves.
  */
 export function buildCoreEntries(now: Date): MetadataRoute.Sitemap {
   return [
     {
-      url: SITE_URL,
+      url: homeUrl(),
       lastModified: now,
       changeFrequency: "daily",
       priority: 1,
     },
     {
-      url: `${SITE_URL}/leaderboard`,
+      url: leaderboardUrl(),
       lastModified: now,
       changeFrequency: "hourly",
       priority: 0.9,
+    },
+    {
+      url: leaderboardUrl("groups"),
+      lastModified: now,
+      changeFrequency: "daily",
+      priority: 0.7,
     },
   ];
 }
@@ -71,7 +72,7 @@ export function buildUserEntries(
   fallbackLastModified: Date
 ): MetadataRoute.Sitemap {
   return rows.map((row) => ({
-    url: `${SITE_URL}/u/${encodeURIComponent(row.username)}`,
+    url: profileUrl(row.username),
     lastModified: row.updatedAt ?? fallbackLastModified,
     changeFrequency: "daily",
     priority: 0.7,
@@ -83,7 +84,7 @@ export function buildGroupEntries(
   fallbackLastModified: Date
 ): MetadataRoute.Sitemap {
   return rows.map((row) => ({
-    url: `${SITE_URL}/groups/${encodeURIComponent(row.slug)}`,
+    url: groupUrl(row.slug),
     lastModified: row.updatedAt ?? fallbackLastModified,
     changeFrequency: "weekly",
     priority: 0.6,

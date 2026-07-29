@@ -1,5 +1,5 @@
 import type { MetadataRoute } from "next";
-import { SITE_URL } from "@/lib/seo/sitemap";
+import { SITE_URL } from "@/lib/seo/urls";
 
 export default function robots(): MetadataRoute.Robots {
   return {
