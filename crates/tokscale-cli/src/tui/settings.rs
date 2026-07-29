@@ -73,6 +73,16 @@ pub struct AutosubmitSettings {
     pub scheduler: Option<String>,
     #[serde(default)]
     pub managed_executable: Option<String>,
+    /// Version of the build that `managed_executable` was copied from.
+    ///
+    /// The copy is written only by `autosubmit enable`, so upgrading the
+    /// installed binary leaves the scheduled job on the old build. Without this
+    /// there is no way to tell a stale scheduled job from a current one, and
+    /// the drift is silent. `None` on configs written before this field
+    /// existed, and on those the version is reported as unknown rather than
+    /// assumed current.
+    #[serde(default)]
+    pub managed_executable_version: Option<String>,
     #[serde(default)]
     pub last_run_at_ms: Option<i64>,
     #[serde(default)]
@@ -94,6 +104,7 @@ impl Default for AutosubmitSettings {
             month: false,
             scheduler: None,
             managed_executable: None,
+            managed_executable_version: None,
             last_run_at_ms: None,
             last_error: None,
         }
