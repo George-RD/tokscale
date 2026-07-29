@@ -6,6 +6,7 @@ import {
   buildCoreEntries,
   buildGroupEntries,
   buildUserEntries,
+  latestSubmissionTime,
 } from "@/lib/seo/sitemap";
 import { SITE_URL, homeUrl, leaderboardUrl } from "@/lib/seo/urls";
 
@@ -109,6 +110,57 @@ describe("buildGroupEntries", () => {
 
     expect(entry.url).toBe(`${SITE_URL}/groups/anthropic`);
     expect(entry.lastModified).toBe(SUBMITTED_AT);
+  });
+});
+
+describe("latestSubmissionTime", () => {
+  const OLDER = new Date("2026-07-01T00:00:00.000Z");
+  const NEWER = new Date("2026-07-20T00:00:00.000Z");
+
+  it("returns the newest submission time regardless of row order", () => {
+    // Rows arrive ordered by totalTokens, not by time, so this cannot just
+    // read the first or last element.
+    const rows = [
+      { username: "a", updatedAt: OLDER },
+      { username: "b", updatedAt: NEWER },
+      { username: "c", updatedAt: OLDER },
+    ];
+
+    expect(latestSubmissionTime(rows)).toBe(NEWER);
+  });
+
+  it("ignores rows with no submission time", () => {
+    const rows = [
+      { username: "a", updatedAt: null },
+      { username: "b", updatedAt: OLDER },
+      { username: "c", updatedAt: null },
+    ];
+
+    expect(latestSubmissionTime(rows)).toBe(OLDER);
+  });
+
+  it("returns null when there is nothing truthful to report", () => {
+    expect(latestSubmissionTime([])).toBeNull();
+    expect(latestSubmissionTime([{ username: "a", updatedAt: null }])).toBeNull();
+  });
+
+  it("does not advance when the same rows are passed again", () => {
+    // The whole point: an hourly revalidation must not move lastmod unless a
+    // submission actually landed. Google discounts lastmod site-wide when it
+    // moves without the page changing.
+    const rows = [{ username: "a", updatedAt: OLDER }];
+
+    expect(latestSubmissionTime(rows)).toBe(latestSubmissionTime(rows));
+  });
+});
+
+describe("buildCoreEntries lastmod", () => {
+  it("stamps every core page with the supplied time, not the current time", () => {
+    const activity = new Date("2026-07-20T00:00:00.000Z");
+
+    for (const entry of buildCoreEntries(activity)) {
+      expect(entry.lastModified).toBe(activity);
+    }
   });
 });
 

@@ -29,7 +29,35 @@ export interface SitemapGroupRow {
 }
 
 /**
+ * The newest submission time across the listed users, which is the moment the
+ * leaderboard (and the top-5 table on the home page) last actually changed.
+ *
+ * Used as the core pages' `lastmod` instead of the generation timestamp.
+ * Google only honors lastmod when it is "consistently and verifiably accurate"
+ * — a value that advances on every hourly revalidation while the page content
+ * is unchanged is precisely the pattern that teaches it to ignore ours, and it
+ * discounts lastmod per-site rather than per-URL.
+ *
+ * Returns null for an empty list so the caller can fall back explicitly.
+ */
+export function latestSubmissionTime(
+  rows: readonly SitemapUserRow[]
+): Date | null {
+  let latest: Date | null = null;
+
+  for (const row of rows) {
+    if (row.updatedAt && (latest === null || row.updatedAt > latest)) {
+      latest = row.updatedAt;
+    }
+  }
+
+  return latest;
+}
+
+/**
  * Pages that exist independently of the database.
+ *
+ * `lastModified` should come from latestSubmissionTime(), not `new Date()`.
  *
  * Deliberately excluded, and mirrored by the disallow list in app/robots.ts:
  * - /settings, /profile, /device  — auth-gated or redirect-only
@@ -44,23 +72,26 @@ export interface SitemapGroupRow {
  * page, from/to, search) all canonicalize back to this URL, so listing any of
  * them would point crawlers at pages that disclaim themselves.
  */
-export function buildCoreEntries(now: Date): MetadataRoute.Sitemap {
+export function buildCoreEntries(lastModified: Date): MetadataRoute.Sitemap {
+  // changeFrequency and priority are inert for Google, which documents that it
+  // ignores both. Kept because Bing, Naver and Daum still read them and they
+  // cost nothing.
   return [
     {
       url: homeUrl(),
-      lastModified: now,
+      lastModified,
       changeFrequency: "daily",
       priority: 1,
     },
     {
       url: leaderboardUrl(),
-      lastModified: now,
+      lastModified,
       changeFrequency: "hourly",
       priority: 0.9,
     },
     {
       url: leaderboardUrl("groups"),
-      lastModified: now,
+      lastModified,
       changeFrequency: "daily",
       priority: 0.7,
     },

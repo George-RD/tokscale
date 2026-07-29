@@ -7,6 +7,7 @@ import {
   buildCoreEntries,
   buildGroupEntries,
   buildUserEntries,
+  latestSubmissionTime,
   type SitemapGroupRow,
   type SitemapUserRow,
 } from "@/lib/seo/sitemap";
@@ -70,8 +71,15 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
     loadOrEmpty("groups", loadGroupRows),
   ]);
 
+  // Anchored to real submission activity rather than `now`: this route
+  // revalidates hourly, so `now` would advance the core pages' lastmod every
+  // hour whether or not anything changed, which is what makes Google stop
+  // trusting the field. Falls back to `now` only when the DB is unreachable
+  // and there is nothing truthful to report.
+  const coreLastModified = latestSubmissionTime(userRows) ?? now;
+
   return [
-    ...buildCoreEntries(now),
+    ...buildCoreEntries(coreLastModified),
     ...buildUserEntries(userRows, now),
     ...buildGroupEntries(groupRows, now),
   ];
