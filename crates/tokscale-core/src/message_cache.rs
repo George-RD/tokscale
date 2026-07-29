@@ -856,7 +856,10 @@ fn parser_version(client: ClientId) -> u32 {
         ClientId::Kiro => 2,
         // Kimi v2 checks token buckets without an overflowing sum. v2->v3:
         // symbolic usage-record models now resolve from the latest llm.request.
-        ClientId::Kimi => 3,
+        // v3->v4: non-positive wire timestamps (kimi-cli `timestamp`,
+        // kimi-code `time`) now fall back to the file mtime instead of
+        // anchoring the message in a pre-epoch bucket.
+        ClientId::Kimi => 4,
         // v1->v2: per-model token attribution now comes from
         // session_model_usage instead of crediting the whole session to
         // sessions.model, and dedup keys are namespaced per (session, model).
@@ -2093,8 +2096,8 @@ mod tests {
     }
 
     #[test]
-    fn test_kimi_parser_version_invalidates_v2_entries() {
-        assert_eq!(parser_version(ClientId::Kimi), 3);
+    fn test_kimi_parser_version_invalidates_v3_entries() {
+        assert_eq!(parser_version(ClientId::Kimi), 4);
     }
 
     #[test]
