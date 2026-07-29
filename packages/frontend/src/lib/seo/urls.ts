@@ -55,3 +55,17 @@ export function profileUrl(username: string): string {
 export function groupUrl(slug: string): string {
   return `${SITE_URL}/groups/${encodeURIComponent(slug)}`;
 }
+
+/**
+ * Static informational pages. Listed here rather than inlined so they land in
+ * the sitemap and their canonical tags through the same path as everything
+ * else — ad networks and search engines both check that these exist and are
+ * reachable, so they must not be the one set of URLs that drifts.
+ */
+export const LEGAL_PATHS = ["privacy", "terms", "contact"] as const;
+
+export type LegalPath = (typeof LEGAL_PATHS)[number];
+
+export function legalUrl(page: LegalPath): string {
+  return `${SITE_URL}/${page}`;
+}

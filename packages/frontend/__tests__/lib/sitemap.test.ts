@@ -8,10 +8,17 @@ import {
   buildUserEntries,
   latestSubmissionTime,
 } from "@/lib/seo/sitemap";
-import { SITE_URL, homeUrl, leaderboardUrl } from "@/lib/seo/urls";
+import {
+  LEGAL_PATHS,
+  SITE_URL,
+  homeUrl,
+  leaderboardUrl,
+  legalUrl,
+} from "@/lib/seo/urls";
 
 const NOW = new Date("2026-07-29T00:00:00.000Z");
 const SUBMITTED_AT = new Date("2026-07-01T12:34:56.000Z");
+const LEGAL_URLS = new Set<string>(LEGAL_PATHS.map(legalUrl));
 
 describe("buildCoreEntries", () => {
   it("lists the home page and both leaderboard views as absolute canonical URLs", () => {
@@ -21,7 +28,18 @@ describe("buildCoreEntries", () => {
       SITE_URL,
       `${SITE_URL}/leaderboard`,
       `${SITE_URL}/leaderboard?view=groups`,
+      `${SITE_URL}/privacy`,
+      `${SITE_URL}/terms`,
+      `${SITE_URL}/contact`,
     ]);
+  });
+
+  it("lists the privacy policy, which ad networks check for", () => {
+    const urls = buildCoreEntries(NOW).map((entry) => entry.url);
+
+    expect(urls).toContain(legalUrl("privacy"));
+    expect(urls).toContain(legalUrl("terms"));
+    expect(urls).toContain(legalUrl("contact"));
   });
 
   it("uses the same builders the pages canonicalize with", () => {
@@ -155,12 +173,29 @@ describe("latestSubmissionTime", () => {
 });
 
 describe("buildCoreEntries lastmod", () => {
-  it("stamps every core page with the supplied time, not the current time", () => {
-    const activity = new Date("2026-07-20T00:00:00.000Z");
+  const activity = new Date("2026-07-20T00:00:00.000Z");
 
-    for (const entry of buildCoreEntries(activity)) {
+  it("stamps the data-driven pages with the supplied time, not the current time", () => {
+    const dataDriven = buildCoreEntries(activity).filter(
+      (entry) => !LEGAL_URLS.has(entry.url)
+    );
+
+    expect(dataDriven).toHaveLength(3);
+    for (const entry of dataDriven) {
       expect(entry.lastModified).toBe(activity);
     }
+  });
+
+  it("does not move the static legal pages when leaderboard activity moves", () => {
+    // Their text is static, so their lastmod must reflect a real edit date.
+    // Tying them to submission activity would be exactly the untrustworthy
+    // lastmod that makes Google discount the field site-wide.
+    const legalAt = (at: Date) =>
+      buildCoreEntries(at)
+        .filter((entry) => LEGAL_URLS.has(entry.url))
+        .map((entry) => entry.lastModified);
+
+    expect(legalAt(activity)).toEqual(legalAt(new Date("2027-01-01T00:00:00.000Z")));
   });
 });
 

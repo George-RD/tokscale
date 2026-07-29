@@ -1,5 +1,22 @@
 import type { MetadataRoute } from "next";
-import { groupUrl, homeUrl, leaderboardUrl, profileUrl } from "./urls";
+import {
+  LEGAL_PATHS,
+  groupUrl,
+  homeUrl,
+  leaderboardUrl,
+  legalUrl,
+  profileUrl,
+} from "./urls";
+
+/**
+ * When the legal pages' text last changed. Hardcoded on purpose: these pages
+ * are static, so their lastmod must be a real edit date rather than anything
+ * derived from request or build time — the same rule that applies to the
+ * data-driven entries below.
+ *
+ * Bump this, and the "Last updated" line rendered on each page, together.
+ */
+const LEGAL_LAST_MODIFIED = new Date("2026-07-30T00:00:00.000Z");
 
 /**
  * sitemaps.org caps one sitemap file at 50,000 URLs / 50 MB uncompressed, and
@@ -95,6 +112,14 @@ export function buildCoreEntries(lastModified: Date): MetadataRoute.Sitemap {
       changeFrequency: "daily",
       priority: 0.7,
     },
+    // Low priority but deliberately listed: ad networks and search engines
+    // both check that a reachable privacy policy exists.
+    ...LEGAL_PATHS.map((page) => ({
+      url: legalUrl(page),
+      lastModified: LEGAL_LAST_MODIFIED,
+      changeFrequency: "yearly" as const,
+      priority: 0.3,
+    })),
   ];
 }
 
