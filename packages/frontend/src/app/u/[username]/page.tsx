@@ -67,25 +67,20 @@ export async function generateMetadata({ params }: { params: Promise<{ username:
     alternates: {
       canonical: profileUrl(username),
     },
+    // No `images` on either block: opengraph-image.tsx in this directory
+    // supplies a card rendered from this user's real numbers. Setting an
+    // explicit images array here would override it with the generic
+    // site-wide PNG, which is what every profile used to share.
     openGraph: {
       title: `@${username}'s Token Usage | Tokscale`,
       description: `AI token usage statistics for ${username} on Tokscale`,
       type: 'profile',
       url: profileUrl(username),
       siteName: 'Tokscale',
-      images: [
-        {
-          url: 'https://tokscale.ai/og-image.png',
-          width: 1200,
-          height: 630,
-          alt: `${username}'s Token Usage on Tokscale`,
-        },
-      ],
     },
     twitter: {
       card: 'summary_large_image',
       title: `@${username}'s Token Usage | Tokscale`,
-      images: ['https://tokscale.ai/og-image.png'],
     },
   };
 }
