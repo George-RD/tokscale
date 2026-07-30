@@ -1629,6 +1629,32 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .collect();
     all_messages.extend(zcode_messages);
 
+    // opencodereview `llm_response` records carry usage but never a cost, so
+    // every message leaves the parser at 0.0 and pricing is its only cost
+    // source. That makes the generic source cache safe here — unlike Junie
+    // above, there is no authoritative embedded cost for cached_messages()'s
+    // unconditional reprice to overwrite. The parser also dedups within a file
+    // on its own, so no cross-file `should_keep_deduped_message` pass is needed.
+    let opencodereview_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::OpenCodeReview)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                message_cache::CacheIdentity::for_client(ClientId::OpenCodeReview),
+                path,
+                &source_cache,
+                pricing,
+                sessions::opencodereview::parse_opencodereview_file,
+            )
+        })
+        .collect();
+    for outcome in opencodereview_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     let kimi_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Kimi)
         .par_iter()
@@ -5013,6 +5039,60 @@ mod tests {
             assert_eq!(parsed.messages.len(), 4);
             assert_eq!(parsed.messages.iter().map(|m| m.input).sum::<i64>(), 40);
             assert_eq!(parsed.messages.iter().map(|m| m.output).sum::<i64>(), 5);
+        }
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_all_messages_with_pricing_includes_opencodereview() {
+        // Regression: opencodereview declares submit_default, and
+        // parse_local_clients has always parsed it, so `tokscale report`
+        // showed the usage. But the submit path
+        // (parse_all_messages_with_pricing_with_env_strategy) had no
+        // opencodereview block at all, so none of that usage was ever
+        // uploaded. Pin the submit path specifically — a green
+        // parse_local_clients test cannot catch this.
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+
+        {
+            let session_dir = source_home
+                .path()
+                .join(".opencodereview/sessions/-home-user-project");
+            std::fs::create_dir_all(&session_dir).unwrap();
+            std::fs::write(
+                session_dir.join("session-1.jsonl"),
+                r#"{"type":"session_start","sessionId":"session-1","timestamp":"2026-01-15T10:00:00Z","cwd":"/home/user/project","model":"claude-sonnet-4-20250514"}
+{"type":"llm_response","sessionId":"session-1","timestamp":"2026-01-15T10:00:05Z","model":"claude-sonnet-4-20250514","duration_ms":1500,"usage":{"prompt_tokens":1000,"completion_tokens":200,"cache_read_tokens":500,"cache_write_tokens":100}}
+{"type":"llm_response","sessionId":"session-1","timestamp":"2026-01-15T10:01:00Z","model":"gpt-4o","duration_ms":900,"usage":{"prompt_tokens":300,"completion_tokens":50,"cache_read_tokens":0,"cache_write_tokens":0}}"#,
+            )
+            .unwrap();
+
+            let messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["opencodereview".to_string()],
+                None,
+            );
+
+            assert_eq!(messages.len(), 2);
+            assert!(messages.iter().all(|m| m.client == "opencodereview"));
+            assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 1300);
+            assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 250);
+            assert_eq!(
+                messages.iter().map(|m| m.tokens.cache_read).sum::<i64>(),
+                500
+            );
+            assert_eq!(
+                messages.iter().map(|m| m.tokens.cache_write).sum::<i64>(),
+                100
+            );
         }
 
         match original_home {
