@@ -91,8 +91,18 @@ export const SLOP_MODEL_PATTERNS = [
   "madeup",
 ] as const;
 
-/** Case-insensitive alternation for the SQL-side pre-filter. */
-export const SLOP_MODEL_REGEX = `(${SLOP_MODEL_PATTERNS.join("|")})`;
+/**
+ * Case-insensitive alternation for the SQL-side pre-filter, anchored to the
+ * start of a name or of a segment within it.
+ *
+ * Unanchored, the pattern matched anywhere inside an id, so any future
+ * legitimate name that merely contains one of these words would be flagged.
+ * Anchoring only the left side is deliberate: requiring a delimiter on BOTH
+ * sides would stop matching `slopllm`, which is the exact shape the list is
+ * written to catch. `slop-llm`, `slop/llm` and `slopllm` all still match;
+ * `notaslopname` no longer does.
+ */
+export const SLOP_MODEL_REGEX = `(^|[^a-z0-9])(${SLOP_MODEL_PATTERNS.join("|")})`;
 
 /** A user holding more than this share of all tokens is worth a look. */
 export const SITE_SHARE_THRESHOLD = 0.05;
@@ -171,8 +181,15 @@ export function scoreCandidate(
     signals.push({
       key: "slopModelName",
       label: `Reports invented model names: ${shown}${extra > 0 ? ` and ${extra} more` : ""}`,
-      // The strongest signal available. Magnitude and duplication can both have
-      // innocent explanations; a model called "slopllm" cannot.
+      // The heaviest FIXED weight: magnitude and duplication can both have
+      // innocent explanations, and a model called "slopllm" cannot.
+      //
+      // Not the highest possible score, though — siteShare is 40 * share, so an
+      // account holding more than 87.5% of every token on the site outranks
+      // this. That ordering is correct and left alone: one account owning
+      // essentially the whole site is a bigger thing to look at than a bad
+      // model name, and it is the sort of claim worth stating accurately since
+      // the weights are what the queue order rests on.
       weight: 35,
     });
   }

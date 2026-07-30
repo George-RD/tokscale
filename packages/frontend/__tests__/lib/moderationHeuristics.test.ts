@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  SLOP_MODEL_REGEX,
   rankCandidates,
   scoreCandidate,
   type CandidateContext,
@@ -221,5 +222,40 @@ describe("rankCandidates", () => {
     );
 
     expect(ranked.map((c) => c.username)).toEqual(["adam", "zoe"]);
+  });
+});
+
+describe("SLOP_MODEL_REGEX", () => {
+  // The pattern is interpolated into a Postgres `~*` comparison, so this is a
+  // JS approximation of that operator. Both are POSIX-flavoured and the
+  // constructs used here -- alternation, a negated class, an anchor -- behave
+  // identically, which is enough to pin the boundary this test is about.
+  const matches = (name: string) => new RegExp(SLOP_MODEL_REGEX, "i").test(name);
+
+  it("matches an invented name with no delimiter before the marker", () => {
+    // The case the pattern list exists for. Requiring delimiters on BOTH sides
+    // would silently stop catching it, which is why only the left is anchored.
+    expect(matches("slopllm")).toBe(true);
+    expect(matches("SlopLLM")).toBe(true);
+  });
+
+  it("matches the marker at a segment boundary", () => {
+    expect(matches("slop-llm")).toBe(true);
+    expect(matches("slopai/slopllm:5m")).toBe(true);
+    expect(matches("gpt-4-fake")).toBe(true);
+    expect(matches("my_dummy_model")).toBe(true);
+  });
+
+  it("does not match a marker buried inside a longer word", () => {
+    // The false-positive class: a future legitimate id that merely contains
+    // one of these words should not enter the queue.
+    expect(matches("notaslopname")).toBe(false);
+    expect(matches("xfakey")).toBe(false);
+  });
+
+  it("leaves ordinary model ids alone", () => {
+    expect(matches("claude-sonnet-4-5")).toBe(false);
+    expect(matches("deepseek-v3")).toBe(false);
+    expect(matches("gpt-5.4")).toBe(false);
   });
 });

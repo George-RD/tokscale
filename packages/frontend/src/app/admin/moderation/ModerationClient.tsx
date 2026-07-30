@@ -42,7 +42,17 @@ const HIDE_REASONS = [
   "Data issue on our side",
 ] as const;
 
-const UNHIDE_REASONS = ["Restored"] as const;
+/**
+ * Mirrors the ours-versus-theirs distinction above. A single "Restored" made
+ * the audit trail lossy in exactly the direction that matters: clearing an
+ * account we hid because of our own ratchet inflation looked identical to
+ * clearing one a human reviewed and disagreed with. Both are the same button
+ * press; only the record can tell them apart later.
+ */
+const UNHIDE_REASONS = [
+  "Restored after review",
+  "Restored — data issue on our side",
+] as const;
 
 export default function ModerationClient() {
   const [candidates, setCandidates] = useState<Candidate[] | null>(null);
