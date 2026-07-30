@@ -29,6 +29,12 @@ export interface CandidateRow {
   dailyTokens: number;
   /** How many OTHER users report a near-identical token total. */
   nearDuplicateCount: number;
+  /**
+   * This user's model names that match SLOP_MODEL_PATTERNS. Pre-filtered in SQL
+   * rather than sent whole: the busiest account reports 141 models, and only
+   * the matches are of any interest.
+   */
+  slopModels: string[];
 }
 
 export interface CandidateContext {
@@ -44,7 +50,8 @@ export interface CandidateSignal {
     | "medianRatio"
     | "duplicateTotal"
     | "dailyMismatch"
-    | "impliedRate";
+    | "impliedRate"
+    | "slopModelName";
   /** Shown verbatim in the review UI. */
   label: string;
   weight: number;
@@ -55,14 +62,42 @@ export interface ScoredCandidate extends CandidateRow {
   signals: CandidateSignal[];
 }
 
+/**
+ * Substrings that only appear in a model name someone invented.
+ *
+ * Deliberately tiny, and every entry was checked against production before
+ * being included. Two things are NOT here on purpose:
+ *
+ * - `test` — `test-model` is reported by 4 separate accounts, so it is someone
+ *   genuinely testing rather than a fabrication.
+ * - `hack` — the only hit was a tool name, and the word appears in enough
+ *   legitimate contexts to be a false-positive risk.
+ *
+ * Statistical alternatives were measured and rejected. Model *count* looked
+ * promising until the distribution came back at p50=20, p99=140, max=206 with
+ * 51 accounts above 100 models — the 141-model account is unremarkable on that
+ * axis. Counting models nobody else reports fails too, because the
+ * one-user-only set is mostly parser debris (`*`, `{`, `│`, bare UUIDs).
+ *
+ * So this is a content signal, not a statistical one: a name that declares
+ * itself fake is evidence in a way that an unusual count is not.
+ */
+export const SLOP_MODEL_PATTERNS = [
+  "slop",
+  "fake",
+  "dummy",
+  "bogus",
+  "notreal",
+  "madeup",
+] as const;
+
+/** Case-insensitive alternation for the SQL-side pre-filter. */
+export const SLOP_MODEL_REGEX = `(${SLOP_MODEL_PATTERNS.join("|")})`;
+
 /** A user holding more than this share of all tokens is worth a look. */
 export const SITE_SHARE_THRESHOLD = 0.05;
 /** Multiples of the median that stop being explainable as heavy usage. */
 export const MEDIAN_RATIO_THRESHOLD = 500;
-/**
- * Published provider pricing sits well inside this band per token. Outside it,
- * either the cost or the token count is not what it claims to be.
- */
 /**
  * Only an upper bound. There is deliberately no floor.
  *
@@ -125,6 +160,21 @@ export function scoreCandidate(
         weight: Math.min(25, Math.log10(ratio) * 6),
       });
     }
+  }
+
+  if (row.slopModels.length > 0) {
+    // Quoted verbatim so the reviewer judges the actual string rather than
+    // trusting the match — the whole point is that the name speaks for itself.
+    const shown = row.slopModels.slice(0, 3).map((name) => `"${name}"`).join(", ");
+    const extra = row.slopModels.length - 3;
+
+    signals.push({
+      key: "slopModelName",
+      label: `Reports invented model names: ${shown}${extra > 0 ? ` and ${extra} more` : ""}`,
+      // The strongest signal available. Magnitude and duplication can both have
+      // innocent explanations; a model called "slopllm" cannot.
+      weight: 35,
+    });
   }
 
   if (row.nearDuplicateCount > 0) {

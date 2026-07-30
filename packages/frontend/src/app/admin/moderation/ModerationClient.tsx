@@ -19,6 +19,32 @@ interface Candidate {
   signals: CandidateSignal[];
 }
 
+/**
+ * Fixed reasons rather than free text.
+ *
+ * These strings land verbatim in moderation_actions and are the only record of
+ * why a decision was made, so they need to still be legible to someone reading
+ * the audit log months later. A typed sentence would drift in wording and
+ * detail between entries; a closed set stays comparable.
+ *
+ * The wording separates the two cases the heuristics exist to distinguish:
+ * fabricated data, versus our own ratchet inflation (#960). Never record the
+ * latter as if the user did something wrong.
+ */
+const HIDE_REASONS = [
+  "Fabricated usage — reports invented model names",
+  "Duplicate dataset — token total matches another account almost exactly",
+  "Implausible magnitude — usage inconsistent with any real workload",
+  "Suspected ratchet inflation (#960) — our bug, hidden pending correction",
+  "Under investigation — withheld from rankings until reviewed",
+] as const;
+
+const UNHIDE_REASONS = [
+  "Reviewed — no evidence of fabrication, restored",
+  "Resolved — inflation corrected upstream, restored",
+  "Hidden in error — restored",
+] as const;
+
 export default function ModerationClient() {
   const [candidates, setCandidates] = useState<Candidate[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -56,7 +82,7 @@ export default function ModerationClient() {
     // Enforced client-side as well as in the API so the reviewer is told what
     // is missing before a round trip, not after a 400.
     if (!reason) {
-      setError(`A reason is required before changing @${candidate.username}.`);
+      setError(`Select a reason before changing @${candidate.username}.`);
       return;
     }
 
@@ -142,17 +168,25 @@ export default function ModerationClient() {
                 </Signals>
 
                 <ActionRow>
-                  <ReasonInput
+                  <ReasonSelect
                     aria-label={`Reason for changing @${candidate.username}`}
                     value={reasons[candidate.username] ?? ""}
-                    placeholder="Reason (recorded permanently)"
                     onChange={(event) =>
                       setReasons((current) => ({
                         ...current,
                         [candidate.username]: event.target.value,
                       }))
                     }
-                  />
+                  >
+                    <option value="">Select a reason (recorded permanently)…</option>
+                    {(candidate.leaderboardHidden ? UNHIDE_REASONS : HIDE_REASONS).map(
+                      (reason) => (
+                        <option key={reason} value={reason}>
+                          {reason}
+                        </option>
+                      )
+                    )}
+                  </ReasonSelect>
                   <ActionButton
                     type="button"
                     $danger={!candidate.leaderboardHidden}
@@ -281,9 +315,9 @@ const ActionRow = styled.div`
   margin-top: 16px;
 `;
 
-const ReasonInput = styled.input`
+const ReasonSelect = styled.select`
   flex: 1;
-  min-width: 240px;
+  min-width: 320px;
   padding: 9px 12px;
   border: 1px solid var(--service-border);
   border-radius: 8px;

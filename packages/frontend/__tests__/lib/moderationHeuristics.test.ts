@@ -32,6 +32,7 @@ function row(overrides: Partial<CandidateRow> = {}): CandidateRow {
     hasBackfill: false,
     dailyTokens: 1_200_000,
     nearDuplicateCount: 0,
+    slopModels: [],
     ...overrides,
   };
 }
@@ -57,6 +58,45 @@ describe("scoreCandidate", () => {
 
     expect(signalKeys(scored)).toContain("siteShare");
     expect(scored.signals.find((s) => s.key === "siteShare")?.label).toContain("99.4%");
+  });
+
+  it("flags invented model names and quotes them verbatim", () => {
+    // The real three variants on the rank-1 account.
+    const scored = scoreCandidate(
+      row({
+        slopModels: ["slopllm-5m", "slopai/slopllm-5m", "slopai/slopllm:5m"],
+      }),
+      CONTEXT
+    );
+
+    expect(signalKeys(scored)).toContain("slopModelName");
+    // Quoted so the reviewer judges the string itself rather than trusting the
+    // match — the name is the evidence.
+    expect(scored.signals.find((s) => s.key === "slopModelName")?.label).toContain(
+      '"slopllm-5m"'
+    );
+  });
+
+  it("outweighs every other single signal, since a name cannot be innocent", () => {
+    const slop = scoreCandidate(row({ slopModels: ["slopllm-5m"] }), CONTEXT);
+    const duplicate = scoreCandidate(row({ nearDuplicateCount: 1 }), CONTEXT);
+
+    expect(slop.score).toBeGreaterThan(duplicate.score);
+  });
+
+  it("summarises rather than listing every match", () => {
+    const scored = scoreCandidate(
+      row({ slopModels: ["a-slop", "b-slop", "c-slop", "d-slop", "e-slop"] }),
+      CONTEXT
+    );
+
+    expect(scored.signals[0].label).toContain("and 2 more");
+  });
+
+  it("does not flag an account with no invented names", () => {
+    expect(signalKeys(scoreCandidate(row({ slopModels: [] }), CONTEXT))).not.toContain(
+      "slopModelName"
+    );
   });
 
   it("flags a token total that matches another account almost exactly", () => {
