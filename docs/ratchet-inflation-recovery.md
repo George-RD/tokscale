@@ -49,9 +49,11 @@ written at `:834`) and is not — only because no per-device token total exists 
 derive from.
 
 **Tokens have the same invariant.** A re-split moves tokens between days without
-creating or destroying them, so any total taken across all days is invariant to
-it. `calculate_summary` (`crates/tokscale-core/src/aggregator.rs:107-110`)
-already folds exactly that way.
+creating or destroying them, so a total taken over any window wider than the
+shift is invariant to it. `calculate_summary`
+(`crates/tokscale-core/src/aggregator.rs:107-110`) already folds that way for the
+whole payload. Which window to store is a separate decision with real
+consequences — see "Why month, and not a lifetime total" below.
 
 The plan is therefore ordered by risk, not by ambition: give tokens the
 treatment session metrics already have, and only then consider rewriting rows.
@@ -70,11 +72,42 @@ in short sessions would be invisible to it.
 One table, needed by every phase below:
 
 ```
-submitted_device_client_totals(submitted_device_id, client, origin, tokens_highwater, cost_highwater)
-  PRIMARY KEY (submitted_device_id, client, origin)
+submitted_device_client_totals(submitted_device_id, client, origin, month, tokens_highwater, cost_highwater)
+  PRIMARY KEY (submitted_device_id, client, origin, month)     -- month as 'YYYY-MM'
 ```
 
-maintained with `GREATEST` on conflict, exactly as `route.ts:412` does.
+maintained with `GREATEST` on conflict, exactly as `route.ts:412` does. Buckets
+are computed server-side by folding the payload's `contributions` on their
+`date` prefix, so no CLI change is required.
+
+### Why month, and not a lifetime total
+
+Granularity is the whole design here, and both extremes are wrong.
+
+A **per-day** high-water is just the daily rows again, and inflates under a
+re-split — the original bug.
+
+A **lifetime total** is timezone-proof but silently swallows new work after a
+deletion. Concretely: 100 tokens submitted in January, January's session files
+deleted, 30 tokens earned in February. The payload now reports 30, so
+`GREATEST(100, 30)` holds at 100 and February's work never appears. The account
+stays frozen until new usage alone exceeds the old peak.
+
+That is strictly worse than today's behavior, which preserves January's rows and
+inserts February's alongside them for a correct 130 — and it lands on the
+`d9df8c9c` user, the exact person this protection exists for. "My usage isn't
+going up" is a far more visible failure than a total that is too high.
+
+**Monthly buckets keep both properties.** A timezone shift moves usage by at most
+one day, so it stays inside its month except at a boundary, leaving monthly sums
+invariant. And deleted months hold their high-water while later months grow
+independently, so the January/February case sums to 130 correctly.
+
+The residual is one day per month boundary (the 31st↔1st), and only the portion
+of it crossing midnight — bounded and small, against today's unbounded
+ratcheting. Coarser buckets shrink that residual further but re-introduce the
+swallowing problem within a bucket: a yearly bucket breaks the moment someone
+deletes January and works in February of the same year.
 
 **`origin` is part of the key, and this is load-bearing.** `getSubmitDevice`
 (`:154-168`) falls back to `LEGACY_SUBMIT_DEVICE_KEY` when a payload omits
@@ -95,19 +128,22 @@ This is deliberately inert, and it buys the measurement the rest of the plan is
 gated on. After a week of normal submits,
 
 ```sql
-SUM(daily per client) / tokens_highwater
+SUM(daily tokens for that client in that month) / tokens_highwater
 ```
 
-is an exact per-client, per-device inflation census — on tokens, the quantity
-that matters, rather than the active-time ratio proxy in #960's first comment.
+is an exact per-client, per-device, per-month inflation census — on tokens, the
+quantity that matters, rather than the active-time ratio proxy in #960's first
+comment. Per-month granularity also shows *when* each account drifted, which a
+lifetime ratio cannot.
 The measurement stops being a prerequisite and becomes a byproduct of storage
 needed anyway. Nothing can regress, because nothing reads it yet.
 
 ## Phase 2 — Switch the read path
 
 Change `:751` to derive `totalTokens` (and `totalCost`) from
-`SUM(tokens_highwater)` across the user's `(device, client, origin)` rows,
-mirroring `:787-790`.
+`SUM(tokens_highwater)` across the user's `(device, client, origin, month)` rows,
+mirroring `:787-790`. Summing over months is what makes a deleted month hold its
+value while later months keep growing.
 
 **The leaderboard becomes correct immediately** — `getLeaderboard.ts:369,371`
 reads `submissions.totalTokens` — with no row rewrite, no delete path, no backup
@@ -141,10 +177,14 @@ Per device, per client `C`, `C` may be rewritten from the payload when both:
 1. **Range coverage** — the payload's contribution dates span at least the
    device's stored date range for `C`. Without it, a `--since` scan's smaller
    total is not comparable to an all-time high-water.
-2. **Invariant clears** — the payload's total tokens for `C` is at least
-   `tokens_highwater` for `(device, C, "cli")`.
+2. **Invariant clears** — for every month the rewrite would touch, the payload's
+   token total for `C` in that month is at least the stored high-water for
+   `(device, C, "cli", month)`.
 
-Otherwise `C` falls through to the current guard.
+Otherwise `C` falls through to the current guard for the months that failed.
+Checking per month rather than per lifetime keeps one shrunken month from
+blocking every other month's repair, the same reasoning that makes the check
+per-client rather than per-payload.
 
 ### This is an existing pattern, not new machinery
 
@@ -265,6 +305,7 @@ Phase 2 (P2) fixes ranked totals; Phase 3 (P3) fixes day-level rows.
 | 5 | TZ-inflated, multi-device | fixed | per-device | Each device heals independently. |
 | 6 | **Deleted sessions (`d9df8c9c`)** | high-water held | blocked | Protected exactly as today. |
 | 6b | Sessions moved where the collector does not scan | held | blocked, temporarily | Self-resolves once support lands. |
+| 6c | **Deleted sessions, then kept working** | deleted months hold, later months grow | later months heal | The case monthly bucketing exists for. A lifetime high-water would swallow the new work until it exceeded the old peak. |
 | 7 | Deleted sessions *and* changed TZ | held | blocked | No loss, no healing. Phase 5. |
 | 8 | Retired device | contributes its peak | never runs | Pre-existing, not worsened. |
 | 9 | No high-water yet | falls back to stored | blocked | One-submit warm-up. A missing baseline must not be read as `0`. |
@@ -294,8 +335,14 @@ Phase 2 (P2) fixes ranked totals; Phase 3 (P3) fixes day-level rows.
   `submittedClients`, never rewritten, never zeroed.
 - **Cost is recomputed at current pricing** on rewrite, so historical costs shift
   if pricing changed. Tokens are exact; cost is not.
-- **No tolerance band is needed for tokens** — a re-split does not change a range
-  total at all, so equality is exact.
+- **Month boundaries still inflate.** A session crossing midnight on the 1st can
+  be counted in two months, so the bucket sums are invariant everywhere except
+  there. Bounded at one day per boundary versus today's unbounded ratcheting,
+  and Phase 3 repairs it at the row level, but Phase 2 alone does not eliminate
+  inflation — it bounds it.
+- **No tolerance band is needed within a month** — a re-split does not change a
+  monthly total unless it crosses the boundary above, so equality is exact for
+  the rest.
 
 ## Decision needed
 
