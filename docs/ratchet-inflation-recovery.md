@@ -143,6 +143,17 @@ SUM(daily tokens in that bucket) / tokens_highwater
 
 Nothing can regress, because nothing reads it yet.
 
+**One thing the census cannot see.** `ClientId::OpenCodeReview` declares
+`submit_default: true` (`crates/tokscale-core/src/clients.rs:509-517`) but is
+parsed only by `parse_local_clients` (`lib.rs:3239`), which the submit path never
+calls — `message_cache.rs:853-855` states this outright. Its usage appears in
+`tokscale report` and has never reached the server, so it is absent from the
+baseline entirely. When that gap is fixed, affected accounts will show a step
+increase that is real usage arriving late, not drift. Audited against the whole
+registry: of 37 `submit_default` clients it is the only one missing (Goose,
+Hermes and Kilo appear absent from a naive `ClientId::` grep but are handled at
+`:1171`, `:1161` and via `ClientId::KiloCode` at `:1087`).
+
 ## Phase 2 — Switch the read path
 
 Change `:751` to derive `totalTokens` and `totalCost` from
@@ -261,17 +272,49 @@ fraction of a long history.
 re-cements permanently". Safe rule: **a client with a fold floor is never
 eligible for this heal.**
 
+That rule is now doing more work than originally intended, because the fold path
+has a live aliasing defect underneath it. `:94` copies a client with
+`{ ...data, models: { ...data.models } }` — a new map, but the model *value
+objects* remain shared with `rawExistingBreakdown`. `:107` then calls
+`mergeModelBreakdowns`, which at `:48-54` does `existingModel.tokens += …`
+**in place**, mutating the stored raw object; `:640-643` writes that mutated
+object back as the supposedly-raw alias key. Each submit folds the already-folded
+values again, so the nested `models` map compounds without bound. Client-level
+`tokens` escapes because `{ ...data }` copied the scalar, which is why day totals
+and the leaderboard look correct while per-model views drift.
+
+This is a separate bug and should be fixed on its own (deep-copy the model
+values). It is recorded here because it means fold-affected rows are actively
+corrupting while unhealed, so "exclude them" is a deferral, not a resolution.
+
 **Backfill coexistence.** `origin: "backfill"` is stamped per client inside
 `source_breakdown` (`:595-601`) and carried through merges by
 `deriveClientBreakdownProvenance` (`helpers.ts:113-126`). A CLI scan cannot see
 imported history, so the rewrite must **preserve `backfill`-tagged entries**. A
 payload whose own `provenance.origin` is `backfill` never heals.
 
-**Day-level active time.** `activeTimeMs` has its own monotonic merge (`:622-630`)
-and the same inflation. Rewrite it alongside a healed client.
+**Day-level active time is ratcheted at TWO enforcement points, and the second
+one silently cancels the heal.** `mergeActiveTimeMs` (`:178-185`) is a
+`Math.max` in the JS merge, and `:707` mirrors it in SQL:
+
+```sql
+active_time_ms = GREATEST(daily_breakdown.active_time_ms, EXCLUDED.active_time_ms),
+```
+
+whose own comment says the arm "must not be a hole in the monotonic guard the
+in-memory merge path applies." A heal writes a *lower* value. Routed through
+that `ON CONFLICT` arm, `GREATEST(stale_high, healed_low)` returns the stale
+value — **the heal reports success and changes nothing.** No error, no warning;
+the post-rewrite assertion above is the only thing that would catch it. Both
+enforcement points must be bypassed, not just the JS one.
 
 **Transaction.** Gate, backup, rewrite, zero-out and assertion share the existing
-transaction, or the gate races a concurrent submit from another device.
+transaction. Note this is already stronger than it looks: `:303-314` takes
+`.for('update')` on the `submissions` row, which is unique per user
+(`submissions_user_id_unique`), so every submit for one user is serialized —
+including across devices. A second device cannot commit between the merge's read
+and its write, so the gate is never computed against stale data. An audit pass
+initially concluded otherwise; the lock is what makes it safe.
 
 ## Phase 5 — Declare
 
@@ -323,6 +366,14 @@ P2 fixes ranked totals; P3 removes the cause; P4 fixes day-level rows.
 
 - **Phase 2 bounds inflation, it does not eliminate it.** The boundary leak
   survives until Phase 3 pins the key or Phase 4 repairs the rows.
+- **Filtered period leaderboards over-count independently of all of this.**
+  `getLeaderboard.ts:207-233` filters whole daily *rows* and the aggregation then
+  adds `row.tokens` (`:158`), the row's total across every client — so
+  `client:codex` counts other clients that shared a day and device. The all-time
+  path filters per user via `sources_used` (`:374-379`), a different semantic
+  again. Phase 2 does not touch this, and fixing the totals it reads will not fix
+  it. Listed so nobody validates Phase 2 against a filtered board and concludes
+  the derivation is wrong.
 - **Swallowing survives inside one bucket.** Bounded by the chosen width; zero
   only after Phase 3 permits daily buckets.
 - **`inputTokens` / `outputTokens` stay inflated** until Phase 4. No
