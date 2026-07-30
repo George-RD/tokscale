@@ -7,11 +7,11 @@ production data loss. This document proposes a correction that heals the
 inflation without weakening that protection, and states what happens to every
 class of user under the change.
 
-> **Status: proposal. Nothing here is implemented.** No `scanScope`,
-> `daily_breakdown_prereplace_backup`, or gate branch exists in the tree. Accept,
+> **Status: proposal. Nothing here is implemented.** No gate branch,
+> `total_tokens_reported` column, or backup table exists in the tree. Accept,
 > reject, or amend.
 
-Verified against `origin/main` @ `7b2885e1`. Every file:line below was read at
+Verified against `origin/main` @ `10c88c9d`. Every file:line below was read at
 that commit; the "how to re-derive" section says how to recheck each claim.
 
 ## The two failures are one mechanism
@@ -39,56 +39,81 @@ Both failures present to the server as the same signal — *a per-day client tot
 went down* — and the payload carries nothing that separates them. Any fix that
 simply relaxes the guard re-breaks the user `d9df8c9c` was written for.
 
-## The discriminator already exists
+## The discriminator: a day-agnostic token total
 
-`compute_time_metrics` (`sessionize.rs:180`) is:
+The re-split moves tokens **between** days. It does not create or destroy them.
+So any total taken across all days is invariant to it, while the per-day rows
+are not.
+
+The payload already carries exactly that. `calculate_summary`
+(`crates/tokscale-core/src/aggregator.rs:107-110`):
 
 ```rust
-let total_active_time_ms: i64 = intervals.iter().map(|s| s.active_duration_ms).sum();
+let total_tokens: i64 = contributions
+    .iter()
+    .map(|c| c.totals.tokens)
+    .fold(0i64, i64::saturating_add);
 ```
 
-A plain sum of interval durations. There is no date bucketing and no `chrono::Local`
-anywhere in the function — the only `Local` references in the file are at `:288`
-and `:377-379`, both in the daily-bucketing path. It is timezone-invariant by
-construction.
+A fold over every contribution, with no reference to which day each belongs to.
+It has three properties the guard needs, and it has them simultaneously:
 
-That gives the property the guard lacks:
+1. **Timezone-invariant** — summed across all days, so a re-split cannot change it.
+2. **Scope-proportional** — computed from the same `filtered` set as the daily
+   rows (`crates/tokscale-core/src/lib.rs:2655-2662`), so a `--client` or
+   `--since` scan yields a proportionally smaller total and cannot pass a
+   full-scope baseline.
+3. **It measures the quantity being protected.** Tokens are what the leaderboard
+   ranks and what the profile shows.
 
-| | `SUM(daily_breakdown)` | `submitted_devices.total_active_time_ms` |
+`summary` is a required field of `SubmissionDataSchema`
+(`packages/frontend/src/lib/validation/submission.ts:91-100`), so every payload
+from every CLI version carries it.
+
+| | `SUM(daily_breakdown)` | `summary.totalTokens` |
 |---|---|---|
 | sessions deleted | falls | **falls** |
 | timezone re-split | inflates | **unchanged** |
-| parser attributes better (#961) | falls | unchanged |
+| parser attributes better (#961) | falls | falls |
 
-Deletion moves the invariant. Re-splitting does not. So the invariant answers
-the question the numbers alone cannot: *is this payload deficient, or are the
-stored rows inflated?*
+### Why not active time
 
-There is a second, equally important property. `time_metrics` and the daily rows
-are computed from the **same filtered set** (`crates/tokscale-core/src/lib.rs:2655-2662`):
+An earlier draft of this document used `submitted_devices.total_active_time_ms`
+as the sensor, on the grounds that `compute_time_metrics` (`sessionize.rs:180`)
+is a plain sum of interval durations with no date bucketing. That part is true —
+it is timezone-invariant, and `schema.ts` documents this in the column comment.
 
-```rust
-let filtered = filter_messages_for_report(all_messages, &options);
+It was still the wrong choice, because it is a **proxy** for token coverage
+rather than a measure of it, and the two can move independently:
 
-let intervals   = sessionize::sessionize(&filtered, DEFAULT_IDLE_GAP_MS);
-let time_metrics = compute_time_metrics(&intervals, DEFAULT_IDLE_GAP_MS);
-let daily_active_time = compute_daily_active_time(&intervals);
-let contributions = aggregator::aggregate_by_date(filtered);
-```
+- Only 11 of 45 session parsers populate `duration_ms`. For the rest,
+  `active_duration_ms` falls back to the wall-clock span between messages in a
+  block (`sessionize.rs:155-160`), which is a different shape of quantity.
+- A session containing a single message contributes zero active time regardless
+  of how many tokens it carries.
 
-So a `--client` or `--since` scan produces a proportionally smaller
-`time_metrics` too. The invariant is not merely timezone-invariant, it is
-**scope-proportional**: it shrinks whenever coverage shrinks, for any reason.
+So a token-coverage loss concentrated in short or single-message sessions is
+invisible to an active-time sensor. The gate would pass and overwrite the stored
+rows with token-deficient data — the exact failure the gate exists to prevent,
+on the exact quantity that matters. Active time is retained below only as an
+optional corroborating signal, never as the gate.
 
 ## The gate
 
 On submit, per device, a payload may **replace** that device's daily rows across
 its date range when **both** hold:
 
-1. `payload.timeMetrics.totalActiveTimeMs >= submitted_devices.total_active_time_ms`
+1. `payload.summary.totalTokens >= submitted_devices.total_tokens_reported`
 2. the payload's client set ⊇ the client set of the stored rows in that date range
 
 Otherwise the current guard applies, unchanged.
+
+`total_tokens_reported` is a new per-device high-water column, maintained with
+`GREATEST` on the conflict arm exactly as the existing metric columns are
+(`packages/frontend/src/app/api/submit/route.ts:412`). It is **not** the same as
+`submissions.totalTokens`, which is recomputed from the daily rows on every
+submit (`route.ts:787`) and is therefore itself inflated — it cannot serve as its
+own reference.
 
 Condition 1 establishes that no coverage was lost. Condition 2 closes a hole
 condition 1 misses on its own: a user who alternates `--client codex` and
@@ -116,18 +141,32 @@ The column that matters is what happens to a user who does nothing differently.
 | 3 | Healthy, multi-device | per-device | Each device gated independently under `UNIQUE(submission_id, submitted_device_id, date)`. No cross-device effect. |
 | 4 | **TZ-inflated, sessions intact** | passes | Rows replaced with the correct un-re-split values. **Healed on next submit.** |
 | 5 | TZ-inflated, multi-device, some devices clean | per-device | Each device heals as it submits. Partial healing moves monotonically toward truth. |
-| 6 | **Lost local sessions (`d9df8c9c`)** — deleted by the user *or* rotated/archived by the client tool | **fails** (invariant dropped) | Current guard defends. **History preserved exactly as today.** Note the two causes are indistinguishable here; see Known holes. |
+| 6 | **Deleted local sessions (`d9df8c9c`)** | **fails** (token total dropped) | Current guard defends. **History preserved exactly as today.** |
+| 6b | Sessions moved somewhere the collector does not yet scan | fails, temporarily | Same protection as 6, but self-resolving: healing resumes once collector support lands. Not a member of state 7. |
 | 7 | Deleted sessions *and* changed TZ | fails | Guard defends everything. No loss, but no healing either — this is Phase 3's constituency. |
 | 8 | Retired device, never submits again | never runs | Rows frozen as-is. Pre-existing condition, not worsened. |
-| 9 | Pre-`0019` device, stored metrics `NULL` | cannot evaluate | Keep the guard and record the baseline. One-submit warm-up, then behaves as its real state. Treating `NULL` as `0` would let any payload pass and is rejected. |
-| 10 | Old CLI, never sends `timeMetrics` | cannot evaluate | Guard, indefinitely. `timeMetrics` is `.optional()` (`validation/submission.ts:229`), so nothing breaks. |
-| 11 | Habitual `--client` submitter | fails while partial | Scope-proportional metric falls below a full-scope baseline. Never replaced, never healed. Safe. |
+| 9 | Device with no stored high-water yet | cannot evaluate | Keep the guard and record the baseline. One-submit warm-up, then behaves as its real state. Treating a missing baseline as `0` would let any payload pass and is rejected. |
+| 10 | Any CLI version | evaluable | `summary.totalTokens` is a required field, so unlike a `timeMetrics`-based gate there is no permanently-unevaluable population. |
+| 11 | Habitual `--client` submitter | fails while partial | Scope-proportional total falls below a full-scope baseline. Never replaced, never healed. Safe. |
 | 12 | `--since` submitter | may pass | Replace is already scoped to the payload's date range, so a narrow scan heals a narrow window. Correct, just slower. |
-| 13 | Backfill / `tokscale import` user | **excluded** | `provenance.origin === "backfill"` must skip the gate outright. Aggregate imports have no session intervals and must never overwrite live CLI rows. |
-| 14 | **#961 parser upgrade (Hermes)** | passes | Sessions unchanged, tokens legitimately lower. Correct values land. **Fixed as a side effect.** |
-| 15 | **Parser regression** | passes | Same signature as 14, wrong values land. **This is the known hole** — see below. |
+| 13 | Backfill / `tokscale import` user | **excluded** | `provenance.origin === "backfill"` must skip the gate outright. Aggregate imports must never overwrite live CLI rows. |
+| 14 | **#961 parser upgrade (Hermes)** | **fails** | Better attribution genuinely lowers the token total, so the token sensor cannot distinguish it from loss. Needs Phase 2. See below. |
+| 15 | Parser regression | fails | Correctly defended, for the same reason 14 is incorrectly defended. |
 | 16 | Hidden / moderated user | orthogonal | `leaderboardHidden` affects ranking only; the submit path is untouched. |
 | 17 | Alternating TZ every day (VPS / shell-rc case) | passes | Rows stop ratcheting and instead reflect whichever split the latest submit used. Each value is internally consistent. Oscillation replaces unbounded inflation. |
+
+Two rows changed meaning when the sensor moved from active time to tokens, and
+the trade is worth stating plainly:
+
+- **State 10 improved.** `timeMetrics` is `.optional()` (`validation/submission.ts:229`),
+  so an active-time gate could never evaluate an old CLI. `summary` is required,
+  so the token gate always can.
+- **State 14 regressed.** An active-time gate would have healed #961's
+  constituency for free, because better per-model attribution changes tokens
+  without touching session shape. The token gate sees that same drop as coverage
+  loss and defends. #961 therefore moves from "fixed as a side effect of Phase 1"
+  to "requires Phase 2", which is the honest cost of measuring the right
+  quantity instead of a convenient one.
 
 State 17 deserves a note. #960's third comment established this is the plausible
 high-frequency population: neither the launchd plist nor the systemd unit sets
@@ -140,52 +179,40 @@ strictly better but still not stable. See "Complementary CLI fix" below.
 
 ### Phase 1 — Gate
 
-Ships alone. No CLI release. Heals states 4, 5, 14, and 17.
+Ships alone. No CLI release. Heals states 4, 5, and 17.
 
-1. Migration for `daily_breakdown_prereplace_backup`, generated with
-   `drizzle-kit generate` and never hand-written. Latest applied is `0021`, so
-   this lands as `0022`.
-2. `packages/frontend/src/app/api/submit/route.ts`: evaluate the gate before
+1. Migration adding `submitted_devices.total_tokens_reported` and the
+   `daily_breakdown_prereplace_backup` table, generated with `drizzle-kit
+   generate` and never hand-written. Latest applied is `0021`, so this lands as
+   `0022`.
+2. Maintain the new column with `GREATEST` on the conflict arm, alongside the
+   existing metric columns at `route.ts:412`.
+3. `packages/frontend/src/app/api/submit/route.ts`: evaluate the gate before
    merging; on pass, copy affected rows to the backup table and write the
    payload's values directly instead of routing through
    `mergeClientBreakdownsWithRegressionGuard`.
-3. Restrict the write to rows whose values actually changed, so a healthy user
+4. Restrict the write to rows whose values actually changed, so a healthy user
    does not rewrite their whole range on every submit.
-4. The gate and the replace must share the merge's transaction. A gate evaluated
+5. The gate and the replace must share the merge's transaction. A gate evaluated
    outside it races a concurrent submit from another device.
 
-Tests: gate passes → replace; invariant dropped → guard; client-filtered payload
-→ guard; alternating-filter payload (condition 2) → guard; `backfill` origin →
-guard; `NULL` baseline → guard plus baseline recorded; multi-device isolation.
-
-**The load-bearing assumption is verified.** Stored `total_active_time_ms` is
-`GREATEST`-floored on the per-device conflict arm
-(`packages/frontend/src/app/api/submit/route.ts:412`):
-
-```ts
-totalActiveTimeMs: sql`GREATEST(${submittedDevices.totalActiveTimeMs}, EXCLUDED.total_active_time_ms)`
-```
-
-and `packages/frontend/src/lib/db/schema.ts` documents the invariance directly in
-the column comment — "comes from the CLI's `timeMetrics`, which sums raw interval
-durations and is therefore TIMEZONE-INVARIANT", contrasted against the daily rows
-which "apportion each interval across LOCAL calendar days". Both halves hold.
-
-Note this is the *per-device* floor. A second, separate floor exists at the
-submission level (`route.ts:867`, `Math.max(deviceTotals, storedSessionMetrics)`)
-— that one is #960 Layer 1's target and is not what the gate reads.
+Tests: gate passes → replace; token total dropped → guard; client-filtered
+payload → guard; alternating-filter payload (condition 2) → guard; `backfill`
+origin → guard; missing baseline → guard plus baseline recorded; multi-device
+isolation.
 
 ### Phase 2 — Declare
 
-Closes state 15. Requires a CLI release, so it lands on an adoption curve.
+Restores state 14 and separates it from state 15. Requires a CLI release, so it
+lands on an adoption curve.
 
 1. CLI: add `scanScope { parserVersions: Record<client, u32> }` to
    `TsTokenContributionData` (`crates/tokscale-cli/src/main.rs:4327`).
 2. Extend `SubmissionProvenanceSchema` (`validation/submission.ts:205`), which is
    already optional and already excluded from `generateSubmissionHash`, so older
    clients are unaffected.
-3. If the gate passes but client `C`'s tokens fell **and** `C`'s parser version
-   is unchanged, defend `C` specifically rather than replacing it.
+3. A token decrease for client `C` is accepted when `C`'s parser version changed,
+   and defended when it did not.
 
 `meta.version` is the CLI version, not a per-client `parser_version`, and cannot
 substitute.
@@ -221,25 +248,24 @@ correct behavior — day boundaries stay stable — but it is a product decision
 
 ## Known holes
 
-- **Parser regressions pass the gate until Phase 2 ships.** The backup table is
-  the only protection in the interim, which makes it a same-PR requirement for
-  Phase 1, not a later refinement.
+- **#961's constituency is not healed until Phase 2.** This is a real
+  regression against the active-time design and is accepted deliberately; see
+  the state-14 note above.
+- **A gate failure means "the token total dropped", not "the user deleted
+  something."** Because the high-water mark never comes down, a device stays
+  blocked until it accumulates enough new usage to exceed its own peak. Causes
+  differ in duration: genuine deletion is permanent (states 6, 7), while a
+  collector that does not yet scan a client's new session location is temporary
+  (state 6b) — [#779](https://github.com/junhoyeo/tokscale/issues/779) is the
+  worked example, with Codex's `archived_sessions` now scanned
+  (`crates/tokscale-core/src/scanner.rs:1389-1395`) after a ten-day
+  report-to-fix window. The Phase 1 census must report these separately; only
+  the permanent kind sizes Phase 3.
 - **A user who stopped using a client entirely** has a full scan that no longer
   covers a stored client, fails condition 2, and is never healed. Conservative
   and safe; needs Phase 2's explicit scope declaration to resolve.
-- **Any path that lowers active time blocks the gate permanently**, not just
-  deliberate deletion. Because the per-device value is `GREATEST`-floored it
-  never comes back down, so a client tool that rotates or archives its own
-  session files produces the same signature as a user running `rm`. [#779](https://github.com/junhoyeo/tokscale/issues/779)
-  ("scan Codex `archived_sessions`") is evidence this happens in the wild. The
-  population of states 6 and 7 may therefore be materially larger than
-  deliberate cleanup alone would suggest, which raises the value of both Phase 3
-  and the complementary CLI fix. **The Phase 1 gate-failure census should
-  distinguish rotation from deletion** — if rotation dominates, extending the
-  collectors to read archived directories is a cheaper fix than either.
-- **State 7 has no automatic remedy** before Phase 3.
-- **Conservation is approximate.** Pricing changes and rounding mean comparisons
-  need a tolerance band rather than equality.
+- **Comparisons need a tolerance band.** Pricing changes and rounding mean
+  equality will not hold exactly.
 
 ## Decision needed
 
@@ -260,12 +286,13 @@ knows what it is touching before it touches it.
 
 | Claim | Command |
 |---|---|
-| `compute_time_metrics` is a plain sum | `rg -n -A15 'pub fn compute_time_metrics' crates/tokscale-core/src/sessionize.rs` |
-| No `Local` in that function | `rg -n 'Local' crates/tokscale-core/src/sessionize.rs` — expect only `:288`, `:377-379` |
-| Metrics and daily rows share `filtered` | `sed -n '2650,2665p' crates/tokscale-core/src/lib.rs` |
-| `timeMetrics` and provenance are optional | `sed -n '200,232p' packages/frontend/src/lib/validation/submission.ts` |
+| `summary.totalTokens` is day-agnostic | `sed -n '103,112p' crates/tokscale-core/src/aggregator.rs` |
+| `summary` is a required payload field | `sed -n '91,100p' packages/frontend/src/lib/validation/submission.ts` |
+| Sensor and daily rows share `filtered` | `sed -n '2650,2665p' crates/tokscale-core/src/lib.rs` |
+| Only 11 of 45 parsers set `duration_ms` | `rg -l 'duration_ms:\s*Some\|duration_ms =' crates/tokscale-core/src/sessions/ \| wc -l` then `ls crates/tokscale-core/src/sessions/*.rs \| wc -l` |
+| Active time falls back to wall-clock span | `sed -n '126,162p' crates/tokscale-core/src/sessionize.rs` |
+| Existing high-water columns use `GREATEST` | `rg -n 'totalActiveTimeMs' packages/frontend/src/app/api/submit/route.ts` — expect `GREATEST` at `:412` |
+| `submissions.totalTokens` is derived, not stored | `rg -n 'totalTokens' packages/frontend/src/app/api/submit/route.ts` — see `:787` |
 | Guard location | `rg -n 'mergeClientBreakdownsWithRegressionGuard' packages/frontend/src/lib/db/helpers.ts` |
 | Latest migration | `ls packages/frontend/src/lib/db/migrations/*.sql \| tail -3` |
-| Per-device value is `GREATEST`-floored | `rg -n 'totalActiveTimeMs' packages/frontend/src/app/api/submit/route.ts` — expect `GREATEST` at `:412`, the submission-level `Math.max` at `:867` |
-| Invariance is documented in-schema | `sed -n '270,290p' packages/frontend/src/lib/db/schema.ts` |
 | Why the guard exists | `git log -1 d9df8c9c` |
