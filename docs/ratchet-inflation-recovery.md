@@ -8,8 +8,10 @@ inflation without weakening that protection.
 
 > **Status: proposal. Nothing here is implemented.** Accept, reject, or amend.
 
-Verified against `origin/main` @ `e770eff3`. Every file:line below was read at
-that commit; "How to re-derive" says how to recheck each claim.
+Verified against `origin/main` @ `96e58fd9`. Every file:line below was read at
+that commit; "How to re-derive" says how to recheck each claim. If you are
+reading this at a later commit, re-run that section before trusting a line
+number — this header went stale once already.
 
 ## The two failures are one mechanism
 
@@ -163,6 +165,28 @@ Change `:751` to derive `totalTokens` and `totalCost` from
 reads `submissions.totalTokens` — with no row rewrite, no delete path, no backup
 table and no gate. The precedent sits twelve lines below the line being changed.
 
+**This phase can zero out real accounts if shipped naively, and that is its one
+sharp edge.** A user's high-water rows only exist once they have submitted since
+Phase 1 landed. Switch the derivation before that and `SUM` over zero rows
+returns 0 — the account's ranked total collapses to nothing. The damage is
+display-only, since `daily_breakdown` is untouched and the next submit repairs
+it, but it is a visible, alarming, self-inflicted outage for a user who did
+nothing.
+
+Two acceptable guards, in preference order:
+
+1. **Coverage gate.** Do not switch until Phase 1 shows high-water rows covering
+   every device that has submitted recently. Phase 1 already measures exactly
+   this, so the gate costs nothing extra.
+2. **Per-user fallback.** Derive from the high-water table only when the user has
+   rows spanning their stored date range; otherwise fall back to
+   `SUM(daily_breakdown)` for that user. Correct but leaves two code paths live,
+   and the fallback path stays inflated — so it must be temporary, not permanent.
+
+`COALESCE(SUM(highwater), SUM(daily))` looks like a third option and is not one:
+a user with *partial* coverage returns a non-null but too-small sum, which
+coalesce will happily accept.
+
 | Surface | Source | Fixed by Phase 2? |
 |---|---|---|
 | Leaderboard, profile total, all-time | `submissions.totalTokens` | **yes, to within the boundary leak** |
@@ -180,6 +204,13 @@ Phase 2 makes it visible in the ranked total rather than hidden in the daily
 merge.
 
 ## Phase 3 — Pin the bucket key (the only exact fix)
+
+**The numbering here is misleading and worth saying plainly: this is not third in
+sequence.** It is a CLI change with no server dependency, so it can and probably
+should ship in parallel with Phases 1 and 2 rather than after them. It is also
+the only item that stops the damage from growing while everything else is being
+decided. Read the phases as two tracks — server (1, 2, 4) and client (3, 5) —
+that meet only at Phase 4.
 
 Every error above exists because the bucket key is derived from a mutable input.
 Have the CLI **record its bucketing timezone in the config directory on first
