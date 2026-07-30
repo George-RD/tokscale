@@ -87,18 +87,41 @@ describe("scoreCandidate", () => {
     expect(signalKeys(scored)).not.toContain("dailyMismatch");
   });
 
-  it("flags an implied per-token price outside provider pricing", () => {
+  it("flags an implied per-token price above every provider's list price", () => {
     const tooExpensive = scoreCandidate(
       row({ totalTokens: 1_000, totalCost: 500 }),
       CONTEXT
     );
-    const tooCheap = scoreCandidate(
-      row({ totalTokens: 1_000_000_000_000, totalCost: 1 }),
-      CONTEXT
-    );
 
     expect(signalKeys(tooExpensive)).toContain("impliedRate");
-    expect(signalKeys(tooCheap)).toContain("impliedRate");
+  });
+
+  it("does not flag a very low implied rate, which local and free models produce", () => {
+    // Measured against production: a 1e-7 floor flagged 38 ordinary accounts
+    // against 3 genuine ones. Ollama and LM Studio cost nothing, free tiers
+    // cost nothing, and cache reads are far cheaper than input tokens, so a
+    // low blended rate is normal heavy usage rather than evidence of anything.
+    // @adheizal's real figures, with the real median (~5.8e9, derived from
+    // grenadeoftacoss reporting 1,550,270x it) and daily rows that agree with
+    // the stored total, so this isolates the implied-rate signal alone.
+    const localModels = scoreCandidate(
+      row({
+        totalTokens: 87_931_302_128,
+        totalCost: 6_232,
+        dailyTokens: 87_931_302_128,
+      }),
+      { siteTokens: 9_078_292_663_926_388, medianTokens: 5_822_000_000 }
+    );
+    const nearlyFree = scoreCandidate(
+      row({ totalTokens: 1_000_000_000, totalCost: 1, dailyTokens: 1_000_000_000 }),
+      { siteTokens: 9_078_292_663_926_388, medianTokens: 5_822_000_000 }
+    );
+
+    expect(signalKeys(localModels)).not.toContain("impliedRate");
+    expect(signalKeys(nearlyFree)).not.toContain("impliedRate");
+    // Drops out of the queue entirely rather than sitting there as permanent
+    // noise — which is what the old floor did to 38 accounts like this one.
+    expect(localModels.signals).toEqual([]);
   });
 
   it("never divides by zero on an empty site or a zero-token user", () => {

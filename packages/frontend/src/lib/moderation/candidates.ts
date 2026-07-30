@@ -4,7 +4,6 @@ import {
   DAILY_MISMATCH_THRESHOLD,
   MAX_IMPLIED_RATE,
   MEDIAN_RATIO_THRESHOLD,
-  MIN_IMPLIED_RATE,
   rankCandidates,
   SITE_SHARE_THRESHOLD,
   type CandidateRow,
@@ -108,10 +107,7 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
         OR (daily_tokens > 0 AND total_tokens::numeric / daily_tokens >= ${DAILY_MISMATCH_THRESHOLD})
         OR (
           total_tokens > 0
-          AND (
-            total_cost / total_tokens::numeric > ${MAX_IMPLIED_RATE}
-            OR total_cost / total_tokens::numeric < ${MIN_IMPLIED_RATE}
-          )
+          AND total_cost / total_tokens::numeric > ${MAX_IMPLIED_RATE}
         )
     )
     SELECT

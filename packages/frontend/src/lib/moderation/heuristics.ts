@@ -63,7 +63,18 @@ export const MEDIAN_RATIO_THRESHOLD = 500;
  * Published provider pricing sits well inside this band per token. Outside it,
  * either the cost or the token count is not what it claims to be.
  */
-export const MIN_IMPLIED_RATE = 0.0000001;
+/**
+ * Only an upper bound. There is deliberately no floor.
+ *
+ * A low implied rate carries no signal: local models via Ollama or LM Studio
+ * cost nothing, free tiers cost nothing, and cache reads are an order of
+ * magnitude cheaper than input tokens — so ordinary heavy users legitimately
+ * land far below any floor worth setting. Measured against real data, a
+ * 1e-7 floor flagged 38 innocent accounts against 3 genuine ones, which is a
+ * queue nobody would keep reading.
+ *
+ * The ceiling still means something: nobody pays above list price.
+ */
 export const MAX_IMPLIED_RATE = 0.001;
 /**
  * Daily rows should sum to roughly the stored total. A large gap is the
@@ -144,10 +155,10 @@ export function scoreCandidate(
 
   if (row.totalTokens > 0) {
     const impliedRate = row.totalCost / row.totalTokens;
-    if (impliedRate > MAX_IMPLIED_RATE || impliedRate < MIN_IMPLIED_RATE) {
+    if (impliedRate > MAX_IMPLIED_RATE) {
       signals.push({
         key: "impliedRate",
-        label: `Implied $${impliedRate.toPrecision(3)}/token is outside plausible provider pricing`,
+        label: `Implied $${impliedRate.toPrecision(3)}/token is above any provider's list price`,
         weight: 15,
       });
     }
