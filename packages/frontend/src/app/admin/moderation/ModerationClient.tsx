@@ -20,30 +20,29 @@ interface Candidate {
 }
 
 /**
- * Fixed reasons rather than free text.
+ * Fixed reasons rather than free text, and deliberately vague ones.
  *
- * These strings land verbatim in moderation_actions and are the only record of
- * why a decision was made, so they need to still be legible to someone reading
- * the audit log months later. A typed sentence would drift in wording and
- * detail between entries; a closed set stays comparable.
+ * An earlier draft spelled out which signal fired ("reports invented model
+ * names", "token total matches another account"). That is a detection
+ * playbook: anyone who reads it learns exactly what to avoid next time. These
+ * strings are stored, and anything stored can end up shown, so they say
+ * nothing about how the account was found.
  *
- * The wording separates the two cases the heuristics exist to distinguish:
- * fabricated data, versus our own ratchet inflation (#960). Never record the
- * latter as if the user did something wrong.
+ * Nothing is lost by being vague. The review screen recomputes the signals
+ * live from current data, so the specific evidence is always reconstructible —
+ * the audit row only needs to record the decision and who made it.
+ *
+ * The one distinction kept is ours-versus-theirs. It leaks no method, and
+ * without it a hide caused by our own ratchet inflation would be recorded
+ * identically to genuine abuse.
  */
 const HIDE_REASONS = [
-  "Fabricated usage — reports invented model names",
-  "Duplicate dataset — token total matches another account almost exactly",
-  "Implausible magnitude — usage inconsistent with any real workload",
-  "Suspected ratchet inflation (#960) — our bug, hidden pending correction",
-  "Under investigation — withheld from rankings until reviewed",
+  "Abuse",
+  "Under investigation",
+  "Data issue on our side",
 ] as const;
 
-const UNHIDE_REASONS = [
-  "Reviewed — no evidence of fabrication, restored",
-  "Resolved — inflation corrected upstream, restored",
-  "Hidden in error — restored",
-] as const;
+const UNHIDE_REASONS = ["Restored"] as const;
 
 export default function ModerationClient() {
   const [candidates, setCandidates] = useState<Candidate[] | null>(null);
