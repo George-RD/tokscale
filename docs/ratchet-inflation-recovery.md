@@ -116,7 +116,7 @@ The column that matters is what happens to a user who does nothing differently.
 | 3 | Healthy, multi-device | per-device | Each device gated independently under `UNIQUE(submission_id, submitted_device_id, date)`. No cross-device effect. |
 | 4 | **TZ-inflated, sessions intact** | passes | Rows replaced with the correct un-re-split values. **Healed on next submit.** |
 | 5 | TZ-inflated, multi-device, some devices clean | per-device | Each device heals as it submits. Partial healing moves monotonically toward truth. |
-| 6 | **Deleted local sessions (`d9df8c9c`)** | **fails** (invariant dropped) | Current guard defends. **History preserved exactly as today.** |
+| 6 | **Lost local sessions (`d9df8c9c`)** — deleted by the user *or* rotated/archived by the client tool | **fails** (invariant dropped) | Current guard defends. **History preserved exactly as today.** Note the two causes are indistinguishable here; see Known holes. |
 | 7 | Deleted sessions *and* changed TZ | fails | Guard defends everything. No loss, but no healing either — this is Phase 3's constituency. |
 | 8 | Retired device, never submits again | never runs | Rows frozen as-is. Pre-existing condition, not worsened. |
 | 9 | Pre-`0019` device, stored metrics `NULL` | cannot evaluate | Keep the guard and record the baseline. One-submit warm-up, then behaves as its real state. Treating `NULL` as `0` would let any payload pass and is rejected. |
@@ -158,10 +158,22 @@ Tests: gate passes → replace; invariant dropped → guard; client-filtered pay
 → guard; alternating-filter payload (condition 2) → guard; `backfill` origin →
 guard; `NULL` baseline → guard plus baseline recorded; multi-device isolation.
 
-**Verify before building:** that stored `total_active_time_ms` is the
-`GREATEST`-floored high-water mark of a quantity that cannot inflate. The whole
-design rests on it, and it is now load-bearing for a write path rather than a
-diagnostic.
+**The load-bearing assumption is verified.** Stored `total_active_time_ms` is
+`GREATEST`-floored on the per-device conflict arm
+(`packages/frontend/src/app/api/submit/route.ts:412`):
+
+```ts
+totalActiveTimeMs: sql`GREATEST(${submittedDevices.totalActiveTimeMs}, EXCLUDED.total_active_time_ms)`
+```
+
+and `packages/frontend/src/lib/db/schema.ts` documents the invariance directly in
+the column comment — "comes from the CLI's `timeMetrics`, which sums raw interval
+durations and is therefore TIMEZONE-INVARIANT", contrasted against the daily rows
+which "apportion each interval across LOCAL calendar days". Both halves hold.
+
+Note this is the *per-device* floor. A second, separate floor exists at the
+submission level (`route.ts:867`, `Math.max(deviceTotals, storedSessionMetrics)`)
+— that one is #960 Layer 1's target and is not what the gate reads.
 
 ### Phase 2 — Declare
 
@@ -215,6 +227,16 @@ correct behavior — day boundaries stay stable — but it is a product decision
 - **A user who stopped using a client entirely** has a full scan that no longer
   covers a stored client, fails condition 2, and is never healed. Conservative
   and safe; needs Phase 2's explicit scope declaration to resolve.
+- **Any path that lowers active time blocks the gate permanently**, not just
+  deliberate deletion. Because the per-device value is `GREATEST`-floored it
+  never comes back down, so a client tool that rotates or archives its own
+  session files produces the same signature as a user running `rm`. [#779](https://github.com/junhoyeo/tokscale/issues/779)
+  ("scan Codex `archived_sessions`") is evidence this happens in the wild. The
+  population of states 6 and 7 may therefore be materially larger than
+  deliberate cleanup alone would suggest, which raises the value of both Phase 3
+  and the complementary CLI fix. **The Phase 1 gate-failure census should
+  distinguish rotation from deletion** — if rotation dominates, extending the
+  collectors to read archived directories is a cheaper fix than either.
 - **State 7 has no automatic remedy** before Phase 3.
 - **Conservation is approximate.** Pricing changes and rounding mean comparisons
   need a tolerance band rather than equality.
@@ -244,4 +266,6 @@ knows what it is touching before it touches it.
 | `timeMetrics` and provenance are optional | `sed -n '200,232p' packages/frontend/src/lib/validation/submission.ts` |
 | Guard location | `rg -n 'mergeClientBreakdownsWithRegressionGuard' packages/frontend/src/lib/db/helpers.ts` |
 | Latest migration | `ls packages/frontend/src/lib/db/migrations/*.sql \| tail -3` |
+| Per-device value is `GREATEST`-floored | `rg -n 'totalActiveTimeMs' packages/frontend/src/app/api/submit/route.ts` — expect `GREATEST` at `:412`, the submission-level `Math.max` at `:867` |
+| Invariance is documented in-schema | `sed -n '270,290p' packages/frontend/src/lib/db/schema.ts` |
 | Why the guard exists | `git log -1 d9df8c9c` |
