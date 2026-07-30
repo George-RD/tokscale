@@ -539,6 +539,136 @@ describe("GET /api/users/[username]", () => {
     ]);
   });
 
+  it("merges client model breakdowns without mutating the stored daily rows", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-12T12:00:00.000Z"));
+
+    mockState.pushSelectResult([
+      {
+        id: "user-1",
+        username: "alice",
+        displayName: "Alice",
+        avatarUrl: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        totalTokens: 35,
+        totalCost: 2.25,
+        inputTokens: 30,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        reasoningTokens: 0,
+        submissionCount: 1,
+        earliestDate: "2026-04-30",
+        latestDate: "2026-05-01",
+        sessionCount: 0,
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        sourcesUsed: ["codex", "kilo"],
+        modelsUsed: ["gpt-5.5", "k-1"],
+        updatedAt: new Date("2026-05-01T12:00:00.000Z"),
+        cliVersion: "2.0.0",
+        schemaVersion: 2,
+      },
+    ]);
+
+    const model = (
+      tokens: number,
+      cost: number,
+      input: number,
+      output: number,
+    ) => ({
+      tokens,
+      cost,
+      input,
+      output,
+      cacheRead: 0,
+      cacheWrite: 0,
+      reasoning: 0,
+      messages: 1,
+    });
+    // Two shapes that both make the aggregator adopt a stored `models` map and
+    // then merge a second breakdown into it: same-date rows from two devices,
+    // and a single row whose `kilocode` key folds onto `kilo`.
+    const dailyRows = [
+      {
+        date: "2026-04-30",
+        timestampMs: 100,
+        tokens: 10,
+        cost: "1.0000",
+        inputTokens: 10,
+        outputTokens: 0,
+        sourceBreakdown: {
+          codex: {
+            ...model(10, 1, 10, 0),
+            models: { "gpt-5.5": model(10, 1, 10, 0) },
+          },
+        },
+      },
+      {
+        date: "2026-04-30",
+        timestampMs: 200,
+        tokens: 15,
+        cost: "0.7500",
+        inputTokens: 10,
+        outputTokens: 5,
+        sourceBreakdown: {
+          codex: {
+            ...model(15, 0.75, 10, 5),
+            models: { "gpt-5.5": model(15, 0.75, 10, 5) },
+          },
+        },
+      },
+      {
+        date: "2026-05-01",
+        timestampMs: 300,
+        tokens: 10,
+        cost: "0.5000",
+        inputTokens: 10,
+        outputTokens: 0,
+        sourceBreakdown: {
+          kilocode: {
+            ...model(4, 0.2, 4, 0),
+            models: { "k-1": model(4, 0.2, 4, 0) },
+          },
+          kilo: {
+            ...model(6, 0.3, 6, 0),
+            models: { "k-1": model(6, 0.3, 6, 0) },
+          },
+        },
+      },
+    ];
+    const storedRows = structuredClone(dailyRows);
+    mockState.pushSelectResult(dailyRows);
+    mockState.pushExecuteResult([{ rank: 1 }]);
+
+    const response = await GET(
+      new Request("http://localhost:3000/api/users/alice"),
+      { params: Promise.resolve({ username: "alice" }) },
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.contributions[0].clients[0].models).toEqual({
+      "gpt-5.5": expect.objectContaining({ tokens: 25, cost: 1.75 }),
+    });
+    expect(body.contributions[1].clients[0].client).toBe("kilo");
+    expect(body.contributions[1].clients[0].models).toEqual({
+      "k-1": expect.objectContaining({ tokens: 10, cost: 0.5 }),
+    });
+
+    // The rows are query results, not scratch space. Accumulating into one in
+    // place leaves the row reporting a merged total it never carried, which is
+    // only harmless while nothing reads it twice — an invariant no caller of
+    // this loop states or is obliged to keep.
+    expect(dailyRows).toEqual(storedRows);
+  });
+
   it("clamps leap-day rolling ranges to the prior year's last valid day", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2024-02-29T12:00:00.000Z"));

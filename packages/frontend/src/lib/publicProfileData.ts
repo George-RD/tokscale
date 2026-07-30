@@ -300,6 +300,26 @@ export async function getPublicProfileResponse(
       modelId?: string;
     };
 
+    /**
+     * Every merge below accumulates in place, so whatever an accumulator holds
+     * it will eventually rewrite. `breakdown.models` belongs to a `dailyData`
+     * row, so adopting it by reference makes the accumulator and the row the
+     * same object and the next row's merge silently rewrites the row that
+     * seeded it. Copy the map and its entries at the boundary so the
+     * accumulator only ever mutates memory it owns.
+     */
+    const cloneClientModels = (
+      models: Record<string, ModelData> | undefined,
+    ) => {
+      if (!models) return undefined;
+
+      const copy: Record<string, ModelData> = {};
+      for (const [modelId, model] of Object.entries(models)) {
+        copy[modelId] = { ...model };
+      }
+      return copy;
+    };
+
     const mergeClientModel = (
       client: ClientBreakdown,
       modelId: string,
@@ -405,7 +425,7 @@ export async function getPublicProfileResponse(
                 cacheWrite: breakdown.cacheWrite || 0,
                 reasoning: breakdown.reasoning || 0,
                 messages: breakdown.messages || 0,
-                models: breakdown.models,
+                models: cloneClientModels(breakdown.models),
                 modelId: breakdown.modelId,
               };
             }
@@ -468,7 +488,7 @@ export async function getPublicProfileResponse(
                 cacheWrite: breakdown.cacheWrite || 0,
                 reasoning: breakdown.reasoning || 0,
                 messages: breakdown.messages || 0,
-                models: breakdown.models,
+                models: cloneClientModels(breakdown.models),
                 modelId: breakdown.modelId,
               };
             }
