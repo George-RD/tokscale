@@ -44,6 +44,58 @@ Line numbers *did* rot for real in the #988–#992 batch (`route.ts` shifted a
 uniform +28), so before trusting one, re-run "How to re-derive"; each row there
 greps for content rather than seeking to an offset.
 
+## What the census found (2026-07-31)
+
+Run read-only against production. It uses the one timezone-invariant reference
+that already exists: `submitted_devices.total_active_time_ms` comes from the
+CLI's `timeMetrics`, which sums raw interval durations, while
+`daily_breakdown.active_time_ms` apportions the same intervals across local
+days. Their ratio measures the re-split directly, with **no migration, no
+deploy, and no waiting for resubmits**.
+
+```
+coverage        3959 devices total
+                 650 carry the invariant   (16%)
+                2457 have daily rows
+
+bands (of 650)   438 clean   (<1.05x)      67%
+                 131 mild    (1.05-1.5x)   20%
+                  56 clear   (1.5-3x)       8.6%
+                  25 severe  (>3x)          3.8%
+
+of the 212 above 1.05x, split by whether the ratio tracks history length:
+                   4 artifact-like    ratio ~ scan-window count (incl. one 2300x)
+                  11 ambiguous
+                 197 NOT explained by scan windowing  (1.05-12.43x)
+```
+
+**Three findings, and the third is the one that matters.**
+
+1. **The inflation is real and not rare.** Only 4 devices are cleanly explained
+   by the `--since`/`--date` artifact. 197 of 650 measurable devices — 30% —
+   show inflation that scan windowing does not account for. The mechanism is
+   active, not theoretical.
+
+2. **The extreme tail is artifact, not ratchet.** 2300x cannot be a re-split; a
+   re-split moves usage between adjacent days, it cannot multiply a total by
+   three orders of magnitude. Do not size the problem from the worst ratios.
+
+3. **The census cannot see the accounts that hold the tokens.** Devices above
+   1.5x hold **11.95% of the measurable slice but 0.02% of site-wide daily
+   tokens** — because the measurable slice itself is only ~0.17% of all tokens.
+   `total_active_time_ms` requires a recent CLI, so the 650 visible devices are
+   recent, low-history adopters. **The 84% this cannot measure hold essentially
+   all of the tokens.**
+
+So the incidence question is answered (common) and the magnitude question is
+not (unmeasured, on the population that matters). That is precisely the gap
+Phase 1 exists to close, and it is why Phase 1 survives while the phases
+downstream of it stay gated.
+
+**Reproduce:** the script is not committed; rebuild it from the ratio above
+against `submitted_devices` joined to `daily_breakdown` on
+`submitted_device_id`, filtering `total_active_time_ms > 0`.
+
 ## The two failures are one mechanism
 
 `compute_daily_active_time` (`crates/tokscale-core/src/sessionize.rs:285`)
@@ -561,14 +613,33 @@ P2 fixes ranked totals; P3 removes the cause; P4 fixes day-level rows.
 
 ## Decision needed
 
-Phases 1 and 2 are low-risk and independently valuable: one writes a table
-nothing reads, the other changes a single derivation to match a pattern already
-proven on adjacent columns. Phase 3 is the only change that removes the cause and
-should be weighed earlier than its number suggests. Phase 4 is where production
-rows become writable downward, and it is gated on Phase 1's census.
+The census settled some of this. Revised standing:
 
-Open: whether Phase 2 ships broadly or behind a per-user allowlist validated
-against one known inflated account first.
+**Ship Phase 3 (pin the bucket key).** 197 of 650 measurable devices show
+inflation that scan windowing does not explain, so the mechanism is active and
+still producing new damage every time someone rescans from another zone. Phase 3
+is CLI-only, has no server dependency, and is the sole change that removes the
+cause rather than cleaning up after it. Nothing else here is worth doing first.
+
+**Ship Phase 1 (populate only).** Its justification is now stronger than when it
+was written, not weaker. The active-time census answered incidence but not
+magnitude, because `total_active_time_ms` only exists on recent CLIs — the 650
+visible devices hold ~0.17% of site-wide tokens, so the accounts that actually
+matter are invisible to it. Phase 1 writes a per-device **token** high-water on
+every submit, which is the only way to measure that population. It reads
+nothing, so it cannot regress anything.
+
+**Phases 2, 4, 5 and 6 stay gated**, now on Phase 1's token census specifically
+rather than on "a census" generally. Do not build them against the active-time
+numbers above; those are an incidence signal on an unrepresentative slice, not a
+magnitude estimate.
+
+**Do not size the work from the worst ratios.** The 2300x device is a
+partial-scan artifact. Four devices are cleanly artifact, eleven ambiguous.
+
+Still open: whether Phase 2 ships broadly or behind a per-user allowlist
+validated against one known inflated account first. That question does not need
+answering until Phase 1 reports.
 
 ## How to re-derive
 
