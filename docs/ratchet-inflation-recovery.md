@@ -6,12 +6,43 @@ totals, and the monotonic guard that causes it exists to prevent a real
 production data loss. This document proposes a correction that heals the
 inflation without weakening that protection.
 
-> **Status: proposal. Nothing here is implemented.** Accept, reject, or amend.
+> **Status: none of Phases 1–6 is implemented.** Accept, reject, or amend.
+> Several *adjacent* defects this document catalogued have since been fixed and
+> are marked inline — see "Already fixed" below.
 
-Verified against `origin/main` @ `96e58fd9`. Every file:line below was read at
-that commit; "How to re-derive" says how to recheck each claim. If you are
-reading this at a later commit, re-run that section before trusting a line
-number — this header went stale once already.
+### Already fixed
+
+Found while investigating #960, shipped separately, and no longer open:
+
+| | Fix | Commit |
+|---|---|---|
+| OpenCodeReview never reached the submit path | parse it there, through the source cache | `b9fd593a` (#990) |
+| Alias fold mutated the stored raw breakdown, compounding per-model totals | `cloneClientBreakdownForFold` | `cdfd1d0c` (#989) |
+| Period leaderboards credited whole daily rows to one client | `scopeBreakdownToDirectives` | `cb65bbbf` (#988), `e80b44a3` (#991) |
+| Profile day aggregator mutated query-result rows (latent) | `cloneClientModels` | `ce555ab6` (#992) |
+
+None of these was the ratchet. They are recorded because the analysis below
+originally leaned on them, and because #990 in particular changes what the
+census will see.
+
+### Verification pin
+
+Every `file:line` below was read at `ce555ab6`, against these files only:
+
+```
+packages/frontend/src/app/api/submit/route.ts
+packages/frontend/src/lib/db/helpers.ts
+packages/frontend/src/lib/leaderboard/getLeaderboard.ts
+crates/tokscale-core/src/{lib.rs, sessionize.rs, clients.rs, message_cache.rs}
+crates/tokscale-core/src/sessions/mod.rs
+```
+
+**Pin to those files, not to `main`'s HEAD.** An earlier version pinned to HEAD
+and read as stale after three commits that touched nothing it cited — a
+staleness marker that fires on unrelated changes trains readers to ignore it.
+Line numbers *did* rot for real in the #988–#992 batch (`route.ts` shifted a
+uniform +28), so before trusting one, re-run "How to re-derive"; each row there
+greps for content rather than seeking to an offset.
 
 ## The two failures are one mechanism
 
@@ -39,7 +70,7 @@ and the payload carries nothing that separates them.
 
 ## The fix already exists here, applied to the wrong column
 
-`route.ts:763-774` states the problem and its solution in the tree today:
+`route.ts:791-802` states the problem and its solution in the tree today:
 
 > Session-shape totals come from the PER-DEVICE high-water marks, not from
 > `SUM(daily_breakdown.active_time_ms)`. … (2) Timezone stability: the daily rows
@@ -47,9 +78,9 @@ and the payload carries nothing that separates them.
 > history under a different TZ re-splits it; combined with the monotonic per-day
 > merge that permanently inflates `SUM(daily)`.
 
-So `totalActiveTimeMs` is derived from `submittedDevices` (`:787-790`) and is
-immune. `totalTokens` is still `SUM(dailyBreakdown.tokens)` (`:751`, written at
-`:834`) and is not — only because no per-device token total exists to derive
+So `totalActiveTimeMs` is derived from `submittedDevices` (`:815-818`) and is
+immune. `totalTokens` is still `SUM(dailyBreakdown.tokens)` (`:779`, written at
+`:862`) and is not — only because no per-device token total exists to derive
 from. Tokens have the same invariant: a re-split moves them between days without
 creating or destroying them, so a total over a window wider than the shift is
 invariant to it.
@@ -107,7 +138,7 @@ submitted_device_client_totals(
 PRIMARY KEY (submitted_device_id, client, origin, bucket_width, bucket_key)
 ```
 
-maintained with `GREATEST` on conflict, exactly as `route.ts:412` does. Buckets
+maintained with `GREATEST` on conflict, exactly as `route.ts:440` does. Buckets
 are folded server-side from the payload's `contributions` on their `date`, so no
 CLI change is required.
 
@@ -115,14 +146,14 @@ CLI change is required.
 loser. `bucket_key` is a stable string (`YYYY-MM`, or ISO `YYYY-Www`).
 
 **`origin` is part of the key, and this is load-bearing.** `getSubmitDevice`
-(`:154-168`) falls back to `LEGACY_SUBMIT_DEVICE_KEY` when a payload omits
+(`:182-196`) falls back to `LEGACY_SUBMIT_DEVICE_KEY` when a payload omits
 `device`, so a `tokscale import` backfill and a legacy CLI submit land on the
 *same* device row. Keyed without origin, `GREATEST` would take the **max** of
 imported and locally-scanned history instead of their sum, silently dropping
 whichever is smaller from the ranked total.
 
 `submissions.totalTokens` cannot serve as its own reference: it is recomputed
-from the daily rows every submit (`:751`) and is itself inflated.
+from the daily rows every submit (`:779`) and is itself inflated.
 
 ## Phase 1 — Populate only. No behavior change.
 
@@ -145,23 +176,28 @@ SUM(daily tokens in that bucket) / tokens_highwater
 
 Nothing can regress, because nothing reads it yet.
 
-**One thing the census cannot see.** `ClientId::OpenCodeReview` declares
-`submit_default: true` (`crates/tokscale-core/src/clients.rs:509-517`) but is
-parsed only by `parse_local_clients` (`lib.rs:3239`), which the submit path never
-calls — `message_cache.rs:853-855` states this outright. Its usage appears in
-`tokscale report` and has never reached the server, so it is absent from the
-baseline entirely. When that gap is fixed, affected accounts will show a step
-increase that is real usage arriving late, not drift. Audited against the whole
-registry: of 37 `submit_default` clients it is the only one missing (Goose,
-Hermes and Kilo appear absent from a naive `ClientId::` grep but are handled at
-`:1171`, `:1161` and via `ClientId::KiloCode` at `:1087`).
+**One thing the census cannot see — fixed, but it still distorts the baseline.**
+`ClientId::OpenCodeReview` declared `submit_default: true`
+(`crates/tokscale-core/src/clients.rs:509-517`) while being parsed only by
+`parse_local_clients` (`lib.rs:3265`), which the submit path never called. Its
+usage showed up in `tokscale report` and had never once reached the server.
+
+Fixed in `b9fd593a` (#990) — the submit path now parses it through the shared
+source cache. But every affected account's *history* is still missing it, so as
+those users resubmit they will show a step increase. **That is real usage
+arriving late, not drift, and the census must not score it as inflation.**
+
+Audited against the whole registry at the time: of 37 `submit_default` clients
+it was the only one missing (Goose, Hermes and Kilo look absent from a naive
+`ClientId::` grep but are handled at `lib.rs:1171`, `:1161`, and via
+`ClientId::KiloCode` at `:1087`).
 
 ## Phase 2 — Switch the read path
 
-Change `:751` to derive `totalTokens` and `totalCost` from
-`SUM(tokens_highwater)` over the winning `bucket_width`, mirroring `:787-790`.
+Change `:779` to derive `totalTokens` and `totalCost` from
+`SUM(tokens_highwater)` over the winning `bucket_width`, mirroring `:815-818`.
 
-**The leaderboard becomes correct immediately** — `getLeaderboard.ts:369,371,396`
+**The leaderboard becomes correct immediately** — `getLeaderboard.ts:353,355,380`
 reads `submissions.totalTokens` — with no row rewrite, no delete path, no backup
 table and no gate. The precedent sits twelve lines below the line being changed.
 
@@ -191,9 +227,9 @@ coalesce will happily accept.
 |---|---|---|
 | Leaderboard, profile total, all-time | `submissions.totalTokens` | **yes, to within the boundary leak** |
 | Heatmap, per-day views, weekly/monthly | `daily_breakdown` rows | no — Phase 4 |
-| `inputTokens` / `outputTokens` (`:753-754`) | `daily_breakdown` | no — no payload-level invariant exists |
+| `inputTokens` / `outputTokens` (`:781-782`) | `daily_breakdown` | no — no payload-level invariant exists |
 
-Deriving per-device also inherits the additivity the comment at `:766-769`
+Deriving per-device also inherits the additivity the comment at `:794-797`
 cites: two devices reporting 100 and 40 total 140, where a max would drop the
 second machine.
 
@@ -246,7 +282,7 @@ An earlier draft made the heal a branch inside `submit/route.ts`, deciding
 mid-request whether the in-flight payload was authoritative and rewriting rows on
 the spot. Every trap catalogued below came from that choice, and they surfaced one
 at a time over several readings rather than from any systematic sweep — the
-`:707` double-ratchet, which would have made the whole phase a silent no-op,
+`:735` double-ratchet, which would have made the whole phase a silent no-op,
 turned up last. When hazards keep arriving in a code path, the honest conclusion
 is that the path is not mapped, not that the list is finally complete.
 
@@ -283,20 +319,26 @@ per device per day per client, overwritten rather than accumulated.
 A separate, resumable job — not a request handler — compares shadow against
 stored and applies the repair per `(device, client)` when both hold:
 
-1. **Range coverage** — the shadow's dates span at least the device's stored date
-   range for `C`. Without it a `--since` scan's smaller total is not comparable
-   to an all-time high-water.
-2. **Invariant clears** — for every bucket touched, the shadow's token total for
-   `C` in that bucket is at least the stored high-water.
+1. **Bucket coverage** — the shadow's dates span the bucket being repaired.
+   Without it a `--since` scan's smaller total is not comparable to the stored
+   high-water for that bucket.
+2. **Invariant clears** — the shadow's token total for `C` in that bucket is at
+   least the stored high-water.
 
-Otherwise `C` is skipped for the buckets that failed. Checking per bucket, like
-checking per client, keeps one shrunken period from blocking every other
-period's repair.
+**Both gates are evaluated per bucket**, and a bucket failing either is skipped
+while its neighbours proceed. Checking per bucket, like checking per client,
+keeps one shrunken period from blocking every other period's repair.
+
+An earlier draft scoped gate 1 to the whole `(device, client)` date range, which
+silently contradicted row 6c below: a device that deleted its sessions and then
+kept working fails a range-wide check outright, even though its later buckets
+are perfectly comparable. The two gates were at different granularities and the
+text never said what a coarse-gate failure did. Per-bucket for both resolves it.
 
 ### Why this is materially safer
 
 - **Two of the four traps below stop existing.** The shadow table has no monotonic
-  guard, so there is no `:707` arm to bypass and no `mergeActiveTimeMs` to
+  guard, so there is no `:735` arm to bypass and no `mergeActiveTimeMs` to
   neutralise. It stores raw payload values, so the alias-fold machinery and its
   compounding `models` defect never touch it. The backfill constraint survives
   unchanged, and the transaction requirement changes shape rather than going
@@ -337,7 +379,7 @@ The route has **no delete path for `daily_breakdown`**, and adding one is the
 largest source of risk here. It is also unnecessary: remove `C`'s entry from
 `source_breakdown` and let `recalculateDayTotals` (`helpers.ts:68`) recompute. A
 day that lands at zero keeps a zero row. `activeDays` already guards with
-`COUNT(DISTINCT CASE WHEN tokens > 0 …)` (`:757`), so a zero row does not inflate
+`COUNT(DISTINCT CASE WHEN tokens > 0 …)` (`:785`), so a zero row does not inflate
 it; other consumers must be checked before shipping.
 
 ### The zero-out itself is mandatory
@@ -347,7 +389,7 @@ reproduces the double count exactly** — a heal without the zero-out repairs
 nothing.
 
 This is where the split earns its keep. In the submit path the signal was
-ambiguous: the per-day loop visits only days present in the payload (`:604`), and
+ambiguous: the per-day loop visits only days present in the payload (`:632`), and
 `aggregate_by_date` emits only days with activity, so an emptied day and a day
 outside the scan's scope are indistinguishable at request time. Against the
 shadow table the question is decidable — a day present in stored, absent from
@@ -376,30 +418,35 @@ collapsing the split back into the submit path inherits all of them again.
 **Alias folds — neutralised by 4a.** The shadow stores raw payload values and
 never runs alias normalisation, so none of the following can reach it. It remains
 true of the stored rows 4b writes into. A preserved fold must keep its raw alias
-keys (`:638-645`) or
+keys (`:666-673`) or
 "the heal floor is burned on the first partial resubmit and the double count
 re-cements permanently". Safe rule: **a client with a fold floor is never
 eligible for this heal.**
 
 That rule is now doing more work than originally intended, because the fold path
-has a live aliasing defect underneath it. `:94` copies a client with
-`{ ...data, models: { ...data.models } }` — a new map, but the model *value
-objects* remain shared with `rawExistingBreakdown`. `:107` then calls
-`mergeModelBreakdowns`, which at `:48-54` does `existingModel.tokens += …`
-**in place**, mutating the stored raw object; `:640-643` writes that mutated
-object back as the supposedly-raw alias key. Each submit folds the already-folded
-values again, so the nested `models` map compounds without bound. Client-level
-`tokens` escapes because `{ ...data }` copied the scalar, which is why day totals
-and the leaderboard look correct while per-model views drift.
+had a live aliasing defect underneath it. The normalized view copied the models
+*map* but left the model *value objects* shared with `rawExistingBreakdown`; an
+in-place `+=` merge then mutated those stored objects, and the writeback
+persisted the mutated values as the supposedly-raw alias keys. Each submit
+re-folded already-folded values, so the nested `models` map compounded without
+bound. Client-level `tokens` escaped because the spread copied a scalar, which
+is why day totals and the leaderboard stayed correct while per-model views
+drifted.
 
-This is a separate bug and should be fixed on its own (deep-copy the model
-values). It is recorded here because it means fold-affected rows are actively
-corrupting while unhealed, so "exclude them" is a deferral, not a resolution.
+**Fixed in `cdfd1d0c` (#989)** by `cloneClientBreakdownForFold`
+(`route.ts:77`, applied at `:122`), which gives the normalized view outright
+ownership at the point the sharing is created — covering `models` and
+`provenance`, the only two non-scalar fields on `ClientBreakdownData`.
+
+That changes the standing of the exclusion rule rather than removing it. It was
+a deferral of an active corruption; it is now an ordinary scope boundary.
+Fold-affected rows are no longer degrading while they wait, so excluding them
+from the heal costs nothing beyond the heal itself.
 
 **Backfill coexistence — survives the split.** 4b writes into the same
 `source_breakdown` the merge path owns, so this constraint is unchanged and must
 be honoured by the reconciliation job. `origin: "backfill"` is stamped per client inside
-`source_breakdown` (`:595-601`) and carried through merges by
+`source_breakdown` (`:623-629`) and carried through merges by
 `deriveClientBreakdownProvenance` (`helpers.ts:113-126`). A CLI scan cannot see
 imported history, so the rewrite must **preserve `backfill`-tagged entries**. A
 payload whose own `provenance.origin` is `backfill` never heals.
@@ -407,8 +454,8 @@ payload whose own `provenance.origin` is `backfill` never heals.
 **Day-level active time — neutralised by 4a, and the single strongest argument
 for the split.** The shadow has no monotonic guard, so there is no arm to bypass.
 Under the in-submit design this would have shipped as a silent no-op: it is
-ratcheted at TWO enforcement points, and the second one cancels the heal. `mergeActiveTimeMs` (`:178-185`) is a
-`Math.max` in the JS merge, and `:707` mirrors it in SQL:
+ratcheted at TWO enforcement points, and the second one cancels the heal. `mergeActiveTimeMs` (`:206-213`) is a
+`Math.max` in the JS merge, and `:735` mirrors it in SQL:
 
 ```sql
 active_time_ms = GREATEST(daily_breakdown.active_time_ms, EXCLUDED.active_time_ms),
@@ -425,7 +472,7 @@ enforcement points must be bypassed, not just the JS one.
 existing submit transaction, which is the whole of its footprint there. 4b runs
 outside the request path and takes its own transaction per batch, so it must
 re-acquire the same row lock to avoid racing a live submit for that user. Note
-the lock is already stronger than it looks: `:303-314` takes
+the lock is already stronger than it looks: `:331-342` takes
 `.for('update')` on the `submissions` row, which is unique per user
 (`submissions_user_id_unique`), so every submit for one user is serialized —
 including across devices. A second device cannot commit between the merge's read
@@ -482,14 +529,16 @@ P2 fixes ranked totals; P3 removes the cause; P4 fixes day-level rows.
 
 - **Phase 2 bounds inflation, it does not eliminate it.** The boundary leak
   survives until Phase 3 pins the key or Phase 4 repairs the rows.
-- **Filtered period leaderboards over-count independently of all of this.**
-  `getLeaderboard.ts:207-233` filters whole daily *rows* and the aggregation then
-  adds `row.tokens` (`:158`), the row's total across every client — so
-  `client:codex` counts other clients that shared a day and device. The all-time
-  path filters per user via `sources_used` (`:374-379`), a different semantic
-  again. Phase 2 does not touch this, and fixing the totals it reads will not fix
-  it. Listed so nobody validates Phase 2 against a filtered board and concludes
-  the derivation is wrong.
+- **Filtered *all-time* leaderboards still over-count, independently of all of
+  this.** The period boards were fixed in `cb65bbbf` (#988) and `e80b44a3`
+  (#991); both now sum only the matching slice through
+  `scopeBreakdownToDirectives` (`lib/leaderboard/sourceBreakdown.ts`). The
+  all-time path was not, and cannot be repaired the same way: it filters per
+  user via `sources_used` (`getLeaderboard.ts:359`) and then sums whole
+  `submissions.totalTokens` values, and those columns are bare arrays with no
+  per-element token attribution. Scoping it needs a join down to
+  `daily_breakdown.source_breakdown`. Listed so nobody validates Phase 2 against
+  a filtered all-time board and concludes the derivation is wrong.
 - **Swallowing survives inside one bucket.** Bounded by the chosen width; zero
   only after Phase 3 permits daily buckets.
 - **`inputTokens` / `outputTokens` stay inflated** until Phase 4. No
@@ -525,17 +574,17 @@ against one known inflated account first.
 
 | Claim | Command |
 |---|---|
-| Session metrics already avoid `SUM(daily)`, and why | `sed -n '763,791p' packages/frontend/src/app/api/submit/route.ts` |
-| `totalTokens` still uses `SUM(daily)` | `rg -n 'totalTokens' packages/frontend/src/app/api/submit/route.ts` — `:751`, written `:834` |
+| Session metrics already avoid `SUM(daily)`, and why | `sed -n '791,819p' packages/frontend/src/app/api/submit/route.ts` |
+| `totalTokens` still uses `SUM(daily)` | `rg -n 'totalTokens' packages/frontend/src/app/api/submit/route.ts` — `:779`, written `:862` |
 | Leaderboard reads that column | `rg -n 'submissions.totalTokens' packages/frontend/src/lib/leaderboard/getLeaderboard.ts` |
 | Contribution dates are local, not UTC | `sed -n '443,445p' crates/tokscale-core/src/sessions/mod.rs` |
-| Device-less submits share a legacy key | `sed -n '154,168p' packages/frontend/src/app/api/submit/route.ts` |
+| Device-less submits share a legacy key | `sed -n '182,196p' packages/frontend/src/app/api/submit/route.ts` |
 | Guard is per-client; fold heal-floor precedent | `sed -n '154,238p' packages/frontend/src/lib/db/helpers.ts` |
 | Only 11 of 45 parsers set `duration_ms` | `rg -l 'duration_ms:\s*Some\|duration_ms =' crates/tokscale-core/src/sessions/ \| wc -l`; `ls crates/tokscale-core/src/sessions/*.rs \| wc -l` |
-| Only payload days are visited | `sed -n '604,672p' packages/frontend/src/app/api/submit/route.ts` |
+| Only payload days are visited | `sed -n '632,700p' packages/frontend/src/app/api/submit/route.ts` |
 | No delete path exists | `rg -n '\.delete\(' packages/frontend/src/app/api/submit/route.ts` — expect no `dailyBreakdown` hit |
-| `activeDays` ignores zero rows | `sed -n '757p' packages/frontend/src/app/api/submit/route.ts` |
-| Fold writeback restores raw alias keys | `sed -n '632,646p' packages/frontend/src/app/api/submit/route.ts` |
-| Backfill origin is per-client | `sed -n '592,602p' packages/frontend/src/app/api/submit/route.ts` |
-| `submittedClients` is the scope set | `sed -n '274,282p' packages/frontend/src/app/api/submit/route.ts` |
+| `activeDays` ignores zero rows | `sed -n '785p' packages/frontend/src/app/api/submit/route.ts` |
+| Fold writeback restores raw alias keys | `sed -n '660,674p' packages/frontend/src/app/api/submit/route.ts` |
+| Backfill origin is per-client | `sed -n '620,630p' packages/frontend/src/app/api/submit/route.ts` |
+| `submittedClients` is the scope set | `sed -n '302,310p' packages/frontend/src/app/api/submit/route.ts` |
 | Why the guard exists | `git log -1 d9df8c9c` |
