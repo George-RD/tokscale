@@ -12,6 +12,7 @@ import {
   escapeLikePattern,
   hasDirectives,
   parseSearchDirectives,
+  type ParsedSearchDirectives,
 } from "@/lib/leaderboard/searchDirectives";
 
 export type { LeaderboardData, LeaderboardUser, Period, SortBy } from "@/lib/leaderboard/types";
@@ -26,6 +27,18 @@ export type { LeaderboardData, LeaderboardUser, Period, SortBy } from "@/lib/lea
  */
 const RANKABLE_USER = eq(users.leaderboardHidden, false);
 
+/**
+ * The part of `daily_breakdown.source_breakdown` the leaderboard reads. Every
+ * field is optional because the stored blob has grown over time and rows
+ * written by older CLI versions are still on the board — see db/schema.ts for
+ * the full shape.
+ */
+interface PeriodClientBreakdown {
+  tokens?: number;
+  cost?: number;
+  models?: Record<string, { tokens?: number; cost?: number }>;
+}
+
 interface LeaderboardPeriodRow {
   userId: string;
   username: string;
@@ -33,7 +46,7 @@ interface LeaderboardPeriodRow {
   avatarUrl: string | null;
   tokens: number;
   cost: number;
-  sourceBreakdown: Record<string, { models: Record<string, unknown> }> | null;
+  sourceBreakdown: Record<string, PeriodClientBreakdown> | null;
   /**
    * Carried through so the period path can drop the user from the rankings
    * while still counting them in the period totals. Internal only — it must
@@ -54,7 +67,7 @@ interface PeriodLeaderboardDbRow {
   avatarUrl: string | null;
   tokens: number | string | null;
   cost: number | string | null;
-  sourceBreakdown: Record<string, { models: Record<string, unknown> }> | null;
+  sourceBreakdown: Record<string, PeriodClientBreakdown> | null;
   leaderboardHidden: boolean;
 }
 
@@ -193,6 +206,70 @@ function matchesLeaderboardSearch(
   return false;
 }
 
+/**
+ * Narrows a daily row to the tokens and cost a `client:`/`model:` search
+ * actually asked for, or null when nothing in the row was selected.
+ *
+ * A daily row's own `tokens`/`cost` are the total across every client and
+ * model that shared that day and device, so a filtered board must not sum
+ * them: crediting the whole row to a `client:codex` search hands the user
+ * every other client they happened to run that day. The per-client and
+ * per-model figures inside `sourceBreakdown` are the only ones narrow enough
+ * to add up.
+ *
+ * `client:x model:y` is read as an intersection within one client — a model's
+ * tokens count only where they were spent under a matching client. A union
+ * reading would let `client:codex model:opus` re-credit Codex work that never
+ * touched Opus, which is the same over-count wearing a different hat.
+ */
+function scopeRowToDirectives(
+  row: LeaderboardPeriodRow,
+  parsed: ParsedSearchDirectives
+): { tokens: number; cost: number } | null {
+  if (!row.sourceBreakdown) {
+    return null;
+  }
+
+  let tokens = 0;
+  let cost = 0;
+  let matched = false;
+
+  for (const [clientId, client] of Object.entries(row.sourceBreakdown)) {
+    // Case-insensitive substring, carried over verbatim from the row filter
+    // this replaced: `client:claude` has always matched `claude-code`, and
+    // tightening that to equality here would quietly drop usage from every
+    // saved search built against the old behaviour.
+    const clientMatches =
+      parsed.clients.length === 0 ||
+      parsed.clients.some((candidate) => clientId.toLowerCase().includes(candidate));
+
+    if (!clientMatches) {
+      continue;
+    }
+
+    if (parsed.models.length === 0) {
+      matched = true;
+      tokens += Number(client.tokens) || 0;
+      cost += Number(client.cost) || 0;
+      continue;
+    }
+
+    for (const [modelId, model] of Object.entries(client.models ?? {})) {
+      if (!parsed.models.some((candidate) => modelId.toLowerCase().includes(candidate))) {
+        continue;
+      }
+      matched = true;
+      tokens += Number(model.tokens) || 0;
+      cost += Number(model.cost) || 0;
+    }
+  }
+
+  // Tracked separately from a zero sum: a client that genuinely burned no
+  // tokens still puts its owner on the filtered board and into uniqueUsers,
+  // whereas a row nothing matched must leave no trace at all.
+  return matched ? { tokens, cost } : null;
+}
+
 function buildPeriodLeaderboardData(
   rows: LeaderboardPeriodRow[],
   page: number,
@@ -206,29 +283,9 @@ function buildPeriodLeaderboardData(
 
   let filteredRows = rows;
   if (hasDirectives(parsed)) {
-    filteredRows = rows.filter((row) => {
-      if (!row.sourceBreakdown) return false;
-
-      const clientKeys = Object.keys(row.sourceBreakdown).map((k) => k.toLowerCase());
-      const modelKeys = Object.values(row.sourceBreakdown).flatMap((client) =>
-        client.models ? Object.keys(client.models).map((m) => m.toLowerCase()) : []
-      );
-
-      if (parsed.clients.length > 0) {
-        const hasMatchingClient = parsed.clients.some((c) =>
-          clientKeys.some((k) => k.includes(c))
-        );
-        if (!hasMatchingClient) return false;
-      }
-
-      if (parsed.models.length > 0) {
-        const hasMatchingModel = parsed.models.some((m) =>
-          modelKeys.some((k) => k.includes(m))
-        );
-        if (!hasMatchingModel) return false;
-      }
-
-      return true;
+    filteredRows = rows.flatMap((row) => {
+      const scoped = scopeRowToDirectives(row, parsed);
+      return scoped ? [{ ...row, tokens: scoped.tokens, cost: scoped.cost }] : [];
     });
   }
 
