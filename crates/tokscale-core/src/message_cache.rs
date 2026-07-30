@@ -850,9 +850,13 @@ fn parser_version(client: ClientId) -> u32 {
         // their own `timestamp` now carry a line-number discriminator in the
         // dedup key, so distinct calls sharing a model and token counts no
         // longer collapse into one under the shared file-mtime fallback.
-        // Both bumps are precautionary rather than corrective: opencodereview
-        // is parsed only by parse_local_clients, which does not go through
-        // this cache, so no entry has ever been written under this namespace.
+        // Both bumps were precautionary rather than corrective: until the
+        // submit path learned to parse opencodereview, the only reader was
+        // parse_local_clients, which does not go through this cache, so no
+        // entry was ever written under this namespace. 3 is therefore the
+        // first version to describe real cache entries — it is not carrying
+        // an invalidation debt forward, and a further bump would have had
+        // nothing to invalidate.
         ClientId::OpenCodeReview => 3,
         // Kiro's structured messages.jsonl turns now back-calculate the
         // start anchor from `turn_end - elapsedTime` when the user prompt's
