@@ -54,9 +54,37 @@ function mergeModelBreakdowns(
       existingModel.reasoning = (existingModel.reasoning || 0) + (modelData.reasoning || 0);
       existingModel.messages += modelData.messages || 0;
     } else {
+      // ModelBreakdownData is entirely scalar, so a spread is a full copy --
+      // the merged model never shares state with `incoming`. Adding a nested
+      // field to that interface would silently turn this back into an alias.
       target[modelId] = { ...modelData };
     }
   }
+}
+
+// `normalized` is mutated in place below (scalar `+=` on the client entry and
+// mergeModelBreakdowns on its models), while the fold-preservation writeback
+// in POST re-reads the ORIGINAL raw entries afterwards to restore the legacy
+// alias keys. Those two only coexist if the normalized view owns its data
+// outright: a shallow `{ ...data, models: { ...data.models } }` copies the
+// client scalars and the models MAP but leaves the model VALUE objects shared
+// with the stored breakdown, so folding a day mutated the very raw data the
+// writeback then persisted -- and each later submit re-folded the
+// already-folded values, compounding the nested models without bound. Client
+// totals hid it because those are scalars the spread genuinely copied, which
+// is why day totals and the leaderboard stayed correct while per-model views
+// drifted.
+function cloneClientBreakdownForFold(data: ClientBreakdownData): ClientBreakdownData {
+  const models: ClientBreakdownData["models"] = {};
+  for (const [modelId, modelData] of Object.entries(data.models ?? {})) {
+    models[modelId] = { ...modelData };
+  }
+
+  return {
+    ...data,
+    models,
+    ...(data.provenance ? { provenance: { ...data.provenance } } : {}),
+  };
 }
 
 interface NormalizedClientBreakdownAliases {
@@ -91,7 +119,7 @@ function normalizeClientBreakdownAliases(
     );
 
     if (!existing) {
-      normalized[clientName] = { ...data, models: { ...data.models } };
+      normalized[clientName] = cloneClientBreakdownForFold(data);
       continue;
     }
 
