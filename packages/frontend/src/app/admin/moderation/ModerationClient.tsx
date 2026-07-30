@@ -19,6 +19,41 @@ interface Candidate {
   signals: CandidateSignal[];
 }
 
+/**
+ * Fixed reasons rather than free text, and deliberately vague ones.
+ *
+ * An earlier draft spelled out which signal fired ("reports invented model
+ * names", "token total matches another account"). That is a detection
+ * playbook: anyone who reads it learns exactly what to avoid next time. These
+ * strings are stored, and anything stored can end up shown, so they say
+ * nothing about how the account was found.
+ *
+ * Nothing is lost by being vague. The review screen recomputes the signals
+ * live from current data, so the specific evidence is always reconstructible —
+ * the audit row only needs to record the decision and who made it.
+ *
+ * The one distinction kept is ours-versus-theirs. It leaks no method, and
+ * without it a hide caused by our own ratchet inflation would be recorded
+ * identically to genuine abuse.
+ */
+const HIDE_REASONS = [
+  "Abuse",
+  "Under investigation",
+  "Data issue on our side",
+] as const;
+
+/**
+ * Mirrors the ours-versus-theirs distinction above. A single "Restored" made
+ * the audit trail lossy in exactly the direction that matters: clearing an
+ * account we hid because of our own ratchet inflation looked identical to
+ * clearing one a human reviewed and disagreed with. Both are the same button
+ * press; only the record can tell them apart later.
+ */
+const UNHIDE_REASONS = [
+  "Restored after review",
+  "Restored — data issue on our side",
+] as const;
+
 export default function ModerationClient() {
   const [candidates, setCandidates] = useState<Candidate[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -56,7 +91,7 @@ export default function ModerationClient() {
     // Enforced client-side as well as in the API so the reviewer is told what
     // is missing before a round trip, not after a 400.
     if (!reason) {
-      setError(`A reason is required before changing @${candidate.username}.`);
+      setError(`Select a reason before changing @${candidate.username}.`);
       return;
     }
 
@@ -142,17 +177,25 @@ export default function ModerationClient() {
                 </Signals>
 
                 <ActionRow>
-                  <ReasonInput
+                  <ReasonSelect
                     aria-label={`Reason for changing @${candidate.username}`}
                     value={reasons[candidate.username] ?? ""}
-                    placeholder="Reason (recorded permanently)"
                     onChange={(event) =>
                       setReasons((current) => ({
                         ...current,
                         [candidate.username]: event.target.value,
                       }))
                     }
-                  />
+                  >
+                    <option value="">Select a reason (recorded permanently)…</option>
+                    {(candidate.leaderboardHidden ? UNHIDE_REASONS : HIDE_REASONS).map(
+                      (reason) => (
+                        <option key={reason} value={reason}>
+                          {reason}
+                        </option>
+                      )
+                    )}
+                  </ReasonSelect>
                   <ActionButton
                     type="button"
                     $danger={!candidate.leaderboardHidden}
@@ -281,9 +324,9 @@ const ActionRow = styled.div`
   margin-top: 16px;
 `;
 
-const ReasonInput = styled.input`
+const ReasonSelect = styled.select`
   flex: 1;
-  min-width: 240px;
+  min-width: 320px;
   padding: 9px 12px;
   border: 1px solid var(--service-border);
   border-radius: 8px;

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  SLOP_MODEL_REGEX,
   rankCandidates,
   scoreCandidate,
   type CandidateContext,
@@ -32,6 +33,7 @@ function row(overrides: Partial<CandidateRow> = {}): CandidateRow {
     hasBackfill: false,
     dailyTokens: 1_200_000,
     nearDuplicateCount: 0,
+    slopModels: [],
     ...overrides,
   };
 }
@@ -57,6 +59,45 @@ describe("scoreCandidate", () => {
 
     expect(signalKeys(scored)).toContain("siteShare");
     expect(scored.signals.find((s) => s.key === "siteShare")?.label).toContain("99.4%");
+  });
+
+  it("flags invented model names and quotes them verbatim", () => {
+    // The real three variants on the rank-1 account.
+    const scored = scoreCandidate(
+      row({
+        slopModels: ["slopllm-5m", "slopai/slopllm-5m", "slopai/slopllm:5m"],
+      }),
+      CONTEXT
+    );
+
+    expect(signalKeys(scored)).toContain("slopModelName");
+    // Quoted so the reviewer judges the string itself rather than trusting the
+    // match — the name is the evidence.
+    expect(scored.signals.find((s) => s.key === "slopModelName")?.label).toContain(
+      '"slopllm-5m"'
+    );
+  });
+
+  it("outweighs every other single signal, since a name cannot be innocent", () => {
+    const slop = scoreCandidate(row({ slopModels: ["slopllm-5m"] }), CONTEXT);
+    const duplicate = scoreCandidate(row({ nearDuplicateCount: 1 }), CONTEXT);
+
+    expect(slop.score).toBeGreaterThan(duplicate.score);
+  });
+
+  it("summarises rather than listing every match", () => {
+    const scored = scoreCandidate(
+      row({ slopModels: ["a-slop", "b-slop", "c-slop", "d-slop", "e-slop"] }),
+      CONTEXT
+    );
+
+    expect(scored.signals[0].label).toContain("and 2 more");
+  });
+
+  it("does not flag an account with no invented names", () => {
+    expect(signalKeys(scoreCandidate(row({ slopModels: [] }), CONTEXT))).not.toContain(
+      "slopModelName"
+    );
   });
 
   it("flags a token total that matches another account almost exactly", () => {
@@ -87,18 +128,41 @@ describe("scoreCandidate", () => {
     expect(signalKeys(scored)).not.toContain("dailyMismatch");
   });
 
-  it("flags an implied per-token price outside provider pricing", () => {
+  it("flags an implied per-token price above every provider's list price", () => {
     const tooExpensive = scoreCandidate(
       row({ totalTokens: 1_000, totalCost: 500 }),
       CONTEXT
     );
-    const tooCheap = scoreCandidate(
-      row({ totalTokens: 1_000_000_000_000, totalCost: 1 }),
-      CONTEXT
-    );
 
     expect(signalKeys(tooExpensive)).toContain("impliedRate");
-    expect(signalKeys(tooCheap)).toContain("impliedRate");
+  });
+
+  it("does not flag a very low implied rate, which local and free models produce", () => {
+    // Measured against production: a 1e-7 floor flagged 38 ordinary accounts
+    // against 3 genuine ones. Ollama and LM Studio cost nothing, free tiers
+    // cost nothing, and cache reads are far cheaper than input tokens, so a
+    // low blended rate is normal heavy usage rather than evidence of anything.
+    // @adheizal's real figures, with the real median (~5.8e9, derived from
+    // grenadeoftacoss reporting 1,550,270x it) and daily rows that agree with
+    // the stored total, so this isolates the implied-rate signal alone.
+    const localModels = scoreCandidate(
+      row({
+        totalTokens: 87_931_302_128,
+        totalCost: 6_232,
+        dailyTokens: 87_931_302_128,
+      }),
+      { siteTokens: 9_078_292_663_926_388, medianTokens: 5_822_000_000 }
+    );
+    const nearlyFree = scoreCandidate(
+      row({ totalTokens: 1_000_000_000, totalCost: 1, dailyTokens: 1_000_000_000 }),
+      { siteTokens: 9_078_292_663_926_388, medianTokens: 5_822_000_000 }
+    );
+
+    expect(signalKeys(localModels)).not.toContain("impliedRate");
+    expect(signalKeys(nearlyFree)).not.toContain("impliedRate");
+    // Drops out of the queue entirely rather than sitting there as permanent
+    // noise — which is what the old floor did to 38 accounts like this one.
+    expect(localModels.signals).toEqual([]);
   });
 
   it("never divides by zero on an empty site or a zero-token user", () => {
@@ -158,5 +222,40 @@ describe("rankCandidates", () => {
     );
 
     expect(ranked.map((c) => c.username)).toEqual(["adam", "zoe"]);
+  });
+});
+
+describe("SLOP_MODEL_REGEX", () => {
+  // The pattern is interpolated into a Postgres `~*` comparison, so this is a
+  // JS approximation of that operator. Both are POSIX-flavoured and the
+  // constructs used here -- alternation, a negated class, an anchor -- behave
+  // identically, which is enough to pin the boundary this test is about.
+  const matches = (name: string) => new RegExp(SLOP_MODEL_REGEX, "i").test(name);
+
+  it("matches an invented name with no delimiter before the marker", () => {
+    // The case the pattern list exists for. Requiring delimiters on BOTH sides
+    // would silently stop catching it, which is why only the left is anchored.
+    expect(matches("slopllm")).toBe(true);
+    expect(matches("SlopLLM")).toBe(true);
+  });
+
+  it("matches the marker at a segment boundary", () => {
+    expect(matches("slop-llm")).toBe(true);
+    expect(matches("slopai/slopllm:5m")).toBe(true);
+    expect(matches("gpt-4-fake")).toBe(true);
+    expect(matches("my_dummy_model")).toBe(true);
+  });
+
+  it("does not match a marker buried inside a longer word", () => {
+    // The false-positive class: a future legitimate id that merely contains
+    // one of these words should not enter the queue.
+    expect(matches("notaslopname")).toBe(false);
+    expect(matches("xfakey")).toBe(false);
+  });
+
+  it("leaves ordinary model ids alone", () => {
+    expect(matches("claude-sonnet-4-5")).toBe(false);
+    expect(matches("deepseek-v3")).toBe(false);
+    expect(matches("gpt-5.4")).toBe(false);
   });
 });

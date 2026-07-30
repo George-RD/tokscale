@@ -4,7 +4,7 @@ import {
   DAILY_MISMATCH_THRESHOLD,
   MAX_IMPLIED_RATE,
   MEDIAN_RATIO_THRESHOLD,
-  MIN_IMPLIED_RATE,
+  SLOP_MODEL_REGEX,
   rankCandidates,
   SITE_SHARE_THRESHOLD,
   type CandidateRow,
@@ -29,6 +29,7 @@ interface CandidateDbRow extends Record<string, unknown> {
   has_backfill: boolean | null;
   daily_tokens: number | string | null;
   near_duplicate_count: number | string | null;
+  slop_models: string[] | null;
   site_tokens: number | string | null;
   median_tokens: number | string | null;
 }
@@ -63,7 +64,17 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
         s.total_tokens,
         CAST(s.total_cost AS DECIMAL(18,4)) AS total_cost,
         s.submit_count,
-        s.has_backfill
+        s.has_backfill,
+        -- Pre-filtered here rather than shipping the whole array: the busiest
+        -- account reports 141 models and only the matches are of interest.
+        COALESCE(
+          (
+            SELECT array_agg(DISTINCT m)
+            FROM unnest(s.models_used) AS m
+            WHERE m ~* ${SLOP_MODEL_REGEX}
+          ),
+          ARRAY[]::text[]
+        ) AS slop_models
       FROM users u
       JOIN submissions s ON s.user_id = u.id
     ),
@@ -105,19 +116,17 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
         OR (site_tokens > 0 AND total_tokens::numeric / site_tokens >= ${SITE_SHARE_THRESHOLD})
         OR (median_tokens > 0 AND total_tokens::numeric / median_tokens >= ${MEDIAN_RATIO_THRESHOLD})
         OR near_duplicate_count > 0
+        OR cardinality(slop_models) > 0
         OR (daily_tokens > 0 AND total_tokens::numeric / daily_tokens >= ${DAILY_MISMATCH_THRESHOLD})
         OR (
           total_tokens > 0
-          AND (
-            total_cost / total_tokens::numeric > ${MAX_IMPLIED_RATE}
-            OR total_cost / total_tokens::numeric < ${MIN_IMPLIED_RATE}
-          )
+          AND total_cost / total_tokens::numeric > ${MAX_IMPLIED_RATE}
         )
     )
     SELECT
       user_id, username, avatar_url, leaderboard_hidden, total_tokens,
       total_cost, submit_count, has_backfill, daily_tokens,
-      near_duplicate_count, site_tokens, median_tokens
+      near_duplicate_count, slop_models, site_tokens, median_tokens
     FROM eligible
   `);
 
@@ -138,6 +147,7 @@ export async function getModerationCandidates(): Promise<ScoredCandidate[]> {
     hasBackfill: row.has_backfill === true,
     dailyTokens: toNumber(row.daily_tokens),
     nearDuplicateCount: toNumber(row.near_duplicate_count),
+    slopModels: Array.isArray(row.slop_models) ? row.slop_models : [],
   }));
 
   return rankCandidates(rows, {

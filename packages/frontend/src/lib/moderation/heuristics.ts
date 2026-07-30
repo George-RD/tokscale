@@ -29,6 +29,12 @@ export interface CandidateRow {
   dailyTokens: number;
   /** How many OTHER users report a near-identical token total. */
   nearDuplicateCount: number;
+  /**
+   * This user's model names that match SLOP_MODEL_PATTERNS. Pre-filtered in SQL
+   * rather than sent whole: the busiest account reports 141 models, and only
+   * the matches are of any interest.
+   */
+  slopModels: string[];
 }
 
 export interface CandidateContext {
@@ -44,7 +50,8 @@ export interface CandidateSignal {
     | "medianRatio"
     | "duplicateTotal"
     | "dailyMismatch"
-    | "impliedRate";
+    | "impliedRate"
+    | "slopModelName";
   /** Shown verbatim in the review UI. */
   label: string;
   weight: number;
@@ -55,15 +62,64 @@ export interface ScoredCandidate extends CandidateRow {
   signals: CandidateSignal[];
 }
 
+/**
+ * Substrings that only appear in a model name someone invented.
+ *
+ * Deliberately tiny, and every entry was checked against production before
+ * being included. Two things are NOT here on purpose:
+ *
+ * - `test` — `test-model` is reported by 4 separate accounts, so it is someone
+ *   genuinely testing rather than a fabrication.
+ * - `hack` — the only hit was a tool name, and the word appears in enough
+ *   legitimate contexts to be a false-positive risk.
+ *
+ * Statistical alternatives were measured and rejected. Model *count* looked
+ * promising until the distribution came back at p50=20, p99=140, max=206 with
+ * 51 accounts above 100 models — the 141-model account is unremarkable on that
+ * axis. Counting models nobody else reports fails too, because the
+ * one-user-only set is mostly parser debris (`*`, `{`, `│`, bare UUIDs).
+ *
+ * So this is a content signal, not a statistical one: a name that declares
+ * itself fake is evidence in a way that an unusual count is not.
+ */
+export const SLOP_MODEL_PATTERNS = [
+  "slop",
+  "fake",
+  "dummy",
+  "bogus",
+  "notreal",
+  "madeup",
+] as const;
+
+/**
+ * Case-insensitive alternation for the SQL-side pre-filter, anchored to the
+ * start of a name or of a segment within it.
+ *
+ * Unanchored, the pattern matched anywhere inside an id, so any future
+ * legitimate name that merely contains one of these words would be flagged.
+ * Anchoring only the left side is deliberate: requiring a delimiter on BOTH
+ * sides would stop matching `slopllm`, which is the exact shape the list is
+ * written to catch. `slop-llm`, `slop/llm` and `slopllm` all still match;
+ * `notaslopname` no longer does.
+ */
+export const SLOP_MODEL_REGEX = `(^|[^a-z0-9])(${SLOP_MODEL_PATTERNS.join("|")})`;
+
 /** A user holding more than this share of all tokens is worth a look. */
 export const SITE_SHARE_THRESHOLD = 0.05;
 /** Multiples of the median that stop being explainable as heavy usage. */
 export const MEDIAN_RATIO_THRESHOLD = 500;
 /**
- * Published provider pricing sits well inside this band per token. Outside it,
- * either the cost or the token count is not what it claims to be.
+ * Only an upper bound. There is deliberately no floor.
+ *
+ * A low implied rate carries no signal: local models via Ollama or LM Studio
+ * cost nothing, free tiers cost nothing, and cache reads are an order of
+ * magnitude cheaper than input tokens — so ordinary heavy users legitimately
+ * land far below any floor worth setting. Measured against real data, a
+ * 1e-7 floor flagged 38 innocent accounts against 3 genuine ones, which is a
+ * queue nobody would keep reading.
+ *
+ * The ceiling still means something: nobody pays above list price.
  */
-export const MIN_IMPLIED_RATE = 0.0000001;
 export const MAX_IMPLIED_RATE = 0.001;
 /**
  * Daily rows should sum to roughly the stored total. A large gap is the
@@ -116,6 +172,28 @@ export function scoreCandidate(
     }
   }
 
+  if (row.slopModels.length > 0) {
+    // Quoted verbatim so the reviewer judges the actual string rather than
+    // trusting the match — the whole point is that the name speaks for itself.
+    const shown = row.slopModels.slice(0, 3).map((name) => `"${name}"`).join(", ");
+    const extra = row.slopModels.length - 3;
+
+    signals.push({
+      key: "slopModelName",
+      label: `Reports invented model names: ${shown}${extra > 0 ? ` and ${extra} more` : ""}`,
+      // The heaviest FIXED weight: magnitude and duplication can both have
+      // innocent explanations, and a model called "slopllm" cannot.
+      //
+      // Not the highest possible score, though — siteShare is 40 * share, so an
+      // account holding more than 87.5% of every token on the site outranks
+      // this. That ordering is correct and left alone: one account owning
+      // essentially the whole site is a bigger thing to look at than a bad
+      // model name, and it is the sort of claim worth stating accurately since
+      // the weights are what the queue order rests on.
+      weight: 35,
+    });
+  }
+
   if (row.nearDuplicateCount > 0) {
     signals.push({
       key: "duplicateTotal",
@@ -144,10 +222,10 @@ export function scoreCandidate(
 
   if (row.totalTokens > 0) {
     const impliedRate = row.totalCost / row.totalTokens;
-    if (impliedRate > MAX_IMPLIED_RATE || impliedRate < MIN_IMPLIED_RATE) {
+    if (impliedRate > MAX_IMPLIED_RATE) {
       signals.push({
         key: "impliedRate",
-        label: `Implied $${impliedRate.toPrecision(3)}/token is outside plausible provider pricing`,
+        label: `Implied $${impliedRate.toPrecision(3)}/token is above any provider's list price`,
         weight: 15,
       });
     }
