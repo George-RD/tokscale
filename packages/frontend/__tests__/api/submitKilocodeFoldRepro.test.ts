@@ -530,3 +530,139 @@ describe("POST /api/submit kilocode alias fold vs regression guard", () => {
     expect(warnings.join(" ")).toMatch(/would reduce/i);
   });
 });
+
+// The fold builds its normalized view by copying each client entry, then sums
+// into that copy in place. When the copy was shallow, the nested model objects
+// were still the STORED ones, so folding a day mutated the raw breakdown that
+// the fold-preservation writeback persists moments later -- and every later
+// submit folded the already-folded values into themselves again. Client-level
+// scalars were spread-copied and so stayed correct, which is why this only
+// ever surfaced in per-model views.
+type PersistedBreakdown = Record<
+  string,
+  { tokens: number; models: Record<string, { tokens: number }> }
+>;
+
+describe("POST /api/submit alias fold leaves the stored raw breakdown untouched", () => {
+  /** 40 tokens is below the fold's 100-token largest component, so the guard
+   * preserves the fold and the writeback restores BOTH raw alias keys -- the
+   * path that persists whatever the fold did to the raw model objects. */
+  function mockPartialKiloResubmit() {
+    mockKiloResubmit();
+    mockState.validateSubmission.mockReturnValue({
+      valid: true,
+      errors: [],
+      warnings: [],
+      data: {
+        device: { id: "dev_1", name: "Device one" },
+        meta: {
+          generatedAt: "2026-05-11T00:00:00Z",
+          version: "4.6.0",
+          dateRange: { start: "2026-05-11", end: "2026-05-11" },
+        },
+        summary: { clients: ["kilo"] },
+        years: [],
+        contributions: [
+          {
+            date: "2026-05-11",
+            clients: [
+              {
+                client: "kilo",
+                modelId: "test-model",
+                tokens: { input: 40, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+                cost: 0.4,
+                messages: 2,
+              },
+            ],
+          },
+        ],
+      },
+    });
+  }
+
+  /** One fold-PRESERVING submit (incoming is below the heal floor, so the raw
+   * alias keys are written back verbatim). Returns what was persisted. */
+  async function submitBelowHealFloor(
+    storedBreakdown: Record<string, unknown>
+  ): Promise<PersistedBreakdown> {
+    const existingDay = {
+      id: "day-1",
+      date: "2026-05-11",
+      timestampMs: null,
+      activeTimeMs: null,
+      sourceBreakdown: storedBreakdown,
+    };
+
+    const { executedSqlArgs } = buildTx([
+      [{ id: "submission-existing" }],
+      [existingDay],
+      [AGGREGATES_ROW],
+      [{ sourceBreakdown: existingDay.sourceBreakdown }],
+    ]);
+
+    const response = await POST(
+      new Request("http://localhost:3000/api/submit", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer tt_valid",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ meta: {}, contributions: [] }),
+      })
+    );
+    expect(response.status).toBe(200);
+
+    const strings: string[] = [];
+    for (const arg of executedSqlArgs) collectStrings(arg, strings);
+    const breakdownJson = strings.find(
+      (s) => s.includes('"kilocode"') && s.includes('"models"')
+    );
+    expect(breakdownJson).toBeDefined();
+    return JSON.parse(breakdownJson!) as PersistedBreakdown;
+  }
+
+  it("does not compound the raw alias keys' nested model values across repeated submits", async () => {
+    mockPartialKiloResubmit();
+
+    const storedBefore = {
+      kilocode: structuredClone(CLIENT_ENTRY_100),
+      kilo: structuredClone(CLIENT_ENTRY_100),
+    };
+
+    const afterFirst = await submitBelowHealFloor(storedBefore);
+
+    // Each raw key still carries only ITS OWN 100 tokens at the model level.
+    // Pre-fix this was 200: the fold summed kilo's models into the objects
+    // kilocode's entry still pointed at.
+    expect(afterFirst.kilocode.models["test-model"].tokens).toBe(100);
+    expect(afterFirst.kilo.models["test-model"].tokens).toBe(100);
+    // The model total must keep agreeing with the client total it decomposes.
+    expect(afterFirst.kilocode.models["test-model"].tokens).toBe(
+      afterFirst.kilocode.tokens
+    );
+
+    // Feed the persisted row back in, exactly as the next submit would read
+    // it. Pre-fix this second pass produced 300, then 400, without bound.
+    const afterSecond = await submitBelowHealFloor(afterFirst);
+
+    expect(afterSecond.kilocode.models["test-model"].tokens).toBe(100);
+    expect(afterSecond.kilo.models["test-model"].tokens).toBe(100);
+    expect(afterSecond).toEqual(afterFirst);
+  });
+
+  it("leaves the caller's stored breakdown object unmutated by the fold", async () => {
+    mockPartialKiloResubmit();
+
+    const storedBreakdown = {
+      kilocode: structuredClone(CLIENT_ENTRY_100),
+      kilo: structuredClone(CLIENT_ENTRY_100),
+    };
+    const pristine = structuredClone(storedBreakdown);
+
+    await submitBelowHealFloor(storedBreakdown);
+
+    // The row object handed to the route is the parsed source_breakdown JSON;
+    // the merge must treat it as read-only input, not scratch space.
+    expect(storedBreakdown).toEqual(pristine);
+  });
+});
