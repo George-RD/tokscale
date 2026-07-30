@@ -238,19 +238,84 @@ stay stable — but it is a product decision.
 ## Phase 4 — Heal the daily rows
 
 For the day-level surfaces, and only if Phase 1's census says the tail justifies
-it. This is the risky part, quarantined behind a measurement.
+it.
 
-Per device, per client `C`, `C` may be rewritten from the payload when both:
+### Do not put this in the submit path
 
-1. **Range coverage** — the payload's contribution dates span at least the
-   device's stored date range for `C`. Without it a `--since` scan's smaller
-   total is not comparable to an all-time high-water.
-2. **Invariant clears** — for every bucket the rewrite would touch, the payload's
-   token total for `C` in that bucket is at least the stored high-water.
+An earlier draft made the heal a branch inside `submit/route.ts`, deciding
+mid-request whether the in-flight payload was authoritative and rewriting rows on
+the spot. Every trap catalogued below came from that choice, and they surfaced one
+at a time over several readings rather than from any systematic sweep — the
+`:707` double-ratchet, which would have made the whole phase a silent no-op,
+turned up last. When hazards keep arriving in a code path, the honest conclusion
+is that the path is not mapped, not that the list is finally complete.
 
-Otherwise `C` falls through to the current guard for the buckets that failed.
-Checking per bucket, like checking per client, keeps one shrunken period from
-blocking every other period's repair.
+The submit route is the worst place in this repository to add a conditional
+destructive write. It already carries alias folding with a one-shot heal floor,
+backfill provenance stamped inside the same JSONB, two independent monotonic
+enforcement points, chunked batch inserts, a row lock, and a hash-based identity.
+A new branch has to be correct against all of it, at request time, with no way to
+review what it is about to do.
+
+**Split it in two instead.**
+
+### 4a — Record what the CLI actually reported (additive, safe)
+
+Submit additionally writes each payload's **unguarded** per-`(device, date,
+client)` values to a shadow table:
+
+```
+daily_breakdown_reported(submitted_device_id, date, client, tokens, cost,
+                         input, output, active_time_ms, origin, reported_at)
+PRIMARY KEY (submitted_device_id, date, client)
+```
+
+Last-write-wins, no `GREATEST`, no merge, no fold normalisation — it records what
+the most recent scan said, which is the one thing the system currently throws
+away. This is a pure insert alongside the existing write, inside the same
+transaction. It cannot regress anything, because nothing reads it.
+
+Sized at roughly one extra `daily_breakdown`, and bounded the same way: one row
+per device per day per client, overwritten rather than accumulated.
+
+### 4b — Reconcile offline
+
+A separate, resumable job — not a request handler — compares shadow against
+stored and applies the repair per `(device, client)` when both hold:
+
+1. **Range coverage** — the shadow's dates span at least the device's stored date
+   range for `C`. Without it a `--since` scan's smaller total is not comparable
+   to an all-time high-water.
+2. **Invariant clears** — for every bucket touched, the shadow's token total for
+   `C` in that bucket is at least the stored high-water.
+
+Otherwise `C` is skipped for the buckets that failed. Checking per bucket, like
+checking per client, keeps one shrunken period from blocking every other
+period's repair.
+
+### Why this is materially safer
+
+- **Two of the four traps below stop existing.** The shadow table has no monotonic
+  guard, so there is no `:707` arm to bypass and no `mergeActiveTimeMs` to
+  neutralise. It stores raw payload values, so the alias-fold machinery and its
+  compounding `models` defect never touch it. The backfill constraint survives
+  unchanged, and the transaction requirement changes shape rather than going
+  away — both are marked as such below.
+- **The diff is reviewable before it is applied.** `shadow ⊖ stored` is the census
+  at row granularity — strictly better than the bucket ratio in Phase 1, and it
+  can be read, sampled, and sanity-checked by a human before a single row changes.
+- **The zero-out becomes trivial.** A day present in stored and absent from a
+  shadow whose range covers it is unambiguously an emptied day. No inferring
+  absence from an in-flight payload.
+- **Idempotent, resumable, abortable.** Re-running converges; stopping halfway
+  leaves consistent state; a bad batch stops the job instead of failing a user's
+  submit.
+- **The risky part is no longer on the hot path.** A defect in 4b degrades to "the
+  repair did not run", not "submissions are failing".
+
+The cost is one table and a job to operate. Given that the alternative is a
+conditional destructive write inside the most interaction-dense function in the
+codebase, that is the cheaper side of the trade.
 
 ### This is an existing pattern, not new machinery
 
@@ -277,28 +342,41 @@ it; other consumers must be checked before shipping.
 
 ### The zero-out itself is mandatory
 
-The per-day loop visits only days present in the payload (`:604`), and
-contributions come from `aggregate_by_date`, which emits only days with activity.
-A re-split that empties day `d` leaves `d` absent, unvisited and stale forever.
 **Rewriting the day that gained while the day that lost keeps its old value
 reproduces the double count exactly** — a heal without the zero-out repairs
 nothing.
 
+This is where the split earns its keep. In the submit path the signal was
+ambiguous: the per-day loop visits only days present in the payload (`:604`), and
+`aggregate_by_date` emits only days with activity, so an emptied day and a day
+outside the scan's scope are indistinguishable at request time. Against the
+shadow table the question is decidable — a day present in stored, absent from
+shadow, and inside a shadow range that covers it, is unambiguously emptied.
+
 ### Assert, then commit
 
-After rewriting `C`, verify `SUM(daily for C over the range) == payload total for
-C` inside the transaction and roll back on mismatch. This turns a silent
-corruption on the one path where silence is most expensive into a caught error
-and a preserved account.
+After rewriting `C`, verify `SUM(stored daily for C over the range) == SUM(shadow
+for C over the same range)` inside the batch transaction and roll back on
+mismatch. This turns a silent corruption into a caught error and a preserved
+account — and unlike the in-submit design, a rollback here costs a retry of one
+batch rather than a failed user submission.
 
 ### Bound the writes
 
-Touch only days where stored differs from payload. A re-split changes a small
-fraction of a long history.
+Touch only rows where stored differs from shadow. A re-split changes a small
+fraction of a long history, and the comparison is now a plain table diff rather
+than something reconstructed per request.
 
-### Interactions a naive rewrite breaks
+### Interactions — what the split neutralises, and what survives it
 
-**Alias folds.** A preserved fold must keep its raw alias keys (`:638-645`) or
+These were catalogued against the in-submit design. Recorded here because each is
+the reason for a specific property of 4a, and because anyone who proposes
+collapsing the split back into the submit path inherits all of them again.
+
+**Alias folds — neutralised by 4a.** The shadow stores raw payload values and
+never runs alias normalisation, so none of the following can reach it. It remains
+true of the stored rows 4b writes into. A preserved fold must keep its raw alias
+keys (`:638-645`) or
 "the heal floor is burned on the first partial resubmit and the double count
 re-cements permanently". Safe rule: **a client with a fold floor is never
 eligible for this heal.**
@@ -318,14 +396,18 @@ This is a separate bug and should be fixed on its own (deep-copy the model
 values). It is recorded here because it means fold-affected rows are actively
 corrupting while unhealed, so "exclude them" is a deferral, not a resolution.
 
-**Backfill coexistence.** `origin: "backfill"` is stamped per client inside
+**Backfill coexistence — survives the split.** 4b writes into the same
+`source_breakdown` the merge path owns, so this constraint is unchanged and must
+be honoured by the reconciliation job. `origin: "backfill"` is stamped per client inside
 `source_breakdown` (`:595-601`) and carried through merges by
 `deriveClientBreakdownProvenance` (`helpers.ts:113-126`). A CLI scan cannot see
 imported history, so the rewrite must **preserve `backfill`-tagged entries**. A
 payload whose own `provenance.origin` is `backfill` never heals.
 
-**Day-level active time is ratcheted at TWO enforcement points, and the second
-one silently cancels the heal.** `mergeActiveTimeMs` (`:178-185`) is a
+**Day-level active time — neutralised by 4a, and the single strongest argument
+for the split.** The shadow has no monotonic guard, so there is no arm to bypass.
+Under the in-submit design this would have shipped as a silent no-op: it is
+ratcheted at TWO enforcement points, and the second one cancels the heal. `mergeActiveTimeMs` (`:178-185`) is a
 `Math.max` in the JS merge, and `:707` mirrors it in SQL:
 
 ```sql
@@ -339,8 +421,11 @@ value — **the heal reports success and changes nothing.** No error, no warning
 the post-rewrite assertion above is the only thing that would catch it. Both
 enforcement points must be bypassed, not just the JS one.
 
-**Transaction.** Gate, backup, rewrite, zero-out and assertion share the existing
-transaction. Note this is already stronger than it looks: `:303-314` takes
+**Transaction — changed shape under the split.** 4a's shadow write joins the
+existing submit transaction, which is the whole of its footprint there. 4b runs
+outside the request path and takes its own transaction per batch, so it must
+re-acquire the same row lock to avoid racing a live submit for that user. Note
+the lock is already stronger than it looks: `:303-314` takes
 `.for('update')` on the `submissions` row, which is unique per user
 (`submissions_user_id_unique`), so every submit for one user is serialized —
 including across devices. A second device cannot commit between the merge's read
