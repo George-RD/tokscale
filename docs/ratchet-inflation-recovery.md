@@ -228,6 +228,58 @@ SUM(daily tokens in that bucket) / tokens_highwater
 
 Nothing can regress, because nothing reads it yet.
 
+### What it costs, measured (2026-07-31)
+
+"Inert" describes the read side. It says nothing about the write side, so this
+was measured against production rather than asserted.
+
+```
+rows per full-history submit — actual distinct (client, bucket) pairs
+  both widths      p50   33    p95   122    max   349
+  month only       p50    9    p95    32    max    91
+  daily_breakdown
+  writes today     p50   64    p95   218    max  1257
+
+steady-state table   108,866 rows (both widths) / 29,640 (month only)
+daily_breakdown      204,696 rows / 305 MB
+```
+
+**Phase 1 writes roughly half of what the submit path already writes**, and its
+rows are narrow — five key columns and two numerics, against
+`daily_breakdown`'s JSONB payload. Storage is not a consideration.
+
+A first estimate put this 6–7x higher by multiplying bucket count by client
+count. That is an upper bound, not a count: a device with nine clients runs one
+to three of them in any given month, so the real cardinality is far below the
+product. Measure this rather than deriving it.
+
+### The real exposure is placement, not volume
+
+The submit path runs inside a single `db.transaction` (`route.ts:322`) and
+takes `.for('update')` on the submissions row inside it (`:341`), which
+serializes every submit for a user across all their devices until commit. A
+Phase 1 write placed there inherits both properties:
+
+- it extends the lock hold, modestly — about +50% on write volume at p95;
+- **a defect in it fails the user's submit entirely.** "Nothing reads it" is no
+  protection here. This repo has already seen a `COALESCE(SUM(x),0)::int`
+  overflow abort a transaction, and `tokens_highwater` is exactly the kind of
+  column that invites the same mistake.
+
+**It does not have to live there.** The write is a `GREATEST` upsert, so it is
+idempotent: applying it twice is applying it once. That means it can run after
+the submit transaction commits, at which point a failure costs one deferred
+measurement — repaired by the next submit — instead of a rejected submission.
+The reconciliation Phase 4b needs is unaffected either way.
+
+The cost of moving it out is that the table lags the daily rows by one submit
+for any request that dies between commit and the follow-up write. Phase 2 must
+therefore treat a missing bucket as *unknown*, never as zero — which is already
+required for a different reason, see that phase's coverage gate.
+
+Writing only one bucket width halves everything above again, and Phase 3 makes
+the width question much less interesting by permitting daily buckets outright.
+
 **One thing the census cannot see — fixed, but it still distorts the baseline.**
 `ClientId::OpenCodeReview` declared `submit_default: true`
 (`crates/tokscale-core/src/clients.rs:509-517`) while being parsed only by
