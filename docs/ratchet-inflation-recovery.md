@@ -296,6 +296,67 @@ it was the only one missing (Goose, Hermes and Kilo look absent from a naive
 `ClientId::` grep but are handled at `lib.rs:1171`, `:1161`, and via
 `ClientId::KiloCode` at `:1087`).
 
+## Phase 1.5 — Dual read: compute both, serve the old, record the delta
+
+Phase 1 and Phase 2 are already a dual-*write* followed by a cutover. What sits
+between them is a **flip gated by a rule**, not by evidence: the coverage gate
+below asks "do rows exist?", never "do the two derivations agree?". Nothing in
+the plan as written ever compares them on live traffic before the switch.
+
+So add a stage that does. On each submission recompute, derive the total **both**
+ways — `SUM(dailyBreakdown.tokens)` and `SUM(tokens_highwater)` — serve the old
+one, and record the pair.
+
+It costs one extra aggregate per submit and carries no read risk, because the
+value served is unchanged. In exchange:
+
+- **The token-axis census arrives as a by-product**, on real traffic, without
+  anyone running a script. This is the measurement the 2026-07-31 census could
+  not reach.
+- **Phase 2's gate stops being a rule and becomes a measurement**: switch when
+  the recorded deltas agree within tolerance, for a stated share of users, over
+  a stated window. "Coverage exists" is a much weaker claim than "the numbers
+  match".
+- **The zero-out failure is observed rather than reasoned about.** A user whose
+  high-water sum is 0 or partial shows up as an enormous recorded delta long
+  before any read depends on it.
+
+### The table cannot be seeded from `daily_breakdown` — the warm-up is forced
+
+This is the part that makes dual mode mandatory rather than merely prudent, and
+it is worth stating plainly because the obvious shortcut is actively harmful.
+
+Backfilling `tokens_highwater` from existing daily rows would set it to
+`SUM(daily in bucket)` — **the inflated value**. A later full scan reports the
+true, lower bucket total, and `GREATEST(inflated, true)` keeps the inflated one.
+Permanently. Seeding the table from the data it exists to correct would cement
+the very inflation it is measuring, with no path back.
+
+So the table starts empty and can only be filled by incoming payloads. The
+warm-up period is not a convenience to be optimised away; it is forced by the
+merge semantics. That is also the real reason Phase 2 needs a coverage gate at
+all, and why row 9 of the state table insists a missing baseline must never be
+read as `0`.
+
+### What can be deprecated afterwards, and what cannot
+
+- **Can be retired:** the `SUM(daily)` derivation *for submission totals*, once
+  Phase 2 is stable and the deltas have stayed flat.
+- **Cannot be retired:** `daily_breakdown` itself. The heatmap and per-day views
+  read it, Phase 4 repairs it, and the high-water table holds bucket totals with
+  no day-level detail to replace it with.
+
+Dual mode ends by retiring a *derivation*, not a table.
+
+### Make the write killable without a deploy
+
+The migration is effectively irreversible — drizzle stores the content hash of
+each applied migration, so migrations are immutable once applied (see
+`AGENTS.md`). The *write* need not inherit that property. Put it behind a flag
+so a misbehaving Phase 1 can be switched off in seconds, without reverting a
+migration or shipping a rollback. Combined with after-commit placement, that
+leaves Phase 1 with no failure mode that reaches a user.
+
 ## Phase 2 — Switch the read path
 
 Change `:779` to derive `totalTokens` and `totalCost` from
