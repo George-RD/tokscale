@@ -997,6 +997,8 @@ pub enum ClientFilter {
     #[value(name = "devin-desktop")]
     DevinDesktop,
     Senpi,
+    #[value(alias = "auggie")]
+    Augment,
     Synthetic,
 }
 
@@ -1047,6 +1049,7 @@ impl ClientFilter {
             Self::DevinCli => "devin-cli",
             Self::DevinDesktop => "devin-desktop",
             Self::Senpi => "senpi",
+            Self::Augment => "augment",
             Self::Synthetic => "synthetic",
         }
     }
@@ -1100,6 +1103,7 @@ impl ClientFilter {
             Self::DevinCli => Some(ClientId::DevinCli),
             Self::DevinDesktop => Some(ClientId::DevinDesktop),
             Self::Senpi => Some(ClientId::Senpi),
+            Self::Augment => Some(ClientId::Augment),
             Self::Synthetic => None,
         }
     }
@@ -1149,6 +1153,7 @@ impl ClientFilter {
             ClientId::DevinCli => Self::DevinCli,
             ClientId::DevinDesktop => Self::DevinDesktop,
             ClientId::Senpi => Self::Senpi,
+            ClientId::Augment => Self::Augment,
         }
     }
 
@@ -1157,6 +1162,12 @@ impl ClientFilter {
     /// any unknown id so callers can drop unrecognized settings entries
     /// without erroring.
     pub fn from_filter_str(s: &str) -> Option<Self> {
+        // Canonical ids match as_filter_str. A few product aliases map onto
+        // the same ClientFilter (e.g. "auggie" -> Augment).
+        match s {
+            "auggie" => return Some(Self::Augment),
+            _ => {}
+        }
         Self::value_variants()
             .iter()
             .copied()
@@ -3791,6 +3802,7 @@ fn capitalize_client(client: &str) -> String {
         "devin-cli" => "Devin CLI".to_string(),
         "devin-desktop" => "Devin Desktop".to_string(),
         "senpi" => "Senpi (OmO Native)".to_string(),
+        "augment" => "Augment Code".to_string(),
         other => other.to_string(),
     }
 }
