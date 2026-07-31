@@ -436,6 +436,58 @@ Trade-off: a user who relocates keeps bucketing into their old zone until they
 change the setting. For historical data that is arguably correct — day boundaries
 stay stable — but it is a product decision.
 
+### What it costs, verified (2026-07-31)
+
+This phase was called "cheap" throughout earlier drafts on no evidence. It
+mostly is, but via a route those drafts had not identified, and it carries a
+dependency decision they never mentioned.
+
+**Already in place, so not part of the cost:**
+
+- Both bucketing functions already have injectable variants —
+  `compute_daily_active_time_with_timezone` (`sessionize.rs:291`) and
+  `timestamp_to_date_with_timezone` (`sessions/mod.rs:447`), each generic over
+  `Tz`. Today's callers simply pass `&chrono::Local`.
+- `settings.json` already exists, and adding a field to it is a documented
+  drop-in pattern: `#[serde(default)]` so files written before the field still
+  load (`tui/settings.rs:141`).
+- `ScannerSettings` is a single shared type (`tokscale_core::scanner`, re-used
+  by the TUI) and **already flows through the parse path** — `LocalParseOptions`
+  carries it at `lib.rs:410`/`:510` and threads it to `:620`, `:1020`, `:2421`,
+  `:2478`, `:2577`.
+- `compute_daily_active_time` has exactly **one** caller (`lib.rs:2687`).
+
+**The trap.** `timestamp_to_date` is called from `UnifiedMessage::new_full`, a
+constructor. Threading a timezone through it means touching every parser:
+`UnifiedMessage::new` has **92 call sites across 42 files**. Done naively, this
+phase is not cheap at all.
+
+**The cheap route, which exists by luck rather than design.**
+`refresh_derived_fields` (`sessions/mod.rs:380`) already recomputes
+`self.date` from `self.timestamp` after construction, and it is **already
+called in a post-parse pass at `lib.rs:634`** — inside
+`parse_all_messages_with_pricing_with_env_strategy`, which already holds
+`scanner_settings`. So the date is already treated as a derived field that gets
+re-normalised where the settings are in scope. Pinning the zone becomes a
+parameter on that pass, not a change to 92 constructor calls.
+
+**The unpriced decision: `chrono-tz` is not a dependency.** The workspace has
+`chrono` only (`Cargo.toml:35`). That forces a choice the earlier drafts never
+raised:
+
+| | `chrono::FixedOffset` | `chrono-tz` named zone |
+|---|---|---|
+| new dependency | none | yes, embeds the tz database |
+| binary size | unchanged | grows, across all 9 build targets |
+| DST correctness | **drifts an hour twice a year** | correct |
+
+A fixed offset reintroduces a bounded version of the very bug this phase
+removes: after a DST transition the pinned offset no longer matches local
+midnight, so usage within an hour of the boundary lands on the wrong day. It is
+far smaller than the current failure — an hour twice a year, not a full re-split
+on every rescan — but it is not zero, and calling this "the only exact fix"
+above is only true of the named-zone variant.
+
 ## Phase 4 — Heal the daily rows
 
 For the day-level surfaces, and only if Phase 1's census says the tail justifies
