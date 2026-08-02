@@ -1,3 +1,4 @@
+use crate::process_liveness::pid_is_alive;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -402,7 +403,16 @@ impl SyncLockGuard {
                     // long as their PID is alive, or two processes will
                     // overlap on the manifest and delete each other's
                     // artifacts. Age-based eviction was removed for this
-                    // reason.
+                    // reason, and `pid_is_alive` resolves every uncertain
+                    // probe to "alive" so no platform quietly opts out of it.
+                    //
+                    // That is a bias, not a guarantee. The read-decide-unlink
+                    // below is not atomic, so two contenders can still both
+                    // find the same dead owner and both proceed; PID reuse can
+                    // also make a stranger's process look like the owner.
+                    // Closing those needs an OS-held exclusive lock (as
+                    // `autosubmit::try_acquire_run_lock` uses), not a tighter
+                    // liveness probe.
                     if let Some((existing_pid, _)) = read_sync_lock(&lock_path) {
                         if pid_is_alive(existing_pid) {
                             anyhow::bail!(
@@ -441,28 +451,6 @@ fn read_sync_lock(path: &Path) -> Option<(u32, u64)> {
     let pid = parts.next()?.parse::<u32>().ok()?;
     let timestamp = parts.next()?.parse::<u64>().ok()?;
     Some((pid, timestamp))
-}
-
-fn pid_is_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        let result = unsafe { libc_kill(pid as i32, 0) };
-        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(1)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
-}
-
-#[cfg(unix)]
-extern "C" {
-    #[link_name = "kill"]
-    fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
 pub fn load_antigravity_manifest() -> Result<AntigravityManifest> {
@@ -556,8 +544,28 @@ fn delete_artifact_relative_path(relative_path: &str) -> Result<bool> {
     Ok(false)
 }
 
+/// Rewrite `\` to `/` so a stored path parses the same way on every platform.
+///
+/// `to_relative_artifact_path` renders with `Path::to_string_lossy`, so a
+/// manifest written on Windows records `sessions\<id>.jsonl`. Normalising here
+/// also tightens the Unix side: `Path` does not treat `\` as a separator
+/// there, so `..\..\escape.jsonl` would otherwise reach the traversal check
+/// below as one innocuous file name.
+///
+/// Safe against false positives because `sanitize_session_id` replaces every
+/// character outside `[A-Za-z0-9._-]` with `-`, so a generated artifact name
+/// can never legitimately contain a backslash.
+///
+/// `stale_relative_paths` keys its comparison through this same function.
+/// Normalising only at deletion made the two disagree about which entries name
+/// the same file, and deletion runs after the manifest has been written.
+fn normalize_artifact_path_separators(relative_path: &str) -> String {
+    relative_path.replace('\\', "/")
+}
+
 fn resolve_cache_relative_artifact_path(relative_path: &str) -> Result<PathBuf> {
-    let relative = Path::new(relative_path);
+    let normalized = normalize_artifact_path_separators(relative_path);
+    let relative = Path::new(&normalized);
     if relative.is_absolute() {
         anyhow::bail!("Artifact path must stay within cache root");
     }
@@ -2140,16 +2148,24 @@ fn to_safe_i64(value: Option<&Value>) -> i64 {
 }
 
 fn stale_relative_paths(previous: &AntigravityManifest, next: &AntigravityManifest) -> Vec<String> {
-    let next_paths: std::collections::HashSet<&str> = next
+    // Key both sides the way `delete_artifact_relative_path` resolves them.
+    // `to_relative_artifact_path` renders with the native separator, so the
+    // same artifact reads `sessions\<id>.jsonl` in a manifest written on
+    // Windows and `sessions/<id>.jsonl` in one written on Unix. Comparing the
+    // raw strings would retire the old spelling while deletion normalises it
+    // back onto the file the new manifest still points at.
+    let next_paths: std::collections::HashSet<String> = next
         .sessions
         .iter()
-        .map(|session| session.artifact_path.as_str())
+        .map(|session| normalize_artifact_path_separators(&session.artifact_path))
         .collect();
 
     previous
         .sessions
         .iter()
-        .filter(|session| !next_paths.contains(session.artifact_path.as_str()))
+        .filter(|session| {
+            !next_paths.contains(&normalize_artifact_path_separators(&session.artifact_path))
+        })
         .map(|session| session.artifact_path.clone())
         .collect()
 }
@@ -2158,7 +2174,22 @@ fn cleanup_stale_session_artifacts(
     previous: &AntigravityManifest,
     next: &AntigravityManifest,
 ) -> Result<()> {
+    // Second gate, on the resolved path rather than the text. Cleanup runs
+    // after `save_antigravity_manifest`, so a deletion here is unrecoverable
+    // and unannounced: the manifest already advertises the artifact. Any future
+    // spelling that `stale_relative_paths` fails to equate but resolution does
+    // stops here instead of destroying live data.
+    let live: std::collections::HashSet<PathBuf> = next
+        .sessions
+        .iter()
+        .filter_map(|session| resolve_cache_relative_artifact_path(&session.artifact_path).ok())
+        .collect();
+
     for relative_path in stale_relative_paths(previous, next) {
+        let resolved = resolve_cache_relative_artifact_path(&relative_path)?;
+        if live.contains(&resolved) {
+            continue;
+        }
         delete_artifact_relative_path(&relative_path)?;
     }
 
@@ -2690,6 +2721,20 @@ mod tests {
         );
     }
 
+    /// The same artifact is spelled `sessions\<id>.jsonl` in a manifest written
+    /// on Windows and `sessions/<id>.jsonl` in one written on Unix, so a
+    /// textual compare calls the old spelling stale while the new spelling is
+    /// still live. Both sides must be keyed the same way `delete_artifact_relative_path`
+    /// resolves them.
+    #[test]
+    fn stale_relative_paths_ignores_separator_spelling() {
+        let mut previous = sample_manifest();
+        previous.sessions[0].artifact_path = "sessions\\session-1.jsonl".to_string();
+        let next = sample_manifest();
+
+        assert!(stale_relative_paths(&previous, &next).is_empty());
+    }
+
     #[test]
     #[serial]
     fn cleanup_stale_session_artifacts_removes_legacy_files_after_migration() {
@@ -2734,6 +2779,48 @@ mod tests {
         assert!(new_path.exists());
     }
 
+    /// Cleanup runs *after* `save_antigravity_manifest`, so anything it deletes
+    /// is gone while the manifest still advertises it. A manifest carried from
+    /// Windows spells the entry `sessions\<id>.jsonl` and the re-sync on Unix
+    /// rewrites it to `sessions/<id>.jsonl`; those are the same file, and
+    /// retiring the old spelling would silently destroy the artifact the new
+    /// manifest points at.
+    #[test]
+    #[serial]
+    fn cleanup_stale_session_artifacts_keeps_a_live_artifact_respelled_across_platforms() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _env = TestEnvGuard::redirect_to(temp_dir.path());
+
+        let sessions_dir = get_antigravity_sessions_dir().unwrap();
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let artifact = sessions_dir.join("session-one.jsonl");
+        std::fs::write(&artifact, "live\n").unwrap();
+
+        let entry = |artifact_path: &str| ManifestSessionEntry {
+            session_id: "session-one".to_string(),
+            artifact_path: artifact_path.to_string(),
+            last_modified_ms: None,
+            step_count: None,
+            connection_fingerprint: "pid:1:port:1111".to_string(),
+            artifact_hash: None,
+        };
+
+        let previous = AntigravityManifest {
+            sessions: vec![entry("sessions\\session-one.jsonl")],
+            ..AntigravityManifest::default()
+        };
+        let next = AntigravityManifest {
+            sessions: vec![entry("sessions/session-one.jsonl")],
+            ..AntigravityManifest::default()
+        };
+
+        cleanup_stale_session_artifacts(&previous, &next).unwrap();
+        assert!(
+            artifact.exists(),
+            "cleanup deleted an artifact the new manifest still references"
+        );
+    }
+
     #[test]
     #[serial]
     fn delete_artifact_relative_path_rejects_paths_outside_cache_root() {
@@ -2749,6 +2836,41 @@ mod tests {
 
         let err = delete_artifact_relative_path("manifest.json").unwrap_err();
         assert!(err.to_string().contains("session artifact"));
+    }
+
+    /// A manifest written on Windows stores `sessions\<id>.jsonl`, because
+    /// `to_relative_artifact_path` renders with the native separator. Rejecting
+    /// that form made `cleanup_stale_session_artifacts` — and with it the whole
+    /// `antigravity sync` — fail on every run that had an artifact to retire.
+    #[test]
+    #[serial]
+    fn delete_artifact_relative_path_accepts_windows_separators() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _env = TestEnvGuard::redirect_to(temp_dir.path());
+
+        let sessions_dir = get_antigravity_sessions_dir().unwrap();
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let artifact = sessions_dir.join("session-one.jsonl");
+        std::fs::write(&artifact, "{}\n").unwrap();
+
+        assert!(delete_artifact_relative_path("sessions\\session-one.jsonl").unwrap());
+        assert!(!artifact.exists());
+    }
+
+    /// Normalising separators before the component check also closes a hole on
+    /// Unix, where `Path` reads `..\..\outside.jsonl` as a single file name and
+    /// never sees a `ParentDir` component.
+    #[test]
+    #[serial]
+    fn delete_artifact_relative_path_rejects_backslash_traversal() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _env = TestEnvGuard::redirect_to(temp_dir.path());
+
+        let err = delete_artifact_relative_path("..\\..\\outside.jsonl").unwrap_err();
+        assert!(err.to_string().contains("cache root"));
+
+        let err = delete_artifact_relative_path("sessions\\..\\..\\outside.jsonl").unwrap_err();
+        assert!(err.to_string().contains("cache root"));
     }
 
     #[test]

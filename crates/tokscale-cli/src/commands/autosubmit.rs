@@ -478,6 +478,26 @@ pub fn submit_filters(
     (clients, since, until, year)
 }
 
+/// A contended `LockFileEx` on Windows fails with `ERROR_LOCK_VIOLATION`,
+/// which `std` leaves uncategorised instead of mapping to `WouldBlock`.
+///
+/// Deliberately not behind `cfg(windows)`: the bug this guards against only
+/// reproduces on a platform CI does not run, so keeping the constant
+/// unconditional is what lets the classification be unit-tested at all. No
+/// Unix `flock` failure uses errno 33, so matching it everywhere cannot
+/// disguise a genuine error as contention.
+const WINDOWS_ERROR_LOCK_VIOLATION: i32 = 33;
+
+/// Whether `err` means "another process already holds this lock" rather than a
+/// real I/O failure.
+///
+/// Only `WouldBlock` used to count, so on Windows a second scheduled run hit
+/// the error arm and the caller's `unwrap` panicked — a run that found another
+/// already in progress failed instead of stepping aside.
+fn is_lock_contention(err: &std::io::Error) -> bool {
+    err.kind() == ErrorKind::WouldBlock || err.raw_os_error() == Some(WINDOWS_ERROR_LOCK_VIOLATION)
+}
+
 pub fn try_acquire_run_lock() -> Result<Option<AutosubmitRunLock>> {
     let path = autosubmit_lock_path()?;
     let file = OpenOptions::new()
@@ -489,7 +509,7 @@ pub fn try_acquire_run_lock() -> Result<Option<AutosubmitRunLock>> {
         .with_context(|| format!("Could not open autosubmit lock at {}", path.display()))?;
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(AutosubmitRunLock { _file: file })),
-        Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(None),
+        Err(err) if is_lock_contention(&err) => Ok(None),
         Err(err) => Err(err)
             .with_context(|| format!("Could not lock autosubmit state at {}", path.display())),
     }
@@ -1947,9 +1967,15 @@ mod tests {
             SchedulerKind::WindowsTaskScheduler,
         ] {
             let spec = render_scheduler_spec(scheduler, &managed, &settings).unwrap();
+            // `Debug` escapes each `\` as `\\`, so a Windows path compared
+            // against the unescaped `to_string_lossy` never matches. Escape
+            // the needle the same way instead of rendering the spec with
+            // `Display`, which `SchedulerSpec` does not implement.
             let rendered = format!("{spec:?}");
-            assert!(rendered.contains(managed.to_string_lossy().as_ref()));
-            assert!(!rendered.contains(process_executable.to_string_lossy().as_ref()));
+            let needle = managed.to_string_lossy().replace('\\', "\\\\");
+            assert!(rendered.contains(&needle));
+            let absent = process_executable.to_string_lossy().replace('\\', "\\\\");
+            assert!(!rendered.contains(&absent));
         }
     }
 
@@ -2420,6 +2446,35 @@ mod tests {
         assert!(try_acquire_run_lock().unwrap().is_none());
         drop(first);
         assert!(try_acquire_run_lock().unwrap().is_some());
+    }
+
+    /// `run_lock_blocks_concurrent_holder` above only exercises whatever the
+    /// host reports, so it cannot see the Windows classification. These pin the
+    /// error values directly: on Windows a contended lock arrives as
+    /// `ERROR_LOCK_VIOLATION`, which is not `WouldBlock`, and treating it as a
+    /// hard error made a scheduled run fail instead of yielding to the run
+    /// already in progress.
+    #[test]
+    fn lock_contention_covers_every_platform_error() {
+        // Whatever this host reports for a contended lock must classify as
+        // contention — that is the contract `try_acquire_run_lock` relies on.
+        assert!(is_lock_contention(&fs2::lock_contended_error()));
+
+        assert!(is_lock_contention(&std::io::Error::from_raw_os_error(
+            WINDOWS_ERROR_LOCK_VIOLATION
+        )));
+        assert!(is_lock_contention(&std::io::Error::from(
+            ErrorKind::WouldBlock
+        )));
+
+        // A genuine failure must still surface rather than be silently read as
+        // "someone else is running".
+        assert!(!is_lock_contention(&std::io::Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!is_lock_contention(&std::io::Error::from(
+            ErrorKind::NotFound
+        )));
     }
     /// The scheduler runs its own copy, so an upgrade that replaces the
     /// installed binary leaves it behind. These pin the detection, because the
