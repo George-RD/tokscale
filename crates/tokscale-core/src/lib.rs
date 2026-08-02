@@ -1095,7 +1095,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
     }
 
     // Parse MiMo Code: SQLite database(s)
-    let mut micode_seen: HashSet<String> = HashSet::new();
+    let mut micode_indices: HashMap<String, usize> = HashMap::new();
 
     for db_path in &scan_result.micode_dbs {
         // Pass `None` so the loader does not reprice: MiMo Code carries an
@@ -1114,22 +1114,22 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             sessions::micode::parse_micode_sqlite,
         );
 
-        all_messages.extend(
-            messages
-                .into_iter()
-                .map(|mut message| {
-                    if message.cost <= 0.0 {
-                        apply_pricing_if_available(&mut message, pricing);
+        for mut message in messages {
+            if !message.has_authoritative_cost() {
+                apply_pricing_if_available(&mut message, pricing);
+            }
+            if let Some(key) = message.dedup_key.as_ref() {
+                if let Some(index) = micode_indices.get(key).copied() {
+                    if message.has_authoritative_cost() {
+                        all_messages[index].cost = message.cost;
+                        all_messages[index].mark_provider_reported_cost();
                     }
-                    message
-                })
-                .filter(|message| {
-                    message
-                        .dedup_key
-                        .as_ref()
-                        .is_none_or(|key| micode_seen.insert(key.clone()))
-                }),
-        );
+                    continue;
+                }
+                micode_indices.insert(key.clone(), all_messages.len());
+            }
+            all_messages.push(message);
+        }
 
         if let Some(entry) = cache_entry {
             source_cache.insert(entry);
@@ -5080,6 +5080,74 @@ mod tests {
                 "authoritative cost must survive the cache hit, got {}",
                 second[0].cost
             );
+        }
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_micode_cross_database_dedup_prefers_explicit_zero_cost() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+
+        {
+            let micode_dir = source_home.path().join(".local/share/mimocode");
+            std::fs::create_dir_all(&micode_dir).unwrap();
+            let without_cost = r#"{
+                "id": "shared-message",
+                "role": "assistant",
+                "modelID": "unknown-model",
+                "providerID": "mimo",
+                "tokens": { "input": 10, "output": 5 },
+                "time": { "created": 1700000000000.0 }
+            }"#;
+            let with_zero_cost = r#"{
+                "id": "shared-message",
+                "role": "assistant",
+                "modelID": "unknown-model",
+                "providerID": "mimo",
+                "cost": 0,
+                "tokens": { "input": 10, "output": 5 },
+                "time": { "created": 1700000000000.0 }
+            }"#;
+            for (name, data) in [
+                ("mimocode-alpha.db", without_cost),
+                ("mimocode-beta.db", with_zero_cost),
+            ] {
+                let db_path = micode_dir.join(name);
+                let conn = rusqlite::Connection::open(db_path).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE message (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL,
+                        data TEXT NOT NULL
+                    );",
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![name, "session", data],
+                )
+                .unwrap();
+            }
+
+            let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
+            let messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["micode".to_string()],
+                Some(&pricing),
+            );
+
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].cost, 0.0);
+            assert!(messages[0].has_authoritative_cost());
+            assert!(validate_priced_messages(&messages, Some(&pricing)).is_ok());
         }
 
         match original_home {
