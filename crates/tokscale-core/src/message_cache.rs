@@ -831,6 +831,16 @@ fn parser_version(client: ClientId) -> u32 {
         // Desktop v1 parsed a non-ACP shape and did not track its CLI title
         // lookup; its timestamp handling is unaffected by the #890 follow-up.
         ClientId::DevinDesktop => 2,
+        // WARNING — bumping this discards data that is not recoverable by
+        // re-parsing. Claude Code rewrites a transcript in place on
+        // resume/compact, and since #994 a Claude entry deliberately carries
+        // assistant turns the live file no longer contains (see
+        // `HistoryRetention::RetainObserved`). A bump drops every entry, and
+        // the cold rebuild that follows sees only the compacted file — so it
+        // silently retires those turns from every user's totals and
+        // reintroduces the exact drift #994 reported. Bumping for a real
+        // parser change is still correct; do it knowing the cost, and prefer
+        // a fix that does not need one.
         ClientId::Claude => 2,
         // Junie's usage-event timestamp is now back-calculated to the call
         // start (timestampMs - usage.time) instead of the recorded
@@ -932,6 +942,11 @@ pub(crate) struct CachedSourceEntry {
     parser_version: u32,
     pub path: CachedPath,
     pub fingerprint: SourceFingerprint,
+    /// Not always a pure function of the source file. For a namespace that
+    /// `retained_history_key_filter` covers, this can hold messages the live
+    /// file no longer contains, and re-parsing will not reproduce them — the
+    /// cache is the only copy. That is what makes a parser_version bump for
+    /// those namespaces lossy rather than merely cold.
     pub messages: Vec<UnifiedMessage>,
     pub fallback_timestamp_indices: Vec<usize>,
     pub codex_incremental: Option<CodexIncrementalCache>,
@@ -961,6 +976,62 @@ impl CachedSourceEntry {
         CacheIdentity::current_for_namespace(&self.parser_namespace)
             .is_some_and(|identity| identity.parser_version == self.parser_version)
     }
+
+    /// Carry forward keyed messages an entry already on disk holds for this
+    /// same path and this one does not.
+    ///
+    /// Two processes can scan at once — a running TUI and a `tokscale submit`,
+    /// say. Each loads the entry, parses, and saves back, and the last writer
+    /// replaces the other's entry wholesale. For most namespaces that is
+    /// harmless: the loser's messages come from the same bytes and reappear on
+    /// the next scan. For a namespace that retains history it is not, because
+    /// the messages the loser observed are gone from the live file too, so
+    /// nothing will ever put them back.
+    ///
+    /// Same filter as the parse-time merge: a key that is only unique within
+    /// one file must not outlive the bytes that produced it.
+    fn absorb_retained_history(&mut self, stored: &CachedSourceEntry) {
+        let Some(key_is_globally_stable) = retained_history_key_filter(&self.parser_namespace)
+        else {
+            return;
+        };
+        // A stored entry from a different parser version describes a layout
+        // this one does not agree with; let the wholesale replace stand.
+        if stored.parser_namespace != self.parser_namespace
+            || stored.parser_version != self.parser_version
+        {
+            return;
+        }
+
+        let mut seen: HashSet<String> = self
+            .messages
+            .iter()
+            .filter_map(|message| message.dedup_key.clone())
+            .collect();
+        for message in &stored.messages {
+            let Some(key) = message.dedup_key.as_ref() else {
+                continue;
+            };
+            if !key_is_globally_stable(key) {
+                continue;
+            }
+            if seen.insert(key.clone()) {
+                self.messages.push(message.clone());
+            }
+        }
+    }
+}
+
+/// The dedup-key filter for namespaces whose entries carry history the live
+/// file may no longer contain, or `None` for namespaces that do not retain
+/// history.
+///
+/// Mirrors the `HistoryRetention` choice each lane makes in `lib.rs`. It has to
+/// exist here as well because the save merge is the other place a retained
+/// message can be dropped, and it must honor the same contract.
+fn retained_history_key_filter(namespace: &str) -> Option<fn(&str) -> bool> {
+    (namespace == ClientId::Claude.as_str())
+        .then_some(crate::sessions::claudecode::dedup_key_is_globally_stable)
 }
 
 /// The envelope is deliberately independent from CachedSourceEntry's binary
@@ -1248,7 +1319,15 @@ impl SourceMessageCache {
             if let Some(dirty) = dirty_by_shard.get(&shard_key) {
                 for key in dirty {
                     if let Some(entry) = self.entries.get(key) {
-                        merged_entries.insert(key.clone(), entry.clone());
+                        let mut entry = entry.clone();
+                        // Another process holding the lock before us may have
+                        // stored history for this same path that our in-memory
+                        // entry never saw. Union it in rather than replacing
+                        // wholesale — see `absorb_retained_history`.
+                        if let Some(stored) = merged_entries.remove(key) {
+                            entry.absorb_retained_history(&stored);
+                        }
+                        merged_entries.insert(key.clone(), entry);
                     }
                 }
             }
@@ -3212,6 +3291,188 @@ mod tests {
                 .get(identity, &path)
                 .expect("recreated source cache entry should survive stale delete");
             assert_eq!(entry.messages[0].session_id, "fresh-session");
+        }
+
+        restore_cache_env(prev_env);
+    }
+
+    fn keyed_message(namespace: &str, session_id: &str, dedup_key: &str) -> UnifiedMessage {
+        UnifiedMessage::new_with_dedup(
+            namespace,
+            "claude-3-5-sonnet",
+            "anthropic",
+            session_id,
+            1,
+            TokenBreakdown {
+                input: 1,
+                output: 2,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.0,
+            Some(dedup_key.to_string()),
+        )
+    }
+
+    fn entry_with_messages(
+        identity: CacheIdentity,
+        path: &Path,
+        messages: Vec<UnifiedMessage>,
+    ) -> CachedSourceEntry {
+        CachedSourceEntry::new(
+            identity,
+            path,
+            SourceFingerprint::from_path(path).unwrap(),
+            messages,
+            Vec::new(),
+            None,
+        )
+    }
+
+    /// A Claude entry can hold assistant turns the live transcript no longer
+    /// contains (an in-place compaction dropped them). Two processes scanning
+    /// at once therefore hold genuinely different histories for one path, and
+    /// the wholesale last-writer-wins replace would retire the loser's turns
+    /// for good — the live file cannot hand them back.
+    #[test]
+    #[serial_test::serial]
+    fn test_save_if_dirty_unions_retained_history_for_the_same_path() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("conversation.jsonl");
+            std::fs::write(&path, b"{\"id\":\"live\"}\n").unwrap();
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let namespace = ClientId::Claude.as_str();
+
+            // Both processes carry the turn the file still has. Only the first
+            // ever observed the one a compaction later removed.
+            let shared = keyed_message(namespace, "session", "msg_shared:req_shared");
+            let observed_only_by_first =
+                keyed_message(namespace, "session", "msg_dropped:req_dropped");
+
+            let mut observer = SourceMessageCache::load();
+            observer.insert(entry_with_messages(
+                identity,
+                &path,
+                vec![shared.clone(), observed_only_by_first],
+            ));
+            observer.save_if_dirty();
+
+            let mut latecomer = SourceMessageCache::load();
+            latecomer.insert(entry_with_messages(identity, &path, vec![shared]));
+            latecomer.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            let entry = loaded.get(identity, &path).expect("entry should survive");
+            let keys: HashSet<&str> = entry
+                .messages
+                .iter()
+                .filter_map(|message| message.dedup_key.as_deref())
+                .collect();
+            assert!(
+                keys.contains("msg_dropped:req_dropped"),
+                "a concurrent writer must not discard history it never saw, got {keys:?}"
+            );
+            assert_eq!(
+                entry.messages.len(),
+                2,
+                "and must not duplicate the shared turn"
+            );
+        }
+
+        restore_cache_env(prev_env);
+    }
+
+    /// The union is scoped to keys that stay valid wherever the message is
+    /// written. A Claude tool-result key embeds the transcript's file stem, so
+    /// a carried-forward copy could never collapse against the same tool
+    /// result replayed into a forked transcript — both would count.
+    #[test]
+    #[serial_test::serial]
+    fn test_save_if_dirty_does_not_union_path_scoped_keys() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("conversation.jsonl");
+            std::fs::write(&path, b"{\"id\":\"live\"}\n").unwrap();
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let namespace = ClientId::Claude.as_str();
+
+            let shared = keyed_message(namespace, "session", "msg_shared:req_shared");
+            let tool_result = keyed_message(
+                namespace,
+                "session",
+                "claude:tool_result:conversation:tool_result:toolu_1",
+            );
+
+            let mut observer = SourceMessageCache::load();
+            observer.insert(entry_with_messages(
+                identity,
+                &path,
+                vec![shared.clone(), tool_result],
+            ));
+            observer.save_if_dirty();
+
+            let mut latecomer = SourceMessageCache::load();
+            latecomer.insert(entry_with_messages(identity, &path, vec![shared]));
+            latecomer.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            let entry = loaded.get(identity, &path).expect("entry should survive");
+            assert_eq!(
+                entry.messages.len(),
+                1,
+                "path-scoped keys must not outlive the bytes that produced them"
+            );
+        }
+
+        restore_cache_env(prev_env);
+    }
+
+    /// The union exists only for namespaces that retain history. Everywhere
+    /// else the live file is the whole truth, so a stale entry must still be
+    /// replaced outright rather than accumulating.
+    #[test]
+    #[serial_test::serial]
+    fn test_save_if_dirty_still_replaces_entries_for_non_retaining_clients() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("rollout.jsonl");
+            std::fs::write(&path, b"{\"id\":\"live\"}\n").unwrap();
+            let identity = CacheIdentity::for_client(ClientId::Codex);
+            let namespace = ClientId::Codex.as_str();
+
+            let mut observer = SourceMessageCache::load();
+            observer.insert(entry_with_messages(
+                identity,
+                &path,
+                vec![
+                    keyed_message(namespace, "session", "codex-key-a"),
+                    keyed_message(namespace, "session", "codex-key-b"),
+                ],
+            ));
+            observer.save_if_dirty();
+
+            let mut latecomer = SourceMessageCache::load();
+            latecomer.insert(entry_with_messages(
+                identity,
+                &path,
+                vec![keyed_message(namespace, "session", "codex-key-a")],
+            ));
+            latecomer.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            let entry = loaded.get(identity, &path).expect("entry should survive");
+            assert_eq!(entry.messages.len(), 1);
         }
 
         restore_cache_env(prev_env);

@@ -930,6 +930,7 @@ pub mod sync {
     //! under the single `trae` client cache.
 
     use super::auth::{self, get_trae_cache_dir, TraeVariant};
+    use crate::process_liveness::pid_is_alive;
     use anyhow::{Context, Result};
     use chrono::Utc;
     use serde::{Deserialize, Serialize};
@@ -1180,37 +1181,6 @@ pub mod sync {
         Some((pid, timestamp))
     }
 
-    fn pid_is_alive(pid: u32) -> bool {
-        if pid == 0 {
-            return false;
-        }
-        #[cfg(unix)]
-        {
-            // `kill(pid, 0)` is a signal-free liveness probe. EPERM (errno
-            // 1) still means the process exists, just that we lack
-            // permission to signal it.
-            let result = unsafe { libc_kill(pid as i32, 0) };
-            result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(1)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = pid;
-            // No portable PID probe available. Treat the lock as stale so a
-            // crashed previous run doesn't permanently block subsequent
-            // syncs. This matches the policy used by Antigravity sync and
-            // accepts a small concurrent-corruption risk on Windows; that
-            // risk is acceptable because tokscale is a single-user CLI and
-            // overlapping syncs are rare in practice.
-            false
-        }
-    }
-
-    #[cfg(unix)]
-    extern "C" {
-        #[link_name = "kill"]
-        fn libc_kill(pid: i32, sig: i32) -> i32;
-    }
-
     // ── Main sync logic ────────────────────────────────────────────────────
 
     /// Run a single incremental sync for one variant.
@@ -1416,17 +1386,8 @@ pub mod sync {
             assert!(read_sync_lock(&path).is_none());
         }
 
-        #[test]
-        fn test_pid_is_alive_zero_is_dead() {
-            assert!(!pid_is_alive(0));
-        }
-
-        #[test]
-        #[cfg(unix)]
-        fn test_pid_is_alive_current_process_is_alive() {
-            let me = std::process::id();
-            assert!(pid_is_alive(me));
-        }
+        // Liveness probe coverage moved to `crate::process_liveness`, which
+        // now owns the single implementation both sync locks share.
 
         #[test]
         fn test_acquire_recovers_from_stale_lock_with_dead_pid() {

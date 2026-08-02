@@ -5,6 +5,7 @@ mod commands;
 mod cursor;
 mod device;
 mod paths;
+mod process_liveness;
 mod trae;
 mod tui;
 mod warp;

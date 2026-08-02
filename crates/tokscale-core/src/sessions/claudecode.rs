@@ -923,6 +923,35 @@ struct ClaudeToolResultUsage {
     dedup_key: Option<String>,
 }
 
+/// The segment that marks a dedup key as scoped to one transcript file.
+/// `tool_result_dedup_key` puts the session id — which is the transcript's
+/// file stem — behind it.
+const PATH_SCOPED_KEY_MARKER: &str = ":tool_result:";
+
+/// Whether a dedup key this parser mints identifies its message by content
+/// wherever that message happens to be written.
+///
+/// Assistant keys are `messageId:requestId` (or `message:{id}` when the
+/// transcript recorded no request id). Both come straight out of the API
+/// response, so the same turn replayed into a forked transcript keys
+/// identically and the two copies collapse at the cross-file dedup.
+/// Tool-result keys do not: they embed the session id, so the same tool result
+/// under a new filename is a different key and both copies count.
+///
+/// Only globally stable keys may be carried across an in-place rewrite. A
+/// retained path-scoped copy could never collapse against a live replay of
+/// itself, so retaining one would double count its input tokens.
+pub(crate) fn dedup_key_is_globally_stable(key: &str) -> bool {
+    !key.contains(PATH_SCOPED_KEY_MARKER)
+}
+
+/// A tool_use id is only unique within the conversation that issued it, so the
+/// key is deliberately scoped to the session. See `dedup_key_is_globally_stable`
+/// for what that costs.
+fn tool_result_dedup_key(client_id: &str, session_id: &str, usage_key: &str) -> String {
+    format!("{client_id}{PATH_SCOPED_KEY_MARKER}{session_id}:{usage_key}")
+}
+
 struct ClaudeToolResultContext<'a> {
     entry: &'a ClaudeEntry,
     last_model: Option<&'a str>,
@@ -991,12 +1020,9 @@ fn extract_claude_tool_result_message(
             reasoning: 0,
         },
         0.0,
-        usage.dedup_key.map(|key| {
-            format!(
-                "{}:tool_result:{}:{key}",
-                context.client_id, context.session_id
-            )
-        }),
+        usage
+            .dedup_key
+            .map(|key| tool_result_dedup_key(context.client_id, context.session_id, &key)),
     );
     message.message_count = 0;
     message.agent = context.sidechain_agent;
@@ -2146,6 +2172,24 @@ mod tests {
             Some(expected_dedup_key.as_str())
         );
         assert_eq!(messages[0].message_count, 0);
+    }
+
+    /// History retention across an in-place transcript rewrite is only sound
+    /// for keys that identify a message by content across files. This pins
+    /// which of the parser's own key shapes qualify, so a future key change
+    /// trips here rather than silently making a retained copy double count.
+    #[test]
+    fn test_only_content_derived_dedup_keys_are_globally_stable() {
+        let tool_result =
+            tool_result_dedup_key("claude", "0f1e2d3c-session", "tool_result:toolu_1");
+        assert!(
+            !dedup_key_is_globally_stable(&tool_result),
+            "tool-result keys embed the transcript file stem: {tool_result}"
+        );
+
+        // The two shapes `parse_claude_file` mints for assistant turns.
+        assert!(dedup_key_is_globally_stable("msg_01ABC:req_01XYZ"));
+        assert!(dedup_key_is_globally_stable("message:msg_01ABC"));
     }
 
     #[test]
