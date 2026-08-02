@@ -1120,7 +1120,9 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             }
             if let Some(key) = message.dedup_key.as_ref() {
                 if let Some(index) = micode_indices.get(key).copied() {
-                    if message.has_authoritative_cost() {
+                    if message.has_authoritative_cost()
+                        && !all_messages[index].has_authoritative_cost()
+                    {
                         all_messages[index].cost = message.cost;
                         all_messages[index].mark_provider_reported_cost();
                     }
