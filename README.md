@@ -914,6 +914,8 @@ The regenerable CLI/TUI/pricing/Wrapped caches now live under `~/.config/tokscal
 
 It is safe to delete this directory. Tokscale will recreate and repopulate it on demand.
 
+One caveat, for Claude Code only. Claude Code rewrites a session transcript in place when you resume or compact it: the file keeps its name but loses assistant turns it had already written. `source-message-cache-v2/` remembers those turns for as long as the transcript file exists, so they keep counting toward your totals. That is the only place they still exist — the transcript itself no longer has them. Deleting the cache (or letting a Claude parser upgrade rebuild it) rebuilds from the compacted transcripts, so totals for heavily compacted sessions can come back lower. Deleting a transcript still drops its turns either way, which is what makes local disk the source of truth.
+
 ### Environment Variables
 
 Environment variables override config file values. For CI/CD or one-off use:
