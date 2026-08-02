@@ -1,6 +1,7 @@
 pub mod aliases;
 pub mod cache;
 pub mod custom;
+mod fetch;
 pub mod litellm;
 pub mod lookup;
 pub mod models_dev;
@@ -23,6 +24,26 @@ static PRICING_SERVICE: OnceCell<Arc<PricingService>> = OnceCell::const_new();
 /// Provider prefixes in LiteLLM data that use subscription-based pricing ($0.00)
 /// and should be excluded from pay-per-token cost estimation.
 const EXCLUDED_LITELLM_PREFIXES: &[&str] = &["github_copilot/"];
+
+// @keep: explains why we do not just print the error.
+/// Flatten an error and its `source()` chain into one line.
+///
+/// `reqwest::Error`'s `Display` is deliberately terse: a body-decode failure
+/// renders as the bare string "error decoding response body", and the
+/// `serde_json` cause that names the offending field and byte offset hangs off
+/// `source()`, which `{}` never walks. Issue #1002 was reported with exactly
+/// that message, which is why it was impossible to tell a transport failure
+/// from an upstream schema change and the reporter guessed at TLS. Printing the
+/// chain makes the next such report actionable.
+pub(crate) fn describe_error(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(inner) = source {
+        parts.push(inner.to_string());
+        source = inner.source();
+    }
+    parts.join(": ")
+}
 
 pub struct PricingService {
     custom: CustomPricing,
@@ -72,10 +93,12 @@ impl PricingService {
     ) -> HashMap<String, ModelPricing> {
         data.retain(|key, _| {
             let lower = key.to_lowercase();
-            !EXCLUDED_LITELLM_PREFIXES
+            let included_provider = !EXCLUDED_LITELLM_PREFIXES
                 .iter()
-                .any(|prefix| lower.starts_with(prefix))
+                .any(|prefix| lower.starts_with(prefix));
+            included_provider
         });
+        data.retain(|_, pricing| pricing.has_any_usable_base_rate());
         data
     }
 
@@ -178,36 +201,76 @@ impl PricingService {
             models_dev::fetch()
         );
 
-        let (litellm_data, litellm_error) = match litellm_result {
-            Ok(data) => (Self::filter_litellm_data(data), None),
-            Err(error) => {
-                eprintln!(
-                    "[tokscale] Warning: LiteLLM pricing unavailable ({}), using other sources",
-                    error
-                );
-                (
-                    litellm::load_cached_any_age()
-                        .map(Self::filter_litellm_data)
-                        .unwrap_or_default(),
-                    Some(error.to_string()),
-                )
-            }
-        };
-        let models_dev_data = match models_dev_result {
-            Ok(data) => data,
-            Err(e) => {
-                eprintln!("[tokscale] models.dev fetch failed: {}", e);
-                HashMap::new()
-            }
-        };
+        Self::combine_fetched_sources(
+            litellm_result,
+            openrouter_data,
+            models_dev_result,
+            litellm::load_cached_any_age,
+            openrouter::load_cached_any_age,
+            models_dev::load_cached_any_age,
+            CustomPricing::load_from_default_path(),
+        )
+    }
 
-        if litellm_data.is_empty() && openrouter_data.is_empty() && models_dev_data.is_empty() {
-            return Err(litellm_error
-                .unwrap_or_else(|| "No dynamic pricing source returned usable data".to_string()));
+    /// Degrade one failed source to its own stale cache, else to nothing.
+    fn degrade_source(
+        label: &str,
+        result: Result<HashMap<String, ModelPricing>, String>,
+        cached: impl FnOnce() -> Option<HashMap<String, ModelPricing>>,
+    ) -> HashMap<String, ModelPricing> {
+        match result {
+            Ok(data) => data,
+            Err(error) => {
+                let cached = cached();
+                eprintln!(
+                    "[tokscale] Warning: {} pricing fetch failed ({}); {}",
+                    label,
+                    error,
+                    if cached.is_some() {
+                        "falling back to the cached copy"
+                    } else {
+                        "continuing with the remaining pricing sources"
+                    }
+                );
+                cached.unwrap_or_default()
+            }
         }
+    }
+
+    // @keep: the asymmetry this removes was load-bearing and non-obvious.
+    /// Assemble a service from whatever the three upstream sources returned.
+    ///
+    /// No single source may be fatal. LiteLLM is the largest dataset, but it is
+    /// not the only one, and propagating its fetch error made every command
+    /// that prices tokens — `submit` included — dead in the water whenever
+    /// raw.githubusercontent.com was unreachable or served something we could
+    /// not decode (#1002). Every dynamic source now preserves fetch failure as
+    /// an error here, degrades to its own stale cache, and finally to nothing;
+    /// the surviving sources still price what they cover. Submission safety is
+    /// checked against the actual filtered messages later, rather than treating
+    /// an empty dynamic dataset as a construction failure: custom and bundled
+    /// pricing remain useful during an outage.
+    fn combine_fetched_sources(
+        litellm_result: Result<HashMap<String, ModelPricing>, String>,
+        openrouter_result: Result<HashMap<String, ModelPricing>, String>,
+        models_dev_result: Result<HashMap<String, ModelPricing>, String>,
+        litellm_cached: impl FnOnce() -> Option<HashMap<String, ModelPricing>>,
+        openrouter_cached: impl FnOnce() -> Option<HashMap<String, ModelPricing>>,
+        models_dev_cached: impl FnOnce() -> Option<HashMap<String, ModelPricing>>,
+        custom: CustomPricing,
+    ) -> Result<Self, String> {
+        let litellm_data = Self::filter_litellm_data(Self::degrade_source(
+            "LiteLLM",
+            litellm_result,
+            litellm_cached,
+        ));
+        let models_dev_data =
+            Self::degrade_source("models.dev", models_dev_result, models_dev_cached);
+        let openrouter_data =
+            Self::degrade_source("OpenRouter", openrouter_result, openrouter_cached);
 
         Ok(Self::new_with_custom_and_models_dev(
-            CustomPricing::load_from_default_path(),
+            custom,
             litellm_data,
             openrouter_data,
             models_dev_data,
@@ -328,6 +391,18 @@ impl PricingService {
             .calculate_cost_with_provider(model_id, provider_id, usage)
     }
 
+    pub fn covers_usage_with_provider(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+        usage: &TokenBreakdown,
+    ) -> bool {
+        let Some(result) = self.lookup_with_source_and_provider(model_id, None, provider_id) else {
+            return false;
+        };
+        result.pricing.covers_usage(usage)
+    }
+
     fn lookup_custom(&self, model_id: &str) -> Option<LookupResult> {
         self.custom
             .lookup_with_key(model_id)
@@ -376,6 +451,127 @@ mod tests {
             openrouter,
             models_dev,
         )
+    }
+
+    // Regression: #1002. A LiteLLM fetch failure used to propagate out of
+    // fetch_inner, so `tokscale submit` died with "error decoding response
+    // body" even though models.dev and openrouter were both reachable and
+    // carried usable pricing.
+    #[test]
+    fn litellm_fetch_failure_is_not_fatal_when_another_source_has_data() {
+        let mut models_dev = HashMap::new();
+        models_dev.insert("test-model-alpha".to_string(), model_pricing(1e-6, 2e-6));
+
+        let service = PricingService::combine_fetched_sources(
+            Err("error decoding response body".to_string()),
+            Err("OpenRouter unavailable".to_string()),
+            Ok(models_dev),
+            // Fresh install, as in the report: nothing cached yet.
+            || None,
+            || None,
+            || None,
+            CustomPricing::default(),
+        )
+        .expect("a LiteLLM failure must not be fatal while another source has pricing");
+
+        let cost = service.calculate_cost("test-model-alpha", 1_000_000, 0, 0, 0, 0);
+        assert!(
+            (cost - 1.0).abs() < 1e-9,
+            "models.dev pricing should still resolve after LiteLLM fails, got {}",
+            cost
+        );
+    }
+
+    // Regression: #1002. The reporter's workaround was hand-populating the
+    // cache file. A cached copy older than the 1h TTL must be preferred over
+    // dropping LiteLLM entirely, so that workaround keeps working unattended.
+    #[test]
+    fn litellm_fetch_failure_falls_back_to_stale_cache() {
+        let mut cached = HashMap::new();
+        cached.insert("test-model-beta".to_string(), model_pricing(3e-6, 4e-6));
+
+        let service = PricingService::combine_fetched_sources(
+            Err("error decoding response body".to_string()),
+            Err("OpenRouter unavailable".to_string()),
+            Ok(HashMap::new()),
+            || Some(cached),
+            || None,
+            || None,
+            CustomPricing::default(),
+        )
+        .expect("a stale LiteLLM cache must keep the service usable");
+
+        let cost = service.calculate_cost("test-model-beta", 1_000_000, 0, 0, 0, 0);
+        assert!(
+            (cost - 3.0).abs() < 1e-9,
+            "stale LiteLLM cache should price the model, got {}",
+            cost
+        );
+    }
+
+    // Regression: models.dev is a degradable source too. Its errors used to be
+    // dropped straight to an empty map even though it keeps a cache of its own,
+    // so a models.dev outage discarded pricing that was sitting on disk.
+    #[test]
+    fn models_dev_fetch_failure_falls_back_to_stale_cache() {
+        let mut cached = HashMap::new();
+        cached.insert("test-model-gamma".to_string(), model_pricing(5e-6, 6e-6));
+
+        let service = PricingService::combine_fetched_sources(
+            Ok(HashMap::new()),
+            Err("OpenRouter unavailable".to_string()),
+            Err("models.dev unreachable".to_string()),
+            || None,
+            || None,
+            || Some(cached),
+            CustomPricing::default(),
+        )
+        .expect("a stale models.dev cache must keep the service usable");
+
+        let cost = service.calculate_cost("test-model-gamma", 1_000_000, 0, 0, 0, 0);
+        assert!(
+            (cost - 5.0).abs() < 1e-9,
+            "stale models.dev cache should price the model, got {}",
+            cost
+        );
+    }
+
+    #[test]
+    fn custom_pricing_keeps_service_available_during_dynamic_outage() {
+        let mut custom = HashMap::new();
+        custom.insert("custom-only".to_string(), model_pricing(3e-6, 4e-6));
+        let service = PricingService::combine_fetched_sources(
+            Err("error decoding response body: expected f64".to_string()),
+            Err("OpenRouter unreachable".to_string()),
+            Err("models.dev unreachable".to_string()),
+            || None,
+            || None,
+            || None,
+            CustomPricing::from_models(custom),
+        )
+        .expect("custom pricing should remain usable during an upstream outage");
+        assert!(service.lookup_with_source("custom-only", None).is_some());
+    }
+
+    #[test]
+    fn openrouter_fetch_failure_falls_back_to_stale_cache() {
+        let mut cached = HashMap::new();
+        cached.insert("openrouter-only".to_string(), model_pricing(7e-6, 8e-6));
+
+        let service = PricingService::combine_fetched_sources(
+            Err("LiteLLM unavailable".to_string()),
+            Err("OpenRouter unavailable".to_string()),
+            Err("models.dev unavailable".to_string()),
+            || None,
+            || Some(cached),
+            || None,
+            CustomPricing::default(),
+        )
+        .expect("a stale OpenRouter cache must keep the service usable");
+
+        assert!(service
+            .lookup_with_source("openrouter-only", None)
+            .is_some());
     }
 
     #[test]
@@ -535,13 +731,27 @@ mod tests {
                 ..Default::default()
             },
         );
-        data.insert("openai/gpt-5.2".into(), ModelPricing::default());
+        data.insert(
+            "openai/gpt-5.2".into(),
+            ModelPricing {
+                output_cost_per_token: Some(0.000014),
+                ..Default::default()
+            },
+        );
+        data.insert(
+            "tier-only".into(),
+            ModelPricing {
+                input_cost_per_token_above_272k_tokens: Some(0.00001),
+                ..Default::default()
+            },
+        );
 
         let filtered = PricingService::filter_litellm_data(data);
         assert!(!filtered.contains_key("github_copilot/gpt-5.3-codex"));
         assert!(!filtered.contains_key("github_copilot/gpt-4o"));
         assert!(filtered.contains_key("gpt-5.2"));
         assert!(filtered.contains_key("openai/gpt-5.2"));
+        assert!(!filtered.contains_key("tier-only"));
     }
 
     #[test]

@@ -844,8 +844,10 @@ fn parser_version(client: ClientId) -> u32 {
         ClientId::Claude => 2,
         // Junie's usage-event timestamp is now back-calculated to the call
         // start (timestampMs - usage.time) instead of the recorded
-        // (end-anchored) timestampMs. Follow-up to #890.
-        ClientId::Junie => 2,
+        // (end-anchored) timestampMs. Follow-up to #890. v2->v3: preserve
+        // provider-reported cost provenance, including explicit zeroes, so
+        // strict submission does not reject valid cached unknown-model usage.
+        ClientId::Junie => 3,
         // zcode's model_usage timestamp now prefers `started_at` over
         // `completed_at`. Follow-up to #890. v2->v3: rows with a NULL
         // `started_at` now back-calculate `completed_at - duration_ms`
@@ -884,6 +886,12 @@ fn parser_version(client: ClientId) -> u32 {
         // session_model_usage instead of crediting the whole session to
         // sessions.model, and dedup keys are namespaced per (session, model).
         ClientId::Hermes => 2,
+        // v1 retained MiMo's embedded `cost` value but did not preserve its
+        // provider-reported provenance. Reparse cached rows so strict submit
+        // validation does not reject valid unknown-model MiMo usage offline.
+        // v2->v3: duplicate merging now upgrades the retained row when a later
+        // copy carries an explicit cost, including zero.
+        ClientId::MiMoCode => 3,
         _ => 1,
     }
 }
@@ -2176,7 +2184,7 @@ mod tests {
         // end-anchored when the prompt timestamp was missing. Both bump
         // again here so those stale (start-anchored-but-still-wrong) v2/v1
         // cache entries are also invalidated.
-        assert_eq!(parser_version(ClientId::Junie), 2);
+        assert_eq!(parser_version(ClientId::Junie), 3);
         assert_eq!(parser_version(ClientId::Jcode), 7);
         assert_eq!(parser_version(ClientId::DevinCli), 3);
         assert_eq!(parser_version(ClientId::Zcode), 3);
@@ -2192,6 +2200,16 @@ mod tests {
     #[test]
     fn test_hermes_parser_version_invalidates_v1_entries() {
         assert_eq!(parser_version(ClientId::Hermes), 2);
+    }
+
+    #[test]
+    fn test_micode_parser_version_invalidates_rows_without_cost_provenance() {
+        assert_eq!(parser_version(ClientId::MiMoCode), 3);
+    }
+
+    #[test]
+    fn test_junie_parser_version_invalidates_rows_without_cost_provenance() {
+        assert_eq!(parser_version(ClientId::Junie), 3);
     }
 
     #[test]

@@ -1,5 +1,5 @@
-use super::cache;
 use super::litellm::ModelPricing;
+use super::{cache, describe_error, fetch};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -7,8 +7,6 @@ use tokio::sync::Semaphore;
 
 const CACHE_FILENAME: &str = "pricing-openrouter.json";
 const MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
-const MAX_RETRIES: u32 = 3;
-const INITIAL_BACKOFF_MS: u64 = 200;
 const MAX_CONCURRENT_REQUESTS: usize = 10;
 
 /// Structs for `/api/v1/models` endpoint (list all models).
@@ -177,99 +175,49 @@ async fn fetch_author_pricing(
 }
 
 /// Fetch all models and get author pricing for each
-pub async fn fetch_all_models() -> HashMap<String, ModelPricing> {
-    if let Some(cached) = load_cached() {
-        return cached;
+pub async fn fetch_all_models() -> Result<HashMap<String, ModelPricing>, String> {
+    fetch_all_models_from_url(MODELS_URL, true).await
+}
+
+async fn fetch_all_models_from_url(
+    models_url: &str,
+    use_cache: bool,
+) -> Result<HashMap<String, ModelPricing>, String> {
+    if use_cache {
+        if let Some(cached) = load_cached() {
+            return Ok(cached);
+        }
     }
 
-    let client = Arc::new(
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .unwrap_or_default(),
-    );
-
-    let mut last_error: Option<String> = None;
-
-    let models_with_fallback: Vec<(String, Option<ModelPricing>)> = 'retry: {
-        for attempt in 0..MAX_RETRIES {
-            let response = match client
-                .get(MODELS_URL)
-                .header("Content-Type", "application/json")
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    last_error = Some(format!("network error: {}", e));
-                    if attempt < MAX_RETRIES - 1 {
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            INITIAL_BACKOFF_MS * (1 << attempt),
-                        ))
-                        .await;
-                    }
-                    continue;
-                }
-            };
-
-            let status = response.status();
-            if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                last_error = Some(format!("HTTP {}", status));
-                let _ = response.bytes().await;
-                if attempt < MAX_RETRIES - 1 {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        INITIAL_BACKOFF_MS * (1 << attempt),
-                    ))
-                    .await;
-                }
-                continue;
-            }
-
-            if !status.is_success() {
-                eprintln!("[tokscale] OpenRouter models API returned {}", status);
-                break 'retry Vec::new();
-            }
-
-            let data: ModelsListResponse = match response.json().await {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("[tokscale] OpenRouter models JSON parse failed: {}", e);
-                    break 'retry Vec::new();
-                }
-            };
-
-            break 'retry data
-                .data
-                .into_iter()
-                .map(|m| {
-                    let fallback = m.pricing.and_then(|p| {
-                        let input = parse_price(&p.prompt)?;
-                        let output = parse_price(&p.completion)?;
-                        Some(ModelPricing {
-                            input_cost_per_token: Some(input),
-                            output_cost_per_token: Some(output),
-                            cache_read_input_token_cost: None,
-                            cache_creation_input_token_cost: None,
-                            ..Default::default()
-                        })
-                    });
-                    (m.id, fallback)
+    let client = Arc::new(fetch::pricing_client()?);
+    let response = fetch::get_with_retry(&client, models_url, "OpenRouter").await?;
+    let data: ModelsListResponse = response.json().await.map_err(|error| {
+        format!(
+            "OpenRouter models JSON parse failed: {}",
+            describe_error(&error)
+        )
+    })?;
+    let models_with_fallback: Vec<(String, Option<ModelPricing>)> = data
+        .data
+        .into_iter()
+        .map(|m| {
+            let fallback = m.pricing.and_then(|p| {
+                let input = parse_price(&p.prompt)?;
+                let output = parse_price(&p.completion)?;
+                Some(ModelPricing {
+                    input_cost_per_token: Some(input),
+                    output_cost_per_token: Some(output),
+                    cache_read_input_token_cost: None,
+                    cache_creation_input_token_cost: None,
+                    ..Default::default()
                 })
-                .collect();
-        }
-
-        if let Some(err) = &last_error {
-            eprintln!(
-                "[tokscale] OpenRouter fetch failed after {} retries: {}",
-                MAX_RETRIES, err
-            );
-        }
-        Vec::new()
-    };
+            });
+            (m.id, fallback)
+        })
+        .collect();
 
     if models_with_fallback.is_empty() {
-        return HashMap::new();
+        return Err("OpenRouter returned no models".to_string());
     }
 
     let models_with_authors: Vec<(String, Option<ModelPricing>)> = models_with_fallback
@@ -312,9 +260,56 @@ pub async fn fetch_all_models() -> HashMap<String, ModelPricing> {
         }
     }
 
-    result
+    if result.is_empty() {
+        return Err("OpenRouter returned no usable pricing rows".to_string());
+    }
+
+    Ok(result)
 }
 
-pub async fn fetch_all_mapped() -> HashMap<String, ModelPricing> {
+pub async fn fetch_all_mapped() -> Result<HashMap<String, ModelPricing>, String> {
     fetch_all_models().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn response_server(status: &'static str, body: &'static str, requests: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        thread::spawn(move || {
+            for _ in 0..requests {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0; 1024];
+                let _ = stream.read(&mut buffer);
+                let response = format!(
+                    "{status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn list_status_and_decode_failures_remain_explicit() {
+        let status = response_server("HTTP/1.1 503 Service Unavailable", "", 3);
+        assert!(fetch_all_models_from_url(&status, false)
+            .await
+            .unwrap_err()
+            .contains("HTTP 503"));
+
+        let malformed = response_server("HTTP/1.1 200 OK", "not json", 1);
+        assert!(fetch_all_models_from_url(&malformed, false)
+            .await
+            .unwrap_err()
+            .contains("JSON parse failed"));
+    }
 }

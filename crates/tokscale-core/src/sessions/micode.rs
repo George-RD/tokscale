@@ -255,7 +255,8 @@ pub fn parse_micode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
         let cache = tokens.cache.unwrap_or_default();
         let cache_read = cache.read.max(0);
         let cache_write = cache.write.max(0);
-        let cost = msg.cost.unwrap_or(0.0).max(0.0);
+        let reported_cost = msg.cost.filter(|cost| cost.is_finite() && *cost >= 0.0);
+        let cost = reported_cost.unwrap_or(0.0);
         // Normalize epoch values to milliseconds up front so the timestamp, the
         // dedup fingerprint, and the duration all agree even when MiMo writes
         // seconds instead of milliseconds.
@@ -302,6 +303,9 @@ pub fn parse_micode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
             agent,
         );
         unified.duration_ms = micode_duration_ms(&msg.time);
+        if reported_cost.is_some() {
+            unified.mark_provider_reported_cost();
+        }
         unified.dedup_key = Some(dedup_key);
         let workspace_root = row_workspace_root
             .as_deref()
@@ -310,6 +314,9 @@ pub fn parse_micode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
 
         if let Some(index) = fingerprint_indices.get(&fingerprint).copied() {
             let dedup_state = &mut dedup_states[index];
+            if unified.has_authoritative_cost() {
+                messages[index].mark_provider_reported_cost();
+            }
             if message_id.is_some() && !dedup_state.has_embedded_message_id {
                 dedup_state.has_embedded_message_id = true;
                 messages[index].dedup_key = unified.dedup_key;
@@ -386,6 +393,10 @@ mod tests {
         assert_eq!(messages[0].tokens.cache_read, 200);
         assert_eq!(messages[0].tokens.cache_write, 50);
         assert!((messages[0].cost - 0.05).abs() < 1e-9);
+        assert_eq!(
+            messages[0].cost_source,
+            super::super::CostSource::ProviderReported
+        );
         assert_eq!(messages[0].duration_ms, Some(1234));
     }
 
@@ -631,6 +642,48 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].tokens.input, 1000);
         assert_eq!(messages[1].tokens.input, 1300);
+    }
+
+    #[test]
+    fn duplicate_explicit_zero_cost_upgrades_retained_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_micode.db");
+        let conn = create_micode_sqlite_db(&db_path);
+        let without_cost = r#"{
+            "role": "assistant",
+            "modelID": "unknown-model",
+            "providerID": "mimo",
+            "tokens": { "input": 10, "output": 5 },
+            "time": { "created": 1700000000000.0 }
+        }"#;
+        let with_zero_cost = r#"{
+            "role": "assistant",
+            "modelID": "unknown-model",
+            "providerID": "mimo",
+            "cost": 0,
+            "tokens": { "input": 10, "output": 5 },
+            "time": { "created": 1700000000000.0 }
+        }"#;
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["row_a", "session_a", without_cost],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["row_b", "session_b", with_zero_cost],
+        )
+        .unwrap();
+        drop(conn);
+
+        let messages = parse_micode_sqlite(&db_path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].cost, 0.0);
+        assert_eq!(
+            messages[0].cost_source,
+            super::super::CostSource::ProviderReported
+        );
     }
 
     #[test]
