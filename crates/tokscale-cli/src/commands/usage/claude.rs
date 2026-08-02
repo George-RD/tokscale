@@ -60,6 +60,12 @@ pub fn has_credentials() -> bool {
     credentials_path().exists() || read_keychain().is_ok()
 }
 
+/// How [`fetch_blocking`] obtains Claude Code's credential document. Injected
+/// so tests can also drive the Keychain-sourced shape -- credentials present,
+/// no file on disk -- which no test can produce through [`read_credentials`]
+/// because the Keychain is a real macOS service.
+type CredentialReader = fn() -> Result<Credentials>;
+
 fn read_credentials() -> Result<Credentials> {
     let path = credentials_path();
     if path.exists() {
@@ -110,63 +116,64 @@ fn window_metric(label: &str, w: &Window) -> UsageMetric {
     }
 }
 
-async fn fetch_with_endpoint(
-    client: &reqwest::Client,
-    usage_url: &str,
-    oauth: &Oauth,
-) -> Result<UsageOutput> {
-    let access_token = oauth
-        .access_token
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("No Claude access token."))?;
-    let plan = oauth.subscription_type.as_ref().map(|s| {
-        let tier = oauth
-            .rate_limit_tier
-            .as_deref()
-            .and_then(|t| t.rsplit('_').next());
-        match tier {
-            Some(mult) => format!("{} {}", capitalize(s), mult),
-            None => capitalize(s),
-        }
-    });
-
-    let resp = fetch_usage(client, usage_url, access_token).await?;
-
-    let mut metrics = Vec::new();
-    if let Some(ref w) = resp.five_hour {
-        metrics.push(window_metric("Session", w));
-    }
-    if let Some(ref w) = resp.seven_day {
-        metrics.push(window_metric("Weekly", w));
-    }
-    if let Some(ref w) = resp.seven_day_opus {
-        metrics.push(window_metric("Opus", w));
-    }
-
-    Ok(UsageOutput {
-        provider: "Claude".into(),
-        account: None,
-        plan,
-        email: None,
-        metrics,
-        reset_credits: None,
-        credit_status: None,
-        spend_control: None,
-    })
-}
-
-pub fn fetch() -> Result<UsageOutput> {
+/// The whole Claude usage path, with the only two things a test cannot supply
+/// for real -- the usage endpoint and the credential source -- as parameters.
+/// The destructive refresh-and-write this module was fixed for lived in exactly
+/// this orchestration, so it is the layer the tests must enter; [`fetch`] is one
+/// call with the production values and holds no logic that could diverge.
+fn fetch_blocking(usage_url: &str, read: CredentialReader) -> Result<UsageOutput> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     rt.block_on(async {
-        let creds = read_credentials()?;
+        let creds = read()?;
         let oauth = creds.claude_ai_oauth.ok_or_else(|| {
             anyhow::anyhow!("No Claude OAuth credentials. Run 'claude' to log in.")
         })?;
+        let access_token = oauth
+            .access_token
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("No Claude access token."))?;
+        let plan = oauth.subscription_type.as_ref().map(|s| {
+            let tier = oauth
+                .rate_limit_tier
+                .as_deref()
+                .and_then(|t| t.rsplit('_').next());
+            match tier {
+                Some(mult) => format!("{} {}", capitalize(s), mult),
+                None => capitalize(s),
+            }
+        });
+
         let client = reqwest::Client::new();
-        fetch_with_endpoint(&client, USAGE_URL, &oauth).await
+        let resp = fetch_usage(&client, usage_url, access_token).await?;
+
+        let mut metrics = Vec::new();
+        if let Some(ref w) = resp.five_hour {
+            metrics.push(window_metric("Session", w));
+        }
+        if let Some(ref w) = resp.seven_day {
+            metrics.push(window_metric("Weekly", w));
+        }
+        if let Some(ref w) = resp.seven_day_opus {
+            metrics.push(window_metric("Opus", w));
+        }
+
+        Ok(UsageOutput {
+            provider: "Claude".into(),
+            account: None,
+            plan,
+            email: None,
+            metrics,
+            reset_credits: None,
+            credit_status: None,
+            spend_control: None,
+        })
     })
+}
+
+pub fn fetch() -> Result<UsageOutput> {
+    fetch_blocking(USAGE_URL, read_credentials)
 }
 
 #[cfg(test)]
@@ -174,6 +181,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
 
     /// A Claude Code credential document with the fields tokscale models
     /// (`accessToken`, `subscriptionType`, `rateLimitTier`), the fields it does
@@ -194,6 +202,10 @@ mod tests {
     const USAGE_BODY: &str =
         r#"{"five_hour":{"utilization":12.5,"resets_at":"2026-08-03T12:00:00Z"}}"#;
 
+    /// Mirrors the path component of [`USAGE_URL`] so the recorded request line
+    /// is the same string production would produce.
+    const USAGE_PATH: &str = "/api/oauth/usage";
+
     fn reason(status: u16) -> &'static str {
         match status {
             200 => "OK",
@@ -203,13 +215,26 @@ mod tests {
         }
     }
 
-    /// Blocking HTTP/1.1 server on an ephemeral port that answers by request
-    /// path. `Connection: close` keeps one request per socket so the accept
-    /// loop stays trivial. The thread is left blocked on `accept` when the test
-    /// ends; the test process tears it down.
-    fn spawn_server(routes: Vec<(String, u16, String)>) -> String {
+    /// One request as the server saw it: method and path, plus whatever bearer
+    /// token was presented. The token is recorded so a test can prove the
+    /// credential reached the wire from the fixture it wrote rather than from
+    /// the developer's real `$HOME`.
+    #[derive(Debug, PartialEq)]
+    struct Seen {
+        request: String,
+        bearer: Option<String>,
+    }
+
+    /// Blocking HTTP/1.1 server on an ephemeral port that answers the usage
+    /// path, 404s everything else, and records every request it receives.
+    /// `Connection: close` keeps one request per socket so the accept loop stays
+    /// trivial. The thread is left blocked on `accept` when the test ends; the
+    /// test process tears it down.
+    fn spawn_server(usage_status: u16) -> (String, Arc<Mutex<Vec<Seen>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let addr = listener.local_addr().expect("test server addr");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let server_log = Arc::clone(&log);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
@@ -225,12 +250,25 @@ mod tests {
                     }
                 }
                 let request = String::from_utf8_lossy(&buf).to_string();
-                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
-                let (status, body) = routes
-                    .iter()
-                    .find(|(p, _, _)| *p == path)
-                    .map(|(_, s, b)| (*s, b.clone()))
-                    .unwrap_or_else(|| (404, "{}".to_string()));
+                let mut head = request.split_whitespace();
+                let method = head.next().unwrap_or("?").to_string();
+                let path = head.next().unwrap_or("/").to_string();
+                let bearer = request
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                    .and_then(|l| l.split_once(':'))
+                    .map(|(_, v)| v.trim().trim_start_matches("Bearer ").to_string());
+                if let Ok(mut seen) = server_log.lock() {
+                    seen.push(Seen {
+                        request: format!("{method} {path}"),
+                        bearer,
+                    });
+                }
+                let (status, body) = if path == USAGE_PATH {
+                    (usage_status, USAGE_BODY.to_string())
+                } else {
+                    (404, "{}".to_string())
+                };
                 let response = format!(
                     "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     reason(status),
@@ -240,7 +278,27 @@ mod tests {
                 let _ = stream.flush();
             }
         });
-        format!("http://{addr}")
+        (format!("http://{addr}{USAGE_PATH}"), log)
+    }
+
+    /// The request log is asserted alongside the credential bytes because a
+    /// refresh-and-retry regression shows up here as a second request even when
+    /// it writes nothing to disk. It only sees traffic aimed at the injected
+    /// URL: the refresh this change removed POSTed to an absolute
+    /// `platform.claude.com` URL that no local server can intercept, so byte
+    /// equality is still what actually pins #1001.
+    fn assert_only_usage_request(log: &Arc<Mutex<Vec<Seen>>>) {
+        let seen = log.lock().expect("request log");
+        assert_eq!(
+            *seen,
+            vec![Seen {
+                request: format!("GET {USAGE_PATH}"),
+                // The fixture's token, so this also proves the credential came
+                // from the injected reader and not from the real `$HOME`.
+                bearer: Some("stale-access-token".to_string()),
+            }],
+            "tokscale made a request other than the single usage GET"
+        );
     }
 
     struct HomeGuard {
@@ -285,60 +343,28 @@ mod tests {
         }
     }
 
-    fn oauth_from_fixture() -> Oauth {
-        serde_json::from_str::<Credentials>(FIXTURE)
-            .expect("fixture parses")
-            .claude_ai_oauth
-            .expect("fixture has claudeAiOauth")
-    }
-
-    fn block_on<F: std::future::Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime")
-            .block_on(f)
-    }
-
-    fn routes(usage_status: u16) -> Vec<(String, u16, String)> {
-        vec![
-            (
-                "/api/oauth/usage".to_string(),
-                usage_status,
-                USAGE_BODY.to_string(),
-            ),
-            // The endpoint the removed refresh path used to POST to. Serving it
-            // locally means a regression reaches it here instead of reaching
-            // platform.claude.com, and the assertions below still catch it.
-            (
-                "/v1/oauth/token".to_string(),
-                200,
-                r#"{"access_token":"rotated-access-token","refresh_token":"rotated-refresh-token"}"#
-                    .to_string(),
-            ),
-        ]
+    /// Stands in for a Keychain-sourced credential: the same document, with
+    /// nothing on disk. `read_credentials()` cannot be made to produce this
+    /// shape in a test because the Keychain is a real macOS service.
+    fn keychain_credentials() -> Result<Credentials> {
+        Ok(serde_json::from_str(FIXTURE)?)
     }
 
     /// #1001: a rejected access token must not make tokscale rewrite Claude
     /// Code's credential file. Byte equality is the assertion that matters --
     /// any reconstruction of the document fails it, whatever fields it keeps.
+    /// Entry is through `fetch_blocking` with the real `read_credentials`, so
+    /// the file is genuinely read and re-read across the whole orchestration
+    /// the destructive code used to live in.
     #[test]
     #[serial_test::serial]
     fn rejected_token_leaves_claude_credentials_untouched() {
         let home = HomeGuard::new("401");
         home.write_fixture();
         let before = std::fs::read(home.credentials()).expect("read before");
-        let base = spawn_server(routes(401));
+        let (usage_url, log) = spawn_server(401);
 
-        let result = block_on(async {
-            let client = reqwest::Client::new();
-            fetch_with_endpoint(
-                &client,
-                &format!("{base}/api/oauth/usage"),
-                &oauth_from_fixture(),
-            )
-            .await
-        });
+        let result = fetch_blocking(&usage_url, read_credentials);
 
         let err = result.expect_err("401 must surface as an error, not a refresh");
         assert!(
@@ -352,6 +378,7 @@ mod tests {
             String::from_utf8_lossy(&before),
             "tokscale rewrote Claude Code's credential file"
         );
+        assert_only_usage_request(&log);
     }
 
     /// A 403 takes the same branch as a 401 and must be just as inert.
@@ -361,17 +388,9 @@ mod tests {
         let home = HomeGuard::new("403");
         home.write_fixture();
         let before = std::fs::read(home.credentials()).expect("read before");
-        let base = spawn_server(routes(403));
+        let (usage_url, log) = spawn_server(403);
 
-        let result = block_on(async {
-            let client = reqwest::Client::new();
-            fetch_with_endpoint(
-                &client,
-                &format!("{base}/api/oauth/usage"),
-                &oauth_from_fixture(),
-            )
-            .await
-        });
+        let result = fetch_blocking(&usage_url, read_credentials);
 
         assert!(result.is_err(), "403 must surface as an error");
         let after = std::fs::read(home.credentials()).expect("credentials must still exist");
@@ -380,31 +399,26 @@ mod tests {
             String::from_utf8_lossy(&before),
             "tokscale rewrote Claude Code's credential file"
         );
+        assert_only_usage_request(&log);
     }
 
     /// On macOS the credentials live in the Keychain and the file does not
-    /// exist. Tokscale must not conjure a partial one.
+    /// exist. Tokscale must not conjure a partial one -- the old code did,
+    /// because it read from the Keychain but wrote to the file unconditionally.
     #[test]
     #[serial_test::serial]
     fn rejected_token_does_not_create_a_credential_file() {
         let home = HomeGuard::new("nofile");
-        let base = spawn_server(routes(401));
+        let (usage_url, log) = spawn_server(401);
 
-        let result = block_on(async {
-            let client = reqwest::Client::new();
-            fetch_with_endpoint(
-                &client,
-                &format!("{base}/api/oauth/usage"),
-                &oauth_from_fixture(),
-            )
-            .await
-        });
+        let result = fetch_blocking(&usage_url, keychain_credentials);
 
         assert!(result.is_err(), "401 must surface as an error");
         assert!(
             !home.credentials().exists(),
             "tokscale created a credential file Claude Code did not have"
         );
+        assert_only_usage_request(&log);
     }
 
     #[test]
@@ -413,18 +427,10 @@ mod tests {
         let home = HomeGuard::new("200");
         home.write_fixture();
         let before = std::fs::read(home.credentials()).expect("read before");
-        let base = spawn_server(routes(200));
+        let (usage_url, log) = spawn_server(200);
 
-        let output = block_on(async {
-            let client = reqwest::Client::new();
-            fetch_with_endpoint(
-                &client,
-                &format!("{base}/api/oauth/usage"),
-                &oauth_from_fixture(),
-            )
-            .await
-        })
-        .expect("200 usage response should parse");
+        let output =
+            fetch_blocking(&usage_url, read_credentials).expect("200 usage response should parse");
 
         assert_eq!(output.plan.as_deref(), Some("Max 20x"));
         assert_eq!(output.metrics.len(), 1);
@@ -436,6 +442,29 @@ mod tests {
             String::from_utf8_lossy(&after),
             String::from_utf8_lossy(&before),
             "tokscale rewrote Claude Code's credential file"
+        );
+        assert_only_usage_request(&log);
+    }
+
+    /// `read_credentials()` is the source of truth for what tokscale parses.
+    /// The refresh token must not survive the round trip: the fix is only real
+    /// if the field is absent from the model, not merely unused by the caller.
+    #[test]
+    #[serial_test::serial]
+    fn parsed_credentials_do_not_carry_a_refresh_token() {
+        let home = HomeGuard::new("parse");
+        home.write_fixture();
+
+        let oauth = read_credentials()
+            .expect("fixture credentials parse")
+            .claude_ai_oauth
+            .expect("fixture has claudeAiOauth");
+
+        assert_eq!(oauth.access_token.as_deref(), Some("stale-access-token"));
+        let debug = format!("{oauth:?}");
+        assert!(
+            !debug.contains("claude-code-owned-refresh-token"),
+            "Oauth still models a refresh token: {debug}"
         );
     }
 }
