@@ -1,4 +1,4 @@
-use super::cache;
+use super::{cache, describe_error};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -88,7 +88,10 @@ pub async fn fetch() -> Result<PricingDataset, reqwest::Error> {
                         return Ok(data);
                     }
                     Err(e) => {
-                        eprintln!("[tokscale] LiteLLM JSON parse failed: {}", e);
+                        eprintln!(
+                            "[tokscale] LiteLLM JSON parse failed: {}",
+                            describe_error(&e)
+                        );
                         return Err(e);
                     }
                 }
@@ -98,7 +101,7 @@ pub async fn fetch() -> Result<PricingDataset, reqwest::Error> {
                     "[tokscale] LiteLLM network error (attempt {}/{}): {}",
                     attempt + 1,
                     MAX_RETRIES,
-                    e
+                    describe_error(&e)
                 );
                 last_error = Some(e);
                 if attempt < MAX_RETRIES - 1 {
@@ -117,6 +120,64 @@ pub async fn fetch() -> Result<PricingDataset, reqwest::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    /// Serve one 200 response whose body is well-formed JSON that does not fit
+    /// `PricingDataset` (a string where an f64 is expected) — the shape an
+    /// upstream LiteLLM schema change would take.
+    fn malformed_pricing_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buffer = [0; 1024];
+            let _ = stream.read(&mut buffer);
+            let body = r#"{"some-model":{"input_cost_per_token":"not-a-number"}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        url
+    }
+
+    // Pins the mechanism behind #1002: reqwest's Display collapses ANY body
+    // decode failure to one opaque sentence, so the reported message proves
+    // only that a response arrived and could not be deserialized — it says
+    // nothing about TLS, and cannot mean "no connection was made".
+    #[tokio::test]
+    async fn reqwest_display_hides_the_decode_cause_that_describe_error_recovers() {
+        let url = malformed_pricing_server();
+        let error = reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await
+            .expect("the request itself succeeds")
+            .json::<PricingDataset>()
+            .await
+            .expect_err("the body must fail to deserialize");
+
+        assert_eq!(
+            error.to_string(),
+            "error decoding response body",
+            "this is verbatim what issue #1002 reported"
+        );
+
+        let described = describe_error(&error);
+        assert!(
+            described.contains("expected f64"),
+            "describe_error must surface the serde cause, got: {}",
+            described
+        );
+    }
 
     #[test]
     fn test_deserialize_model_pricing_with_above_200k_fields() {

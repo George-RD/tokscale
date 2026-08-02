@@ -24,6 +24,26 @@ static PRICING_SERVICE: OnceCell<Arc<PricingService>> = OnceCell::const_new();
 /// and should be excluded from pay-per-token cost estimation.
 const EXCLUDED_LITELLM_PREFIXES: &[&str] = &["github_copilot/"];
 
+// @keep: explains why we do not just print the error.
+/// Flatten an error and its `source()` chain into one line.
+///
+/// `reqwest::Error`'s `Display` is deliberately terse: a body-decode failure
+/// renders as the bare string "error decoding response body", and the
+/// `serde_json` cause that names the offending field and byte offset hangs off
+/// `source()`, which `{}` never walks. Issue #1002 was reported with exactly
+/// that message, which is why it was impossible to tell a transport failure
+/// from an upstream schema change and the reporter guessed at TLS. Printing the
+/// chain makes the next such report actionable.
+pub(crate) fn describe_error(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(inner) = source {
+        parts.push(inner.to_string());
+        source = inner.source();
+    }
+    parts.join(": ")
+}
+
 pub struct PricingService {
     custom: CustomPricing,
     lookup: PricingLookup,
@@ -178,21 +198,54 @@ impl PricingService {
             models_dev::fetch()
         );
 
-        let (litellm_data, litellm_error) = match litellm_result {
-            Ok(data) => (Self::filter_litellm_data(data), None),
-            Err(error) => {
+        Self::combine_fetched_sources(
+            litellm_result.map_err(|e| describe_error(&e)),
+            openrouter_data,
+            models_dev_result.map_err(|e| describe_error(&e)),
+            litellm::load_cached_any_age,
+        )
+    }
+
+    // @keep: the asymmetry this removes was load-bearing and non-obvious.
+    /// Assemble a service from whatever the three upstream sources returned.
+    ///
+    /// No single source may be fatal. LiteLLM is the largest dataset, but it is
+    /// not the only one, and propagating its fetch error made every command
+    /// that prices tokens — `submit` included — dead in the water whenever
+    /// raw.githubusercontent.com was unreachable or served something we could
+    /// not decode (#1002). openrouter already degraded (it returns no error at
+    /// all) and models.dev already degraded to an empty map; LiteLLM was the
+    /// lone hard-error, so a single unreachable host took the whole command
+    /// down. A failing source now degrades to its own stale cache, then to
+    /// nothing, and the surviving sources still price what they cover.
+    ///
+    /// The deliberate exception: if *every* source ends up empty we still
+    /// error. Continuing there would price every model at $0.00 and `submit`
+    /// would upload those zeros as though they were real costs, which is a
+    /// worse failure than refusing to run.
+    fn combine_fetched_sources(
+        litellm_result: Result<HashMap<String, ModelPricing>, String>,
+        openrouter_data: HashMap<String, ModelPricing>,
+        models_dev_result: Result<HashMap<String, ModelPricing>, String>,
+        litellm_cached: impl FnOnce() -> Option<HashMap<String, ModelPricing>>,
+    ) -> Result<Self, String> {
+        let litellm_data = match litellm_result {
+            Ok(data) => data,
+            Err(e) => {
+                let cached = litellm_cached();
                 eprintln!(
-                    "[tokscale] Warning: LiteLLM pricing unavailable ({}), using other sources",
-                    error
+                    "[tokscale] Warning: LiteLLM pricing fetch failed ({}); {}",
+                    e,
+                    if cached.is_some() {
+                        "falling back to the cached copy"
+                    } else {
+                        "continuing with the remaining pricing sources"
+                    }
                 );
-                (
-                    litellm::load_cached_any_age()
-                        .map(Self::filter_litellm_data)
-                        .unwrap_or_default(),
-                    Some(error.to_string()),
-                )
+                cached.unwrap_or_default()
             }
         };
+        let litellm_data = Self::filter_litellm_data(litellm_data);
         let models_dev_data = match models_dev_result {
             Ok(data) => data,
             Err(e) => {
@@ -202,8 +255,9 @@ impl PricingService {
         };
 
         if litellm_data.is_empty() && openrouter_data.is_empty() && models_dev_data.is_empty() {
-            return Err(litellm_error
-                .unwrap_or_else(|| "No dynamic pricing source returned usable data".to_string()));
+            return Err(
+                "all pricing sources failed and no cached pricing data is available".to_string(),
+            );
         }
 
         Ok(Self::new_with_custom_and_models_dev(
@@ -376,6 +430,102 @@ mod tests {
             openrouter,
             models_dev,
         )
+    }
+
+    /// Run `body` with the config dir pinned to a throwaway directory.
+    ///
+    /// `combine_fetched_sources` reads user custom pricing from the default
+    /// path; without this the developer's own ~/.config/tokscale could satisfy
+    /// or skew the assertions below.
+    fn with_sandboxed_config_dir<T>(body: impl FnOnce() -> T) -> T {
+        let temp = tempfile::TempDir::new().unwrap();
+        let previous = std::env::var_os("TOKSCALE_CONFIG_DIR");
+        unsafe { std::env::set_var("TOKSCALE_CONFIG_DIR", temp.path()) };
+        let result = body();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("TOKSCALE_CONFIG_DIR", value),
+                None => std::env::remove_var("TOKSCALE_CONFIG_DIR"),
+            }
+        }
+        result
+    }
+
+    // Regression: #1002. A LiteLLM fetch failure used to propagate out of
+    // fetch_inner, so `tokscale submit` died with "error decoding response
+    // body" even though models.dev and openrouter were both reachable and
+    // carried usable pricing.
+    #[test]
+    #[serial_test::serial]
+    fn litellm_fetch_failure_is_not_fatal_when_another_source_has_data() {
+        let mut models_dev = HashMap::new();
+        models_dev.insert("test-model-alpha".to_string(), model_pricing(1e-6, 2e-6));
+
+        let service = with_sandboxed_config_dir(|| {
+            PricingService::combine_fetched_sources(
+                Err("error decoding response body".to_string()),
+                HashMap::new(),
+                Ok(models_dev),
+                // Fresh install, as in the report: nothing cached yet.
+                || None,
+            )
+        })
+        .expect("a LiteLLM failure must not be fatal while another source has pricing");
+
+        let cost = service.calculate_cost("test-model-alpha", 1_000_000, 0, 0, 0, 0);
+        assert!(
+            (cost - 1.0).abs() < 1e-9,
+            "models.dev pricing should still resolve after LiteLLM fails, got {}",
+            cost
+        );
+    }
+
+    // Regression: #1002. The reporter's workaround was hand-populating the
+    // cache file. A cached copy older than the 1h TTL must be preferred over
+    // dropping LiteLLM entirely, so that workaround keeps working unattended.
+    #[test]
+    #[serial_test::serial]
+    fn litellm_fetch_failure_falls_back_to_stale_cache() {
+        let mut cached = HashMap::new();
+        cached.insert("test-model-beta".to_string(), model_pricing(3e-6, 4e-6));
+
+        let service = with_sandboxed_config_dir(|| {
+            PricingService::combine_fetched_sources(
+                Err("error decoding response body".to_string()),
+                HashMap::new(),
+                Ok(HashMap::new()),
+                || Some(cached),
+            )
+        })
+        .expect("a stale LiteLLM cache must keep the service usable");
+
+        let cost = service.calculate_cost("test-model-beta", 1_000_000, 0, 0, 0, 0);
+        assert!(
+            (cost - 3.0).abs() < 1e-9,
+            "stale LiteLLM cache should price the model, got {}",
+            cost
+        );
+    }
+
+    // The deliberate exception to "never fatal": with every source empty we
+    // must NOT hand back a service that silently prices everything at $0.00,
+    // because `submit` would upload those zeros as real costs.
+    #[test]
+    #[serial_test::serial]
+    fn all_sources_empty_still_errors() {
+        let result = with_sandboxed_config_dir(|| {
+            PricingService::combine_fetched_sources(
+                Err("error decoding response body".to_string()),
+                HashMap::new(),
+                Err("models.dev unreachable".to_string()),
+                || None,
+            )
+        });
+
+        assert!(
+            result.is_err(),
+            "a total pricing blackout must stay fatal rather than price everything at $0"
+        );
     }
 
     #[test]
