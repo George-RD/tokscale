@@ -2679,10 +2679,16 @@ pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, S
     })
 }
 
+#[derive(Clone, Copy)]
+enum GraphPricingRequirement {
+    Lenient,
+    Submission,
+}
+
 async fn generate_graph_with_loaded_pricing(
     options: ReportOptions,
     pricing: Option<&pricing::PricingService>,
-    require_pricing: bool,
+    pricing_requirement: GraphPricingRequirement,
 ) -> Result<GraphResult, String> {
     let start = Instant::now();
 
@@ -2707,7 +2713,16 @@ async fn generate_graph_with_loaded_pricing(
 
     let filtered = filter_messages_for_report(all_messages, &options);
 
-    if require_pricing {
+    build_graph_from_messages(filtered, pricing, pricing_requirement, start)
+}
+
+fn build_graph_from_messages(
+    filtered: Vec<UnifiedMessage>,
+    pricing: Option<&pricing::PricingService>,
+    pricing_requirement: GraphPricingRequirement,
+    start: Instant,
+) -> Result<GraphResult, String> {
+    if matches!(pricing_requirement, GraphPricingRequirement::Submission) {
         validate_priced_messages(&filtered, pricing)?;
     }
 
@@ -2772,12 +2787,24 @@ pub async fn get_time_metrics_report(options: ReportOptions) -> Result<TimeMetri
 
 pub async fn generate_graph(options: ReportOptions) -> Result<GraphResult, String> {
     let pricing = pricing::PricingService::get_or_init().await?;
-    generate_graph_with_loaded_pricing(options, Some(&pricing), true).await
+    generate_graph_with_loaded_pricing(options, Some(&pricing), GraphPricingRequirement::Lenient)
+        .await
+}
+
+pub async fn generate_submission_graph(options: ReportOptions) -> Result<GraphResult, String> {
+    let pricing = pricing::PricingService::get_or_init().await?;
+    generate_graph_with_loaded_pricing(options, Some(&pricing), GraphPricingRequirement::Submission)
+        .await
 }
 
 pub async fn generate_local_graph_report(options: ReportOptions) -> Result<GraphResult, String> {
     let pricing = load_pricing_for_local_parse().await;
-    generate_graph_with_loaded_pricing(options, pricing.as_deref(), false).await
+    generate_graph_with_loaded_pricing(
+        options,
+        pricing.as_deref(),
+        GraphPricingRequirement::Lenient,
+    )
+    .await
 }
 
 fn validate_priced_messages(
@@ -3871,11 +3898,12 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_model_usage_entries, apply_pricing_if_available, dedupe_latest_trae_messages,
-        filter_messages_for_report, generate_graph_with_loaded_pricing, message_cache,
-        normalize_model_for_grouping, parse_all_messages_with_pricing_with_env_strategy,
-        parse_local_clients, parsed_to_unified, pricing, retain_for_requested_clients, scanner,
-        select_local_parse_pricing, unified_to_parsed, validate_priced_messages, ClientId, GroupBy,
+        aggregate_model_usage_entries, apply_pricing_if_available, build_graph_from_messages,
+        dedupe_latest_trae_messages, filter_messages_for_report,
+        generate_graph_with_loaded_pricing, message_cache, normalize_model_for_grouping,
+        parse_all_messages_with_pricing_with_env_strategy, parse_local_clients, parsed_to_unified,
+        pricing, retain_for_requested_clients, scanner, select_local_parse_pricing,
+        unified_to_parsed, validate_priced_messages, ClientId, GraphPricingRequirement, GroupBy,
         LocalParseOptions, ReportOptions, TokenBreakdown, UnifiedMessage, UNKNOWN_WORKSPACE_LABEL,
     };
     use std::collections::{HashMap, HashSet};
@@ -6931,6 +6959,41 @@ mod tests {
     }
 
     #[test]
+    fn graph_pricing_policy_is_strict_only_for_submission() {
+        let message = UnifiedMessage::new(
+            "opencode",
+            "genuinely-unpriced-model",
+            "unknown-provider",
+            "unpriced",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 1,
+                ..Default::default()
+            },
+            0.0,
+        );
+        let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
+
+        let report = build_graph_from_messages(
+            vec![message.clone()],
+            Some(&pricing),
+            GraphPricingRequirement::Lenient,
+            std::time::Instant::now(),
+        )
+        .expect("reporting graphs should retain unpriced usage");
+        let submission_error = build_graph_from_messages(
+            vec![message],
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+        )
+        .expect_err("submission graphs should reject unpriced usage");
+
+        assert_eq!(report.summary.total_tokens, 1);
+        assert!(submission_error.contains("unknown-provider/genuinely-unpriced-model"));
+    }
+
+    #[test]
     fn strict_pricing_validation_accepts_bundled_pricing() {
         let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
         let message = UnifiedMessage::new(
@@ -8650,7 +8713,7 @@ mod tests {
                     scanner_settings: scanner::ScannerSettings::default(),
                 },
                 None,
-                false,
+                GraphPricingRequirement::Lenient,
             ))
             .unwrap();
 
