@@ -6933,6 +6933,25 @@ mod tests {
     }
 
     #[test]
+    fn strict_pricing_validation_accepts_bundled_pricing() {
+        let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
+        let message = UnifiedMessage::new(
+            "cursor",
+            "composer-2.5",
+            "cursor",
+            "bundled",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 1,
+                ..Default::default()
+            },
+            0.0,
+        );
+
+        assert!(validate_priced_messages(&[message], Some(&pricing)).is_ok());
+    }
+
+    #[test]
     fn strict_pricing_validation_ignores_filtered_out_unpriced_usage() {
         let mut old = UnifiedMessage::new(
             "synthetic",

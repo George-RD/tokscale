@@ -210,19 +210,11 @@ impl PricingService {
         )
     }
 
-    // @keep: the eprintln wording is chosen to be actionable; the failure is
-    // also retained because an all-empty result has to name its causes.
     /// Degrade one failed source to its own stale cache, else to nothing.
-    ///
-    /// Recording the cause in `failures` is what keeps the terminal error
-    /// diagnosable: without it a total blackout reports only that everything
-    /// failed, which is exactly the uninformative message that made #1002 hard
-    /// to triage in the first place.
     fn degrade_source(
         label: &str,
         result: Result<HashMap<String, ModelPricing>, String>,
         cached: impl FnOnce() -> Option<HashMap<String, ModelPricing>>,
-        failures: &mut Vec<String>,
     ) -> HashMap<String, ModelPricing> {
         match result {
             Ok(data) => data,
@@ -238,7 +230,6 @@ impl PricingService {
                         "continuing with the remaining pricing sources"
                     }
                 );
-                failures.push(format!("{}: {}", label, error));
                 cached.unwrap_or_default()
             }
         }
@@ -251,14 +242,12 @@ impl PricingService {
     /// not the only one, and propagating its fetch error made every command
     /// that prices tokens — `submit` included — dead in the water whenever
     /// raw.githubusercontent.com was unreachable or served something we could
-    /// not decode (#1002). openrouter already degraded (it returns no error at
-    /// all) and models.dev already degraded to an empty map; LiteLLM was the
-    /// lone hard-error, so a single unreachable host took the whole command
-    /// down. LiteLLM and models.dev now each degrade to their own stale cache
-    /// and then to nothing, and the surviving sources still price what they
-    /// cover. Submission safety is checked against the actual filtered messages
-    /// later, rather than treating an empty dynamic dataset as a construction
-    /// failure: custom and bundled pricing remain useful during an outage.
+    /// not decode (#1002). Every dynamic source now preserves fetch failure as
+    /// an error here, degrades to its own stale cache, and finally to nothing;
+    /// the surviving sources still price what they cover. Submission safety is
+    /// checked against the actual filtered messages later, rather than treating
+    /// an empty dynamic dataset as a construction failure: custom and bundled
+    /// pricing remain useful during an outage.
     fn combine_fetched_sources(
         litellm_result: Result<HashMap<String, ModelPricing>, String>,
         openrouter_result: Result<HashMap<String, ModelPricing>, String>,
@@ -268,26 +257,15 @@ impl PricingService {
         models_dev_cached: impl FnOnce() -> Option<HashMap<String, ModelPricing>>,
         custom: CustomPricing,
     ) -> Result<Self, String> {
-        let mut failures = Vec::new();
-
         let litellm_data = Self::filter_litellm_data(Self::degrade_source(
             "LiteLLM",
             litellm_result,
             litellm_cached,
-            &mut failures,
         ));
-        let models_dev_data = Self::degrade_source(
-            "models.dev",
-            models_dev_result,
-            models_dev_cached,
-            &mut failures,
-        );
-        let openrouter_data = Self::degrade_source(
-            "OpenRouter",
-            openrouter_result,
-            openrouter_cached,
-            &mut failures,
-        );
+        let models_dev_data =
+            Self::degrade_source("models.dev", models_dev_result, models_dev_cached);
+        let openrouter_data =
+            Self::degrade_source("OpenRouter", openrouter_result, openrouter_cached);
 
         Ok(Self::new_with_custom_and_models_dev(
             custom,
