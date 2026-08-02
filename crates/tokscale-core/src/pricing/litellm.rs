@@ -38,23 +38,12 @@ impl ModelPricing {
             && (usage.cache_write <= 0 || valid_rate(self.cache_creation_input_token_cost))
     }
 
-    pub(crate) fn has_any_usable_rate(&self) -> bool {
+    pub(crate) fn has_any_usable_base_rate(&self) -> bool {
         [
             self.input_cost_per_token,
-            self.input_cost_per_token_above_128k_tokens,
-            self.input_cost_per_token_above_200k_tokens,
-            self.input_cost_per_token_above_256k_tokens,
-            self.input_cost_per_token_above_272k_tokens,
             self.output_cost_per_token,
-            self.output_cost_per_token_above_128k_tokens,
-            self.output_cost_per_token_above_200k_tokens,
-            self.output_cost_per_token_above_256k_tokens,
-            self.output_cost_per_token_above_272k_tokens,
             self.cache_creation_input_token_cost,
-            self.cache_creation_input_token_cost_above_200k_tokens,
             self.cache_read_input_token_cost,
-            self.cache_read_input_token_cost_above_200k_tokens,
-            self.cache_read_input_token_cost_above_272k_tokens,
         ]
         .into_iter()
         .any(|rate| rate.is_some_and(|rate| rate.is_finite() && rate >= 0.0))
@@ -84,11 +73,12 @@ async fn fetch_inner(url: &str, use_cache: bool) -> Result<PricingDataset, Strin
 
     let client = fetch::pricing_client()?;
     let response = fetch::get_with_retry(&client, url, "LiteLLM").await?;
-    let data = response
+    let mut data = response
         .json::<PricingDataset>()
         .await
         .map_err(|error| describe_error(&error))?;
-    if !data.values().any(ModelPricing::has_any_usable_rate) {
+    data.retain(|_, pricing| pricing.has_any_usable_base_rate());
+    if data.is_empty() {
         return Err("LiteLLM returned no usable pricing rows".to_string());
     }
     if let Err(e) = cache::save_cache(CACHE_FILENAME, &data) {
@@ -111,7 +101,7 @@ mod tests {
     /// Serve one 200 response whose body is well-formed JSON that does not fit
     /// `PricingDataset` (a string where an f64 is expected) — the shape an
     /// upstream LiteLLM schema change would take.
-    fn malformed_pricing_server() -> String {
+    fn pricing_server(body: &'static str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
 
@@ -121,7 +111,6 @@ mod tests {
             };
             let mut buffer = [0; 1024];
             let _ = stream.read(&mut buffer);
-            let body = r#"{"some-model":{"input_cost_per_token":"not-a-number"}}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -131,6 +120,10 @@ mod tests {
         });
 
         url
+    }
+
+    fn malformed_pricing_server() -> String {
+        pricing_server(r#"{"some-model":{"input_cost_per_token":"not-a-number"}}"#)
     }
 
     /// Serve `MAX_RETRIES` responses with a retryable status, so every attempt
@@ -187,6 +180,35 @@ mod tests {
         let result = fetch_inner(&url, false).await;
 
         assert!(result.is_err(), "429 is retried the same way 5xx is");
+    }
+
+    #[tokio::test]
+    async fn tier_only_rows_are_not_cached_as_usable_pricing() {
+        let url =
+            pricing_server(r#"{"tier-only":{"input_cost_per_token_above_272k_tokens":0.00001}}"#);
+
+        let error = fetch_inner(&url, false)
+            .await
+            .expect_err("a tier rate without a base rate cannot price all tokens");
+
+        assert!(error.contains("no usable pricing rows"));
+    }
+
+    #[tokio::test]
+    async fn tier_only_rows_are_removed_from_an_otherwise_usable_response() {
+        let url = pricing_server(
+            r#"{
+                "tier-only":{"input_cost_per_token_above_272k_tokens":0.00001},
+                "usable":{"input_cost_per_token":0.000005}
+            }"#,
+        );
+
+        let data = fetch_inner(&url, false)
+            .await
+            .expect("the response contains one usable base-priced row");
+
+        assert!(!data.contains_key("tier-only"));
+        assert!(data.contains_key("usable"));
     }
 
     // Pins the mechanism behind #1002: reqwest's Display collapses ANY body

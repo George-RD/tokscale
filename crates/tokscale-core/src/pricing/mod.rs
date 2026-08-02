@@ -93,10 +93,12 @@ impl PricingService {
     ) -> HashMap<String, ModelPricing> {
         data.retain(|key, _| {
             let lower = key.to_lowercase();
-            !EXCLUDED_LITELLM_PREFIXES
+            let included_provider = !EXCLUDED_LITELLM_PREFIXES
                 .iter()
-                .any(|prefix| lower.starts_with(prefix))
+                .any(|prefix| lower.starts_with(prefix));
+            included_provider
         });
+        data.retain(|_, pricing| pricing.has_any_usable_base_rate());
         data
     }
 
@@ -729,13 +731,27 @@ mod tests {
                 ..Default::default()
             },
         );
-        data.insert("openai/gpt-5.2".into(), ModelPricing::default());
+        data.insert(
+            "openai/gpt-5.2".into(),
+            ModelPricing {
+                output_cost_per_token: Some(0.000014),
+                ..Default::default()
+            },
+        );
+        data.insert(
+            "tier-only".into(),
+            ModelPricing {
+                input_cost_per_token_above_272k_tokens: Some(0.00001),
+                ..Default::default()
+            },
+        );
 
         let filtered = PricingService::filter_litellm_data(data);
         assert!(!filtered.contains_key("github_copilot/gpt-5.3-codex"));
         assert!(!filtered.contains_key("github_copilot/gpt-4o"));
         assert!(filtered.contains_key("gpt-5.2"));
         assert!(filtered.contains_key("openai/gpt-5.2"));
+        assert!(!filtered.contains_key("tier-only"));
     }
 
     #[test]

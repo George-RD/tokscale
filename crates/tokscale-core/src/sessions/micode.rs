@@ -314,6 +314,9 @@ pub fn parse_micode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
 
         if let Some(index) = fingerprint_indices.get(&fingerprint).copied() {
             let dedup_state = &mut dedup_states[index];
+            if unified.has_authoritative_cost() {
+                messages[index].mark_provider_reported_cost();
+            }
             if message_id.is_some() && !dedup_state.has_embedded_message_id {
                 dedup_state.has_embedded_message_id = true;
                 messages[index].dedup_key = unified.dedup_key;
@@ -639,6 +642,48 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].tokens.input, 1000);
         assert_eq!(messages[1].tokens.input, 1300);
+    }
+
+    #[test]
+    fn duplicate_explicit_zero_cost_upgrades_retained_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_micode.db");
+        let conn = create_micode_sqlite_db(&db_path);
+        let without_cost = r#"{
+            "role": "assistant",
+            "modelID": "unknown-model",
+            "providerID": "mimo",
+            "tokens": { "input": 10, "output": 5 },
+            "time": { "created": 1700000000000.0 }
+        }"#;
+        let with_zero_cost = r#"{
+            "role": "assistant",
+            "modelID": "unknown-model",
+            "providerID": "mimo",
+            "cost": 0,
+            "tokens": { "input": 10, "output": 5 },
+            "time": { "created": 1700000000000.0 }
+        }"#;
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["row_a", "session_a", without_cost],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["row_b", "session_b", with_zero_cost],
+        )
+        .unwrap();
+        drop(conn);
+
+        let messages = parse_micode_sqlite(&db_path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].cost, 0.0);
+        assert_eq!(
+            messages[0].cost_source,
+            super::super::CostSource::ProviderReported
+        );
     }
 
     #[test]
