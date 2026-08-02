@@ -389,6 +389,18 @@ impl PricingService {
             .calculate_cost_with_provider(model_id, provider_id, usage)
     }
 
+    pub fn covers_usage_with_provider(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+        usage: &TokenBreakdown,
+    ) -> bool {
+        let Some(result) = self.lookup_with_source_and_provider(model_id, None, provider_id) else {
+            return false;
+        };
+        result.pricing.covers_usage(usage)
+    }
+
     fn lookup_custom(&self, model_id: &str) -> Option<LookupResult> {
         self.custom
             .lookup_with_key(model_id)

@@ -2799,13 +2799,11 @@ fn validate_priced_messages(
                 || tokens.reasoning > 0;
             token_bearing
                 && !message.has_authoritative_cost()
-                && pricing
-                    .lookup_with_source_and_provider(
-                        &message.model_id,
-                        None,
-                        Some(&message.provider_id),
-                    )
-                    .is_none()
+                && !pricing.covers_usage_with_provider(
+                    &message.model_id,
+                    Some(&message.provider_id),
+                    &message.tokens,
+                )
         })
         .map(|message| {
             if message.provider_id.is_empty() {
@@ -6982,6 +6980,83 @@ mod tests {
             ))
         )
         .is_ok());
+    }
+
+    #[test]
+    fn strict_pricing_validation_requires_each_populated_bucket_to_have_a_base_rate() {
+        let mut custom = HashMap::new();
+        custom.insert(
+            "input-only".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.0),
+                ..Default::default()
+            },
+        );
+        custom.insert(
+            "output-only".to_string(),
+            pricing::ModelPricing {
+                output_cost_per_token: Some(1e-6),
+                ..Default::default()
+            },
+        );
+        custom.insert(
+            "tier-only".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token_above_272k_tokens: Some(1e-6),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new_with_custom(
+            pricing::custom::CustomPricing::from_models(custom),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let usage = |model, input, output, reasoning, cache_read, cache_write| {
+            UnifiedMessage::new(
+                "synthetic",
+                model,
+                "provider",
+                model,
+                1_733_011_200_000,
+                TokenBreakdown {
+                    input,
+                    output,
+                    reasoning,
+                    cache_read,
+                    cache_write,
+                },
+                0.0,
+            )
+        };
+
+        assert!(
+            validate_priced_messages(&[usage("input-only", 1, 0, 0, 0, 0)], Some(&pricing)).is_ok()
+        );
+        assert!(
+            validate_priced_messages(&[usage("input-only", 0, 1, 0, 0, 0)], Some(&pricing))
+                .is_err()
+        );
+        assert!(
+            validate_priced_messages(&[usage("output-only", 0, 1, 1, 0, 0)], Some(&pricing))
+                .is_ok()
+        );
+        assert!(
+            validate_priced_messages(&[usage("output-only", 1, 0, 0, 0, 0)], Some(&pricing))
+                .is_err()
+        );
+        assert!(
+            validate_priced_messages(&[usage("output-only", 0, 0, 0, 1, 0)], Some(&pricing))
+                .is_err()
+        );
+        assert!(
+            validate_priced_messages(&[usage("output-only", 0, 0, 0, 0, 1)], Some(&pricing))
+                .is_err()
+        );
+        assert!(validate_priced_messages(
+            &[usage("tier-only", 300_000, 0, 0, 0, 0)],
+            Some(&pricing)
+        )
+        .is_err());
     }
 
     #[test]

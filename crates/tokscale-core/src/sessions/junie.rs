@@ -99,9 +99,9 @@ pub fn parse_junie_file(path: &Path) -> Vec<UnifiedMessage> {
                 .to_string();
             let provider_id = provider_from_usage(usage, &model_id);
             let tokens = tokens_from_usage(usage);
-            let cost = float_field(usage, "cost")
-                .filter(|cost| cost.is_finite() && *cost >= 0.0)
-                .unwrap_or(0.0);
+            let reported_cost =
+                float_field(usage, "cost").filter(|cost| cost.is_finite() && *cost >= 0.0);
+            let cost = reported_cost.unwrap_or(0.0);
             if tokens.total() == 0 && cost == 0.0 {
                 continue;
             }
@@ -150,6 +150,9 @@ pub fn parse_junie_file(path: &Path) -> Vec<UnifiedMessage> {
             );
             message.dedup_key = Some(dedup_key);
             message.duration_ms = duration_ms;
+            if reported_cost.is_some() {
+                message.mark_provider_reported_cost();
+            }
             if pending_turn_start && !turn_start_assigned {
                 message.is_turn_start = true;
                 turn_start_assigned = true;
@@ -344,6 +347,18 @@ mod tests {
         assert_ne!(
             messages[0].dedup_key, messages[1].dedup_key,
             "distinct usage rows must receive distinct dedup keys"
+        );
+    }
+
+    #[test]
+    fn field_present_cost_is_provider_reported_even_when_zero() {
+        let content = r#"{"timestampMs":1750000000000,"event":{"agentEvent":{"kind":"LlmResponseMetadataEvent","modelUsage":[{"model":"unknown-model","inputTokens":1,"outputTokens":0,"cost":0}]}}}"#;
+        let messages = parse_events(content);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].cost, 0.0);
+        assert_eq!(
+            messages[0].cost_source,
+            super::super::CostSource::ProviderReported
         );
     }
 

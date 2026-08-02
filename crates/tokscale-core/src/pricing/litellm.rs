@@ -25,6 +25,42 @@ pub struct ModelPricing {
     pub cache_read_input_token_cost_above_272k_tokens: Option<f64>,
 }
 
+impl ModelPricing {
+    /// Whether this row can price every populated token bucket under
+    /// `compute_cost`'s current base-rate fallback semantics. Explicit zeroes
+    /// are valid prices; a missing base rate is not covered by a later tier.
+    pub(crate) fn covers_usage(&self, usage: &crate::TokenBreakdown) -> bool {
+        let valid_rate =
+            |rate: Option<f64>| rate.is_some_and(|rate| rate.is_finite() && rate >= 0.0);
+        (usage.input <= 0 || valid_rate(self.input_cost_per_token))
+            && (usage.output <= 0 && usage.reasoning <= 0 || valid_rate(self.output_cost_per_token))
+            && (usage.cache_read <= 0 || valid_rate(self.cache_read_input_token_cost))
+            && (usage.cache_write <= 0 || valid_rate(self.cache_creation_input_token_cost))
+    }
+
+    pub(crate) fn has_any_usable_rate(&self) -> bool {
+        [
+            self.input_cost_per_token,
+            self.input_cost_per_token_above_128k_tokens,
+            self.input_cost_per_token_above_200k_tokens,
+            self.input_cost_per_token_above_256k_tokens,
+            self.input_cost_per_token_above_272k_tokens,
+            self.output_cost_per_token,
+            self.output_cost_per_token_above_128k_tokens,
+            self.output_cost_per_token_above_200k_tokens,
+            self.output_cost_per_token_above_256k_tokens,
+            self.output_cost_per_token_above_272k_tokens,
+            self.cache_creation_input_token_cost,
+            self.cache_creation_input_token_cost_above_200k_tokens,
+            self.cache_read_input_token_cost,
+            self.cache_read_input_token_cost_above_200k_tokens,
+            self.cache_read_input_token_cost_above_272k_tokens,
+        ]
+        .into_iter()
+        .any(|rate| rate.is_some_and(|rate| rate.is_finite() && rate >= 0.0))
+    }
+}
+
 pub type PricingDataset = HashMap<String, ModelPricing>;
 
 pub fn load_cached() -> Option<PricingDataset> {
@@ -52,7 +88,7 @@ async fn fetch_inner(url: &str, use_cache: bool) -> Result<PricingDataset, Strin
         .json::<PricingDataset>()
         .await
         .map_err(|error| describe_error(&error))?;
-    if data.is_empty() {
+    if !data.values().any(ModelPricing::has_any_usable_rate) {
         return Err("LiteLLM returned no usable pricing rows".to_string());
     }
     if let Err(e) = cache::save_cache(CACHE_FILENAME, &data) {

@@ -255,7 +255,8 @@ pub fn parse_micode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
         let cache = tokens.cache.unwrap_or_default();
         let cache_read = cache.read.max(0);
         let cache_write = cache.write.max(0);
-        let cost = msg.cost.unwrap_or(0.0).max(0.0);
+        let reported_cost = msg.cost.filter(|cost| cost.is_finite() && *cost >= 0.0);
+        let cost = reported_cost.unwrap_or(0.0);
         // Normalize epoch values to milliseconds up front so the timestamp, the
         // dedup fingerprint, and the duration all agree even when MiMo writes
         // seconds instead of milliseconds.
@@ -302,6 +303,9 @@ pub fn parse_micode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
             agent,
         );
         unified.duration_ms = micode_duration_ms(&msg.time);
+        if reported_cost.is_some() {
+            unified.mark_provider_reported_cost();
+        }
         unified.dedup_key = Some(dedup_key);
         let workspace_root = row_workspace_root
             .as_deref()
@@ -386,6 +390,10 @@ mod tests {
         assert_eq!(messages[0].tokens.cache_read, 200);
         assert_eq!(messages[0].tokens.cache_write, 50);
         assert!((messages[0].cost - 0.05).abs() < 1e-9);
+        assert_eq!(
+            messages[0].cost_source,
+            super::super::CostSource::ProviderReported
+        );
         assert_eq!(messages[0].duration_ms, Some(1234));
     }
 
