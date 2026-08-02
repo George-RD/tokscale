@@ -4249,6 +4249,45 @@ mod tests {
         assert_eq!(unhinted.pricing.input_cost_per_token, Some(30e-6));
     }
 
+    /// Regression (#1004 follow-up): a reseller provider hint must select the
+    /// reseller-scoped models.dev row instead of a direct upstream catalog row
+    /// with the same terminal model id.
+    #[test]
+    fn orcarouter_hint_selects_orcarouter_models_dev_row() {
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "openai/gpt-5.5".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(5e-6),
+                output_cost_per_token: Some(30e-6),
+                ..Default::default()
+            },
+        );
+        let mut models_dev = HashMap::new();
+        models_dev.insert(
+            "orcarouter/openai/gpt-5.5".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(8e-6),
+                output_cost_per_token: Some(48e-6),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            openrouter,
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        let result = lookup
+            .lookup_with_provider("gpt-5.5", Some("orcarouter"))
+            .unwrap();
+        assert_eq!(result.source, "Models.dev");
+        assert_eq!(result.matched_key, "orcarouter/openai/gpt-5.5");
+        assert_eq!(result.pricing.input_cost_per_token, Some(8e-6));
+    }
+
     /// Regression (#707 review, cubic follow-up): the provider-hint pin must
     /// also beat the unscoped OpenRouter MODEL-PART fallback, not just the
     /// separator-normalized passes. When the hinted provider's models.dev key
@@ -5018,6 +5057,41 @@ mod tests {
         ] {
             assert!(!uses_openai_full_request_272k_pricing(&result, provider));
         }
+    }
+
+    #[test]
+    fn orcarouter_hint_keeps_litellm_fallback_on_progressive_long_context_pricing() {
+        // OrcaRouter can fall back to LiteLLM's unscoped OpenAI row when its
+        // provider-specific catalog has no match. The provider hint, not an
+        // invented OrcaRouter LiteLLM key, must keep that fallback on normal
+        // progressive tiers instead of applying direct-OpenAI full-request
+        // 272K semantics.
+        let result = openai_272k_result("gpt-5.5", "LiteLLM");
+        let usage = TokenBreakdown {
+            input: 200_000,
+            output: 10_000,
+            cache_read: 72_001,
+            ..Default::default()
+        };
+
+        assert!(uses_openai_full_request_272k_pricing(
+            &result,
+            Some("openai")
+        ));
+        assert!(!uses_openai_full_request_272k_pricing(
+            &result,
+            Some("orcarouter")
+        ));
+
+        let direct_openai_cost = compute_cost_for_lookup(&result, Some("openai"), &usage);
+        let direct_openai_expected =
+            (200_000.0 * 0.000010) + (10_000.0 * 0.000045) + (72_001.0 * 0.000001);
+        assert!((direct_openai_cost - direct_openai_expected).abs() < 1e-12);
+
+        let orcarouter_cost = compute_cost_for_lookup(&result, Some("orcarouter"), &usage);
+        let orcarouter_expected =
+            (200_000.0 * 0.000005) + (10_000.0 * 0.000030) + (72_001.0 * 0.0000005);
+        assert!((orcarouter_cost - orcarouter_expected).abs() < 1e-12);
     }
 
     #[test]
