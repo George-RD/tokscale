@@ -5060,8 +5060,13 @@ mod tests {
     }
 
     #[test]
-    fn orcarouter_litellm_result_uses_progressive_long_context_pricing() {
-        let result = openai_272k_result("orcarouter/gpt-5.5", "LiteLLM");
+    fn orcarouter_hint_keeps_litellm_fallback_on_progressive_long_context_pricing() {
+        // OrcaRouter can fall back to LiteLLM's unscoped OpenAI row when its
+        // provider-specific catalog has no match. The provider hint, not an
+        // invented OrcaRouter LiteLLM key, must keep that fallback on normal
+        // progressive tiers instead of applying direct-OpenAI full-request
+        // 272K semantics.
+        let result = openai_272k_result("gpt-5.5", "LiteLLM");
         let usage = TokenBreakdown {
             input: 200_000,
             output: 10_000,
@@ -5069,14 +5074,24 @@ mod tests {
             ..Default::default()
         };
 
+        assert!(uses_openai_full_request_272k_pricing(
+            &result,
+            Some("openai")
+        ));
         assert!(!uses_openai_full_request_272k_pricing(
             &result,
             Some("orcarouter")
         ));
 
-        let cost = compute_cost_for_lookup(&result, Some("orcarouter"), &usage);
-        let expected = (200_000.0 * 0.000005) + (10_000.0 * 0.000030) + (72_001.0 * 0.0000005);
-        assert!((cost - expected).abs() < 1e-12);
+        let direct_openai_cost = compute_cost_for_lookup(&result, Some("openai"), &usage);
+        let direct_openai_expected =
+            (200_000.0 * 0.000010) + (10_000.0 * 0.000045) + (72_001.0 * 0.000001);
+        assert!((direct_openai_cost - direct_openai_expected).abs() < 1e-12);
+
+        let orcarouter_cost = compute_cost_for_lookup(&result, Some("orcarouter"), &usage);
+        let orcarouter_expected =
+            (200_000.0 * 0.000005) + (10_000.0 * 0.000030) + (72_001.0 * 0.0000005);
+        assert!((orcarouter_cost - orcarouter_expected).abs() < 1e-12);
     }
 
     #[test]
