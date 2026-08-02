@@ -203,7 +203,42 @@ impl PricingService {
             openrouter_data,
             models_dev_result.map_err(|e| describe_error(&e)),
             litellm::load_cached_any_age,
+            models_dev::load_cached_any_age,
         )
+    }
+
+    // @keep: the eprintln wording is chosen to be actionable; the failure is
+    // also retained because an all-empty result has to name its causes.
+    /// Degrade one failed source to its own stale cache, else to nothing.
+    ///
+    /// Recording the cause in `failures` is what keeps the terminal error
+    /// diagnosable: without it a total blackout reports only that everything
+    /// failed, which is exactly the uninformative message that made #1002 hard
+    /// to triage in the first place.
+    fn degrade_source(
+        label: &str,
+        result: Result<HashMap<String, ModelPricing>, String>,
+        cached: impl FnOnce() -> Option<HashMap<String, ModelPricing>>,
+        failures: &mut Vec<String>,
+    ) -> HashMap<String, ModelPricing> {
+        match result {
+            Ok(data) => data,
+            Err(error) => {
+                let cached = cached();
+                eprintln!(
+                    "[tokscale] Warning: {} pricing fetch failed ({}); {}",
+                    label,
+                    error,
+                    if cached.is_some() {
+                        "falling back to the cached copy"
+                    } else {
+                        "continuing with the remaining pricing sources"
+                    }
+                );
+                failures.push(format!("{}: {}", label, error));
+                cached.unwrap_or_default()
+            }
+        }
     }
 
     // @keep: the asymmetry this removes was load-bearing and non-obvious.
@@ -216,8 +251,12 @@ impl PricingService {
     /// not decode (#1002). openrouter already degraded (it returns no error at
     /// all) and models.dev already degraded to an empty map; LiteLLM was the
     /// lone hard-error, so a single unreachable host took the whole command
-    /// down. A failing source now degrades to its own stale cache, then to
-    /// nothing, and the surviving sources still price what they cover.
+    /// down. LiteLLM and models.dev now each degrade to their own stale cache
+    /// and then to nothing, and the surviving sources still price what they
+    /// cover. openrouter has no stale-cache step here because it never reports
+    /// a failure to begin with: `fetch_all_mapped` swallows per-model errors
+    /// and returns whatever it collected, so there is no error for this
+    /// function to see.
     ///
     /// The deliberate exception: if *every* source ends up empty we still
     /// error. Continuing there would price every model at $0.00 and `submit`
@@ -228,36 +267,35 @@ impl PricingService {
         openrouter_data: HashMap<String, ModelPricing>,
         models_dev_result: Result<HashMap<String, ModelPricing>, String>,
         litellm_cached: impl FnOnce() -> Option<HashMap<String, ModelPricing>>,
+        models_dev_cached: impl FnOnce() -> Option<HashMap<String, ModelPricing>>,
     ) -> Result<Self, String> {
-        let litellm_data = match litellm_result {
-            Ok(data) => data,
-            Err(e) => {
-                let cached = litellm_cached();
-                eprintln!(
-                    "[tokscale] Warning: LiteLLM pricing fetch failed ({}); {}",
-                    e,
-                    if cached.is_some() {
-                        "falling back to the cached copy"
-                    } else {
-                        "continuing with the remaining pricing sources"
-                    }
-                );
-                cached.unwrap_or_default()
-            }
-        };
-        let litellm_data = Self::filter_litellm_data(litellm_data);
-        let models_dev_data = match models_dev_result {
-            Ok(data) => data,
-            Err(e) => {
-                eprintln!("[tokscale] models.dev fetch failed: {}", e);
-                HashMap::new()
-            }
-        };
+        let mut failures = Vec::new();
+
+        let litellm_data = Self::filter_litellm_data(Self::degrade_source(
+            "LiteLLM",
+            litellm_result,
+            litellm_cached,
+            &mut failures,
+        ));
+        let models_dev_data = Self::degrade_source(
+            "models.dev",
+            models_dev_result,
+            models_dev_cached,
+            &mut failures,
+        );
 
         if litellm_data.is_empty() && openrouter_data.is_empty() && models_dev_data.is_empty() {
-            return Err(
-                "all pricing sources failed and no cached pricing data is available".to_string(),
-            );
+            // Callers surface this string to the user and to bug reports, so it
+            // has to carry the per-source causes rather than just the verdict.
+            let causes = if failures.is_empty() {
+                "every source returned an empty dataset".to_string()
+            } else {
+                failures.join("; ")
+            };
+            return Err(format!(
+                "all pricing sources failed and no cached pricing data is available ({})",
+                causes
+            ));
         }
 
         Ok(Self::new_with_custom_and_models_dev(
@@ -432,6 +470,37 @@ mod tests {
         )
     }
 
+    /// Restore `TOKSCALE_CONFIG_DIR` on the way out, including on unwind.
+    ///
+    /// Restoring after the call instead is not equivalent: a failed assertion
+    /// unwinds past the restore and leaves the variable pointing at a TempDir
+    /// that has already been deleted, so one red test silently corrupts every
+    /// later config-reading test in the same process. Mirrors the guard in
+    /// tokscale-cli's autosubmit tests, which cannot be imported across crates.
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     /// Run `body` with the config dir pinned to a throwaway directory.
     ///
     /// `combine_fetched_sources` reads user custom pricing from the default
@@ -439,16 +508,10 @@ mod tests {
     /// or skew the assertions below.
     fn with_sandboxed_config_dir<T>(body: impl FnOnce() -> T) -> T {
         let temp = tempfile::TempDir::new().unwrap();
-        let previous = std::env::var_os("TOKSCALE_CONFIG_DIR");
-        unsafe { std::env::set_var("TOKSCALE_CONFIG_DIR", temp.path()) };
-        let result = body();
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("TOKSCALE_CONFIG_DIR", value),
-                None => std::env::remove_var("TOKSCALE_CONFIG_DIR"),
-            }
-        }
-        result
+        // Dropped after the guard, so the directory outlives every read of the
+        // variable that points at it.
+        let _guard = EnvVarGuard::set("TOKSCALE_CONFIG_DIR", temp.path());
+        body()
     }
 
     // Regression: #1002. A LiteLLM fetch failure used to propagate out of
@@ -467,6 +530,7 @@ mod tests {
                 HashMap::new(),
                 Ok(models_dev),
                 // Fresh install, as in the report: nothing cached yet.
+                || None,
                 || None,
             )
         })
@@ -495,6 +559,7 @@ mod tests {
                 HashMap::new(),
                 Ok(HashMap::new()),
                 || Some(cached),
+                || None,
             )
         })
         .expect("a stale LiteLLM cache must keep the service usable");
@@ -507,24 +572,66 @@ mod tests {
         );
     }
 
+    // Regression: models.dev is a degradable source too. Its errors used to be
+    // dropped straight to an empty map even though it keeps a cache of its own,
+    // so a models.dev outage discarded pricing that was sitting on disk.
+    #[test]
+    #[serial_test::serial]
+    fn models_dev_fetch_failure_falls_back_to_stale_cache() {
+        let mut cached = HashMap::new();
+        cached.insert("test-model-gamma".to_string(), model_pricing(5e-6, 6e-6));
+
+        let service = with_sandboxed_config_dir(|| {
+            PricingService::combine_fetched_sources(
+                Ok(HashMap::new()),
+                HashMap::new(),
+                Err("models.dev unreachable".to_string()),
+                || None,
+                || Some(cached),
+            )
+        })
+        .expect("a stale models.dev cache must keep the service usable");
+
+        let cost = service.calculate_cost("test-model-gamma", 1_000_000, 0, 0, 0, 0);
+        assert!(
+            (cost - 5.0).abs() < 1e-9,
+            "stale models.dev cache should price the model, got {}",
+            cost
+        );
+    }
+
     // The deliberate exception to "never fatal": with every source empty we
     // must NOT hand back a service that silently prices everything at $0.00,
     // because `submit` would upload those zeros as real costs.
+    //
+    // The message is asserted, not just the variant: this is the only place a
+    // user or a bug report learns *why* pricing is unavailable, and an earlier
+    // revision of this function threw the per-source causes away.
     #[test]
     #[serial_test::serial]
-    fn all_sources_empty_still_errors() {
+    fn all_sources_empty_errors_and_names_every_cause() {
         let result = with_sandboxed_config_dir(|| {
             PricingService::combine_fetched_sources(
-                Err("error decoding response body".to_string()),
+                Err("error decoding response body: expected f64".to_string()),
                 HashMap::new(),
                 Err("models.dev unreachable".to_string()),
+                || None,
                 || None,
             )
         });
 
+        let error = result
+            .err()
+            .expect("a total pricing blackout must stay fatal rather than price everything at $0");
         assert!(
-            result.is_err(),
-            "a total pricing blackout must stay fatal rather than price everything at $0"
+            error.contains("error decoding response body: expected f64"),
+            "the LiteLLM cause must survive into the terminal error, got: {}",
+            error
+        );
+        assert!(
+            error.contains("models.dev unreachable"),
+            "the models.dev cause must survive into the terminal error, got: {}",
+            error
         );
     }
 

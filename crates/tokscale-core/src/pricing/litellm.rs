@@ -38,8 +38,14 @@ pub fn load_cached_any_age() -> Option<PricingDataset> {
 }
 
 pub async fn fetch() -> Result<PricingDataset, reqwest::Error> {
-    if let Some(cached) = load_cached() {
-        return Ok(cached);
+    fetch_inner(PRICING_URL, true).await
+}
+
+async fn fetch_inner(url: &str, use_cache: bool) -> Result<PricingDataset, reqwest::Error> {
+    if use_cache {
+        if let Some(cached) = load_cached() {
+            return Ok(cached);
+        }
     }
 
     let client = reqwest::Client::builder()
@@ -50,7 +56,7 @@ pub async fn fetch() -> Result<PricingDataset, reqwest::Error> {
     let mut last_error: Option<reqwest::Error> = None;
 
     for attempt in 0..MAX_RETRIES {
-        match client.get(PRICING_URL).send().await {
+        match client.get(url).send().await {
             Ok(response) => {
                 let status = response.status();
 
@@ -61,13 +67,20 @@ pub async fn fetch() -> Result<PricingDataset, reqwest::Error> {
                         attempt + 1,
                         MAX_RETRIES
                     );
-                    let _ = response.bytes().await;
-                    if attempt < MAX_RETRIES - 1 {
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            INITIAL_BACKOFF_MS * (1 << attempt),
-                        ))
-                        .await;
+                    // A retryable status never populated `last_error`, so exhausting
+                    // the retries on 5xx/429 — the likeliest raw.githubusercontent.com
+                    // failure — fell through to the tail below and panicked instead of
+                    // returning Err. That aborted the process before the caller's
+                    // degradation policy could run. models_dev::fetch_inner already
+                    // converts the final attempt into an error; do the same here.
+                    if attempt == MAX_RETRIES - 1 {
+                        return Err(response.error_for_status().unwrap_err());
                     }
+                    let _ = response.bytes().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        INITIAL_BACKOFF_MS * (1 << attempt),
+                    ))
+                    .await;
                     continue;
                 }
 
@@ -114,7 +127,14 @@ pub async fn fetch() -> Result<PricingDataset, reqwest::Error> {
         }
     }
 
-    Err(last_error.expect("should have error after retries"))
+    match last_error {
+        Some(e) => Err(e),
+        // Unreachable: the loop only falls through here after a transport error,
+        // which always records `last_error`. Kept as a non-panicking floor
+        // (matching models_dev::fetch_inner) because the previous `expect` here
+        // was reachable and did abort the process.
+        None => Ok(HashMap::new()),
+    }
 }
 
 #[cfg(test)]
@@ -149,14 +169,75 @@ mod tests {
         url
     }
 
+    /// Serve `MAX_RETRIES` responses with a retryable status, so every attempt
+    /// is consumed. Mirrors `models_dev::tests::retryable_status_server`.
+    fn retryable_status_server(status_line: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        thread::spawn(move || {
+            for _ in 0..MAX_RETRIES {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0; 1024];
+                let _ = stream.read(&mut buffer);
+                let response =
+                    format!("{status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        url
+    }
+
+    /// A client that cannot outlive a wedged listener thread: without this the
+    /// tests below block forever instead of failing if `accept` never fires.
+    fn bounded_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap()
+    }
+
+    // Regression: retryable statuses never recorded `last_error`, so exhausting
+    // the retries on 5xx/429 panicked out of `fetch` instead of returning Err.
+    // That defeated the caller's whole "no single source may be fatal" contract,
+    // because a panic never reaches the caller at all.
+    #[tokio::test]
+    async fn retryable_statuses_return_an_error_rather_than_panicking() {
+        let url = retryable_status_server("HTTP/1.1 503 Service Unavailable");
+
+        let result = fetch_inner(&url, false).await;
+
+        assert!(
+            result.is_err(),
+            "exhausted retries on 503 must surface as Err so the caller can degrade"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_status_returns_an_error_rather_than_panicking() {
+        let url = retryable_status_server("HTTP/1.1 429 Too Many Requests");
+
+        let result = fetch_inner(&url, false).await;
+
+        assert!(result.is_err(), "429 is retried the same way 5xx is");
+    }
+
     // Pins the mechanism behind #1002: reqwest's Display collapses ANY body
     // decode failure to one opaque sentence, so the reported message proves
     // only that a response arrived and could not be deserialized — it says
     // nothing about TLS, and cannot mean "no connection was made".
+    //
+    // Asserted as "Display omits what describe_error recovers" rather than
+    // against reqwest's and serde_json's exact wording: the wording is upstream
+    // prose that a dependency bump may reword, and pinning it would redden this
+    // test without any tokscale defect.
     #[tokio::test]
     async fn reqwest_display_hides_the_decode_cause_that_describe_error_recovers() {
         let url = malformed_pricing_server();
-        let error = reqwest::Client::new()
+        let error = bounded_client()
             .get(&url)
             .send()
             .await
@@ -165,16 +246,24 @@ mod tests {
             .await
             .expect_err("the body must fail to deserialize");
 
-        assert_eq!(
-            error.to_string(),
-            "error decoding response body",
-            "this is verbatim what issue #1002 reported"
+        // Anchored on the offending value, which this fixture owns, rather than
+        // on reqwest's or serde_json's phrasing, which it does not.
+        let displayed = error.to_string();
+        assert!(
+            !displayed.contains("not-a-number"),
+            "Display must say nothing about the payload — that is the bug: {}",
+            displayed
         );
 
         let described = describe_error(&error);
         assert!(
-            described.contains("expected f64"),
-            "describe_error must surface the serde cause, got: {}",
+            described.starts_with(&displayed) && described.len() > displayed.len(),
+            "describe_error must extend Display with the source chain, got: {}",
+            described
+        );
+        assert!(
+            described.contains("not-a-number"),
+            "describe_error must surface the serde cause naming the bad value, got: {}",
             described
         );
     }
