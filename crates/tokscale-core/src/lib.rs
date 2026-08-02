@@ -2682,6 +2682,7 @@ pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, S
 async fn generate_graph_with_loaded_pricing(
     options: ReportOptions,
     pricing: Option<&pricing::PricingService>,
+    require_pricing: bool,
 ) -> Result<GraphResult, String> {
     let start = Instant::now();
 
@@ -2705,6 +2706,10 @@ async fn generate_graph_with_loaded_pricing(
     );
 
     let filtered = filter_messages_for_report(all_messages, &options);
+
+    if require_pricing {
+        validate_priced_messages(&filtered, pricing)?;
+    }
 
     let intervals = sessionize::sessionize(&filtered, sessionize::DEFAULT_IDLE_GAP_MS);
     let time_metrics =
@@ -2767,12 +2772,58 @@ pub async fn get_time_metrics_report(options: ReportOptions) -> Result<TimeMetri
 
 pub async fn generate_graph(options: ReportOptions) -> Result<GraphResult, String> {
     let pricing = pricing::PricingService::get_or_init().await?;
-    generate_graph_with_loaded_pricing(options, Some(&pricing)).await
+    generate_graph_with_loaded_pricing(options, Some(&pricing), true).await
 }
 
 pub async fn generate_local_graph_report(options: ReportOptions) -> Result<GraphResult, String> {
     let pricing = load_pricing_for_local_parse().await;
-    generate_graph_with_loaded_pricing(options, pricing.as_deref()).await
+    generate_graph_with_loaded_pricing(options, pricing.as_deref(), false).await
+}
+
+fn validate_priced_messages(
+    messages: &[UnifiedMessage],
+    pricing: Option<&pricing::PricingService>,
+) -> Result<(), String> {
+    let Some(pricing) = pricing else {
+        return Err("pricing data is unavailable for submission".to_string());
+    };
+
+    let unpriced: Vec<String> = messages
+        .iter()
+        .filter(|message| {
+            let tokens = &message.tokens;
+            let token_bearing = tokens.input > 0
+                || tokens.output > 0
+                || tokens.cache_read > 0
+                || tokens.cache_write > 0
+                || tokens.reasoning > 0;
+            token_bearing
+                && !message.has_authoritative_cost()
+                && pricing
+                    .lookup_with_source_and_provider(
+                        &message.model_id,
+                        None,
+                        Some(&message.provider_id),
+                    )
+                    .is_none()
+        })
+        .map(|message| {
+            if message.provider_id.is_empty() {
+                message.model_id.clone()
+            } else {
+                format!("{}/{}", message.provider_id, message.model_id)
+            }
+        })
+        .collect();
+
+    if unpriced.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "pricing is unavailable for submitted token usage: {}",
+            unpriced.join(", ")
+        ))
+    }
 }
 
 fn filter_messages_for_report(
@@ -3826,8 +3877,8 @@ mod tests {
         filter_messages_for_report, generate_graph_with_loaded_pricing, message_cache,
         normalize_model_for_grouping, parse_all_messages_with_pricing_with_env_strategy,
         parse_local_clients, parsed_to_unified, pricing, retain_for_requested_clients, scanner,
-        select_local_parse_pricing, unified_to_parsed, ClientId, GroupBy, LocalParseOptions,
-        ReportOptions, TokenBreakdown, UnifiedMessage, UNKNOWN_WORKSPACE_LABEL,
+        select_local_parse_pricing, unified_to_parsed, validate_priced_messages, ClientId, GroupBy,
+        LocalParseOptions, ReportOptions, TokenBreakdown, UnifiedMessage, UNKNOWN_WORKSPACE_LABEL,
     };
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
@@ -6821,6 +6872,100 @@ mod tests {
     }
 
     #[test]
+    fn strict_pricing_validation_accepts_covered_and_provider_reported_usage() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "covered-model".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.0),
+                output_cost_per_token: Some(0.0),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let covered = UnifiedMessage::new(
+            "synthetic",
+            "covered-model",
+            "openai",
+            "covered",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 1,
+                ..Default::default()
+            },
+            0.0,
+        );
+        let mut reported = UnifiedMessage::new(
+            "synthetic",
+            "unlisted-model",
+            "provider",
+            "reported",
+            1_733_011_200_000,
+            TokenBreakdown {
+                output: 1,
+                ..Default::default()
+            },
+            0.0,
+        );
+        reported.mark_provider_reported_cost();
+
+        assert!(validate_priced_messages(&[covered, reported], Some(&pricing)).is_ok());
+    }
+
+    #[test]
+    fn strict_pricing_validation_rejects_unpriced_token_usage() {
+        let message = UnifiedMessage::new(
+            "synthetic",
+            "unlisted-model",
+            "provider",
+            "unpriced",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 1,
+                ..Default::default()
+            },
+            0.0,
+        );
+        let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
+
+        let error = validate_priced_messages(&[message], Some(&pricing)).unwrap_err();
+        assert!(error.contains("provider/unlisted-model"));
+    }
+
+    #[test]
+    fn strict_pricing_validation_ignores_filtered_out_unpriced_usage() {
+        let mut old = UnifiedMessage::new(
+            "synthetic",
+            "unlisted-model",
+            "provider",
+            "old",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 1,
+                ..Default::default()
+            },
+            0.0,
+        );
+        old.date = "2020-01-01".to_string();
+        let filtered = filter_messages_for_report(
+            vec![old],
+            &ReportOptions {
+                since: Some("2021-01-01".to_string()),
+                ..Default::default()
+            },
+        );
+
+        assert!(validate_priced_messages(
+            &filtered,
+            Some(&pricing::PricingService::new(
+                HashMap::new(),
+                HashMap::new()
+            ))
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn test_apply_pricing_if_available_overrides_cost_when_pricing_exists() {
         let mut litellm = HashMap::new();
         litellm.insert(
@@ -8411,6 +8556,7 @@ mod tests {
                     scanner_settings: scanner::ScannerSettings::default(),
                 },
                 None,
+                false,
             ))
             .unwrap();
 

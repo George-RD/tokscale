@@ -1,12 +1,10 @@
-use super::{cache, describe_error};
+use super::{cache, describe_error, fetch};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 const CACHE_FILENAME: &str = "pricing-litellm.json";
 const PRICING_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
-const MAX_RETRIES: u32 = 3;
-const INITIAL_BACKOFF_MS: u64 = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ModelPricing {
@@ -37,104 +35,34 @@ pub fn load_cached_any_age() -> Option<PricingDataset> {
     cache::load_cache_any_age(CACHE_FILENAME)
 }
 
-pub async fn fetch() -> Result<PricingDataset, reqwest::Error> {
+pub async fn fetch() -> Result<PricingDataset, String> {
     fetch_inner(PRICING_URL, true).await
 }
 
-async fn fetch_inner(url: &str, use_cache: bool) -> Result<PricingDataset, reqwest::Error> {
+async fn fetch_inner(url: &str, use_cache: bool) -> Result<PricingDataset, String> {
     if use_cache {
         if let Some(cached) = load_cached() {
             return Ok(cached);
         }
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()?;
-
-    let mut last_error: Option<reqwest::Error> = None;
-
-    for attempt in 0..MAX_RETRIES {
-        match client.get(url).send().await {
-            Ok(response) => {
-                let status = response.status();
-
-                if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    eprintln!(
-                        "[tokscale] LiteLLM HTTP {} (attempt {}/{})",
-                        status,
-                        attempt + 1,
-                        MAX_RETRIES
-                    );
-                    // A retryable status never populated `last_error`, so exhausting
-                    // the retries on 5xx/429 — the likeliest raw.githubusercontent.com
-                    // failure — fell through to the tail below and panicked instead of
-                    // returning Err. That aborted the process before the caller's
-                    // degradation policy could run. models_dev::fetch_inner already
-                    // converts the final attempt into an error; do the same here.
-                    if attempt == MAX_RETRIES - 1 {
-                        return Err(response.error_for_status().unwrap_err());
-                    }
-                    let _ = response.bytes().await;
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        INITIAL_BACKOFF_MS * (1 << attempt),
-                    ))
-                    .await;
-                    continue;
-                }
-
-                if !status.is_success() {
-                    eprintln!("[tokscale] LiteLLM HTTP {}", status);
-                    return Err(response.error_for_status().unwrap_err());
-                }
-
-                match response.json::<PricingDataset>().await {
-                    Ok(data) => {
-                        if let Err(e) = cache::save_cache(CACHE_FILENAME, &data) {
-                            eprintln!(
-                                "[tokscale] Warning: Failed to cache LiteLLM pricing at {}: {}",
-                                cache::get_cache_path(CACHE_FILENAME).display(),
-                                e
-                            );
-                        }
-                        return Ok(data);
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[tokscale] LiteLLM JSON parse failed: {}",
-                            describe_error(&e)
-                        );
-                        return Err(e);
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "[tokscale] LiteLLM network error (attempt {}/{}): {}",
-                    attempt + 1,
-                    MAX_RETRIES,
-                    describe_error(&e)
-                );
-                last_error = Some(e);
-                if attempt < MAX_RETRIES - 1 {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        INITIAL_BACKOFF_MS * (1 << attempt),
-                    ))
-                    .await;
-                }
-            }
-        }
+    let client = fetch::pricing_client()?;
+    let response = fetch::get_with_retry(&client, url, "LiteLLM").await?;
+    let data = response
+        .json::<PricingDataset>()
+        .await
+        .map_err(|error| describe_error(&error))?;
+    if data.is_empty() {
+        return Err("LiteLLM returned no usable pricing rows".to_string());
     }
-
-    match last_error {
-        Some(e) => Err(e),
-        // Unreachable: the loop only falls through here after a transport error,
-        // which always records `last_error`. Kept as a non-panicking floor
-        // (matching models_dev::fetch_inner) because the previous `expect` here
-        // was reachable and did abort the process.
-        None => Ok(HashMap::new()),
+    if let Err(e) = cache::save_cache(CACHE_FILENAME, &data) {
+        eprintln!(
+            "[tokscale] Warning: Failed to cache LiteLLM pricing at {}: {}",
+            cache::get_cache_path(CACHE_FILENAME).display(),
+            e
+        );
     }
+    Ok(data)
 }
 
 #[cfg(test)]
@@ -176,7 +104,7 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
 
         thread::spawn(move || {
-            for _ in 0..MAX_RETRIES {
+            for _ in 0..3 {
                 let Ok((mut stream, _)) = listener.accept() else {
                     return;
                 };

@@ -3521,6 +3521,24 @@ fn test_root_with_group_by() {
 fn test_submit_offline_without_pricing_cache_fails() {
     let tmp = create_temp_fixture_dir_without_pricing_cache();
     write_fake_credentials(tmp.path());
+    let unpriced_dir = tmp
+        .path()
+        .join(".local/share/opencode/storage/message/unpriced");
+    fs::create_dir_all(&unpriced_dir).unwrap();
+    fs::write(
+        unpriced_dir.join("unpriced.json"),
+        r#"{
+            "id": "unpriced",
+            "sessionID": "unpriced",
+            "role": "assistant",
+            "modelID": "genuinely-unpriced-model",
+            "providerID": "unknown-provider",
+            "cost": 0,
+            "tokens": { "input": 1, "output": 0, "reasoning": 0, "cache": { "read": 0, "write": 0 } },
+            "time": { "created": 1736510400000.0 }
+        }"#,
+    )
+    .unwrap();
 
     let output = offline_cmd_with_home(tmp.path())
         .args(["submit", "--client", "opencode", "--dry-run"])
@@ -3529,7 +3547,7 @@ fn test_submit_offline_without_pricing_cache_fails() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
-        "submit should fail when pricing is unavailable; stdout: {}",
+        "submit should fail for genuinely unpriced token usage; stdout: {}",
         String::from_utf8_lossy(&output.stdout)
     );
     // Verify failure is from pricing fetch, not from auth or argument errors

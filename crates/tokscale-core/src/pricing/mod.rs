@@ -1,6 +1,7 @@
 pub mod aliases;
 pub mod cache;
 pub mod custom;
+mod fetch;
 pub mod litellm;
 pub mod lookup;
 pub mod models_dev;
@@ -199,11 +200,13 @@ impl PricingService {
         );
 
         Self::combine_fetched_sources(
-            litellm_result.map_err(|e| describe_error(&e)),
+            litellm_result,
             openrouter_data,
-            models_dev_result.map_err(|e| describe_error(&e)),
+            models_dev_result,
             litellm::load_cached_any_age,
+            openrouter::load_cached_any_age,
             models_dev::load_cached_any_age,
+            CustomPricing::load_from_default_path(),
         )
     }
 
@@ -253,21 +256,17 @@ impl PricingService {
     /// lone hard-error, so a single unreachable host took the whole command
     /// down. LiteLLM and models.dev now each degrade to their own stale cache
     /// and then to nothing, and the surviving sources still price what they
-    /// cover. openrouter has no stale-cache step here because it never reports
-    /// a failure to begin with: `fetch_all_mapped` swallows per-model errors
-    /// and returns whatever it collected, so there is no error for this
-    /// function to see.
-    ///
-    /// The deliberate exception: if *every* source ends up empty we still
-    /// error. Continuing there would price every model at $0.00 and `submit`
-    /// would upload those zeros as though they were real costs, which is a
-    /// worse failure than refusing to run.
+    /// cover. Submission safety is checked against the actual filtered messages
+    /// later, rather than treating an empty dynamic dataset as a construction
+    /// failure: custom and bundled pricing remain useful during an outage.
     fn combine_fetched_sources(
         litellm_result: Result<HashMap<String, ModelPricing>, String>,
-        openrouter_data: HashMap<String, ModelPricing>,
+        openrouter_result: Result<HashMap<String, ModelPricing>, String>,
         models_dev_result: Result<HashMap<String, ModelPricing>, String>,
         litellm_cached: impl FnOnce() -> Option<HashMap<String, ModelPricing>>,
+        openrouter_cached: impl FnOnce() -> Option<HashMap<String, ModelPricing>>,
         models_dev_cached: impl FnOnce() -> Option<HashMap<String, ModelPricing>>,
+        custom: CustomPricing,
     ) -> Result<Self, String> {
         let mut failures = Vec::new();
 
@@ -283,23 +282,15 @@ impl PricingService {
             models_dev_cached,
             &mut failures,
         );
-
-        if litellm_data.is_empty() && openrouter_data.is_empty() && models_dev_data.is_empty() {
-            // Callers surface this string to the user and to bug reports, so it
-            // has to carry the per-source causes rather than just the verdict.
-            let causes = if failures.is_empty() {
-                "every source returned an empty dataset".to_string()
-            } else {
-                failures.join("; ")
-            };
-            return Err(format!(
-                "all pricing sources failed and no cached pricing data is available ({})",
-                causes
-            ));
-        }
+        let openrouter_data = Self::degrade_source(
+            "OpenRouter",
+            openrouter_result,
+            openrouter_cached,
+            &mut failures,
+        );
 
         Ok(Self::new_with_custom_and_models_dev(
-            CustomPricing::load_from_default_path(),
+            custom,
             litellm_data,
             openrouter_data,
             models_dev_data,
@@ -470,70 +461,25 @@ mod tests {
         )
     }
 
-    /// Restore `TOKSCALE_CONFIG_DIR` on the way out, including on unwind.
-    ///
-    /// Restoring after the call instead is not equivalent: a failed assertion
-    /// unwinds past the restore and leaves the variable pointing at a TempDir
-    /// that has already been deleted, so one red test silently corrupts every
-    /// later config-reading test in the same process. Mirrors the guard in
-    /// tokscale-cli's autosubmit tests, which cannot be imported across crates.
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match self.previous.take() {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
-
-    /// Run `body` with the config dir pinned to a throwaway directory.
-    ///
-    /// `combine_fetched_sources` reads user custom pricing from the default
-    /// path; without this the developer's own ~/.config/tokscale could satisfy
-    /// or skew the assertions below.
-    fn with_sandboxed_config_dir<T>(body: impl FnOnce() -> T) -> T {
-        let temp = tempfile::TempDir::new().unwrap();
-        // Dropped after the guard, so the directory outlives every read of the
-        // variable that points at it.
-        let _guard = EnvVarGuard::set("TOKSCALE_CONFIG_DIR", temp.path());
-        body()
-    }
-
     // Regression: #1002. A LiteLLM fetch failure used to propagate out of
     // fetch_inner, so `tokscale submit` died with "error decoding response
     // body" even though models.dev and openrouter were both reachable and
     // carried usable pricing.
     #[test]
-    #[serial_test::serial]
     fn litellm_fetch_failure_is_not_fatal_when_another_source_has_data() {
         let mut models_dev = HashMap::new();
         models_dev.insert("test-model-alpha".to_string(), model_pricing(1e-6, 2e-6));
 
-        let service = with_sandboxed_config_dir(|| {
-            PricingService::combine_fetched_sources(
-                Err("error decoding response body".to_string()),
-                HashMap::new(),
-                Ok(models_dev),
-                // Fresh install, as in the report: nothing cached yet.
-                || None,
-                || None,
-            )
-        })
+        let service = PricingService::combine_fetched_sources(
+            Err("error decoding response body".to_string()),
+            Err("OpenRouter unavailable".to_string()),
+            Ok(models_dev),
+            // Fresh install, as in the report: nothing cached yet.
+            || None,
+            || None,
+            || None,
+            CustomPricing::default(),
+        )
         .expect("a LiteLLM failure must not be fatal while another source has pricing");
 
         let cost = service.calculate_cost("test-model-alpha", 1_000_000, 0, 0, 0, 0);
@@ -548,20 +494,19 @@ mod tests {
     // cache file. A cached copy older than the 1h TTL must be preferred over
     // dropping LiteLLM entirely, so that workaround keeps working unattended.
     #[test]
-    #[serial_test::serial]
     fn litellm_fetch_failure_falls_back_to_stale_cache() {
         let mut cached = HashMap::new();
         cached.insert("test-model-beta".to_string(), model_pricing(3e-6, 4e-6));
 
-        let service = with_sandboxed_config_dir(|| {
-            PricingService::combine_fetched_sources(
-                Err("error decoding response body".to_string()),
-                HashMap::new(),
-                Ok(HashMap::new()),
-                || Some(cached),
-                || None,
-            )
-        })
+        let service = PricingService::combine_fetched_sources(
+            Err("error decoding response body".to_string()),
+            Err("OpenRouter unavailable".to_string()),
+            Ok(HashMap::new()),
+            || Some(cached),
+            || None,
+            || None,
+            CustomPricing::default(),
+        )
         .expect("a stale LiteLLM cache must keep the service usable");
 
         let cost = service.calculate_cost("test-model-beta", 1_000_000, 0, 0, 0, 0);
@@ -576,20 +521,19 @@ mod tests {
     // dropped straight to an empty map even though it keeps a cache of its own,
     // so a models.dev outage discarded pricing that was sitting on disk.
     #[test]
-    #[serial_test::serial]
     fn models_dev_fetch_failure_falls_back_to_stale_cache() {
         let mut cached = HashMap::new();
         cached.insert("test-model-gamma".to_string(), model_pricing(5e-6, 6e-6));
 
-        let service = with_sandboxed_config_dir(|| {
-            PricingService::combine_fetched_sources(
-                Ok(HashMap::new()),
-                HashMap::new(),
-                Err("models.dev unreachable".to_string()),
-                || None,
-                || Some(cached),
-            )
-        })
+        let service = PricingService::combine_fetched_sources(
+            Ok(HashMap::new()),
+            Err("OpenRouter unavailable".to_string()),
+            Err("models.dev unreachable".to_string()),
+            || None,
+            || None,
+            || Some(cached),
+            CustomPricing::default(),
+        )
         .expect("a stale models.dev cache must keep the service usable");
 
         let cost = service.calculate_cost("test-model-gamma", 1_000_000, 0, 0, 0, 0);
@@ -600,39 +544,42 @@ mod tests {
         );
     }
 
-    // The deliberate exception to "never fatal": with every source empty we
-    // must NOT hand back a service that silently prices everything at $0.00,
-    // because `submit` would upload those zeros as real costs.
-    //
-    // The message is asserted, not just the variant: this is the only place a
-    // user or a bug report learns *why* pricing is unavailable, and an earlier
-    // revision of this function threw the per-source causes away.
     #[test]
-    #[serial_test::serial]
-    fn all_sources_empty_errors_and_names_every_cause() {
-        let result = with_sandboxed_config_dir(|| {
-            PricingService::combine_fetched_sources(
-                Err("error decoding response body: expected f64".to_string()),
-                HashMap::new(),
-                Err("models.dev unreachable".to_string()),
-                || None,
-                || None,
-            )
-        });
+    fn custom_pricing_keeps_service_available_during_dynamic_outage() {
+        let mut custom = HashMap::new();
+        custom.insert("custom-only".to_string(), model_pricing(3e-6, 4e-6));
+        let service = PricingService::combine_fetched_sources(
+            Err("error decoding response body: expected f64".to_string()),
+            Err("OpenRouter unreachable".to_string()),
+            Err("models.dev unreachable".to_string()),
+            || None,
+            || None,
+            || None,
+            CustomPricing::from_models(custom),
+        )
+        .expect("custom pricing should remain usable during an upstream outage");
+        assert!(service.lookup_with_source("custom-only", None).is_some());
+    }
 
-        let error = result
-            .err()
-            .expect("a total pricing blackout must stay fatal rather than price everything at $0");
-        assert!(
-            error.contains("error decoding response body: expected f64"),
-            "the LiteLLM cause must survive into the terminal error, got: {}",
-            error
-        );
-        assert!(
-            error.contains("models.dev unreachable"),
-            "the models.dev cause must survive into the terminal error, got: {}",
-            error
-        );
+    #[test]
+    fn openrouter_fetch_failure_falls_back_to_stale_cache() {
+        let mut cached = HashMap::new();
+        cached.insert("openrouter-only".to_string(), model_pricing(7e-6, 8e-6));
+
+        let service = PricingService::combine_fetched_sources(
+            Err("LiteLLM unavailable".to_string()),
+            Err("OpenRouter unavailable".to_string()),
+            Err("models.dev unavailable".to_string()),
+            || None,
+            || Some(cached),
+            || None,
+            CustomPricing::default(),
+        )
+        .expect("a stale OpenRouter cache must keep the service usable");
+
+        assert!(service
+            .lookup_with_source("openrouter-only", None)
+            .is_some());
     }
 
     #[test]

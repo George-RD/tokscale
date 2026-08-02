@@ -1,12 +1,10 @@
-use super::cache;
 use super::litellm::ModelPricing;
+use super::{cache, fetch};
 use serde::Deserialize;
 use std::collections::HashMap;
 
 const CACHE_FILENAME: &str = "pricing-models-dev.json";
 const MODELS_DEV_URL: &str = "https://models.dev/api.json";
-const MAX_RETRIES: u32 = 3;
-const INITIAL_BACKOFF_MS: u64 = 200;
 const PER_MILLION: f64 = 1_000_000.0;
 
 #[derive(Deserialize)]
@@ -44,92 +42,33 @@ pub(crate) fn parse_dataset(content: &str) -> Result<PricingDataset, serde_json:
     Ok(map_providers(providers))
 }
 
-pub async fn fetch() -> Result<PricingDataset, reqwest::Error> {
+pub async fn fetch() -> Result<PricingDataset, String> {
     fetch_inner(MODELS_DEV_URL, true).await
 }
 
-async fn fetch_inner(url: &str, use_cache: bool) -> Result<PricingDataset, reqwest::Error> {
+async fn fetch_inner(url: &str, use_cache: bool) -> Result<PricingDataset, String> {
     if use_cache {
         if let Some(cached) = load_cached() {
             return Ok(cached);
         }
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()?;
-
-    let mut last_error: Option<reqwest::Error> = None;
-
-    for attempt in 0..MAX_RETRIES {
-        match client.get(url).send().await {
-            Ok(response) => {
-                let status = response.status();
-
-                if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    eprintln!(
-                        "[tokscale] models.dev HTTP {} (attempt {}/{})",
-                        status,
-                        attempt + 1,
-                        MAX_RETRIES
-                    );
-                    if attempt == MAX_RETRIES - 1 {
-                        return Err(response.error_for_status().unwrap_err());
-                    }
-                    let _ = response.bytes().await;
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        INITIAL_BACKOFF_MS * (1 << attempt),
-                    ))
-                    .await;
-                    continue;
-                }
-
-                if !status.is_success() {
-                    eprintln!("[tokscale] models.dev HTTP {}", status);
-                    return Err(response.error_for_status().unwrap_err());
-                }
-
-                let content = response.text().await?;
-                match parse_dataset(&content) {
-                    Ok(data) => {
-                        if let Err(e) = cache::save_cache(CACHE_FILENAME, &data) {
-                            eprintln!(
-                                "[tokscale] Warning: Failed to cache models.dev pricing at {}: {}",
-                                cache::get_cache_path(CACHE_FILENAME).display(),
-                                e
-                            );
-                        }
-                        return Ok(data);
-                    }
-                    Err(e) => {
-                        eprintln!("[tokscale] models.dev JSON parse failed: {}", e);
-                        return Ok(HashMap::new());
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "[tokscale] models.dev network error (attempt {}/{}): {}",
-                    attempt + 1,
-                    MAX_RETRIES,
-                    e
-                );
-                last_error = Some(e);
-                if attempt < MAX_RETRIES - 1 {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        INITIAL_BACKOFF_MS * (1 << attempt),
-                    ))
-                    .await;
-                }
-            }
-        }
+    let client = fetch::pricing_client()?;
+    let response = fetch::get_with_retry(&client, url, "models.dev").await?;
+    let content = response.text().await.map_err(|error| error.to_string())?;
+    let data = parse_dataset(&content)
+        .map_err(|error| format!("models.dev JSON parse failed: {error}"))?;
+    if data.is_empty() {
+        return Err("models.dev returned no usable pricing rows".to_string());
     }
-
-    match last_error {
-        Some(e) => Err(e),
-        None => Ok(HashMap::new()),
+    if let Err(e) = cache::save_cache(CACHE_FILENAME, &data) {
+        eprintln!(
+            "[tokscale] Warning: Failed to cache models.dev pricing at {}: {}",
+            cache::get_cache_path(CACHE_FILENAME).display(),
+            e
+        );
     }
+    Ok(data)
 }
 
 fn map_providers(providers: HashMap<String, Provider>) -> PricingDataset {
@@ -181,7 +120,7 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
 
         thread::spawn(move || {
-            for _ in 0..MAX_RETRIES {
+            for _ in 0..3 {
                 let Ok((mut stream, _)) = listener.accept() else {
                     return;
                 };
@@ -196,6 +135,27 @@ mod tests {
         url
     }
 
+    fn response_server(body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buffer = [0; 1024];
+            let _ = stream.read(&mut buffer);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        url
+    }
+
     #[tokio::test]
     async fn fetch_returns_error_after_retryable_http_statuses() {
         let url = retryable_status_server("HTTP/1.1 503 Service Unavailable");
@@ -203,5 +163,16 @@ mod tests {
         let result = fetch_inner(&url, false).await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_and_empty_datasets_are_fetch_errors() {
+        let malformed = fetch_inner(&response_server("not json"), false).await;
+        assert!(malformed
+            .unwrap_err()
+            .contains("models.dev JSON parse failed"));
+
+        let empty = fetch_inner(&response_server("{}"), false).await;
+        assert!(empty.unwrap_err().contains("no usable pricing rows"));
     }
 }
