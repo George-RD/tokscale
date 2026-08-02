@@ -1,3 +1,4 @@
+use crate::process_liveness::pid_is_alive;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -402,7 +403,9 @@ impl SyncLockGuard {
                     // long as their PID is alive, or two processes will
                     // overlap on the manifest and delete each other's
                     // artifacts. Age-based eviction was removed for this
-                    // reason.
+                    // reason. `pid_is_alive` resolves every uncertain probe
+                    // to "alive" so that guarantee survives on platforms
+                    // where liveness is harder to establish.
                     if let Some((existing_pid, _)) = read_sync_lock(&lock_path) {
                         if pid_is_alive(existing_pid) {
                             anyhow::bail!(
@@ -441,28 +444,6 @@ fn read_sync_lock(path: &Path) -> Option<(u32, u64)> {
     let pid = parts.next()?.parse::<u32>().ok()?;
     let timestamp = parts.next()?.parse::<u64>().ok()?;
     Some((pid, timestamp))
-}
-
-fn pid_is_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        let result = unsafe { libc_kill(pid as i32, 0) };
-        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(1)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
-}
-
-#[cfg(unix)]
-extern "C" {
-    #[link_name = "kill"]
-    fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
 pub fn load_antigravity_manifest() -> Result<AntigravityManifest> {
@@ -556,8 +537,24 @@ fn delete_artifact_relative_path(relative_path: &str) -> Result<bool> {
     Ok(false)
 }
 
+/// Rewrite `\` to `/` so a stored path parses the same way on every platform.
+///
+/// `to_relative_artifact_path` renders with `Path::to_string_lossy`, so a
+/// manifest written on Windows records `sessions\<id>.jsonl`. Normalising here
+/// also tightens the Unix side: `Path` does not treat `\` as a separator
+/// there, so `..\..\escape.jsonl` would otherwise reach the traversal check
+/// below as one innocuous file name.
+///
+/// Safe against false positives because `sanitize_session_id` strips every
+/// character outside `[A-Za-z0-9._-]`, so a generated artifact name can never
+/// legitimately contain a backslash.
+fn normalize_artifact_path_separators(relative_path: &str) -> String {
+    relative_path.replace('\\', "/")
+}
+
 fn resolve_cache_relative_artifact_path(relative_path: &str) -> Result<PathBuf> {
-    let relative = Path::new(relative_path);
+    let normalized = normalize_artifact_path_separators(relative_path);
+    let relative = Path::new(&normalized);
     if relative.is_absolute() {
         anyhow::bail!("Artifact path must stay within cache root");
     }
@@ -2749,6 +2746,41 @@ mod tests {
 
         let err = delete_artifact_relative_path("manifest.json").unwrap_err();
         assert!(err.to_string().contains("session artifact"));
+    }
+
+    /// A manifest written on Windows stores `sessions\<id>.jsonl`, because
+    /// `to_relative_artifact_path` renders with the native separator. Rejecting
+    /// that form made `cleanup_stale_session_artifacts` — and with it the whole
+    /// `antigravity sync` — fail on every run that had an artifact to retire.
+    #[test]
+    #[serial]
+    fn delete_artifact_relative_path_accepts_windows_separators() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _env = TestEnvGuard::redirect_to(temp_dir.path());
+
+        let sessions_dir = get_antigravity_sessions_dir().unwrap();
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let artifact = sessions_dir.join("session-one.jsonl");
+        std::fs::write(&artifact, "{}\n").unwrap();
+
+        assert!(delete_artifact_relative_path("sessions\\session-one.jsonl").unwrap());
+        assert!(!artifact.exists());
+    }
+
+    /// Normalising separators before the component check also closes a hole on
+    /// Unix, where `Path` reads `..\..\outside.jsonl` as a single file name and
+    /// never sees a `ParentDir` component.
+    #[test]
+    #[serial]
+    fn delete_artifact_relative_path_rejects_backslash_traversal() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _env = TestEnvGuard::redirect_to(temp_dir.path());
+
+        let err = delete_artifact_relative_path("..\\..\\outside.jsonl").unwrap_err();
+        assert!(err.to_string().contains("cache root"));
+
+        let err = delete_artifact_relative_path("sessions\\..\\..\\outside.jsonl").unwrap_err();
+        assert!(err.to_string().contains("cache root"));
     }
 
     #[test]
