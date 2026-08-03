@@ -372,6 +372,7 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                 "sessions.json" => file_name == "sessions.json",
                 "wire.jsonl" => file_name == "wire.jsonl",
                 "updates.jsonl" => file_name == "updates.jsonl",
+                "unified.jsonl" => file_name == "unified.jsonl",
                 "events.jsonl" => file_name == "events.jsonl",
                 "ui_messages.json" => file_name == "ui_messages.json",
                 "session-usage.json" => file_name == "session-usage.json",
@@ -909,6 +910,57 @@ fn push_unique_scan_task_with_pattern(
     }
 }
 
+/// Derive the Grok home directory from a scanned root path.
+///
+/// The primary resolution (`ClientDef::resolve_path_with_env_strategy`) returns
+/// `<home>/sessions`, so a configured alternate root may point at the home
+/// itself, its `sessions` directory, or any nested workspace/session directory.
+/// The nearest ancestor named `sessions` (case-insensitively) is treated as the
+/// home's child in all of those cases.
+fn grok_home_from_scan_root(path: &Path) -> PathBuf {
+    if let Some(sessions_dir) = path.ancestors().find(|candidate| {
+        candidate
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.eq_ignore_ascii_case("sessions"))
+            .unwrap_or(false)
+    }) {
+        if let Some(grok_home) = sessions_dir.parent() {
+            return grok_home.to_path_buf();
+        }
+    }
+
+    path.to_path_buf()
+}
+
+/// Register the dual-source scan tasks for one Grok root.
+///
+/// A Grok root contributes both the legacy per-session rollups
+/// (`sessions/**/updates.jsonl`) and the per-inference token breakdowns
+/// (`logs/unified.jsonl`). The original root is always registered for
+/// `updates.jsonl` — `extraScanPaths` rows are recursive roots, so arbitrary
+/// nested layouts must keep matching — and the sibling `<home>/logs/unified.jsonl`
+/// task is derived from the root via [`grok_home_from_scan_root`].
+///
+/// Running every Grok root — the resolved primary home and each
+/// `scanner.extraScanPaths.grok` entry — through this helper keeps alternate
+/// roots on the same dual-source discovery as the primary home.
+fn push_grok_dual_source_scan_tasks(
+    tasks: &mut Vec<(ClientId, String, &'static str)>,
+    seen: &mut HashSet<(ClientId, PathBuf)>,
+    root: &Path,
+) {
+    push_unique_scan_task(tasks, seen, ClientId::Grok, root);
+    let grok_home = grok_home_from_scan_root(root);
+    push_unique_scan_task_with_pattern(
+        tasks,
+        seen,
+        ClientId::Grok,
+        grok_home.join("logs").join("unified.jsonl"),
+        "unified.jsonl",
+    );
+}
+
 fn kiro_global_storage_roots(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
     let mut roots = vec![
         PathBuf::from(format!(
@@ -1151,6 +1203,7 @@ fn scan_all_clients_with_env_strategy_inner(
                 | ClientId::Gjc
                 | ClientId::MiMoCode
                 | ClientId::DevinCli
+                | ClientId::Grok
         ) {
             continue;
         }
@@ -1160,10 +1213,23 @@ fn scan_all_clients_with_env_strategy_inner(
         push_unique_scan_task(&mut tasks, &mut seen_scan_roots, *client_id, path);
     }
 
+    if enabled.contains(&ClientId::Grok) {
+        let grok_sessions = PathBuf::from(
+            ClientId::Grok
+                .data()
+                .resolve_path_with_env_strategy(home_dir, use_env_roots),
+        );
+        // The resolved path is `<home>/sessions`; `push_grok_dual_source_scan_tasks`
+        // keeps it registered for `updates.jsonl` and derives `logs/unified.jsonl`.
+        push_grok_dual_source_scan_tasks(&mut tasks, &mut seen_scan_roots, &grok_sessions);
+    }
+
     for (client_id, path) in extra_scan_paths_for(scanner_settings, &enabled_with_devin_lookup) {
         warn_if_escapes_home(Path::new(home_dir), client_id, &path);
         if client_id == ClientId::DevinCli {
             devin_cli_roots.push(path);
+        } else if client_id == ClientId::Grok {
+            push_grok_dual_source_scan_tasks(&mut tasks, &mut seen_scan_roots, &path);
         } else {
             push_unique_scan_task(&mut tasks, &mut seen_scan_roots, client_id, path);
         }
@@ -1261,6 +1327,12 @@ fn scan_all_clients_with_env_strategy_inner(
             warn_if_escapes_home(Path::new(home_dir), client_id, &PathBuf::from(&path));
             if client_id == ClientId::DevinCli {
                 devin_cli_roots.push(PathBuf::from(path));
+            } else if client_id == ClientId::Grok {
+                push_grok_dual_source_scan_tasks(
+                    &mut tasks,
+                    &mut seen_scan_roots,
+                    &PathBuf::from(path),
+                );
             } else {
                 push_unique_scan_task(&mut tasks, &mut seen_scan_roots, client_id, path);
             }
@@ -2467,6 +2539,156 @@ mod tests {
         let mut file = File::create(grok_session.join("updates.jsonl")).unwrap();
         file.write_all(b"{\"method\":\"session/update\"}\n")
             .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_grok_extra_scan_path_discovers_both_sources() {
+        // Regression guard: `scanner.extraScanPaths.grok` roots must receive
+        // the same dual-source discovery as the primary Grok home — legacy
+        // `updates.jsonl` under the configured root AND the sibling
+        // `logs/unified.jsonl` derived from the Grok home. Previously the
+        // unified log was only added for the resolved primary home, so an
+        // alternate root contributed only the registered `updates.jsonl`
+        // pattern and its inference breakdowns were silently missed.
+        let mut env = EnvGuard::capture(&["GROK_HOME", "TOKSCALE_EXTRA_DIRS"]);
+        env.remove("GROK_HOME");
+        env.remove("TOKSCALE_EXTRA_DIRS");
+
+        let home = TempDir::new().unwrap();
+        let alt_home = TempDir::new().unwrap();
+
+        // Alternate Grok home laid out like a real ~/.grok.
+        let alt_session = alt_home
+            .path()
+            .join("sessions/%2Ftmp%2Fproject/session-alt");
+        fs::create_dir_all(&alt_session).unwrap();
+        File::create(alt_session.join("updates.jsonl")).unwrap();
+        // A nested legacy update NOT under sessions/ — the configured root is
+        // a recursive scan root, so nested updates.jsonl must keep matching
+        // instead of being replaced by a sessions/ subdirectory task.
+        let nested = alt_home.path().join("imports/nested");
+        fs::create_dir_all(&nested).unwrap();
+        File::create(nested.join("updates.jsonl")).unwrap();
+        fs::create_dir_all(alt_home.path().join("logs")).unwrap();
+        File::create(alt_home.path().join("logs/unified.jsonl")).unwrap();
+
+        let settings: ScannerSettings = serde_json::from_value(serde_json::json!({
+            "extraScanPaths": {
+                "grok": [alt_home.path()]
+            }
+        }))
+        .unwrap();
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.path().to_str().unwrap(),
+            &["grok".to_string()],
+            true,
+            &settings,
+        );
+
+        let files = result.get(ClientId::Grok);
+        assert_eq!(
+            files
+                .iter()
+                .filter(|p| p.ends_with("updates.jsonl"))
+                .count(),
+            2,
+            "alternate Grok root must keep recursive updates.jsonl discovery: {files:?}"
+        );
+        assert!(
+            files.iter().any(|p| p.ends_with("unified.jsonl")),
+            "alternate Grok root must contribute logs/unified.jsonl: {files:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_grok_extra_scan_path_sessions_shape_discovers_unified_log() {
+        // extraScanPaths.grok may point at the `sessions` subdirectory (the
+        // shape the primary resolution returns) instead of the home itself;
+        // the unified log is derived from the parent home either way.
+        let mut env = EnvGuard::capture(&["GROK_HOME", "TOKSCALE_EXTRA_DIRS"]);
+        env.remove("GROK_HOME");
+        env.remove("TOKSCALE_EXTRA_DIRS");
+
+        let home = TempDir::new().unwrap();
+        let alt_home = TempDir::new().unwrap();
+
+        let alt_session = alt_home
+            .path()
+            .join("sessions/%2Ftmp%2Fproject/session-alt");
+        fs::create_dir_all(&alt_session).unwrap();
+        File::create(alt_session.join("updates.jsonl")).unwrap();
+        fs::create_dir_all(alt_home.path().join("logs")).unwrap();
+        File::create(alt_home.path().join("logs/unified.jsonl")).unwrap();
+
+        let settings: ScannerSettings = serde_json::from_value(serde_json::json!({
+            "extraScanPaths": {
+                "grok": [alt_home.path().join("sessions")]
+            }
+        }))
+        .unwrap();
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.path().to_str().unwrap(),
+            &["grok".to_string()],
+            true,
+            &settings,
+        );
+
+        let files = result.get(ClientId::Grok);
+        assert_eq!(
+            files.len(),
+            2,
+            "expected updates.jsonl + unified.jsonl: {files:?}"
+        );
+        assert!(files.iter().any(|p| p.ends_with("updates.jsonl")));
+        assert!(files.iter().any(|p| p.ends_with("unified.jsonl")));
+    }
+
+    #[test]
+    #[serial]
+    fn test_grok_extra_scan_path_nested_session_shape_discovers_unified_log() {
+        // A root below a mixed-case `sessions` directory still belongs to the
+        // surrounding Grok home, so its sibling logs/unified.jsonl is found.
+        let mut env = EnvGuard::capture(&["GROK_HOME", "TOKSCALE_EXTRA_DIRS"]);
+        env.remove("GROK_HOME");
+        env.remove("TOKSCALE_EXTRA_DIRS");
+
+        let home = TempDir::new().unwrap();
+        let alt_home = TempDir::new().unwrap();
+
+        let alt_session = alt_home
+            .path()
+            .join("Sessions/%2Ftmp%2Fproject/session-alt");
+        fs::create_dir_all(&alt_session).unwrap();
+        File::create(alt_session.join("updates.jsonl")).unwrap();
+        fs::create_dir_all(alt_home.path().join("logs")).unwrap();
+        File::create(alt_home.path().join("logs/unified.jsonl")).unwrap();
+
+        let settings: ScannerSettings = serde_json::from_value(serde_json::json!({
+            "extraScanPaths": {
+                "grok": [alt_session]
+            }
+        }))
+        .unwrap();
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.path().to_str().unwrap(),
+            &["grok".to_string()],
+            true,
+            &settings,
+        );
+
+        let files = result.get(ClientId::Grok);
+        assert_eq!(
+            files.len(),
+            2,
+            "expected updates.jsonl + unified.jsonl: {files:?}"
+        );
+        assert!(files.iter().any(|p| p.ends_with("updates.jsonl")));
+        assert!(files.iter().any(|p| p.ends_with("unified.jsonl")));
     }
 
     fn setup_mock_jcode_dir(base: &std::path::Path) {
@@ -4420,13 +4642,27 @@ mod tests {
         let home = dir.path();
         setup_mock_grok_dir(home);
 
+        let unified_dir = home.join(".grok/logs");
+        fs::create_dir_all(&unified_dir).unwrap();
+        let unified_log = unified_dir.join("unified.jsonl");
+        File::create(&unified_log).unwrap();
+        let nested_dir = unified_dir.join("archive");
+        fs::create_dir_all(&nested_dir).unwrap();
+        let nested_log = nested_dir.join("unified.jsonl");
+        File::create(&nested_log).unwrap();
+
         let result = scan_all_clients_with_env_strategy(
             home.to_str().unwrap(),
             &["grok".to_string()],
             false,
         );
-        assert_eq!(result.get(ClientId::Grok).len(), 1);
-        assert!(result.get(ClientId::Grok)[0].ends_with("updates.jsonl"));
+        let grok_files = result.get(ClientId::Grok);
+        assert_eq!(grok_files.len(), 2);
+        assert!(grok_files
+            .iter()
+            .any(|path| path.ends_with("updates.jsonl")));
+        assert!(grok_files.iter().any(|path| path == &unified_log));
+        assert!(!grok_files.iter().any(|path| path == &nested_log));
         assert!(result.get(ClientId::OpenCode).is_empty());
         assert!(result.get(ClientId::Claude).is_empty());
     }

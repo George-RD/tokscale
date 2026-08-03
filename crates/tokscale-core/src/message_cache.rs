@@ -23,7 +23,9 @@ use std::time::UNIX_EPOCH;
 // 3: UnifiedMessage gained session_title, changing the bincode payload layout.
 // Old shards must read as Stale (silent rebuild), not Invalid (corruption
 // warning), so the format version moves with the struct.
-const CACHE_FORMAT_VERSION: u32 = 3;
+// 4: UnifiedMessage gained model_attribution_conflicted, changing the bincode
+// payload layout. Old shards must be silently rebuilt rather than decoded.
+const CACHE_FORMAT_VERSION: u32 = 4;
 // V2 intentionally starts cold and leaves source-message-cache.bin untouched:
 // the monolith did not record a trustworthy parser owner for migration.
 const CACHE_SHARD_DIRNAME: &str = "source-message-cache-v2";
@@ -228,15 +230,12 @@ impl SourceFingerprint {
         Self::from_path_with_related(path, related)
     }
 
-    /// Fingerprint for a Grok `updates.jsonl` session and every sibling read by
-    /// its parser for rollup and session metadata.
+    /// Fingerprint for a Grok source and every file or directory read by its
+    /// parser for rollup and session metadata. Unified-log parsing also reads
+    /// metadata across the complete sessions tree.
     #[cfg(test)]
     pub(crate) fn from_grok_path(path: &Path) -> Option<Self> {
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let related_paths = ["signals.json", "summary.json", "events.jsonl"]
-            .into_iter()
-            .map(|name| (name.to_string(), parent.join(name)));
-        Self::from_path_with_related(path, related_paths)
+        Self::from_path_with_related(path, crate::sessions::grok::grok_related_paths(path))
     }
 
     /// Fingerprint for a Kiro source file. IDE sessions consume a sibling
@@ -438,10 +437,7 @@ impl SourceFingerprint {
         cached: Option<&Self>,
         mode: ContentHashMode,
     ) -> Option<FingerprintStatus> {
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let related_paths = ["signals.json", "summary.json", "events.jsonl"]
-            .into_iter()
-            .map(|name| (name.to_string(), parent.join(name)));
+        let related_paths = crate::sessions::grok::grok_related_paths(path);
         Self::check_path_with_related_mode(path, related_paths, cached, mode)
     }
 
@@ -886,6 +882,15 @@ fn parser_version(client: ClientId) -> u32 {
         // session_model_usage instead of crediting the whole session to
         // sessions.model, and dedup keys are namespaced per (session, model).
         ClientId::Hermes => 2,
+        // v2 added per-turn usage records. v3 adds the canonical unified log,
+        // non-overlapping output/cache/reasoning buckets, and session metadata.
+        // v4 scopes unified model attribution by PID generation and exact child
+        // session, so the same source can now produce different model IDs.
+        // v5 preserves distinct unified events when timestamps and token
+        // buckets repeat, and fingerprints the complete sessions metadata tree.
+        // v6 persists whether an unknown unified model was deliberately
+        // fail-closed due to conflicting child attribution evidence.
+        ClientId::Grok => 6,
         // v1 retained MiMo's embedded `cost` value but did not preserve its
         // provider-reported provenance. Reparse cached rows so strict submit
         // validation does not reject valid unknown-model MiMo usage offline.
@@ -1513,6 +1518,9 @@ fn read_sample_hash(file: &mut File, offset: u64, len: usize) -> Option<FileSamp
 }
 
 fn compute_sample_hashes(path: &Path, size: u64) -> Option<Vec<FileSampleHash>> {
+    if path.metadata().ok()?.is_dir() {
+        return Some(Vec::new());
+    }
     if size == 0 {
         return Some(Vec::new());
     }
@@ -1587,9 +1595,13 @@ fn file_fingerprint_parts(
         .ok()?
         .as_nanos() as u64;
     let sample_hashes = compute_sample_hashes(path, size)?;
-    let content_hash = match mode {
-        ContentHashMode::Full => hash_prefix(path, size)?,
-        ContentHashMode::SamplesOnly => [0_u8; 32],
+    let content_hash = if metadata.is_dir() {
+        [0_u8; 32]
+    } else {
+        match mode {
+            ContentHashMode::Full => hash_prefix(path, size)?,
+            ContentHashMode::SamplesOnly => [0_u8; 32],
+        }
     };
     Some((size, modified_ns, sample_hashes, content_hash))
 }
@@ -2203,6 +2215,11 @@ mod tests {
     }
 
     #[test]
+    fn test_grok_conflicted_model_attribution_bumps_parser_version() {
+        assert_eq!(parser_version(ClientId::Grok), 6);
+    }
+
+    #[test]
     fn test_micode_parser_version_invalidates_rows_without_cost_provenance() {
         assert_eq!(parser_version(ClientId::MiMoCode), 3);
     }
@@ -2283,6 +2300,43 @@ mod tests {
         std::fs::write(&events_path, b"event-2\n").unwrap();
         let updated_events = SourceFingerprint::from_grok_path(&updates_path).unwrap();
         assert_ne!(with_events, updated_events);
+    }
+
+    #[test]
+    fn test_grok_unified_fingerprint_tracks_session_metadata_tree_changes() {
+        let dir = TempDir::new().unwrap();
+        let logs_dir = dir.path().join(".grok/logs");
+        let session_dir = dir.path().join(".grok/sessions/%2Ftmp%2Fproject/session-1");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let unified_path = logs_dir.join("unified.jsonl");
+        std::fs::write(
+            &unified_path,
+            br#"{"sid":"session-1","msg":"shell.turn.inference_done","ctx":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        )
+        .unwrap();
+        let summary_path = session_dir.join("summary.json");
+        std::fs::write(&summary_path, br#"{"current_model_id":"grok-4.5"}"#).unwrap();
+
+        let base = SourceFingerprint::from_grok_path(&unified_path).unwrap();
+
+        std::fs::write(&summary_path, br#"{"current_model_id":"grok-4.6"}"#).unwrap();
+        let changed_summary = SourceFingerprint::from_grok_path(&unified_path).unwrap();
+        assert_ne!(base, changed_summary);
+        assert!(matches!(
+            SourceFingerprint::check_grok_path_samples_only(&unified_path, Some(&base)),
+            Some(FingerprintStatus::Changed(_))
+        ));
+
+        let second_session_dir = dir.path().join(".grok/sessions/%2Ftmp%2Fproject/session-2");
+        std::fs::create_dir_all(&second_session_dir).unwrap();
+        std::fs::write(
+            second_session_dir.join("summary.json"),
+            br#"{"current_model_id":"grok-4.7"}"#,
+        )
+        .unwrap();
+        let changed_tree = SourceFingerprint::from_grok_path(&unified_path).unwrap();
+        assert_ne!(changed_summary, changed_tree);
     }
 
     #[test]
@@ -2971,6 +3025,38 @@ mod tests {
         assert!(SourceMessageCache::load()
             .get(claude, source.path())
             .is_some());
+
+        restore_cache_env(prev_env);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_prior_cache_format_shard_is_skipped_before_decoding_payload() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+        let codex = CacheIdentity::for_client(ClientId::Codex);
+        let stale_key = CacheShardKey {
+            namespace: codex.namespace.to_string(),
+            index: 0,
+        };
+        let stale_path = shard_path(&cache_shard_dir().unwrap(), &stale_key);
+        ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
+        let stale_envelope = CachedShardEnvelope {
+            format_version: CACHE_FORMAT_VERSION - 1,
+            parser_namespace: codex.namespace.to_string(),
+            parser_version: codex.parser_version,
+            payload: b"prior UnifiedMessage layout".to_vec(),
+        };
+        let mut writer = BufWriter::new(File::create(&stale_path).unwrap());
+        bincode::options()
+            .serialize_into(&mut writer, &stale_envelope)
+            .unwrap();
+        writer.flush().unwrap();
+
+        assert!(matches!(
+            read_shard(&stale_path, codex),
+            ShardReadStatus::Stale
+        ));
 
         restore_cache_env(prev_env);
     }
