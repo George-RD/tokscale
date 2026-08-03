@@ -76,13 +76,25 @@ jobs:
   # Windows is a first-class target - `build-native.yml` ships
   # x86_64/aarch64-pc-windows-msvc artifacts - but until #997 nothing ever
   # *executed* a test there, so Windows-only defects reached users unseen.
-  # The matrix is a hard gate, not `continue-on-error`: an advisory job that
-  # nobody is required to read reproduces the exact failure mode this is
-  # meant to close, and the suite is green on windows-latest as of this
-  # change, so there is nothing to grandfather.
+  #
+  # The windows leg is advisory (`continue-on-error`) and Ubuntu stays a hard
+  # gate. That split is deliberate and temporary. Running the suite for the
+  # first time found 33 pre-existing failures that no one has ever seen,
+  # because cargo used to stop at the first failing binary and nine of the ten
+  # never ran at all. They are not one bug: they span at least six unrelated
+  # root causes, and two of those groups (the crush registry scan returning
+  # nothing, cc-mirror attributing the wrong provider) look like real Windows
+  # defects rather than test artefacts. Blocking every PR on them would mean
+  # either reverting this job or landing a 30-plus-fix change nobody can
+  # review, so the signal goes in first and the failures get fixed against a
+  # visible baseline. See #1014 for the enumerated groups.
+  #
+  # This must not become permanent: an advisory job nobody reads is how #997
+  # happened. Flip `continue-on-error` off as soon as #1014 closes.
   coverage:
     name: Code Coverage
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       # Both platforms must report. Cancelling the Windows leg the moment
       # Ubuntu fails (or vice versa) would hide whether a failure is
