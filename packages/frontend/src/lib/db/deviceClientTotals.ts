@@ -291,6 +291,7 @@ export interface HighwaterAggregateRow {
 export interface DualDerivationRow extends HighwaterAggregateRow {
   snapshotTokens: number;
   snapshotCost: string;
+  censusPending: number;
 }
 
 export function interpretHighwaterAggregate(
@@ -382,7 +383,12 @@ export async function readDualDerivation(params: {
   userId: string;
   submissionId: string;
   bucketWidth?: string;
-}): Promise<{ snapshotTokens: number; snapshotCost: number; highwater: HighwaterTotalReading }> {
+}): Promise<{
+  snapshotTokens: number;
+  snapshotCost: number;
+  censusPending: number;
+  highwater: HighwaterTotalReading;
+}> {
   const bucketWidth = params.bucketWidth ?? DEVICE_CLIENT_TOTALS_BUCKET_WIDTH;
   const result = await params.executor.execute(sql`
     SELECT
@@ -396,6 +402,11 @@ export async function readDualDerivation(params: {
         FROM daily_breakdown AS db
         WHERE db.submission_id = ${params.submissionId}::uuid
       ) AS "snapshotCost",
+      (
+        SELECT s.ratchet_census_pending
+        FROM submissions AS s
+        WHERE s.id = ${params.submissionId}::uuid
+      )::int AS "censusPending",
       COUNT(*)::int AS "bucketCount",
       LEAST(COALESCE(SUM(t.tokens_highwater), 0), ${sql.raw(BIGINT_MAX)})::bigint AS "tokens",
       COALESCE(SUM(t.cost_highwater), 0)::text AS "cost"
@@ -407,9 +418,11 @@ export async function readDualDerivation(params: {
 
   const row = firstRow(result) as DualDerivationRow | undefined;
   const snapshotCost = Number.parseFloat(row?.snapshotCost ?? "0");
+  const censusPending = Number(row?.censusPending ?? 0);
   return {
     snapshotTokens: Number(row?.snapshotTokens ?? 0),
     snapshotCost: Number.isFinite(snapshotCost) ? snapshotCost : 0,
+    censusPending: Number.isFinite(censusPending) ? Math.max(0, censusPending) : 0,
     highwater: interpretHighwaterAggregate(row),
   };
 }
@@ -435,12 +448,16 @@ export interface DualDerivationRecord {
   /** `SUM(daily_breakdown)` from the SAME snapshot as the high-water read. */
   snapshotTokens: number;
   snapshotCost: number;
+  /** Outstanding deferred high-water writes, including this request's own. */
+  censusPending: number;
   /**
    * True when a concurrent submit for this user landed between this request's
    * commit and its census read. Not an error — it is why the delta is computed
    * from `snapshotTokens` rather than `servedTokens`.
    */
   racedConcurrentSubmit: boolean;
+  /** A pending peer's daily rows may be visible before its high-water upsert. */
+  censusStatus: "stable" | "pending";
   highwaterStatus: HighwaterTotalReading["status"];
   highwaterTokens: number | null;
   highwaterCost: number | null;
@@ -459,9 +476,14 @@ export function buildDualDerivationRecord(params: {
   servedCost: number;
   snapshotTokens: number;
   snapshotCost: number;
+  censusPending: number;
   highwater: HighwaterTotalReading;
 }): DualDerivationRecord {
   const { highwater } = params;
+  // This request increments the ledger in its submit transaction and clears it
+  // only after its high-water upsert. Any additional entry is a committed
+  // submit whose daily rows may be visible while its high-water rows are not.
+  const hasPendingPeer = params.censusPending > 1;
   const base = {
     userId: params.userId,
     submissionId: params.submissionId,
@@ -470,6 +492,7 @@ export function buildDualDerivationRecord(params: {
     servedCost: params.servedCost,
     snapshotTokens: params.snapshotTokens,
     snapshotCost: params.snapshotCost,
+    censusPending: params.censusPending,
     // Costs are compared too, not just tokens. A concurrent submit that moved
     // only the cost — a reprice, or usage whose tokens were already counted —
     // is still a race, and reporting it as `false` would let the census read a
@@ -477,17 +500,19 @@ export function buildDualDerivationRecord(params: {
     // comparison is safe here: both sides come from the same numeric(18,4)
     // column via the same conversion, so equal stored values are equal doubles.
     racedConcurrentSubmit:
+      hasPendingPeer ||
       params.snapshotTokens !== params.servedTokens ||
       params.snapshotCost !== params.servedCost,
+    censusStatus: hasPendingPeer ? "pending" as const : "stable" as const,
   };
 
-  if (highwater.status === "unknown") {
+  if (highwater.status === "unknown" || hasPendingPeer) {
     return {
       ...base,
-      highwaterStatus: "unknown",
-      highwaterTokens: null,
-      highwaterCost: null,
-      bucketCount: null,
+      highwaterStatus: highwater.status,
+      highwaterTokens: highwater.status === "known" ? highwater.tokens : null,
+      highwaterCost: highwater.status === "known" ? highwater.cost : null,
+      bucketCount: highwater.status === "known" ? highwater.bucketCount : null,
       tokenDelta: null,
       tokenRatio: null,
     };

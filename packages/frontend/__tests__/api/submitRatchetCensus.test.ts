@@ -93,6 +93,7 @@ vi.mock("@/lib/db", () => ({
     modelsUsed: "submissions.modelsUsed",
     cliVersion: "submissions.cliVersion",
     submissionHash: "submissions.submissionHash",
+    ratchetCensusPending: "submissions.ratchetCensusPending",
     schemaVersion: "submissions.schemaVersion",
     hasBackfill: "submissions.hasBackfill",
   },
@@ -402,6 +403,35 @@ describe("POST /api/submit ratchet census placement (phase 1 / 1.5)", () => {
       highwaterTokens: 3,
       tokenDelta: 9,
       highwaterStatus: "known",
+    });
+  });
+
+  it("defers the A/B comparison when B commits daily rows before its high-water upsert", async () => {
+    primeMocks();
+    buildMockTx();
+    const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    // Deterministic A/B timing: A has finished its upsert and reads the
+    // census after B committed its daily rows plus pending ledger entry, but
+    // before B starts its own deferred upsert. The census must not emit the
+    // apparent 9-token gap as a stable divergence.
+    mockState.db.execute.mockResolvedValue([
+      { snapshotTokens: 12, snapshotCost: "0.5000", censusPending: 2, bucketCount: 1, tokens: 3, cost: "0.1000" },
+    ]);
+
+    const response = await POST(submitRequest());
+    expect(response.status).toBe(200);
+
+    const censusLog = consoleLog.mock.calls
+      .map((call) => String(call[0]))
+      .find((line) => line.startsWith("ratchet-census "));
+    const record = JSON.parse(censusLog!.slice("ratchet-census ".length));
+    expect(record).toMatchObject({
+      racedConcurrentSubmit: true,
+      censusStatus: "pending",
+      highwaterTokens: 3,
+      tokenDelta: null,
+      tokenRatio: null,
     });
   });
 

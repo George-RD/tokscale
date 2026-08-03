@@ -207,6 +207,13 @@ export const submissions = pgTable(
     cliVersion: varchar("cli_version", { length: 20 }),
     submissionHash: varchar("submission_hash", { length: 64 }),
     submitCount: integer("submit_count").notNull().default(1),
+    /**
+     * Enabled-only Phase 1.5 work ledger. Each committed submit increments
+     * this before its deferred high-water write; that write decrements it only
+     * after succeeding. A census never treats a snapshot with another pending
+     * write as trustworthy.
+     */
+    ratchetCensusPending: integer("ratchet_census_pending").notNull().default(0),
     /** 0=legacy (no timestamps), 1=timestamp-aware CLI */
     schemaVersion: integer("schema_version").notNull().default(0),
     /**

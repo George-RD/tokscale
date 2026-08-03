@@ -431,7 +431,14 @@ describe("readDualDerivation reads both sides from ONE snapshot", () => {
   it("still reports unknown coverage while returning a served snapshot", async () => {
     const executor = {
       execute: async () => [
-        { snapshotTokens: 1200, snapshotCost: "3.0000", bucketCount: 0, tokens: 0, cost: "0" },
+        {
+          snapshotTokens: 1200,
+          snapshotCost: "3.0000",
+          censusPending: 1,
+          bucketCount: 0,
+          tokens: 0,
+          cost: "0",
+        },
       ],
     };
     const result = await readDualDerivation({ executor, userId: "u", submissionId: "s" });
@@ -449,6 +456,7 @@ describe("buildDualDerivationRecord (Phase 1.5)", () => {
       servedCost: 3,
       snapshotTokens: 1200,
       snapshotCost: 3,
+      censusPending: 1,
       highwater: { status: "known", tokens: 1000, cost: 2.5, bucketCount: 4 },
     });
 
@@ -476,6 +484,7 @@ describe("buildDualDerivationRecord (Phase 1.5)", () => {
       servedCost: 3,
       snapshotTokens: 1500,
       snapshotCost: 4,
+      censusPending: 1,
       highwater: { status: "known", tokens: 1500, cost: 4, bucketCount: 6 },
     });
 
@@ -498,6 +507,7 @@ describe("buildDualDerivationRecord (Phase 1.5)", () => {
       servedCost: 3,
       snapshotTokens: 1500,
       snapshotCost: 4.25,
+      censusPending: 1,
       highwater: { status: "known", tokens: 1500, cost: 4.25, bucketCount: 6 },
     });
 
@@ -513,6 +523,7 @@ describe("buildDualDerivationRecord (Phase 1.5)", () => {
       servedCost: 3,
       snapshotTokens: 1200,
       snapshotCost: 3,
+      censusPending: 1,
       highwater: { status: "unknown" },
     });
 
@@ -524,6 +535,29 @@ describe("buildDualDerivationRecord (Phase 1.5)", () => {
     expect(record.servedTokens).toBe(1200);
   });
 
+  it("defers an A/B read while B's committed daily rows await their high-water upsert", () => {
+    // Deterministic schedule: A has completed its own high-water upsert and
+    // starts the census after B commits daily_breakdown + its ledger entry,
+    // but before B begins the deferred high-water write. Without the ledger,
+    // this pair would look like a trustworthy +300 divergence with
+    // racedConcurrentSubmit false.
+    const record = buildDualDerivationRecord({
+      userId: "u1",
+      submissionId: "s1",
+      servedTokens: 1200,
+      servedCost: 3,
+      snapshotTokens: 1500,
+      snapshotCost: 4,
+      censusPending: 2,
+      highwater: { status: "known", tokens: 1200, cost: 3, bucketCount: 4 },
+    });
+
+    expect(record.racedConcurrentSubmit).toBe(true);
+    expect(record.censusStatus).toBe("pending");
+    expect(record.tokenDelta).toBeNull();
+    expect(record.tokenRatio).toBeNull();
+  });
+
   it("does not divide by a zero high-water total", () => {
     const record = buildDualDerivationRecord({
       userId: "u1",
@@ -532,6 +566,7 @@ describe("buildDualDerivationRecord (Phase 1.5)", () => {
       servedCost: 1,
       snapshotTokens: 500,
       snapshotCost: 1,
+      censusPending: 1,
       highwater: { status: "known", tokens: 0, cost: 0, bucketCount: 2 },
     });
     expect(record.tokenRatio).toBeNull();

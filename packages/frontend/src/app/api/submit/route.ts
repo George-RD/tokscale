@@ -248,9 +248,11 @@ async function recordRatchetCensus(params: {
   origin: "cli" | "backfill";
   servedTokens: number;
   servedCost: number;
+  enabled: boolean;
 }): Promise<void> {
-  if (!isDeviceClientTotalsWriteEnabled()) return;
+  if (!params.enabled) return;
 
+  let highwaterRecorded = false;
   try {
     const buckets = foldContributionsIntoBuckets(params.contributions, params.origin);
     await recordDeviceClientTotals({
@@ -258,6 +260,7 @@ async function recordRatchetCensus(params: {
       submittedDeviceId: params.submittedDeviceId,
       buckets,
     });
+    highwaterRecorded = true;
 
     // Phase 1.5: derive the total the OTHER way and record the pair. Both
     // derivations are read in ONE statement so they share a snapshot — pairing
@@ -265,7 +268,7 @@ async function recordRatchetCensus(params: {
     // report a divergence neither derivation had whenever a second device of
     // the same user commits in between. The value already SERVED is untouched
     // either way; it is recorded alongside as evidence of that.
-    const { snapshotTokens, snapshotCost, highwater } = await readDualDerivation({
+    const { snapshotTokens, snapshotCost, censusPending, highwater } = await readDualDerivation({
       executor: db,
       userId: params.userId,
       submissionId: params.submissionId,
@@ -277,6 +280,7 @@ async function recordRatchetCensus(params: {
       servedCost: params.servedCost,
       snapshotTokens,
       snapshotCost,
+      censusPending,
       highwater,
     });
     console.log(`${DUAL_DERIVATION_LOG_PREFIX} ${JSON.stringify(record)}`);
@@ -284,6 +288,22 @@ async function recordRatchetCensus(params: {
     // A deferred measurement, not a failed submission. The upsert is
     // idempotent, so the next submit from this device repairs the gap.
     console.error("Ratchet census write failed (submission unaffected):", e);
+  } finally {
+    // Do not clear the ledger when the upsert failed: later census reads must
+    // remain conservative rather than treating its missing rows as a real
+    // divergence. A successful upsert is enough to complete this entry even
+    // when the diagnostic read/log itself fails.
+    if (highwaterRecorded) {
+      try {
+        await db.execute(sql`
+          UPDATE submissions
+          SET ratchet_census_pending = GREATEST(ratchet_census_pending - 1, 0)
+          WHERE id = ${params.submissionId}::uuid
+        `);
+      } catch (e) {
+        console.error("Ratchet census completion marker failed (submission unaffected):", e);
+      }
+    }
   }
 }
 
@@ -394,6 +414,7 @@ export async function POST(request: Request) {
     // ========================================
     // STEP 3: DATABASE OPERATIONS IN TRANSACTION
     // ========================================
+    const ratchetCensusEnabled = isDeviceClientTotalsWriteEnabled();
     const result = await db.transaction(async (tx) => {
       await tx
         .update(apiTokens)
@@ -952,6 +973,11 @@ export async function POST(request: Request) {
           // the merged totals still include the imported history.
           ...(isBackfill ? { hasBackfill: true } : {}),
           submitCount: sql`COALESCE(submit_count, 0) + 1`,
+          // Register the post-commit census before its daily rows become
+          // visible. See recordRatchetCensus for the paired completion write.
+          ...(ratchetCensusEnabled
+            ? { ratchetCensusPending: sql`ratchet_census_pending + 1` }
+            : {}),
           schemaVersion: sql`GREATEST(COALESCE(${submissions.schemaVersion}, 0), ${submitDevice.schemaVersion})`,
           // Derived from the per-device high-water marks (see deviceTotals
           // above), floored by whatever is already stored.
@@ -1015,6 +1041,7 @@ export async function POST(request: Request) {
       origin: isBackfill ? "backfill" : "cli",
       servedTokens: result.metrics.totalTokens,
       servedCost: result.metrics.totalCost,
+      enabled: ratchetCensusEnabled,
     });
 
     const usernameCacheKey = normalizeUsernameCacheKey(tokenRecord.username);
