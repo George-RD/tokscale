@@ -22,7 +22,7 @@ import {
   foldContributionsIntoBuckets,
   isDeviceClientTotalsWriteEnabled,
   readDualDerivation,
-  recordDeviceClientTotals,
+  recoverRatchetCensusWork,
   DUAL_DERIVATION_LOG_PREFIX,
 } from "@/lib/db/deviceClientTotals";
 import { normalizeUsernameCacheKey, revalidateUsernamePaths } from "@/lib/db/usernameLookup";
@@ -243,24 +243,17 @@ function mergeActiveTimeMs(
 async function recordRatchetCensus(params: {
   userId: string;
   submissionId: string;
-  submittedDeviceId: string;
-  contributions: SubmissionData["contributions"];
-  origin: "cli" | "backfill";
   servedTokens: number;
   servedCost: number;
   enabled: boolean;
 }): Promise<void> {
   if (!params.enabled) return;
 
-  let highwaterRecorded = false;
   try {
-    const buckets = foldContributionsIntoBuckets(params.contributions, params.origin);
-    await recordDeviceClientTotals({
+    await recoverRatchetCensusWork({
       executor: db,
-      submittedDeviceId: params.submittedDeviceId,
-      buckets,
+      submissionId: params.submissionId,
     });
-    highwaterRecorded = true;
 
     // Phase 1.5: derive the total the OTHER way and record the pair. Both
     // derivations are read in ONE statement so they share a snapshot — pairing
@@ -285,25 +278,9 @@ async function recordRatchetCensus(params: {
     });
     console.log(`${DUAL_DERIVATION_LOG_PREFIX} ${JSON.stringify(record)}`);
   } catch (e) {
-    // A deferred measurement, not a failed submission. The upsert is
-    // idempotent, so the next submit from this device repairs the gap.
+    // A deferred measurement, not a failed submission. Durable work remains
+    // available for the next enabled submit to replay.
     console.error("Ratchet census write failed (submission unaffected):", e);
-  } finally {
-    // Do not clear the ledger when the upsert failed: later census reads must
-    // remain conservative rather than treating its missing rows as a real
-    // divergence. A successful upsert is enough to complete this entry even
-    // when the diagnostic read/log itself fails.
-    if (highwaterRecorded) {
-      try {
-        await db.execute(sql`
-          UPDATE submissions
-          SET ratchet_census_pending = GREATEST(ratchet_census_pending - 1, 0)
-          WHERE id = ${params.submissionId}::uuid
-        `);
-      } catch (e) {
-        console.error("Ratchet census completion marker failed (submission unaffected):", e);
-      }
-    }
   }
 }
 
@@ -415,6 +392,9 @@ export async function POST(request: Request) {
     // STEP 3: DATABASE OPERATIONS IN TRANSACTION
     // ========================================
     const ratchetCensusEnabled = isDeviceClientTotalsWriteEnabled();
+    const ratchetCensusBuckets = ratchetCensusEnabled
+      ? foldContributionsIntoBuckets(data.contributions, isBackfill ? "backfill" : "cli")
+      : [];
     const result = await db.transaction(async (tx) => {
       await tx
         .update(apiTokens)
@@ -973,11 +953,6 @@ export async function POST(request: Request) {
           // the merged totals still include the imported history.
           ...(isBackfill ? { hasBackfill: true } : {}),
           submitCount: sql`COALESCE(submit_count, 0) + 1`,
-          // Register the post-commit census before its daily rows become
-          // visible. See recordRatchetCensus for the paired completion write.
-          ...(ratchetCensusEnabled
-            ? { ratchetCensusPending: sql`ratchet_census_pending + 1` }
-            : {}),
           schemaVersion: sql`GREATEST(COALESCE(${submissions.schemaVersion}, 0), ${submitDevice.schemaVersion})`,
           // Derived from the per-device high-water marks (see deviceTotals
           // above), floored by whatever is already stored.
@@ -1014,9 +989,22 @@ export async function POST(request: Request) {
         })
         .where(eq(submissions.id, submissionId));
 
+      // Register durable post-commit work before the transaction exposes its
+      // daily rows. If this invocation is interrupted after commit, a later
+      // enabled submit replays this row rather than leaving a stranded counter.
+      if (ratchetCensusEnabled && ratchetCensusBuckets.length > 0) {
+        await tx.execute(sql`
+          INSERT INTO ratchet_census_work (submission_id, submitted_device_id, buckets)
+          VALUES (
+            ${submissionId}::uuid,
+            ${submittedDevice.id}::uuid,
+            ${JSON.stringify(ratchetCensusBuckets)}::jsonb
+          )
+        `);
+      }
+
       return {
         submissionId,
-        submittedDeviceId: submittedDevice.id,
         isNewSubmission,
         metrics: {
           totalTokens: aggregates.totalTokens,
@@ -1036,9 +1024,6 @@ export async function POST(request: Request) {
     await recordRatchetCensus({
       userId: tokenRecord.userId,
       submissionId: result.submissionId,
-      submittedDeviceId: result.submittedDeviceId,
-      contributions: data.contributions,
-      origin: isBackfill ? "backfill" : "cli",
       servedTokens: result.metrics.totalTokens,
       servedCost: result.metrics.totalCost,
       enabled: ratchetCensusEnabled,

@@ -210,6 +210,27 @@ export interface DeviceClientTotalsExecutor {
   execute(query: SQL): Promise<unknown>;
 }
 
+export interface RatchetCensusWork {
+  id: string;
+  submittedDeviceId: string;
+  buckets: DeviceClientBucketTotal[];
+}
+
+function isDeviceClientBucketTotal(value: unknown): value is DeviceClientBucketTotal {
+  if (!value || typeof value !== "object") return false;
+  const bucket = value as Partial<DeviceClientBucketTotal>;
+  return (
+    typeof bucket.client === "string" &&
+    (bucket.origin === "cli" || bucket.origin === "backfill") &&
+    typeof bucket.bucketWidth === "string" &&
+    typeof bucket.bucketKey === "string" &&
+    typeof bucket.tokens === "number" &&
+    Number.isFinite(bucket.tokens) &&
+    typeof bucket.cost === "number" &&
+    Number.isFinite(bucket.cost)
+  );
+}
+
 /**
  * `GREATEST` upsert of the folded buckets for one device.
  *
@@ -251,6 +272,67 @@ export async function recordDeviceClientTotals(params: {
   }
 
   return buckets.length;
+}
+
+function workRows(result: unknown): RatchetCensusWork[] {
+  const rows = Array.isArray(result)
+    ? result
+    : result && typeof result === "object" && Array.isArray((result as { rows?: unknown }).rows)
+    ? (result as { rows: unknown[] }).rows
+    : [];
+
+  return rows.flatMap((row): RatchetCensusWork[] => {
+    if (!row || typeof row !== "object") return [];
+    const candidate = row as Partial<RatchetCensusWork>;
+    if (
+      typeof candidate.id !== "string" ||
+      typeof candidate.submittedDeviceId !== "string" ||
+      !Array.isArray(candidate.buckets) ||
+      !candidate.buckets.every(isDeviceClientBucketTotal)
+    ) {
+      return [];
+    }
+    return [{
+      id: candidate.id,
+      submittedDeviceId: candidate.submittedDeviceId,
+      buckets: candidate.buckets,
+    }];
+  });
+}
+
+/**
+ * Replay every committed-but-unfinished census write for one submission.
+ *
+ * The work item is inserted with the daily rows in the submit transaction, so
+ * an invocation interrupted after commit leaves durable evidence rather than a
+ * permanently stranded counter. Upserts are idempotent, therefore concurrent
+ * replayers may safely process the same item; only the invocation that deletes
+ * it first completes it.
+ */
+export async function recoverRatchetCensusWork(params: {
+  executor: DeviceClientTotalsExecutor;
+  submissionId: string;
+}): Promise<number> {
+  const result = await params.executor.execute(sql`
+    SELECT id, submitted_device_id AS "submittedDeviceId", buckets
+    FROM ratchet_census_work
+    WHERE submission_id = ${params.submissionId}::uuid
+  `);
+  const work = workRows(result);
+
+  for (const item of work) {
+    await recordDeviceClientTotals({
+      executor: params.executor,
+      submittedDeviceId: item.submittedDeviceId,
+      buckets: item.buckets,
+    });
+    await params.executor.execute(sql`
+      DELETE FROM ratchet_census_work
+      WHERE id = ${item.id}::uuid
+    `);
+  }
+
+  return work.length;
 }
 
 /**
@@ -403,9 +485,9 @@ export async function readDualDerivation(params: {
         WHERE db.submission_id = ${params.submissionId}::uuid
       ) AS "snapshotCost",
       (
-        SELECT s.ratchet_census_pending
-        FROM submissions AS s
-        WHERE s.id = ${params.submissionId}::uuid
+        SELECT COUNT(*)
+        FROM ratchet_census_work AS w
+        WHERE w.submission_id = ${params.submissionId}::uuid
       )::int AS "censusPending",
       COUNT(*)::int AS "bucketCount",
       LEAST(COALESCE(SUM(t.tokens_highwater), 0), ${sql.raw(BIGINT_MAX)})::bigint AS "tokens",
@@ -448,7 +530,7 @@ export interface DualDerivationRecord {
   /** `SUM(daily_breakdown)` from the SAME snapshot as the high-water read. */
   snapshotTokens: number;
   snapshotCost: number;
-  /** Outstanding deferred high-water writes, including this request's own. */
+  /** Outstanding durable deferred high-water writes. */
   censusPending: number;
   /**
    * True when a concurrent submit for this user landed between this request's
@@ -480,10 +562,12 @@ export function buildDualDerivationRecord(params: {
   highwater: HighwaterTotalReading;
 }): DualDerivationRecord {
   const { highwater } = params;
-  // This request increments the ledger in its submit transaction and clears it
-  // only after its high-water upsert. Any additional entry is a committed
-  // submit whose daily rows may be visible while its high-water rows are not.
-  const hasPendingPeer = params.censusPending > 1;
+  // The current invocation replays every work item before reading. Any row
+  // still present in the same snapshot was inserted by a submit that committed
+  // after this invocation's recovery began, so it is a concurrent peer whose
+  // daily rows may be visible while its high-water rows are not. Unlike the
+  // earlier aggregate counter, each item is replayable after interruption.
+  const hasPendingPeer = params.censusPending > 0;
   const base = {
     userId: params.userId,
     submissionId: params.submissionId,

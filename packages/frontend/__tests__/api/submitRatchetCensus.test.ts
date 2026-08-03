@@ -362,6 +362,17 @@ describe("POST /api/submit ratchet census placement (phase 1 / 1.5)", () => {
     expect(inside).not.toContain("submitted_device_client_totals");
   });
 
+  it("registers durable replay work inside the transaction before the daily rows are visible", async () => {
+    primeMocks();
+    const trace = buildMockTx();
+    mockState.db.execute.mockResolvedValue([]);
+
+    const response = await POST(submitRequest());
+
+    expect(response.status).toBe(200);
+    expect(JSON.stringify(trace.inTransaction)).toContain("ratchet_census_work");
+  });
+
   it("does not fail the submit when the post-commit census write throws", async () => {
     primeMocks();
     buildMockTx();

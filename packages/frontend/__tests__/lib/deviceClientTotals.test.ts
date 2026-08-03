@@ -15,6 +15,7 @@ import {
   readDualDerivation,
   readHighwaterTotal,
   recordDeviceClientTotals,
+  recoverRatchetCensusWork,
   type DeviceClientTotalsContribution,
 } from "@/lib/db/deviceClientTotals";
 
@@ -33,7 +34,7 @@ function capturingExecutor() {
   const queries: CapturedQuery[] = [];
   return {
     queries,
-    execute: async (query: SQL) => {
+    execute: async (query: SQL): Promise<unknown> => {
       queries.push(dialect.sqlToQuery(query));
       return [];
     },
@@ -352,6 +353,89 @@ describe("recordDeviceClientTotals upsert", () => {
   });
 });
 
+describe("recoverRatchetCensusWork", () => {
+  const recoveredWork = {
+    id: "11111111-1111-4111-8111-111111111111",
+    submittedDeviceId: "22222222-2222-4222-8222-222222222222",
+    buckets: foldContributionsIntoBuckets(
+      [day("2026-05-01", [{ client: "codex", tokens: 12, cost: 0.5 }])],
+      "cli"
+    ),
+  };
+
+  it("replays and removes work left by an interrupted request", async () => {
+    const executor = capturingExecutor();
+    let reads = 0;
+    executor.execute = async (query: SQL) => {
+      const captured = dialect.sqlToQuery(query);
+      executor.queries.push(captured);
+      if (captured.sql.includes("SELECT id, submitted_device_id")) {
+        reads += 1;
+        return reads === 1 ? [recoveredWork] : [];
+      }
+      return [];
+    };
+
+    await expect(
+      recoverRatchetCensusWork({
+        executor,
+        submissionId: "33333333-3333-4333-8333-333333333333",
+      })
+    ).resolves.toBe(1);
+    await expect(
+      recoverRatchetCensusWork({
+        executor,
+        submissionId: "33333333-3333-4333-8333-333333333333",
+      })
+    ).resolves.toBe(0);
+
+    expect(executor.queries.some((q) => q.sql.includes("submitted_device_client_totals"))).toBe(
+      true
+    );
+    expect(executor.queries.some((q) => q.sql.includes("DELETE FROM ratchet_census_work"))).toBe(
+      true
+    );
+  });
+
+  it("is safe for concurrent replayers because the high-water write is idempotent", async () => {
+    const executor = capturingExecutor();
+    executor.execute = async (query: SQL) => {
+      const captured = dialect.sqlToQuery(query);
+      executor.queries.push(captured);
+      return captured.sql.includes("SELECT id, submitted_device_id") ? [recoveredWork] : [];
+    };
+
+    await Promise.all([
+      recoverRatchetCensusWork({ executor, submissionId: "33333333-3333-4333-8333-333333333333" }),
+      recoverRatchetCensusWork({ executor, submissionId: "33333333-3333-4333-8333-333333333333" }),
+    ]);
+
+    expect(
+      executor.queries.filter((q) => q.sql.includes("submitted_device_client_totals"))
+    ).toHaveLength(2);
+    expect(executor.queries.filter((q) => q.sql.includes("DELETE FROM ratchet_census_work"))).toHaveLength(2);
+  });
+
+  it("leaves malformed durable work untouched rather than constructing a write from it", async () => {
+    const executor = capturingExecutor();
+    executor.execute = async (query: SQL) => {
+      const captured = dialect.sqlToQuery(query);
+      executor.queries.push(captured);
+      return captured.sql.includes("SELECT id, submitted_device_id")
+        ? [{ ...recoveredWork, buckets: [{ client: "codex" }] }]
+        : [];
+    };
+
+    await expect(
+      recoverRatchetCensusWork({ executor, submissionId: "33333333-3333-4333-8333-333333333333" })
+    ).resolves.toBe(0);
+    expect(executor.queries.some((q) => q.sql.includes("submitted_device_client_totals"))).toBe(
+      false
+    );
+    expect(executor.queries.some((q) => q.sql.includes("DELETE FROM ratchet_census_work"))).toBe(false);
+  });
+});
+
 describe("a missing bucket reads as UNKNOWN, never as zero", () => {
   // The write runs after the submit transaction commits, so the table can lag
   // the daily rows by one submit; and it can only ever be filled by incoming
@@ -434,7 +518,7 @@ describe("readDualDerivation reads both sides from ONE snapshot", () => {
         {
           snapshotTokens: 1200,
           snapshotCost: "3.0000",
-          censusPending: 1,
+          censusPending: 0,
           bucketCount: 0,
           tokens: 0,
           cost: "0",
@@ -456,7 +540,7 @@ describe("buildDualDerivationRecord (Phase 1.5)", () => {
       servedCost: 3,
       snapshotTokens: 1200,
       snapshotCost: 3,
-      censusPending: 1,
+      censusPending: 0,
       highwater: { status: "known", tokens: 1000, cost: 2.5, bucketCount: 4 },
     });
 
@@ -484,7 +568,7 @@ describe("buildDualDerivationRecord (Phase 1.5)", () => {
       servedCost: 3,
       snapshotTokens: 1500,
       snapshotCost: 4,
-      censusPending: 1,
+      censusPending: 0,
       highwater: { status: "known", tokens: 1500, cost: 4, bucketCount: 6 },
     });
 
@@ -507,7 +591,7 @@ describe("buildDualDerivationRecord (Phase 1.5)", () => {
       servedCost: 3,
       snapshotTokens: 1500,
       snapshotCost: 4.25,
-      censusPending: 1,
+      censusPending: 0,
       highwater: { status: "known", tokens: 1500, cost: 4.25, bucketCount: 6 },
     });
 
@@ -523,7 +607,7 @@ describe("buildDualDerivationRecord (Phase 1.5)", () => {
       servedCost: 3,
       snapshotTokens: 1200,
       snapshotCost: 3,
-      censusPending: 1,
+      censusPending: 0,
       highwater: { status: "unknown" },
     });
 
@@ -548,7 +632,7 @@ describe("buildDualDerivationRecord (Phase 1.5)", () => {
       servedCost: 3,
       snapshotTokens: 1500,
       snapshotCost: 4,
-      censusPending: 2,
+      censusPending: 1,
       highwater: { status: "known", tokens: 1200, cost: 3, bucketCount: 4 },
     });
 
@@ -566,7 +650,7 @@ describe("buildDualDerivationRecord (Phase 1.5)", () => {
       servedCost: 1,
       snapshotTokens: 500,
       snapshotCost: 1,
-      censusPending: 1,
+      censusPending: 0,
       highwater: { status: "known", tokens: 0, cost: 0, bucketCount: 2 },
     });
     expect(record.tokenRatio).toBeNull();

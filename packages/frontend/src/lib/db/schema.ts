@@ -207,13 +207,6 @@ export const submissions = pgTable(
     cliVersion: varchar("cli_version", { length: 20 }),
     submissionHash: varchar("submission_hash", { length: 64 }),
     submitCount: integer("submit_count").notNull().default(1),
-    /**
-     * Enabled-only Phase 1.5 work ledger. Each committed submit increments
-     * this before its deferred high-water write; that write decrements it only
-     * after succeeding. A census never treats a snapshot with another pending
-     * write as trustworthy.
-     */
-    ratchetCensusPending: integer("ratchet_census_pending").notNull().default(0),
     /** 0=legacy (no timestamps), 1=timestamp-aware CLI */
     schemaVersion: integer("schema_version").notNull().default(0),
     /**
@@ -502,6 +495,42 @@ export const submittedDeviceClientTotalsRelations = relations(
       references: [submittedDevices.id],
     }),
   })
+);
+
+// ============================================================================
+// RATCHET CENSUS WORK (durable post-commit high-water writes)
+// ============================================================================
+/**
+ * One durable deferred high-water write. It is registered in the submit
+ * transaction, then replayed and deleted only after its idempotent upsert
+ * succeeds. This lets a later submit recover work abandoned by an interrupted
+ * request without mistaking that gap for a stable census divergence.
+ */
+export const ratchetCensusWork = pgTable(
+  "ratchet_census_work",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    submissionId: uuid("submission_id")
+      .notNull()
+      .references(() => submissions.id, { onDelete: "cascade" }),
+    submittedDeviceId: uuid("submitted_device_id")
+      .notNull()
+      .references(() => submittedDevices.id, { onDelete: "cascade" }),
+    buckets: jsonb("buckets").$type<
+      Array<{
+        client: string;
+        origin: "cli" | "backfill";
+        bucketWidth: string;
+        bucketKey: string;
+        tokens: number;
+        cost: number;
+      }>
+    >().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [index("idx_ratchet_census_work_submission_id").on(table.submissionId)]
 );
 
 // ============================================================================

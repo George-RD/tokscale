@@ -169,6 +169,13 @@
       "when": 1785783969629,
       "tag": "0023_stormy_iron_lad",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1785785051220,
+      "tag": "0024_parched_dreadnoughts",
+      "breakpoints": true
     }
   ]
 }
