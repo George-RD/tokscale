@@ -936,7 +936,7 @@ fn main() -> Result<()> {
                 summarizer,
                 rebuild,
                 home_dir: cli.home.clone(),
-                scanner_settings: tui::settings::load_scanner_settings(),
+                scanner_settings: report_scanner_settings(&cli.home),
                 today,
                 week,
                 month,
@@ -1701,6 +1701,12 @@ fn current_bucket_date(home_dir: &Option<String>) -> chrono::NaiveDate {
         &tui::settings::load_scanner_settings_for_home(home_dir),
     )
     .today()
+}
+
+/// Scanner settings for `report`, read from the same profile as its session
+/// data. `--home` can refer to a device with a different pinned bucket zone.
+fn report_scanner_settings(home_dir: &Option<String>) -> tokscale_core::scanner::ScannerSettings {
+    tui::settings::load_scanner_settings_for_home(home_dir)
 }
 
 fn build_date_filter_for_date(
@@ -7269,6 +7275,8 @@ mod tests {
         let kiritimati =
             current_bucket_date(&Some(kiritimati_home.path().to_string_lossy().into_owned()));
         let niue = current_bucket_date(&Some(niue_home.path().to_string_lossy().into_owned()));
+        let report_settings =
+            report_scanner_settings(&Some(kiritimati_home.path().to_string_lossy().into_owned()));
 
         assert_eq!(
             kiritimati,
@@ -7279,6 +7287,11 @@ mod tests {
             kiritimati, niue,
             "two homes pinned 25 hours apart can never share a calendar date — \
              equal values mean the override was ignored"
+        );
+        assert_eq!(
+            report_settings.bucket_timezone.as_deref(),
+            Some("Pacific/Kiritimati"),
+            "report must rebucket sessions with the --home profile's timezone"
         );
     }
 
