@@ -1394,10 +1394,16 @@ impl SessionPathIndex {
 /// the id from the in-file `sessionId`/`session_id` field, so they are keyed by
 /// the parsed id (with the stem kept as a fallback alias).
 fn build_session_path_index(opts: &ReportOptions) -> SessionPathIndex {
+    // Same contract as `tokscale_core::get_home_dir_string`: only
+    // `paths::home_dir` may read `$HOME`, so a Git Bash `HOME=/home/user` on
+    // Windows cannot send this scan to `C:\home\user`. `unwrap_or_default()`
+    // is retained as the last resort because indexing is best-effort, but it
+    // is now only reachable when no home resolves at all rather than whenever
+    // `HOME` was exported blank.
     let home_dir = opts
         .home_dir
         .clone()
-        .or_else(|| std::env::var("HOME").ok())
+        .or_else(|| tokscale_core::paths::home_dir().map(|p| p.to_string_lossy().into_owned()))
         .unwrap_or_default();
     let use_env_roots = opts.home_dir.is_none();
 

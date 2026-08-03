@@ -26,14 +26,23 @@ use std::path::PathBuf;
 /// the machine running the suite, and `test_load_credentials_nonexistent`
 /// was asserting against the developer's own credentials file.
 ///
-/// `$HOME` is only honored on Windows when it carries a real Win32 prefix
-/// (`C:\...`, `\\?\C:\...`, `\\server\share`). MSYS2, Cygwin and Git Bash
-/// export POSIX-shaped values such as `/home/user`, which `Path` resolves
-/// against whatever the current drive happens to be — obeying those would
-/// relocate the config of every user who launches tokscale from a Unix-shell
-/// emulator to `C:\home\user`. Requiring the prefix keeps the redirect
-/// available to anything that can set a native path while leaving the
-/// emulator case on the platform default.
+/// `$HOME` is only honored on Windows when it is an absolute native path
+/// (`C:\...`, `\\?\C:\...`, `\\server\share`). Two shapes are rejected, both
+/// because `Path` silently resolves them against ambient state:
+///
+/// - POSIX-shaped values such as `/home/user`, exported by MSYS2, Cygwin and
+///   Git Bash. `Path` reads the leading `/` as "root of the current drive",
+///   so obeying them would relocate the config of every user who launches
+///   tokscale from a Unix-shell emulator to `C:\home\user`.
+/// - Drive-relative values such as `C:temp`, which carry a `Prefix` but no
+///   root. Windows resolves those against the *per-drive current directory*,
+///   so the same `HOME` names a different place depending on where the
+///   process last `cd`-ed on drive C — home-rooted reads and writes would
+///   land somewhere unintended and unreproducible.
+///
+/// `Path::is_absolute` on Windows is exactly `has_root() && prefix().is_some()`,
+/// which rejects both in one check while leaving the redirect available to
+/// anything that can set a real native path.
 ///
 /// Every home-rooted path in the workspace must resolve through here rather
 /// than calling `dirs::home_dir()` directly, otherwise the redirect holds for
@@ -51,9 +60,10 @@ pub fn home_dir() -> Option<PathBuf> {
 
 /// `$HOME` on Windows, but only when it names a path Win32 can actually use.
 ///
-/// See [`home_dir`] for why the prefix check is load-bearing rather than a
-/// nicety: without it a Git Bash `HOME=/home/user` would win over the real
-/// profile.
+/// See [`home_dir`] for why the absoluteness check is load-bearing rather than
+/// a nicety: without it a Git Bash `HOME=/home/user` would win over the real
+/// profile, and a drive-relative `HOME=C:temp` would resolve against whatever
+/// the current directory on drive C happens to be.
 #[cfg(windows)]
 fn windows_native_home_override() -> Option<PathBuf> {
     let raw = std::env::var_os("HOME")?;
@@ -61,11 +71,7 @@ fn windows_native_home_override() -> Option<PathBuf> {
         return None;
     }
     let path = PathBuf::from(raw);
-    matches!(
-        path.components().next(),
-        Some(std::path::Component::Prefix(_))
-    )
-    .then_some(path)
+    path.is_absolute().then_some(path)
 }
 
 /// Resolve the tokscale config dir, honoring `TOKSCALE_CONFIG_DIR` first.
@@ -236,6 +242,32 @@ mod tests {
             env::set_var("HOME", "/home/runner");
         }
         assert_ne!(home_dir(), Some(PathBuf::from("/home/runner")));
+        restore_env(prev);
+    }
+
+    /// `C:temp` carries a `Prefix` component but no root, so a prefix-only
+    /// check accepts it. Windows then resolves it against the *per-drive
+    /// current directory* for C: — the same `HOME` names a different directory
+    /// depending on where the process last `cd`-ed, so credentials and scan
+    /// roots move unpredictably. Only absolute native paths may redirect home.
+    ///
+    /// Windows-only by construction: `C:temp` is a perfectly ordinary relative
+    /// filename on Unix, and `Path`'s prefix parsing only exists on Windows
+    /// targets, so there is no way to exercise this on macOS. It does run —
+    /// on the `windows-latest` leg this PR adds.
+    #[test]
+    #[serial]
+    #[cfg(windows)]
+    fn home_dir_ignores_a_drive_relative_home() {
+        let prev = save_env();
+        unsafe {
+            env::set_var("HOME", r"C:temp");
+        }
+        assert_ne!(
+            home_dir(),
+            Some(PathBuf::from(r"C:temp")),
+            "a drive-relative HOME resolves against the current directory on that drive"
+        );
         restore_env(prev);
     }
 

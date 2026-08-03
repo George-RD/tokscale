@@ -110,16 +110,19 @@ impl WikiDb {
         Ok(Self { conn })
     }
 
-    /// Default wiki DB path: ~/.config/tokscale/wiki.db
+    /// Default wiki DB path: `<config_dir>/wiki.db`.
+    ///
+    /// Resolved through [`crate::paths::get_config_dir`], the same resolver
+    /// `settings.json`, the caches and `custom-pricing.json` use, so the wiki
+    /// lands in whatever root the user asked for. The hand-rolled
+    /// `dirs::config_dir()` chain this replaces ignored `TOKSCALE_CONFIG_DIR`
+    /// outright: `tokscale report` opened — and created — `wiki.db` in the
+    /// real profile even when every other file was redirected to an isolated
+    /// root. On Windows that is `%APPDATA%\tokscale`, and on macOS
+    /// `~/Library/Application Support/tokscale`, which also contradicted this
+    /// very doc comment's `~/.config/tokscale` claim.
     pub fn default_path() -> PathBuf {
-        let config_dir = dirs::config_dir()
-            .unwrap_or_else(|| {
-                crate::paths::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join(".config")
-            })
-            .join("tokscale");
-        config_dir.join("wiki.db")
+        crate::paths::get_config_dir().join("wiki.db")
     }
 
     const SCHEMA: &'static str = r#"
@@ -523,4 +526,59 @@ pub enum WikiError {
     Io(String),
     #[error("Serialization error: {0}")]
     Serde(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use std::env;
+
+    fn restore(prev: Option<std::ffi::OsString>) {
+        unsafe {
+            match prev {
+                Some(v) => env::set_var("TOKSCALE_CONFIG_DIR", v),
+                None => env::remove_var("TOKSCALE_CONFIG_DIR"),
+            }
+        }
+    }
+
+    /// `tokscale report` is the one command that opens a SQLite database, and
+    /// it was the one path that ignored `TOKSCALE_CONFIG_DIR`: the old
+    /// `dirs::config_dir()` chain only consulted the fallback when
+    /// `dirs::config_dir()` returned `None`, which it never does on macOS,
+    /// Linux or Windows. So an isolated profile got an isolated everything
+    /// except its wiki, which was read from — and created in — the real user's
+    /// config dir.
+    #[test]
+    #[serial]
+    fn default_path_follows_the_config_dir_override() {
+        let prev = env::var_os("TOKSCALE_CONFIG_DIR");
+        let root = env::temp_dir().join("tokscale-wiki-default-path-probe");
+        unsafe {
+            env::set_var("TOKSCALE_CONFIG_DIR", &root);
+        }
+        assert_eq!(WikiDb::default_path(), root.join("wiki.db"));
+        restore(prev);
+    }
+
+    /// The override is the hermetic contract, so the wiki must sit under the
+    /// same root as every other tokscale file rather than beside it. Pinned
+    /// separately from the exact-path assertion above so a future change to
+    /// the filename does not quietly reintroduce a second root.
+    #[test]
+    #[serial]
+    fn default_path_stays_inside_the_resolved_config_dir() {
+        let prev = env::var_os("TOKSCALE_CONFIG_DIR");
+        let root = env::temp_dir().join("tokscale-wiki-containment-probe");
+        unsafe {
+            env::set_var("TOKSCALE_CONFIG_DIR", &root);
+        }
+        let path = WikiDb::default_path();
+        assert!(
+            path.starts_with(&root),
+            "wiki.db escaped the config-dir override: {path:?} is not under {root:?}"
+        );
+        restore(prev);
+    }
 }
