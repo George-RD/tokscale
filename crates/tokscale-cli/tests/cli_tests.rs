@@ -3907,31 +3907,50 @@ fn test_first_run_pins_the_host_timezone_without_changing_its_own_output() {
 }
 
 #[test]
-fn test_config_set_timezone_repoints_day_buckets() {
+fn test_config_rejects_rekeying_or_unsetting_an_established_timezone() {
     let tmp = create_bucket_timezone_fixture_dir();
     pin_bucket_timezone(tmp.path(), "America/Los_Angeles");
-    assert_eq!(
-        graph_day_buckets(tmp.path(), "Asia/Seoul"),
-        vec![("2026-03-02".to_string(), 2)]
-    );
 
     cmd_with_home(tmp.path())
         .args(["config", "set", "timezone", "Pacific/Kiritimati"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("Pacific/Kiritimati"));
-
-    assert_eq!(
-        graph_day_buckets(tmp.path(), "Asia/Seoul"),
-        vec![("2026-03-03".to_string(), 2)],
-        "`config set timezone` must move the day boundaries deliberately"
-    );
+        .failure()
+        .stderr(predicate::str::contains(
+            "historical submitted day rows are monotonic",
+        ));
 
     cmd_with_home(tmp.path())
-        .args(["config", "get", "timezone"])
+        .args(["config", "set", "timezone", "auto"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "server resync/replacement transition",
+        ));
+
+    cmd_with_home(tmp.path())
+        .args(["config", "unset", "timezone"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "historical submitted day rows are monotonic",
+        ));
+
+    cmd_with_home(tmp.path())
+        .args(["config", "set", "timezone", "America/Los_Angeles"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Pacific/Kiritimati"));
+        .stdout(predicate::str::contains("(unchanged)"));
+}
+
+#[test]
+fn test_config_can_recover_an_invalid_or_unpinned_timezone() {
+    let tmp = create_bucket_timezone_fixture_dir();
+    pin_bucket_timezone(tmp.path(), "Mars/Olympus_Mons");
+
+    cmd_with_home(tmp.path())
+        .args(["config", "set", "timezone", "Asia/Seoul"])
+        .assert()
+        .success();
 }
 
 /// A fixed UTC offset cannot follow daylight saving time, so pinning one would

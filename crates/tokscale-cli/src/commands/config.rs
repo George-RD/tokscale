@@ -1,9 +1,8 @@
 //! `tokscale config` — read and write persistent settings from the CLI.
 //!
 //! Currently exposes exactly one key, `timezone`, because it is the one setting
-//! a user has a concrete reason to change by hand: the timezone a device
-//! buckets usage days into is pinned automatically on first run, and someone
-//! who relocates needs a deliberate way to move it.
+//! a user has a concrete reason to inspect by hand: the timezone a device
+//! buckets usage days into is pinned automatically on first run.
 
 use anyhow::{bail, Result};
 use colored::Colorize;
@@ -44,8 +43,17 @@ pub fn run_set(key: &str, value: &str) -> Result<()> {
 
     match key {
         "timezone" => {
+            let is_auto = value.trim().eq_ignore_ascii_case("auto");
             let resolved = resolve_timezone_value(value)?;
             let previous = settings.scanner.bucket_timezone.clone();
+            if is_auto && is_valid_timezone(previous.as_deref()) {
+                bail!(
+                    "cannot set scanner.bucketTimezone to auto because historical submitted day \
+                     rows are monotonic. A server resync/replacement transition is required \
+                     before changing this bucket timezone."
+                );
+            }
+            reject_timezone_rekey(previous.as_deref(), &resolved)?;
             settings.scanner.bucket_timezone = Some(resolved.clone());
             settings.save()?;
 
@@ -54,16 +62,7 @@ pub fn run_set(key: &str, value: &str) -> Result<()> {
                 Some(previous) if previous == resolved => {
                     println!("(unchanged)");
                 }
-                Some(previous) => {
-                    println!("  was: {previous}");
-                    // Say the cost out loud. Repointing the zone re-keys every
-                    // day boundary, so the next scan reports a different split
-                    // of the same history — once.
-                    eprintln!(
-                        "Day boundaries move to {resolved}. The next scan re-splits history \
-                         across days one final time, then stays stable."
-                    );
-                }
+                Some(_) => println!("(unchanged)"),
                 None => {
                     eprintln!(
                         "Day boundaries are now fixed to {resolved} and no longer follow this \
@@ -84,6 +83,7 @@ pub fn run_unset(key: &str) -> Result<()> {
 
     match key {
         "timezone" => {
+            reject_timezone_unset(settings.scanner.bucket_timezone.as_deref())?;
             let previous = settings.scanner.bucket_timezone.take();
             settings.save()?;
 
@@ -91,13 +91,7 @@ pub fn run_unset(key: &str) -> Result<()> {
                 Some(previous) => println!("{} timezone (was {previous})", "unset".green().bold()),
                 None => println!("timezone was already unset"),
             }
-            // Unset means "re-detect", not "stop pinning": the next run pins
-            // this machine's current zone again. That is the useful reading —
-            // it is how someone who moved re-pins without typing a zone name.
-            eprintln!(
-                "The next tokscale run re-pins this machine's current timezone. \
-                 Use `tokscale config set timezone <zone>` to choose one explicitly."
-            );
+            eprintln!("The next tokscale run re-detects this machine's timezone.");
         }
         _ => unreachable!("normalize_key only returns keys handled here"),
     }
@@ -184,6 +178,43 @@ fn resolve_timezone_value(value: &str) -> Result<String> {
     }
 }
 
+/// A valid pin defines submitted day keys. The server only merges those keys
+/// monotonically, so replacing or removing it would submit the same historical
+/// usage under different keys and permanently inflate totals.
+fn reject_timezone_rekey(previous: Option<&str>, resolved: &str) -> Result<()> {
+    let BucketTimezone::Pinned(previous) = BucketTimezone::from_pinned_name(previous) else {
+        return Ok(());
+    };
+
+    if previous.name() == resolved {
+        return Ok(());
+    }
+
+    bail!(
+        "cannot change scanner.bucketTimezone from {} to {resolved}: historical submitted day \
+         rows are monotonic. A server resync/replacement transition is required before changing \
+         this bucket timezone.",
+        previous.name()
+    )
+}
+
+fn reject_timezone_unset(previous: Option<&str>) -> Result<()> {
+    let BucketTimezone::Pinned(previous) = BucketTimezone::from_pinned_name(previous) else {
+        return Ok(());
+    };
+
+    bail!(
+        "cannot unset scanner.bucketTimezone ({}) because historical submitted day rows are \
+         monotonic. A server resync/replacement transition is required before changing this \
+         bucket timezone.",
+        previous.name()
+    )
+}
+
+fn is_valid_timezone(value: Option<&str>) -> bool {
+    BucketTimezone::from_pinned_name(value).is_pinned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +252,30 @@ mod tests {
         // `UTC` is in the tz database and has no DST, so unlike `+00:00` it is
         // a legitimate pin — useful for servers and CI that genuinely run on it.
         assert_eq!(resolve_timezone_value("UTC").unwrap(), "UTC");
+    }
+
+    #[test]
+    fn valid_pins_only_allow_the_same_canonical_zone() {
+        assert!(reject_timezone_rekey(Some("Asia/Seoul"), "Asia/Seoul").is_ok());
+        let error = reject_timezone_rekey(Some("Asia/Seoul"), "UTC").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("historical submitted day rows are monotonic"));
+        assert!(reject_timezone_unset(Some("Asia/Seoul")).is_err());
+    }
+
+    #[test]
+    fn unpinned_or_invalid_values_can_be_recovered() {
+        assert!(reject_timezone_rekey(None, "UTC").is_ok());
+        assert!(reject_timezone_rekey(Some("Mars/Olympus_Mons"), "UTC").is_ok());
+        assert!(reject_timezone_unset(None).is_ok());
+        assert!(reject_timezone_unset(Some("Mars/Olympus_Mons")).is_ok());
+    }
+
+    #[test]
+    fn valid_pin_is_distinguished_from_an_invalid_hand_edited_value() {
+        assert!(is_valid_timezone(Some("Asia/Seoul")));
+        assert!(!is_valid_timezone(Some("Mars/Olympus_Mons")));
+        assert!(!is_valid_timezone(None));
     }
 }

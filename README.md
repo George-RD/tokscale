@@ -906,20 +906,21 @@ timezone     Asia/Seoul
 $ tokscale config get timezone
 Asia/Seoul
 
-# After relocating — day boundaries move once, then stay stable
-$ tokscale config set timezone America/New_York
-
-# Re-detect from the machine instead of naming a zone
+# `set timezone auto` is allowed only before a valid pin exists (or while
+# recovering an invalid hand-edited value). It cannot repin an established
+# device.
 $ tokscale config set timezone auto
-
-# Forget the pin; the next run re-detects
-$ tokscale config unset timezone
 ```
 
 Only IANA zone names are accepted. Fixed UTC offsets such as `+09:00` are
 rejected: an offset cannot follow daylight saving time, so a pinned offset stops
 matching local midnight after a DST transition and re-splits usage near the day
 boundary — a smaller version of the problem pinning removes.
+
+An established valid pin cannot be changed or unset, including with `auto`.
+Historical submitted day rows are monotonic, so re-keying prior usage would
+permanently double count it. Relocating a device requires a server
+resync/replacement transition before choosing a different bucket timezone.
 
 Existing installs are unaffected until they pin, and the run that pins reports
 exactly what it would have reported anyway: the zone recorded is the one the

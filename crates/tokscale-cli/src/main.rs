@@ -925,7 +925,12 @@ fn main() -> Result<()> {
             let today = date.today;
             let week = date.week;
             let month = date.month;
-            let (since, until) = build_date_filter(&date, &cli.home);
+            // Resolve this once for both date boundaries and scanning. `--home`
+            // selects another profile's pinned day keys.
+            let scanner_settings = tui::settings::load_scanner_settings_for_home(&cli.home);
+            let bucket_timezone =
+                tokscale_core::BucketTimezone::from_scanner_settings(&scanner_settings);
+            let (since, until) = build_date_filter_for_date(&date, bucket_timezone.today());
             commands::report::run_report(commands::report::ReportOptions {
                 json,
                 since,
@@ -936,7 +941,7 @@ fn main() -> Result<()> {
                 summarizer,
                 rebuild,
                 home_dir: cli.home.clone(),
-                scanner_settings: report_scanner_settings(&cli.home),
+                scanner_settings,
                 today,
                 week,
                 month,
@@ -1701,12 +1706,6 @@ fn current_bucket_date(home_dir: &Option<String>) -> chrono::NaiveDate {
         &tui::settings::load_scanner_settings_for_home(home_dir),
     )
     .today()
-}
-
-/// Scanner settings for `report`, read from the same profile as its session
-/// data. `--home` can refer to a device with a different pinned bucket zone.
-fn report_scanner_settings(home_dir: &Option<String>) -> tokscale_core::scanner::ScannerSettings {
-    tui::settings::load_scanner_settings_for_home(home_dir)
 }
 
 fn build_date_filter_for_date(
@@ -7275,8 +7274,9 @@ mod tests {
         let kiritimati =
             current_bucket_date(&Some(kiritimati_home.path().to_string_lossy().into_owned()));
         let niue = current_bucket_date(&Some(niue_home.path().to_string_lossy().into_owned()));
-        let report_settings =
-            report_scanner_settings(&Some(kiritimati_home.path().to_string_lossy().into_owned()));
+        let report_settings = tui::settings::load_scanner_settings_for_home(&Some(
+            kiritimati_home.path().to_string_lossy().into_owned(),
+        ));
 
         assert_eq!(
             kiritimati,

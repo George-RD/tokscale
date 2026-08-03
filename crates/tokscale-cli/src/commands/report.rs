@@ -42,9 +42,8 @@ pub fn run_report(opts: ReportOptions) -> Result<()> {
     // Day boundaries have to be resolved in the same zone the day keys are built
     // from, or a pinned device filters pinned-day strings against host-day
     // instants and loses an offset's worth of sessions at each edge.
-    let bucket_timezone = tokscale_core::BucketTimezone::from_scanner_settings(
-        &crate::tui::settings::load_scanner_settings_for_home(&opts.home_dir),
-    );
+    let bucket_timezone =
+        tokscale_core::BucketTimezone::from_scanner_settings(&opts.scanner_settings);
     let (since_ts, until_ts) = parse_date_range(&opts.since, &opts.until, &bucket_timezone);
 
     if opts.rebuild {
