@@ -166,46 +166,102 @@ pub fn legacy_dot_cache_tokscale_dir() -> Option<PathBuf> {
     home_dir().map(|h| h.join(".cache").join("tokscale"))
 }
 
+/// RAII restore of process-global environment variables, shared by the tests
+/// in this crate that redirect `HOME` or `TOKSCALE_CONFIG_DIR`.
+///
+/// The manual `save`/`restore` pairs this replaces only ran the restore when
+/// the test reached the end of its body — a failing assertion panics first and
+/// leaves the redirect in place. `serial_test` guarantees these tests do not
+/// overlap, but they do share a process, so the next one to run inherits a
+/// `HOME` pointing at a deleted `TempDir` and fails for a reason that has
+/// nothing to do with what it asserts. Restoring on `Drop` unwinds correctly.
+///
+/// `scanner.rs` and `sessions/opencode.rs` already carry private copies of
+/// this; this one is `pub(crate)` so `paths`, `wiki` and the crate-root tests
+/// share a single implementation.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serial_test::serial;
-    use std::env;
-    use std::path::Path;
+pub(crate) mod test_env {
+    use std::ffi::{OsStr, OsString};
 
-    fn save_env() -> (
-        Option<std::ffi::OsString>,
-        Option<std::ffi::OsString>,
-        Option<std::ffi::OsString>,
-    ) {
-        (
-            env::var_os("TOKSCALE_CONFIG_DIR"),
-            env::var_os("HOME"),
-            env::var_os("XDG_CONFIG_HOME"),
-        )
+    pub(crate) struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
+
+    impl EnvGuard {
+        pub(crate) fn capture(keys: &[&'static str]) -> Self {
+            Self(
+                keys.iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            )
+        }
+
+        pub(crate) fn set(&self, key: &str, value: impl AsRef<OsStr>) {
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        pub(crate) fn remove(&self, key: &str) {
+            unsafe { std::env::remove_var(key) };
+        }
     }
 
-    fn restore_env(
-        prev: (
-            Option<std::ffi::OsString>,
-            Option<std::ffi::OsString>,
-            Option<std::ffi::OsString>,
-        ),
-    ) {
-        unsafe {
-            match prev.0 {
-                Some(v) => env::set_var("TOKSCALE_CONFIG_DIR", v),
-                None => env::remove_var("TOKSCALE_CONFIG_DIR"),
-            }
-            match prev.1 {
-                Some(v) => env::set_var("HOME", v),
-                None => env::remove_var("HOME"),
-            }
-            match prev.2 {
-                Some(v) => env::set_var("XDG_CONFIG_HOME", v),
-                None => env::remove_var("XDG_CONFIG_HOME"),
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, previous) in self.0.drain(..) {
+                unsafe {
+                    match previous {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_env::EnvGuard;
+    use super::*;
+    use serial_test::serial;
+    use std::path::Path;
+
+    /// Every test in this module redirects at least one of these, and
+    /// `get_config_dir` reads all three, so capturing the set keeps a test
+    /// from leaking a partial redirect into the next one.
+    fn guard() -> EnvGuard {
+        EnvGuard::capture(&["TOKSCALE_CONFIG_DIR", "HOME", "XDG_CONFIG_HOME"])
+    }
+
+    /// The whole point of the guard over a trailing `restore_env(prev)` call:
+    /// a failing assertion panics *before* the manual restore runs, so the
+    /// redirect leaks into every later test in the process. `serial_test`
+    /// does not help — it prevents overlap, not inheritance. The next test to
+    /// run would then resolve `HOME` to a deleted `TempDir` and fail for a
+    /// reason unrelated to what it asserts, which is exactly the kind of
+    /// cascading, order-dependent failure that makes a Windows CI leg
+    /// unreadable.
+    #[test]
+    #[serial]
+    fn env_guard_restores_even_when_the_test_body_panics() {
+        const SENTINEL: &str = "TOKSCALE_ENV_GUARD_PANIC_PROBE";
+        unsafe { std::env::set_var(SENTINEL, "original") };
+
+        // The panic below is deliberate; keep it out of the test output.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(|| {
+            let env = EnvGuard::capture(&[SENTINEL]);
+            env.set(SENTINEL, "redirected");
+            panic!("simulated assertion failure");
+        });
+        std::panic::set_hook(hook);
+
+        assert!(outcome.is_err(), "the probe closure must have panicked");
+        assert_eq!(
+            std::env::var(SENTINEL).ok().as_deref(),
+            Some("original"),
+            "EnvGuard must restore the previous value while unwinding"
+        );
+        unsafe { std::env::remove_var(SENTINEL) };
     }
 
     /// The regression #997 is really about: this assertion has always held on
@@ -217,32 +273,27 @@ mod tests {
     #[test]
     #[serial]
     fn home_dir_follows_an_explicit_native_home_on_every_platform() {
-        let prev = save_env();
+        let env = guard();
         // `env::temp_dir()` is absolute and carries a drive prefix on Windows,
         // which is exactly the shape a `TempDir`-based test produces.
-        let redirect = env::temp_dir().join("tokscale-core-home-dir-probe");
-        unsafe {
-            env::set_var("HOME", &redirect);
-        }
+        let redirect = std::env::temp_dir().join("tokscale-core-home-dir-probe");
+        env.set("HOME", &redirect);
         assert_eq!(home_dir(), Some(redirect));
-        restore_env(prev);
     }
 
     /// MSYS2, Cygwin and Git Bash export `HOME=/home/<user>`. `Path` reads a
     /// leading `/` on Windows as "root of the current drive", so honoring that
     /// value would silently move a real user's credentials and scan roots to
-    /// `C:\home\<user>`. The prefix check in `windows_native_home_override`
-    /// exists solely to keep that from happening.
+    /// `C:\home\<user>`. The absoluteness check in
+    /// `windows_native_home_override` exists solely to keep that from
+    /// happening.
     #[test]
     #[serial]
     #[cfg(windows)]
     fn home_dir_ignores_a_posix_shaped_home() {
-        let prev = save_env();
-        unsafe {
-            env::set_var("HOME", "/home/runner");
-        }
+        let env = guard();
+        env.set("HOME", "/home/runner");
         assert_ne!(home_dir(), Some(PathBuf::from("/home/runner")));
-        restore_env(prev);
     }
 
     /// `C:temp` carries a `Prefix` component but no root, so a prefix-only
@@ -259,16 +310,13 @@ mod tests {
     #[serial]
     #[cfg(windows)]
     fn home_dir_ignores_a_drive_relative_home() {
-        let prev = save_env();
-        unsafe {
-            env::set_var("HOME", r"C:temp");
-        }
+        let env = guard();
+        env.set("HOME", r"C:temp");
         assert_ne!(
             home_dir(),
             Some(PathBuf::from(r"C:temp")),
             "a drive-relative HOME resolves against the current directory on that drive"
         );
-        restore_env(prev);
     }
 
     /// Same contract as `get_config_dir`: an exported-but-blank variable is a
@@ -278,91 +326,71 @@ mod tests {
     #[serial]
     #[cfg(windows)]
     fn home_dir_treats_an_empty_home_as_unset() {
-        let prev = save_env();
-        unsafe {
-            env::set_var("HOME", "");
-        }
+        let env = guard();
+        env.set("HOME", "");
         assert_ne!(home_dir(), Some(PathBuf::new()));
-        restore_env(prev);
     }
 
     #[test]
     #[serial]
     fn env_override_is_returned_verbatim() {
-        let prev = save_env();
-        unsafe {
-            env::set_var("TOKSCALE_CONFIG_DIR", "/tmp/tokscale-custom");
-        }
+        let env = guard();
+        env.set("TOKSCALE_CONFIG_DIR", "/tmp/tokscale-custom");
         assert_eq!(get_config_dir(), PathBuf::from("/tmp/tokscale-custom"));
-        restore_env(prev);
     }
 
     #[test]
     #[serial]
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn unix_default_is_dot_config_tokscale_under_home() {
-        let prev = save_env();
-        unsafe {
-            env::remove_var("TOKSCALE_CONFIG_DIR");
-            env::remove_var("XDG_CONFIG_HOME");
-            env::set_var("HOME", "/tmp/tokscale-core-paths-home");
-        }
+        let env = guard();
+        env.remove("TOKSCALE_CONFIG_DIR");
+        env.remove("XDG_CONFIG_HOME");
+        env.set("HOME", "/tmp/tokscale-core-paths-home");
         assert_eq!(
             get_config_dir(),
             PathBuf::from("/tmp/tokscale-core-paths-home/.config/tokscale"),
         );
-        restore_env(prev);
     }
 
     #[test]
     #[serial]
     #[cfg(target_os = "linux")]
     fn linux_honors_xdg_config_home_when_set() {
-        let prev = save_env();
-        unsafe {
-            env::remove_var("TOKSCALE_CONFIG_DIR");
-            env::set_var("XDG_CONFIG_HOME", "/tmp/tokscale-core-paths-xdg");
-        }
+        let env = guard();
+        env.remove("TOKSCALE_CONFIG_DIR");
+        env.set("XDG_CONFIG_HOME", "/tmp/tokscale-core-paths-xdg");
         assert_eq!(
             get_config_dir(),
             PathBuf::from("/tmp/tokscale-core-paths-xdg/tokscale"),
         );
-        restore_env(prev);
     }
 
     #[test]
     #[serial]
     fn cache_dir_is_cache_subdir_of_config_dir() {
-        let prev = save_env();
-        unsafe {
-            env::set_var("TOKSCALE_CONFIG_DIR", "/tmp/tokscale-cache-test");
-        }
+        let env = guard();
+        env.set("TOKSCALE_CONFIG_DIR", "/tmp/tokscale-cache-test");
         assert_eq!(
             get_cache_dir(),
             PathBuf::from("/tmp/tokscale-cache-test/cache")
         );
-        restore_env(prev);
     }
 
     #[test]
     #[serial]
     fn legacy_helpers_return_none_when_overridden() {
-        let prev = save_env();
-        unsafe {
-            env::set_var("TOKSCALE_CONFIG_DIR", "/tmp/tokscale-override");
-        }
+        let env = guard();
+        env.set("TOKSCALE_CONFIG_DIR", "/tmp/tokscale-override");
         assert!(legacy_dirs_cache_dir().is_none());
         assert!(legacy_dot_cache_tokscale_dir().is_none());
-        restore_env(prev);
     }
 
     #[test]
     #[serial]
     fn legacy_helpers_return_some_when_not_overridden() {
-        let prev = save_env();
-        unsafe {
-            env::remove_var("TOKSCALE_CONFIG_DIR");
-        }
+        let env = guard();
+        env.remove("TOKSCALE_CONFIG_DIR");
         assert!(
             legacy_dirs_cache_dir().is_some(),
             "dirs::cache_dir always resolves on test platforms"
@@ -371,7 +399,6 @@ mod tests {
             legacy_dot_cache_tokscale_dir().is_some(),
             "HOME is set in test environments"
         );
-        restore_env(prev);
     }
 
     #[test]
@@ -381,10 +408,8 @@ mod tests {
         // produced PathBuf::from(""), which silently relocated cache
         // writes to ./cache and ./.tokscale. The resolver must agree
         // with `is_config_dir_overridden`: empty == unset.
-        let prev = save_env();
-        unsafe {
-            env::set_var("TOKSCALE_CONFIG_DIR", "");
-        }
+        let env = guard();
+        env.set("TOKSCALE_CONFIG_DIR", "");
         let resolved = get_config_dir();
         assert_ne!(
             resolved,
@@ -395,17 +420,13 @@ mod tests {
             resolved.is_absolute() || resolved == Path::new(".tokscale"),
             "empty override must fall through to platform default, got {resolved:?}"
         );
-        restore_env(prev);
     }
 
     #[test]
     #[serial]
     fn is_config_dir_overridden_treats_empty_string_as_unset() {
-        let prev = save_env();
-        unsafe {
-            env::set_var("TOKSCALE_CONFIG_DIR", "");
-        }
+        let env = guard();
+        env.set("TOKSCALE_CONFIG_DIR", "");
         assert!(!is_config_dir_overridden());
-        restore_env(prev);
     }
 }

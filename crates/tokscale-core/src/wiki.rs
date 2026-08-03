@@ -531,16 +531,11 @@ pub enum WikiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::test_env::EnvGuard;
     use serial_test::serial;
-    use std::env;
 
-    fn restore(prev: Option<std::ffi::OsString>) {
-        unsafe {
-            match prev {
-                Some(v) => env::set_var("TOKSCALE_CONFIG_DIR", v),
-                None => env::remove_var("TOKSCALE_CONFIG_DIR"),
-            }
-        }
+    fn guard() -> EnvGuard {
+        EnvGuard::capture(&["TOKSCALE_CONFIG_DIR"])
     }
 
     /// `tokscale report` is the one command that opens a SQLite database, and
@@ -553,13 +548,10 @@ mod tests {
     #[test]
     #[serial]
     fn default_path_follows_the_config_dir_override() {
-        let prev = env::var_os("TOKSCALE_CONFIG_DIR");
-        let root = env::temp_dir().join("tokscale-wiki-default-path-probe");
-        unsafe {
-            env::set_var("TOKSCALE_CONFIG_DIR", &root);
-        }
+        let env = guard();
+        let root = std::env::temp_dir().join("tokscale-wiki-default-path-probe");
+        env.set("TOKSCALE_CONFIG_DIR", &root);
         assert_eq!(WikiDb::default_path(), root.join("wiki.db"));
-        restore(prev);
     }
 
     /// The override is the hermetic contract, so the wiki must sit under the
@@ -569,16 +561,13 @@ mod tests {
     #[test]
     #[serial]
     fn default_path_stays_inside_the_resolved_config_dir() {
-        let prev = env::var_os("TOKSCALE_CONFIG_DIR");
-        let root = env::temp_dir().join("tokscale-wiki-containment-probe");
-        unsafe {
-            env::set_var("TOKSCALE_CONFIG_DIR", &root);
-        }
+        let env = guard();
+        let root = std::env::temp_dir().join("tokscale-wiki-containment-probe");
+        env.set("TOKSCALE_CONFIG_DIR", &root);
         let path = WikiDb::default_path();
         assert!(
             path.starts_with(&root),
             "wiki.db escaped the config-dir override: {path:?} is not under {root:?}"
         );
-        restore(prev);
     }
 }

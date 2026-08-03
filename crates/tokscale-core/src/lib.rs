@@ -4081,13 +4081,8 @@ mod tests {
         )
     }
 
-    fn restore_home(prev: Option<std::ffi::OsString>) {
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
+    fn home_guard() -> crate::paths::test_env::EnvGuard {
+        crate::paths::test_env::EnvGuard::capture(&["HOME"])
     }
 
     /// An explicit `--home` outranks every environment lookup. Pinned so the
@@ -4096,15 +4091,12 @@ mod tests {
     #[test]
     #[serial]
     fn get_home_dir_string_prefers_the_explicit_option() {
-        let prev = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", "/tmp/tokscale-env-home");
-        }
+        let env = home_guard();
+        env.set("HOME", "/tmp/tokscale-env-home");
         assert_eq!(
             get_home_dir_string(&Some("/tmp/tokscale-explicit-home".to_string())),
             Ok("/tmp/tokscale-explicit-home".to_string())
         );
-        restore_home(prev);
     }
 
     /// The bypass this test exists for: reading `$HOME` directly meant an
@@ -4121,12 +4113,9 @@ mod tests {
     #[test]
     #[serial]
     fn get_home_dir_string_never_returns_an_empty_home() {
-        let prev = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", "");
-        }
+        let env = home_guard();
+        env.set("HOME", "");
         let resolved = get_home_dir_string(&None);
-        restore_home(prev);
         assert_ne!(
             resolved,
             Ok(String::new()),
@@ -4149,12 +4138,9 @@ mod tests {
     #[serial]
     #[cfg(windows)]
     fn get_home_dir_string_ignores_a_posix_shaped_home_on_windows() {
-        let prev = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", "/home/runner");
-        }
+        let env = home_guard();
+        env.set("HOME", "/home/runner");
         let resolved = get_home_dir_string(&None);
-        restore_home(prev);
         assert_ne!(
             resolved,
             Ok("/home/runner".to_string()),
