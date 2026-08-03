@@ -29,7 +29,7 @@ mod tests {
         let path = project_dir.join("session-1.jsonl");
         std::fs::write(
             &path,
-            r#"{"id":"assistant-1","timestamp":1780000000100,"type":"message","role":"assistant","status":"completed","sessionId":"session-1","cwd":"/Users/alice/repo","providerData":{"model":"glm-5.2","messageId":"msg-1"},"message":{"usage":{"input_tokens":24486,"output_tokens":3,"cache_read_input_tokens":14720}}}"#,
+            r#"{"id":"assistant-1","timestamp":1780000000100,"type":"message","role":"assistant","status":"completed","sessionId":"session-1","cwd":"/Users/alice/repo","providerData":{"model":"glm-5.2","messageId":"msg-1"},"message":{"usage":{"input_tokens":24486,"output_tokens":3,"total_tokens":24489,"cache_read_input_tokens":14720}}}"#,
         )
         .unwrap();
 
@@ -38,9 +38,10 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].client, "codebuddy");
         assert_eq!(messages[0].model_id, "glm-5.2");
-        assert_eq!(messages[0].tokens.input, 24486);
+        assert_eq!(messages[0].tokens.input, 9766);
         assert_eq!(messages[0].tokens.output, 3);
         assert_eq!(messages[0].tokens.cache_read, 14720);
+        assert_eq!(messages[0].tokens.total(), 24489);
         assert_eq!(messages[0].workspace_label.as_deref(), Some("repo"));
     }
 
