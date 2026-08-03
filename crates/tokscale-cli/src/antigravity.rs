@@ -20,7 +20,7 @@ static HTTPS_RPC_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static HTTPS_RPC_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 fn home_dir() -> Result<PathBuf> {
-    dirs::home_dir().context("Could not determine home directory")
+    crate::paths::home_dir().context("Could not determine home directory")
 }
 
 fn antigravity_data_roots() -> Result<Vec<PathBuf>> {

@@ -963,7 +963,7 @@ fn render_scheduler_spec(
 }
 
 fn render_launchd_spec(exe: &Path, settings: &AutosubmitSettings) -> Result<SchedulerSpec> {
-    let home = dirs::home_dir().context("Could not determine home directory")?;
+    let home = crate::paths::home_dir().context("Could not determine home directory")?;
     render_launchd_spec_for_home(exe, settings, &home)
 }
 
@@ -1066,7 +1066,7 @@ fn systemd_user_dir() -> Result<PathBuf> {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(dirs::config_dir)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".config")));
+        .or_else(|| crate::paths::home_dir().map(|home| home.join(".config")));
     Ok(config_dir
         .context("Could not determine XDG config directory")?
         .join("systemd")
@@ -1967,13 +1967,30 @@ mod tests {
             SchedulerKind::WindowsTaskScheduler,
         ] {
             let spec = render_scheduler_spec(scheduler, &managed, &settings).unwrap();
-            // `Debug` escapes each `\` as `\\`, so a Windows path compared
-            // against the unescaped `to_string_lossy` never matches. Escape
-            // the needle the same way instead of rendering the spec with
-            // `Display`, which `SchedulerSpec` does not implement.
+            // Two escaping layers stack here, and #1007 only accounted for
+            // one, so this still failed on Windows.
+            //
+            // Layer 1 is the renderer: `systemd_escape_path` doubles every
+            // `\` (and turns spaces into `\x20`) *before* the value reaches
+            // the unit file, while every other renderer stores the path
+            // verbatim. Layer 2 is `Debug`, which doubles whatever it finds.
+            // A Windows path therefore appears as `\\\\` in the systemd spec
+            // and `\\` in the other three; a needle escaped once matches
+            // three of the four and silently fails the fourth.
+            //
+            // Deriving the needle through the renderer's own escaper keeps
+            // the two in step rather than restating its rules here.
+            let stored = match scheduler {
+                SchedulerKind::Systemd => systemd_escape_path(&managed),
+                _ => managed.to_string_lossy().into_owned(),
+            };
             let rendered = format!("{spec:?}");
-            let needle = managed.to_string_lossy().replace('\\', "\\\\");
-            assert!(rendered.contains(&needle));
+            let needle = stored.replace('\\', "\\\\");
+            assert!(
+                rendered.contains(&needle),
+                "{scheduler:?} spec does not reference the managed executable\n\
+                 needle: {needle}\nrendered: {rendered}"
+            );
             let absent = process_executable.to_string_lossy().replace('\\', "\\\\");
             assert!(!rendered.contains(&absent));
         }

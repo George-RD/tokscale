@@ -22,7 +22,7 @@ struct ApiResult {
 }
 
 fn read_credentials() -> Result<String> {
-    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let home = crate::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     let path = home
         .join(".local")
         .join("share")
@@ -131,7 +131,7 @@ fn detect_plan(metrics: &[UsageMetric]) -> Option<String> {
 }
 
 pub fn has_credentials() -> bool {
-    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let home = crate::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     home.join(".local")
         .join("share")
         .join("amp")

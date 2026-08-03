@@ -587,11 +587,25 @@ pub struct HourlyReport {
     pub processing_time_ms: u32,
 }
 
+/// Resolve the home directory every `from_dir`-style parser scans from.
+///
+/// An explicit `--home` always wins. Everything else goes through
+/// [`crate::paths::home_dir`], which is the *only* place allowed to read
+/// `$HOME`.
+///
+/// Reading `$HOME` here directly — as this used to — defeated that resolver
+/// entirely, because the raw read ran first and always won. On Windows a Git
+/// Bash `HOME=/home/user` therefore still reached every caller, and `Path`
+/// resolves that against the current drive, so the model/monthly/hourly
+/// reports and local parsing scanned `C:\home\user` instead of the real
+/// profile — precisely the case `paths::home_dir` was written to prevent. An
+/// exported-but-empty `HOME` was worse: it produced `Ok("")`, and the
+/// `format!("{home}/...")` joins downstream turned that into absolute scans
+/// from the filesystem root.
 pub fn get_home_dir_string(home_dir_option: &Option<String>) -> Result<String, String> {
     home_dir_option
         .clone()
-        .or_else(|| std::env::var("HOME").ok())
-        .or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().into_owned()))
+        .or_else(|| crate::paths::home_dir().map(|p| p.to_string_lossy().into_owned()))
         .ok_or_else(|| {
             "HOME directory not specified and could not determine home directory".to_string()
         })
@@ -4040,12 +4054,14 @@ mod tests {
     use super::{
         aggregate_model_usage_entries, apply_pricing_if_available, build_graph_from_messages,
         dedupe_latest_trae_messages, filter_messages_for_report,
-        generate_graph_with_loaded_pricing, message_cache, normalize_model_for_grouping,
-        parse_all_messages_with_pricing_with_env_strategy, parse_local_clients, parsed_to_unified,
-        pricing, retain_for_requested_clients, scanner, select_local_parse_pricing,
-        unified_to_parsed, validate_priced_messages, ClientId, GraphPricingRequirement, GroupBy,
-        LocalParseOptions, ReportOptions, TokenBreakdown, UnifiedMessage, UNKNOWN_WORKSPACE_LABEL,
+        generate_graph_with_loaded_pricing, get_home_dir_string, message_cache,
+        normalize_model_for_grouping, parse_all_messages_with_pricing_with_env_strategy,
+        parse_local_clients, parsed_to_unified, pricing, retain_for_requested_clients, scanner,
+        select_local_parse_pricing, unified_to_parsed, validate_priced_messages, ClientId,
+        GraphPricingRequirement, GroupBy, LocalParseOptions, ReportOptions, TokenBreakdown,
+        UnifiedMessage, UNKNOWN_WORKSPACE_LABEL,
     };
+    use serial_test::serial;
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
     use std::str::FromStr;
@@ -4063,6 +4079,73 @@ mod tests {
             false,
             &scanner::ScannerSettings::default(),
         )
+    }
+
+    fn home_guard() -> crate::paths::test_env::EnvGuard {
+        crate::paths::test_env::EnvGuard::capture(&["HOME"])
+    }
+
+    /// An explicit `--home` outranks every environment lookup. Pinned so the
+    /// reordering that routed the fallback through `paths::home_dir` cannot
+    /// quietly promote the resolver above the caller's own argument.
+    #[test]
+    #[serial]
+    fn get_home_dir_string_prefers_the_explicit_option() {
+        let mut env = home_guard();
+        env.set("HOME", "/tmp/tokscale-env-home");
+        assert_eq!(
+            get_home_dir_string(&Some("/tmp/tokscale-explicit-home".to_string())),
+            Ok("/tmp/tokscale-explicit-home".to_string())
+        );
+    }
+
+    /// The bypass this test exists for: reading `$HOME` directly meant an
+    /// exported-but-blank value won outright and produced `Ok("")`. Every
+    /// consumer builds scan roots with `format!("{home}/...")`, so an empty
+    /// home turns each of them into an absolute path from the filesystem root
+    /// — `/.codex/sessions` rather than `~/.codex/sessions`.
+    ///
+    /// `paths::home_dir` delegates to `dirs`, which treats a blank `HOME` as
+    /// unset and falls back to the passwd entry, so the empty string can no
+    /// longer escape. Asserting "not `Ok("")`" rather than a concrete path
+    /// keeps this honest on a runner with no passwd home, where the correct
+    /// answer is the `Err` arm.
+    #[test]
+    #[serial]
+    fn get_home_dir_string_never_returns_an_empty_home() {
+        let mut env = home_guard();
+        env.set("HOME", "");
+        let resolved = get_home_dir_string(&None);
+        assert_ne!(
+            resolved,
+            Ok(String::new()),
+            "a blank HOME must not resolve to the empty string; \
+             every caller joins it into a scan root"
+        );
+    }
+
+    /// MSYS2, Cygwin and Git Bash export `HOME=/home/<user>` on Windows.
+    /// Returning that verbatim points the model, monthly, hourly and local
+    /// parsers at `C:\home\<user>` — `Path` reads the leading `/` as the root
+    /// of the current drive — so a Git Bash user sees none of their own usage.
+    /// `paths::home_dir` rejects the shape; this test pins that
+    /// `get_home_dir_string` actually goes through it rather than around it.
+    ///
+    /// Windows-only by construction: `/home/runner` is a legitimate absolute
+    /// path on macOS and the resolver rightly honors it there. It does run —
+    /// on the `windows-latest` leg this PR adds.
+    #[test]
+    #[serial]
+    #[cfg(windows)]
+    fn get_home_dir_string_ignores_a_posix_shaped_home_on_windows() {
+        let mut env = home_guard();
+        env.set("HOME", "/home/runner");
+        let resolved = get_home_dir_string(&None);
+        assert_ne!(
+            resolved,
+            Ok("/home/runner".to_string()),
+            "a POSIX-shaped HOME must not reach the scanners on Windows"
+        );
     }
 
     #[test]

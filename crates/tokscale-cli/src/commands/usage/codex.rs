@@ -359,7 +359,7 @@ impl CodexAccountStore {
 }
 
 fn current_auth_paths() -> Vec<PathBuf> {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let home = crate::paths::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let mut paths = Vec::new();
 
     if let Ok(codex_home) = std::env::var("CODEX_HOME") {

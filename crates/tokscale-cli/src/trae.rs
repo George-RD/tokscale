@@ -328,7 +328,7 @@ pub mod auth {
     // ── storage.json decryption ────────────────────────────────────────────
 
     fn decrypt_from_storage(variant: TraeVariant) -> Result<CachedCredentials> {
-        let home = dirs::home_dir().context("could not determine home directory")?;
+        let home = crate::paths::home_dir().context("could not determine home directory")?;
         let app_dir = home
             .join("Library/Application Support")
             .join(variant.app_dir_name());

@@ -20,7 +20,7 @@ pub enum McpSource {
 }
 
 pub fn discover_mcp_server_names(home_dir: Option<&Path>) -> Vec<String> {
-    let home = match home_dir.map(PathBuf::from).or_else(dirs::home_dir) {
+    let home = match home_dir.map(PathBuf::from).or_else(crate::paths::home_dir) {
         Some(h) => h,
         None => return Vec::new(),
     };

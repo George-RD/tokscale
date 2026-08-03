@@ -42,7 +42,7 @@ thread_local! {
 fn cache_dir() -> Option<PathBuf> {
     if crate::paths::is_config_dir_overridden()
         || dirs::config_dir().is_some()
-        || cfg!(target_os = "macos") && dirs::home_dir().is_some()
+        || cfg!(target_os = "macos") && crate::paths::home_dir().is_some()
     {
         Some(crate::paths::get_cache_dir())
     } else {
