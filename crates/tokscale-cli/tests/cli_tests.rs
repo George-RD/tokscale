@@ -3945,9 +3945,14 @@ fn test_config_rejects_rekeying_or_unsetting_an_established_timezone() {
 #[test]
 fn test_config_can_recover_an_invalid_or_unpinned_timezone() {
     let tmp = create_bucket_timezone_fixture_dir();
+    let config_dir = tmp.path().join(".config/tokscale");
     pin_bucket_timezone(tmp.path(), "Mars/Olympus_Mons");
 
     cmd_with_home(tmp.path())
+        // macOS resolves its config root from the account home, not `HOME`.
+        // Pin the command to this fixture so a prior test cannot auto-pin a
+        // shared profile before this invalid value is read.
+        .env("TOKSCALE_CONFIG_DIR", &config_dir)
         .args(["config", "set", "timezone", "Asia/Seoul"])
         .assert()
         .success();
