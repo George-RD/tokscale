@@ -72,8 +72,9 @@ pub struct ScannerSettings {
     /// `chrono::Local` exactly as before — pinning changes nothing until it
     /// happens. The CLI fills this in on first run (see
     /// `tui::settings::pin_bucket_timezone_if_unset`); `tokscale config set
-    /// timezone <zone>` changes it deliberately, which is what a user who
-    /// relocates should do.
+    /// timezone <zone>` can initialize an unset value or recover an invalid
+    /// one. A valid pin cannot be changed because submitted day rows are
+    /// monotonic.
     ///
     /// An unparseable value degrades to unpinned rather than failing the scan.
     #[serde(default)]

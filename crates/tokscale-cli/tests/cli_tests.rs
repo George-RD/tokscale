@@ -4026,6 +4026,26 @@ fn test_config_unset_can_initialize_or_recover_a_timezone_before_auto_pinning() 
     }
 }
 
+#[test]
+fn test_read_only_config_commands_still_auto_pin_the_timezone() {
+    let tmp = create_bucket_timezone_fixture_dir();
+    let config_dir = tmp.path().join(".config/tokscale");
+
+    cmd_with_home(tmp.path())
+        .env("TOKSCALE_CONFIG_DIR", &config_dir)
+        .args(["config", "get", "timezone"])
+        .assert()
+        .success();
+
+    let settings: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(config_dir.join("settings.json")).unwrap())
+            .unwrap();
+    assert!(
+        settings["scanner"]["bucketTimezone"].is_string(),
+        "read-only config commands must retain startup auto-pinning"
+    );
+}
+
 /// A fixed UTC offset cannot follow daylight saving time, so pinning one would
 /// reintroduce a bounded version of the bug pinning removes. Reject it at the
 /// boundary rather than storing a value that silently degrades to unpinned.
