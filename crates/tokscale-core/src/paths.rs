@@ -176,9 +176,16 @@ pub fn legacy_dot_cache_tokscale_dir() -> Option<PathBuf> {
 /// `HOME` pointing at a deleted `TempDir` and fails for a reason that has
 /// nothing to do with what it asserts. Restoring on `Drop` unwinds correctly.
 ///
-/// `scanner.rs` and `sessions/opencode.rs` already carry private copies of
-/// this; this one is `pub(crate)` so `paths`, `wiki` and the crate-root tests
-/// share a single implementation.
+/// This is the crate's single implementation. `scanner.rs` and
+/// `sessions/opencode.rs` previously carried private copies; both now import
+/// from here, so panic-safe environment restoration cannot drift between three
+/// versions.
+///
+/// `set` and `remove` take `&mut self` even though they do not touch the
+/// guard's own state. That is deliberate: it is the signature `scanner.rs`
+/// already used, so its fourteen call sites migrated unchanged, and `&mut`
+/// reads correctly for a method whose whole purpose is to mutate
+/// process-global state.
 #[cfg(test)]
 pub(crate) mod test_env {
     use std::ffi::{OsStr, OsString};
@@ -194,11 +201,11 @@ pub(crate) mod test_env {
             )
         }
 
-        pub(crate) fn set(&self, key: &str, value: impl AsRef<OsStr>) {
+        pub(crate) fn set(&mut self, key: &str, value: impl AsRef<OsStr>) {
             unsafe { std::env::set_var(key, value) };
         }
 
-        pub(crate) fn remove(&self, key: &str) {
+        pub(crate) fn remove(&mut self, key: &str) {
             unsafe { std::env::remove_var(key) };
         }
     }
@@ -243,13 +250,16 @@ mod tests {
     #[serial]
     fn env_guard_restores_even_when_the_test_body_panics() {
         const SENTINEL: &str = "TOKSCALE_ENV_GUARD_PANIC_PROBE";
-        unsafe { std::env::set_var(SENTINEL, "original") };
+        // Practise what the test preaches: if an assertion below fails, this
+        // outer guard still restores the sentinel on the way out.
+        let mut outer = EnvGuard::capture(&[SENTINEL]);
+        outer.set(SENTINEL, "original");
 
         // The panic below is deliberate; keep it out of the test output.
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let outcome = std::panic::catch_unwind(|| {
-            let env = EnvGuard::capture(&[SENTINEL]);
+            let mut env = EnvGuard::capture(&[SENTINEL]);
             env.set(SENTINEL, "redirected");
             panic!("simulated assertion failure");
         });
@@ -261,7 +271,6 @@ mod tests {
             Some("original"),
             "EnvGuard must restore the previous value while unwinding"
         );
-        unsafe { std::env::remove_var(SENTINEL) };
     }
 
     /// The regression #997 is really about: this assertion has always held on
@@ -273,7 +282,7 @@ mod tests {
     #[test]
     #[serial]
     fn home_dir_follows_an_explicit_native_home_on_every_platform() {
-        let env = guard();
+        let mut env = guard();
         // `env::temp_dir()` is absolute and carries a drive prefix on Windows,
         // which is exactly the shape a `TempDir`-based test produces.
         let redirect = std::env::temp_dir().join("tokscale-core-home-dir-probe");
@@ -291,7 +300,7 @@ mod tests {
     #[serial]
     #[cfg(windows)]
     fn home_dir_ignores_a_posix_shaped_home() {
-        let env = guard();
+        let mut env = guard();
         env.set("HOME", "/home/runner");
         assert_ne!(home_dir(), Some(PathBuf::from("/home/runner")));
     }
@@ -310,7 +319,7 @@ mod tests {
     #[serial]
     #[cfg(windows)]
     fn home_dir_ignores_a_drive_relative_home() {
-        let env = guard();
+        let mut env = guard();
         env.set("HOME", r"C:temp");
         assert_ne!(
             home_dir(),
@@ -326,7 +335,7 @@ mod tests {
     #[serial]
     #[cfg(windows)]
     fn home_dir_treats_an_empty_home_as_unset() {
-        let env = guard();
+        let mut env = guard();
         env.set("HOME", "");
         assert_ne!(home_dir(), Some(PathBuf::new()));
     }
@@ -334,7 +343,7 @@ mod tests {
     #[test]
     #[serial]
     fn env_override_is_returned_verbatim() {
-        let env = guard();
+        let mut env = guard();
         env.set("TOKSCALE_CONFIG_DIR", "/tmp/tokscale-custom");
         assert_eq!(get_config_dir(), PathBuf::from("/tmp/tokscale-custom"));
     }
@@ -343,7 +352,7 @@ mod tests {
     #[serial]
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn unix_default_is_dot_config_tokscale_under_home() {
-        let env = guard();
+        let mut env = guard();
         env.remove("TOKSCALE_CONFIG_DIR");
         env.remove("XDG_CONFIG_HOME");
         env.set("HOME", "/tmp/tokscale-core-paths-home");
@@ -357,7 +366,7 @@ mod tests {
     #[serial]
     #[cfg(target_os = "linux")]
     fn linux_honors_xdg_config_home_when_set() {
-        let env = guard();
+        let mut env = guard();
         env.remove("TOKSCALE_CONFIG_DIR");
         env.set("XDG_CONFIG_HOME", "/tmp/tokscale-core-paths-xdg");
         assert_eq!(
@@ -369,7 +378,7 @@ mod tests {
     #[test]
     #[serial]
     fn cache_dir_is_cache_subdir_of_config_dir() {
-        let env = guard();
+        let mut env = guard();
         env.set("TOKSCALE_CONFIG_DIR", "/tmp/tokscale-cache-test");
         assert_eq!(
             get_cache_dir(),
@@ -380,7 +389,7 @@ mod tests {
     #[test]
     #[serial]
     fn legacy_helpers_return_none_when_overridden() {
-        let env = guard();
+        let mut env = guard();
         env.set("TOKSCALE_CONFIG_DIR", "/tmp/tokscale-override");
         assert!(legacy_dirs_cache_dir().is_none());
         assert!(legacy_dot_cache_tokscale_dir().is_none());
@@ -389,7 +398,7 @@ mod tests {
     #[test]
     #[serial]
     fn legacy_helpers_return_some_when_not_overridden() {
-        let env = guard();
+        let mut env = guard();
         env.remove("TOKSCALE_CONFIG_DIR");
         assert!(
             legacy_dirs_cache_dir().is_some(),
@@ -408,7 +417,7 @@ mod tests {
         // produced PathBuf::from(""), which silently relocated cache
         // writes to ./cache and ./.tokscale. The resolver must agree
         // with `is_config_dir_overridden`: empty == unset.
-        let env = guard();
+        let mut env = guard();
         env.set("TOKSCALE_CONFIG_DIR", "");
         let resolved = get_config_dir();
         assert_ne!(
@@ -425,7 +434,7 @@ mod tests {
     #[test]
     #[serial]
     fn is_config_dir_overridden_treats_empty_string_as_unset() {
-        let env = guard();
+        let mut env = guard();
         env.set("TOKSCALE_CONFIG_DIR", "");
         assert!(!is_config_dir_overridden());
     }

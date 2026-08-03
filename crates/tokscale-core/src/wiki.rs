@@ -548,7 +548,7 @@ mod tests {
     #[test]
     #[serial]
     fn default_path_follows_the_config_dir_override() {
-        let env = guard();
+        let mut env = guard();
         let root = std::env::temp_dir().join("tokscale-wiki-default-path-probe");
         env.set("TOKSCALE_CONFIG_DIR", &root);
         assert_eq!(WikiDb::default_path(), root.join("wiki.db"));
@@ -561,7 +561,7 @@ mod tests {
     #[test]
     #[serial]
     fn default_path_stays_inside_the_resolved_config_dir() {
-        let env = guard();
+        let mut env = guard();
         let root = std::env::temp_dir().join("tokscale-wiki-containment-probe");
         env.set("TOKSCALE_CONFIG_DIR", &root);
         let path = WikiDb::default_path();

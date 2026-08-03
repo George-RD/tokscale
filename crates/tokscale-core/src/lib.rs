@@ -4091,7 +4091,7 @@ mod tests {
     #[test]
     #[serial]
     fn get_home_dir_string_prefers_the_explicit_option() {
-        let env = home_guard();
+        let mut env = home_guard();
         env.set("HOME", "/tmp/tokscale-env-home");
         assert_eq!(
             get_home_dir_string(&Some("/tmp/tokscale-explicit-home".to_string())),
@@ -4113,7 +4113,7 @@ mod tests {
     #[test]
     #[serial]
     fn get_home_dir_string_never_returns_an_empty_home() {
-        let env = home_guard();
+        let mut env = home_guard();
         env.set("HOME", "");
         let resolved = get_home_dir_string(&None);
         assert_ne!(
@@ -4138,7 +4138,7 @@ mod tests {
     #[serial]
     #[cfg(windows)]
     fn get_home_dir_string_ignores_a_posix_shaped_home_on_windows() {
-        let env = home_guard();
+        let mut env = home_guard();
         env.set("HOME", "/home/runner");
         let resolved = get_home_dir_string(&None);
         assert_ne!(

@@ -1868,43 +1868,11 @@ pub fn scan_all_clients(home_dir: &str, clients: &[String]) -> ScanResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::test_env::EnvGuard;
     use serial_test::serial;
     use std::fs::{self, File};
     use std::io::Write;
     use tempfile::TempDir;
-
-    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
-
-    impl EnvGuard {
-        fn capture(keys: &[&'static str]) -> Self {
-            Self(
-                keys.iter()
-                    .map(|key| (*key, std::env::var_os(key)))
-                    .collect(),
-            )
-        }
-
-        fn set(&mut self, key: &'static str, value: impl AsRef<std::ffi::OsStr>) {
-            unsafe { std::env::set_var(key, value) };
-        }
-
-        fn remove(&mut self, key: &'static str) {
-            unsafe { std::env::remove_var(key) };
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                for (key, previous) in self.0.drain(..) {
-                    match previous {
-                        Some(value) => std::env::set_var(key, value),
-                        None => std::env::remove_var(key),
-                    }
-                }
-            }
-        }
-    }
 
     fn scan_without_extra_dirs(home_dir: &str, clients: &[String]) -> ScanResult {
         let mut extra = EnvGuard::capture(&["TOKSCALE_EXTRA_DIRS", "TOKSCALE_HEADLESS_DIR"]);
