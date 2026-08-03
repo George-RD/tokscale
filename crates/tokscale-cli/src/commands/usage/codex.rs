@@ -1950,10 +1950,10 @@ pub fn run_codex_status(name: Option<String>, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+
+    use crate::commands::usage::test_server::{spawn_server, Seen};
 
     fn test_store_path(tmp: &TempDir) -> PathBuf {
         tmp.path().join("codex-credentials.json")
@@ -3060,92 +3060,25 @@ mod tests {
       "expires_in": 3600
     }"#;
 
-    /// One request as the server saw it: method and path, plus the bearer token
-    /// presented. The token is recorded so a test can prove the credential
-    /// reached the wire from the fixture it wrote rather than from the
-    /// developer's real home directory.
-    #[derive(Debug, PartialEq)]
-    struct Seen {
-        request: String,
-        bearer: Option<String>,
-    }
-
-    fn reason(status: u16) -> &'static str {
-        match status {
-            200 => "OK",
-            401 => "Unauthorized",
-            403 => "Forbidden",
-            _ => "Unknown",
-        }
-    }
-
-    /// Blocking HTTP/1.1 server on an ephemeral port that serves the three
-    /// endpoints the usage path can reach and records every request.
-    ///
-    /// `usage_statuses` is consumed one entry per usage GET, the last entry
-    /// repeating, so a test can stage "401 then 200" for the refresh-and-retry
-    /// path. `Connection: close` keeps one request per socket. The thread is
-    /// left blocked on `accept` when the test ends; the process tears it down.
-    fn spawn_server(usage_statuses: Vec<u16>) -> (CodexEndpoints, Arc<Mutex<Vec<Seen>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
-        let addr = listener.local_addr().expect("test server addr");
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let server_log = Arc::clone(&log);
-        std::thread::spawn(move || {
-            let mut usage_calls = 0usize;
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                let mut buf = Vec::new();
-                let mut chunk = [0u8; 1024];
-                while let Ok(n) = stream.read(&mut chunk) {
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let request = String::from_utf8_lossy(&buf).to_string();
-                let mut head = request.split_whitespace();
-                let method = head.next().unwrap_or("?").to_string();
-                let path = head.next().unwrap_or("/").to_string();
-                let bearer = request
-                    .lines()
-                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
-                    .and_then(|l| l.split_once(':'))
-                    .map(|(_, v)| v.trim().trim_start_matches("Bearer ").to_string());
-                if let Ok(mut seen) = server_log.lock() {
-                    seen.push(Seen {
-                        request: format!("{method} {path}"),
-                        bearer,
-                    });
-                }
-                let (status, body) = if path == USAGE_PATH {
-                    let status = usage_statuses
-                        .get(usage_calls)
-                        .copied()
-                        .or_else(|| usage_statuses.last().copied())
-                        .unwrap_or(200);
-                    usage_calls += 1;
-                    (status, USAGE_BODY.to_string())
-                } else if path == TOKEN_PATH {
-                    (200, REFRESH_BODY.to_string())
-                } else if path == RESET_CREDITS_PATH {
-                    (200, r#"{"available_count":0,"credits":[]}"#.to_string())
-                } else {
-                    (404, "{}".to_string())
-                };
-                let response = format!(
-                    "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    reason(status),
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
+    fn spawn_codex_server(usage_statuses: Vec<u16>) -> (CodexEndpoints, Arc<Mutex<Vec<Seen>>>) {
+        let mut usage_calls = 0usize;
+        let (base, log) = spawn_server(move |path, _| {
+            if path == USAGE_PATH {
+                let status = usage_statuses
+                    .get(usage_calls)
+                    .copied()
+                    .or_else(|| usage_statuses.last().copied())
+                    .unwrap_or(200);
+                usage_calls += 1;
+                (status, USAGE_BODY.to_string())
+            } else if path == TOKEN_PATH {
+                (200, REFRESH_BODY.to_string())
+            } else if path == RESET_CREDITS_PATH {
+                (200, r#"{"available_count":0,"credits":[]}"#.to_string())
+            } else {
+                (404, "{}".to_string())
             }
         });
-        let base = format!("http://{addr}");
         (
             CodexEndpoints {
                 usage: format!("{base}{USAGE_PATH}"),
@@ -3203,7 +3136,7 @@ mod tests {
     fn rejected_token_leaves_codex_auth_json_untouched() -> Result<()> {
         let (_codex_home, _guard, auth_path) = codex_home_with_fixture()?;
         let before = std::fs::read(&auth_path)?;
-        let (endpoints, log) = spawn_server(vec![401]);
+        let (endpoints, log) = spawn_codex_server(vec![401]);
 
         let (auth, source) = read_current_credentials()?;
         assert!(
@@ -3240,7 +3173,7 @@ mod tests {
     fn forbidden_response_leaves_codex_auth_json_untouched() -> Result<()> {
         let (_codex_home, _guard, auth_path) = codex_home_with_fixture()?;
         let before = std::fs::read(&auth_path)?;
-        let (endpoints, log) = spawn_server(vec![403]);
+        let (endpoints, log) = spawn_codex_server(vec![403]);
 
         let (auth, source) = read_current_credentials()?;
         let result = fetch_with_auth_at(&endpoints, auth, source, "Codex".into(), None);
@@ -3268,7 +3201,7 @@ mod tests {
         let codex_home = TempDir::new()?;
         let _guard = EnvVarGuard::set_path("CODEX_HOME", codex_home.path());
         let auth_path = codex_home.path().join("auth.json");
-        let (endpoints, log) = spawn_server(vec![401]);
+        let (endpoints, log) = spawn_codex_server(vec![401]);
 
         let auth: Auth = serde_json::from_str(CODEX_AUTH_FIXTURE)?;
         let result = fetch_with_auth_at(
@@ -3295,7 +3228,7 @@ mod tests {
     fn successful_usage_fetch_leaves_codex_auth_json_untouched() -> Result<()> {
         let (_codex_home, _guard, auth_path) = codex_home_with_fixture()?;
         let before = std::fs::read(&auth_path)?;
-        let (endpoints, log) = spawn_server(vec![200]);
+        let (endpoints, log) = spawn_codex_server(vec![200]);
 
         let (auth, source) = read_current_credentials()?;
         let output = fetch_with_auth_at(&endpoints, auth, source, "Codex".into(), None)?;
@@ -3353,7 +3286,7 @@ mod tests {
             },
         )?;
 
-        let (endpoints, log) = spawn_server(vec![401, 200]);
+        let (endpoints, log) = spawn_codex_server(vec![401, 200]);
         let (_id, account, _info) = load_account(Some("acct_saved"))?;
         let output = fetch_with_auth_at(
             &endpoints,
