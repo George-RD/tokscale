@@ -488,6 +488,112 @@ far smaller than the current failure — an hour twice a year, not a full re-spl
 on every rescan — but it is not zero, and calling this "the only exact fix"
 above is only true of the named-zone variant.
 
+### The size question, now measured (2026-08-03)
+
+Three release builds of `tokscale-cli`, same toolchain and host
+(aarch64-apple-darwin, `lto = true`, `codegen-units = 1`, `strip = true` — so
+these are shipped sizes, not pre-strip ones):
+
+| build | bytes | vs baseline |
+|---|---:|---:|
+| `origin/main` | 15,061,600 | — |
+| pinning + `chrono-tz` | 16,300,464 | **+1,238,864 (+1.18 MiB, +8.23%)** |
+| pinning + `FixedOffset` | 15,094,688 | +33,088 (+32 KiB, +0.22%) |
+
+The feature itself is ~32 KiB. Everything else — 1.15 MiB — is the tz database.
+
+**Shipped the named zone.** The 1.15 MiB is real and it lands on all nine
+targets, but it is the entire price of the phase being exact rather than
+approximate, and the phase exists specifically because approximate re-splitting
+is what inflates the totals. Two things settled it beyond the ratio:
+
+1. `chrono` already depends on `iana-time-zone` to implement `Local`, so
+   *detecting* the machine's zone name costs nothing. Only honoring it later
+   needs the database. Half the mechanism was already paid for.
+2. A fixed offset cannot be what the user configures. `tokscale config set
+   timezone Asia/Seoul` has to store something that survives a DST boundary; the
+   offset variant can only store `+09:00`, which is a different and worse
+   setting to ask someone to reason about after they relocate.
+
+Recorded for whoever revisits this: if the binary budget ever forces the offset
+variant, the sentence at the top of this phase — "the only exact fix" — stops
+being true, and the residual is usage within an hour of local midnight on the
+days following a DST transition.
+
+### Naming the zone is a second, separate problem (2026-08-03)
+
+Pinning has two halves and only one of them was in the design above. Recording a
+zone is easy; deciding *which* zone the device is already using is not, and the
+first implementation got it wrong in a way that would have shipped.
+
+`chrono::Local` honors the `TZ` environment variable. `iana-time-zone` — the
+obvious way to get a name, and already in the tree — **does not read `TZ` at all
+on Linux**; it resolves `/etc/localtime`, then `/etc/timezone`. On macOS it goes
+through CoreFoundation, which does consult `TZ`.
+
+So on a Linux host with `TZ=Asia/Seoul` and `/etc/localtime -> Etc/UTC` the
+detector says `Etc/UTC` while every date already on disk says Seoul. Auto-pinning
+that name re-keys the entire history by nine hours on the first run after
+upgrading — the exact re-split this phase exists to remove, caused by the phase,
+and invisible to anyone developing on a Mac. CI caught it; the local test run did
+not, because the platform difference *is* the bug.
+
+The fix is not "use the other source". Either source can be wrong, and a future
+platform can disagree in a new way. The fix is to stop trusting the name and
+verify it: a candidate is pinned only if its UTC offset matches `chrono::Local`
+at every sampled instant across the window. If it disagrees anywhere, nothing is
+written and the device stays unpinned — which is its previous behaviour, and
+therefore always safe.
+
+That turns the guarantee from "two crates presumably agree" into something
+structural: **the recorded zone produces the same day keys as the zone the device
+was already using, or there is no recorded zone.** Any future change to how the
+zone is detected inherits the guarantee for free, because the check is on the
+value, not on its provenance.
+
+The sampling step is set by what the tz database can express rather than by
+taste: DST offsets move in whole or half hours, and the tightest real case is a
+30-minute shift (`Australia/Lord_Howe` against `Australia/Sydney`), so a
+6-hour step would have stepped straight over it.
+
+**Generalisable:** any time a value is derived from the environment by two
+different libraries, the invariant to test is that they agree — not that either
+one is correct. And measure the real call: benchmarking `zones_agree` between two
+`chrono-tz` zones read 30% low, because `chrono::Local` re-checks `TZ` on every
+lookup and the proxy had no `Local` in it.
+
+### A sampled *window* has the same defect as a coarse *step* (2026-08-03)
+
+The check above shipped with a window of ten years back and one year ahead, and
+that window has exactly the flaw the 6-hour step had, one level up. Two zones can
+share today's rules and still differ in older ones — `America/New_York` and
+`America/Toronto` diverged over the 1974-75 US emergency DST; `Asia/Seoul` and
+`Asia/Tokyo` over Seoul's 1987-88 DST — so a candidate can pass a decade of
+samples and still move day boundaries in older history. And `rebucket_days`
+applies an accepted pin to *every* message, not only recent ones.
+
+So the invariant "pinning never changes existing bucketing" was being asserted
+over a slice of the range it applies to. The fix is the same shape as before:
+make the checked range cover everything that can be re-keyed. The window now runs
+from the Unix epoch to ten years ahead, and the rebucket passes decline to move a
+message whose timestamp is not strictly positive — that value is the parsers'
+"no usable time" sentinel, not an instant before 1970 — so the epoch is a real
+lower bound rather than a convenient one. 1,167,280 lookups, **56 ms** release
+(up from 11.4 ms), once per scan while unpinned and never again after.
+
+The wider window rejects more, including the case where the host's zoneinfo and
+the bundled `chrono-tz` database disagree on an old rule for the *same* zone
+name. That is the safe direction: declining leaves the device bucketing by
+`chrono::Local`, carrying a bug it already had, while accepting wrongly rewrites
+history that is already on the server behind a monotonic guard which makes the
+result permanent.
+
+**Generalisable:** when a check samples, it has two resolutions — how finely it
+samples, and how far. Getting the step right and leaving the window short buys
+nothing, because a claim about all of history cannot be supported by a sample of
+part of it. Either cover the whole range the claim applies to, or narrow the
+claim to the range you covered.
+
 ## Phase 4 — Heal the daily rows
 
 For the day-level surfaces, and only if Phase 1's census says the tail justifies

@@ -883,6 +883,48 @@ Tokscale stores settings in `~/.config/tokscale/settings.json`:
 | `minutelyTabEnabled` | boolean | `false` | Show the per-minute Minutely tab in the TUI and aggregate per-minute usage during data loading. Default-off because minute-granularity is a niche/diagnostic view for most users and the per-minute bucketing has a non-trivial cost on large datasets. |
 | `autosubmit` | object | disabled | Saved `tokscale autosubmit` state: interval, client/date filters, scheduler backend, last run time, and last error. Prefer `tokscale autosubmit enable/status/disable` over editing this object by hand. |
 | `scanner.extraScanPaths` | object | `{}` | Additional per-client scan roots for sessions outside Tokscale's default home-root locations |
+| `scanner.bucketTimezone` | string | auto-detected | IANA name of the timezone this device buckets usage days into (e.g. `"Asia/Seoul"`). Recorded automatically on first run. Prefer `tokscale config set timezone <zone>` over editing this by hand. |
+
+#### Day boundaries and `scanner.bucketTimezone`
+
+Which calendar day a message counts toward depends on a timezone. Tokscale
+records this device's timezone on first run and reuses it, rather than reading
+the machine's current timezone on every scan.
+
+This matters because day totals are submitted per day and never allowed to
+decrease. If the same history were re-bucketed under a different timezone — you
+travel, you change your system clock, you run in CI with a different `TZ` — a
+session near midnight would move to the neighbouring day, and both the old and
+the new day would keep their value. The total would go up without any new usage.
+Pinning the zone makes the day boundary stable, so a rescan of unchanged history
+always produces the same buckets.
+
+```console
+$ tokscale config list
+timezone     Asia/Seoul
+
+$ tokscale config get timezone
+Asia/Seoul
+
+# `set timezone auto` is allowed only before a valid pin exists (or while
+# recovering an invalid hand-edited value). It cannot repin an established
+# device.
+$ tokscale config set timezone auto
+```
+
+Only IANA zone names are accepted. Fixed UTC offsets such as `+09:00` are
+rejected: an offset cannot follow daylight saving time, so a pinned offset stops
+matching local midnight after a DST transition and re-splits usage near the day
+boundary — a smaller version of the problem pinning removes.
+
+An established valid pin cannot be changed or unset, including with `auto`.
+Historical submitted day rows are monotonic, so re-keying prior usage would
+permanently double count it. Relocating a device requires a server
+resync/replacement transition before choosing a different bucket timezone.
+
+Existing installs are unaffected until they pin, and the run that pins reports
+exactly what it would have reported anyway: the zone recorded is the one the
+machine was already using.
 
 Use `scanner.extraScanPaths` for persistent extra roots such as project-level `.codex` directories or imported Gemini/OpenClaw histories. Tokscale automatically discovers Hermes profile databases under `$HERMES_HOME/profiles/*/state.db` (or `~/.hermes/profiles/*/state.db` when `HERMES_HOME` is unset). Use `scanner.extraScanPaths.hermes` only for non-standard Hermes profile locations; entries may point at a profile directory containing `state.db` or directly at a `state.db` file. Tokscale merges these paths with the default scan roots on every run and deduplicates overlapping roots by canonical path.
 
