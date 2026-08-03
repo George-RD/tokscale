@@ -403,9 +403,8 @@ enum ConfigSubcommand {
         about = "Change one setting",
         long_about = "Change one setting.\n\n\
                       timezone: the IANA zone this device buckets usage days into, e.g. \
-                      Asia/Seoul. Pinned automatically on first run; set it explicitly \
-                      after relocating so day boundaries move deliberately instead of on \
-                      the next rescan. Pass `auto` to re-detect from this machine."
+                      Asia/Seoul. Pinned automatically on first run. A valid established pin \
+                      cannot be changed; pass `auto` only to set up or recover an invalid pin."
     )]
     Set {
         #[arg(help = "Setting name (timezone)")]
@@ -416,8 +415,8 @@ enum ConfigSubcommand {
     #[command(
         about = "Clear one setting",
         long_about = "Clear one setting.\n\n\
-                      Clearing timezone makes the next run re-pin this machine's current \
-                      zone; it does not turn pinning off."
+                      A valid established timezone cannot be cleared. Clearing an unset or \
+                      invalid value leaves the next scan to auto-pin this machine's timezone."
     )]
     Unset {
         #[arg(help = "Setting name (timezone)")]
@@ -584,7 +583,18 @@ fn main() -> Result<()> {
     // value on one day and the new one on its neighbour, inflating the total
     // for good. Pinning on first run is what stops that from recurring — see
     // `pin_bucket_timezone_if_unset` for what it deliberately does not do.
-    tui::settings::pin_bucket_timezone_if_unset(&cli.home);
+    // Config mutations must see the saved value exactly as the user left it:
+    // an invalid value is recoverable only if startup does not overwrite it
+    // before `config set`/`unset` gets a chance to act.
+    let config_mutates_timezone = matches!(
+        &cli.command,
+        Some(Commands::Config {
+            subcommand: ConfigSubcommand::Set { .. } | ConfigSubcommand::Unset { .. }
+        })
+    );
+    if !config_mutates_timezone {
+        tui::settings::pin_bucket_timezone_if_unset(&cli.home);
+    }
     tokscale_core::model_alias::set_global(&tui::settings::load_model_aliases_for_home(&cli.home));
     let opencode_model_names = tokscale_core::opencode_model_name::load_for_home(
         cli.home.as_deref().map(std::path::Path::new),

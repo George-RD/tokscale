@@ -3958,6 +3958,74 @@ fn test_config_can_recover_an_invalid_or_unpinned_timezone() {
         .success();
 }
 
+#[test]
+fn test_config_set_can_initialize_or_recover_a_timezone_before_auto_pinning() {
+    for existing in [None, Some("Mars/Olympus_Mons")] {
+        let tmp = create_bucket_timezone_fixture_dir();
+        let config_dir = tmp.path().join(".config/tokscale");
+        if let Some(existing) = existing {
+            pin_bucket_timezone(tmp.path(), existing);
+        }
+
+        cmd_with_home(tmp.path())
+            .env("TOKSCALE_CONFIG_DIR", &config_dir)
+            .args(["config", "set", "timezone", "Asia/Seoul"])
+            .assert()
+            .success();
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(config_dir.join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            settings["scanner"]["bucketTimezone"].as_str(),
+            Some("Asia/Seoul"),
+            "config set must operate on a {existing:?} value before startup auto-pinning"
+        );
+    }
+}
+
+#[test]
+fn test_config_set_auto_can_initialize_or_recover_before_auto_pinning() {
+    for existing in [None, Some("Mars/Olympus_Mons")] {
+        let tmp = create_bucket_timezone_fixture_dir();
+        let config_dir = tmp.path().join(".config/tokscale");
+        if let Some(existing) = existing {
+            pin_bucket_timezone(tmp.path(), existing);
+        }
+
+        cmd_with_home(tmp.path())
+            .env("TOKSCALE_CONFIG_DIR", &config_dir)
+            .args(["config", "set", "timezone", "auto"])
+            .assert()
+            .success();
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(config_dir.join("settings.json")).unwrap())
+                .unwrap();
+        assert!(
+            settings["scanner"]["bucketTimezone"].is_string(),
+            "config set auto must write a detected timezone for a {existing:?} value"
+        );
+    }
+}
+
+#[test]
+fn test_config_unset_can_initialize_or_recover_a_timezone_before_auto_pinning() {
+    for existing in [None, Some("Mars/Olympus_Mons")] {
+        let tmp = create_bucket_timezone_fixture_dir();
+        let config_dir = tmp.path().join(".config/tokscale");
+        if let Some(existing) = existing {
+            pin_bucket_timezone(tmp.path(), existing);
+        }
+
+        cmd_with_home(tmp.path())
+            .env("TOKSCALE_CONFIG_DIR", &config_dir)
+            .args(["config", "unset", "timezone"])
+            .assert()
+            .success();
+    }
+}
+
 /// A fixed UTC offset cannot follow daylight saving time, so pinning one would
 /// reintroduce a bounded version of the bug pinning removes. Reject it at the
 /// boundary rather than storing a value that silently degrades to unpinned.
