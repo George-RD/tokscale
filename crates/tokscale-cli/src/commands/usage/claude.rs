@@ -179,9 +179,9 @@ pub fn fetch() -> Result<UsageOutput> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
+
+    use crate::commands::usage::test_server::{spawn_server, Seen};
 
     /// A Claude Code credential document with the fields tokscale models
     /// (`accessToken`, `subscriptionType`, `rateLimitTier`), the fields it does
@@ -206,79 +206,15 @@ mod tests {
     /// is the same string production would produce.
     const USAGE_PATH: &str = "/api/oauth/usage";
 
-    fn reason(status: u16) -> &'static str {
-        match status {
-            200 => "OK",
-            401 => "Unauthorized",
-            403 => "Forbidden",
-            _ => "Unknown",
-        }
-    }
-
-    /// One request as the server saw it: method and path, plus whatever bearer
-    /// token was presented. The token is recorded so a test can prove the
-    /// credential reached the wire from the fixture it wrote rather than from
-    /// the developer's real `$HOME`.
-    #[derive(Debug, PartialEq)]
-    struct Seen {
-        request: String,
-        bearer: Option<String>,
-    }
-
-    /// Blocking HTTP/1.1 server on an ephemeral port that answers the usage
-    /// path, 404s everything else, and records every request it receives.
-    /// `Connection: close` keeps one request per socket so the accept loop stays
-    /// trivial. The thread is left blocked on `accept` when the test ends; the
-    /// test process tears it down.
-    fn spawn_server(usage_status: u16) -> (String, Arc<Mutex<Vec<Seen>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
-        let addr = listener.local_addr().expect("test server addr");
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let server_log = Arc::clone(&log);
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                let mut buf = Vec::new();
-                let mut chunk = [0u8; 1024];
-                while let Ok(n) = stream.read(&mut chunk) {
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let request = String::from_utf8_lossy(&buf).to_string();
-                let mut head = request.split_whitespace();
-                let method = head.next().unwrap_or("?").to_string();
-                let path = head.next().unwrap_or("/").to_string();
-                let bearer = request
-                    .lines()
-                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
-                    .and_then(|l| l.split_once(':'))
-                    .map(|(_, v)| v.trim().trim_start_matches("Bearer ").to_string());
-                if let Ok(mut seen) = server_log.lock() {
-                    seen.push(Seen {
-                        request: format!("{method} {path}"),
-                        bearer,
-                    });
-                }
-                let (status, body) = if path == USAGE_PATH {
-                    (usage_status, USAGE_BODY.to_string())
-                } else {
-                    (404, "{}".to_string())
-                };
-                let response = format!(
-                    "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    reason(status),
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
+    fn spawn_usage_server(usage_status: u16) -> (String, Arc<Mutex<Vec<Seen>>>) {
+        let (base, log) = spawn_server(move |path, _| {
+            if path == USAGE_PATH {
+                (usage_status, USAGE_BODY.to_string())
+            } else {
+                (404, "{}".to_string())
             }
         });
-        (format!("http://{addr}{USAGE_PATH}"), log)
+        (format!("{base}{USAGE_PATH}"), log)
     }
 
     /// The request log is asserted alongside the credential bytes because a
@@ -362,7 +298,7 @@ mod tests {
         let home = HomeGuard::new("401");
         home.write_fixture();
         let before = std::fs::read(home.credentials()).expect("read before");
-        let (usage_url, log) = spawn_server(401);
+        let (usage_url, log) = spawn_usage_server(401);
 
         let result = fetch_blocking(&usage_url, read_credentials);
 
@@ -388,7 +324,7 @@ mod tests {
         let home = HomeGuard::new("403");
         home.write_fixture();
         let before = std::fs::read(home.credentials()).expect("read before");
-        let (usage_url, log) = spawn_server(403);
+        let (usage_url, log) = spawn_usage_server(403);
 
         let result = fetch_blocking(&usage_url, read_credentials);
 
@@ -409,7 +345,7 @@ mod tests {
     #[serial_test::serial]
     fn rejected_token_does_not_create_a_credential_file() {
         let home = HomeGuard::new("nofile");
-        let (usage_url, log) = spawn_server(401);
+        let (usage_url, log) = spawn_usage_server(401);
 
         let result = fetch_blocking(&usage_url, keychain_credentials);
 
@@ -427,7 +363,7 @@ mod tests {
         let home = HomeGuard::new("200");
         home.write_fixture();
         let before = std::fs::read(home.credentials()).expect("read before");
-        let (usage_url, log) = spawn_server(200);
+        let (usage_url, log) = spawn_usage_server(200);
 
         let output =
             fetch_blocking(&usage_url, read_credentials).expect("200 usage response should parse");

@@ -10,6 +10,8 @@ mod kimi;
 mod minimax;
 mod minimax_tokenplan;
 mod sakana;
+#[cfg(test)]
+mod test_server;
 mod warp;
 mod zai;
 
