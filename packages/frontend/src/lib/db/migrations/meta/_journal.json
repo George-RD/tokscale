@@ -155,6 +155,27 @@
       "when": 1785356630413,
       "tag": "0021_lethal_killraven",
       "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1785715379340,
+      "tag": "0022_uneven_wong",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1785783969629,
+      "tag": "0023_stormy_iron_lad",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1785785051220,
+      "tag": "0024_parched_dreadnoughts",
+      "breakpoints": true
     }
   ]
 }
