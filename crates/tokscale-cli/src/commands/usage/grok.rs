@@ -31,7 +31,7 @@ enum ProtoValue<'a> {
 fn grok_home() -> std::path::PathBuf {
     std::env::var_os("GROK_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".grok")))
+        .or_else(|| crate::paths::home_dir().map(|home| home.join(".grok")))
         .unwrap_or_else(|| std::path::PathBuf::from(".grok"))
 }
 

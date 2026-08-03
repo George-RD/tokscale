@@ -14,6 +14,60 @@
 
 use std::path::PathBuf;
 
+/// Resolve the user's home directory, honoring `$HOME` on every platform.
+///
+/// `dirs::home_dir()` reads `$HOME` on Unix but goes straight to the Win32
+/// known-folder API on Windows, where no environment variable can redirect
+/// it. The asymmetry is invisible until something actually runs on Windows:
+/// a caller that points `HOME` at a scratch directory is obeyed on Unix and
+/// silently ignored on Windows, so it keeps reading — and writing — the real
+/// profile. That is exactly what #997 found once a Windows runner existed;
+/// `test_ensure_config_dir` was creating `%USERPROFILE%\.config\tokscale` on
+/// the machine running the suite, and `test_load_credentials_nonexistent`
+/// was asserting against the developer's own credentials file.
+///
+/// `$HOME` is only honored on Windows when it carries a real Win32 prefix
+/// (`C:\...`, `\\?\C:\...`, `\\server\share`). MSYS2, Cygwin and Git Bash
+/// export POSIX-shaped values such as `/home/user`, which `Path` resolves
+/// against whatever the current drive happens to be — obeying those would
+/// relocate the config of every user who launches tokscale from a Unix-shell
+/// emulator to `C:\home\user`. Requiring the prefix keeps the redirect
+/// available to anything that can set a native path while leaving the
+/// emulator case on the platform default.
+///
+/// Every home-rooted path in the workspace must resolve through here rather
+/// than calling `dirs::home_dir()` directly, otherwise the redirect holds for
+/// some roots and not others and the two disagree about where state lives.
+pub fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Some(explicit) = windows_native_home_override() {
+            return Some(explicit);
+        }
+    }
+
+    dirs::home_dir()
+}
+
+/// `$HOME` on Windows, but only when it names a path Win32 can actually use.
+///
+/// See [`home_dir`] for why the prefix check is load-bearing rather than a
+/// nicety: without it a Git Bash `HOME=/home/user` would win over the real
+/// profile.
+#[cfg(windows)]
+fn windows_native_home_override() -> Option<PathBuf> {
+    let raw = std::env::var_os("HOME")?;
+    if raw.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(raw);
+    matches!(
+        path.components().next(),
+        Some(std::path::Component::Prefix(_))
+    )
+    .then_some(path)
+}
+
 /// Resolve the tokscale config dir, honoring `TOKSCALE_CONFIG_DIR` first.
 ///
 /// Resolution order:
@@ -40,7 +94,7 @@ pub fn get_config_dir() -> PathBuf {
 
     #[cfg(target_os = "macos")]
     {
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = home_dir() {
             return home.join(".config").join("tokscale");
         }
     }
@@ -103,7 +157,7 @@ pub fn legacy_dot_cache_tokscale_dir() -> Option<PathBuf> {
     if is_config_dir_overridden() {
         return None;
     }
-    dirs::home_dir().map(|h| h.join(".cache").join("tokscale"))
+    home_dir().map(|h| h.join(".cache").join("tokscale"))
 }
 
 #[cfg(test)]
@@ -146,6 +200,58 @@ mod tests {
                 None => env::remove_var("XDG_CONFIG_HOME"),
             }
         }
+    }
+
+    /// The regression #997 is really about: this assertion has always held on
+    /// Unix and has never held on Windows, because `dirs::home_dir()` consults
+    /// the Win32 profile API there and no environment variable can reach it.
+    /// Every home-rooted test in the workspace redirects `HOME` and assumes
+    /// the code under test follows, so this one assertion is what makes the
+    /// rest of them mean the same thing on both platforms.
+    #[test]
+    #[serial]
+    fn home_dir_follows_an_explicit_native_home_on_every_platform() {
+        let prev = save_env();
+        // `env::temp_dir()` is absolute and carries a drive prefix on Windows,
+        // which is exactly the shape a `TempDir`-based test produces.
+        let redirect = env::temp_dir().join("tokscale-core-home-dir-probe");
+        unsafe {
+            env::set_var("HOME", &redirect);
+        }
+        assert_eq!(home_dir(), Some(redirect));
+        restore_env(prev);
+    }
+
+    /// MSYS2, Cygwin and Git Bash export `HOME=/home/<user>`. `Path` reads a
+    /// leading `/` on Windows as "root of the current drive", so honoring that
+    /// value would silently move a real user's credentials and scan roots to
+    /// `C:\home\<user>`. The prefix check in `windows_native_home_override`
+    /// exists solely to keep that from happening.
+    #[test]
+    #[serial]
+    #[cfg(windows)]
+    fn home_dir_ignores_a_posix_shaped_home() {
+        let prev = save_env();
+        unsafe {
+            env::set_var("HOME", "/home/runner");
+        }
+        assert_ne!(home_dir(), Some(PathBuf::from("/home/runner")));
+        restore_env(prev);
+    }
+
+    /// Same contract as `get_config_dir`: an exported-but-blank variable is a
+    /// misconfiguration, not a request to resolve every home-rooted path
+    /// against the process CWD.
+    #[test]
+    #[serial]
+    #[cfg(windows)]
+    fn home_dir_treats_an_empty_home_as_unset() {
+        let prev = save_env();
+        unsafe {
+            env::set_var("HOME", "");
+        }
+        assert_ne!(home_dir(), Some(PathBuf::new()));
+        restore_env(prev);
     }
 
     #[test]

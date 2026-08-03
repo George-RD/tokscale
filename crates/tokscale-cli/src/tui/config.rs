@@ -34,7 +34,7 @@ pub struct DisplayNamesConfig {
 
 impl TokscaleConfig {
     fn config_path() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".tokscale"))
+        crate::paths::home_dir().map(|h| h.join(".tokscale"))
     }
 
     pub fn load() -> &'static TokscaleConfig {

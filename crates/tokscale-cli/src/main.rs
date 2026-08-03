@@ -1329,7 +1329,7 @@ struct CursorSetupState {
 fn cursor_setup_state(home_dir: &Option<String>) -> Option<CursorSetupState> {
     let (home_path, home_override) = match home_dir {
         Some(home) => (PathBuf::from(home), true),
-        None => (dirs::home_dir()?, false),
+        None => (crate::paths::home_dir()?, false),
     };
     let has_credentials = if home_override {
         cursor::has_active_credentials_in_home(&home_path)
@@ -1410,7 +1410,7 @@ fn warp_setup_warnings_for_report(
 
     let (home_path, home_override) = match home_dir {
         Some(home) => (PathBuf::from(home), true),
-        None => match dirs::home_dir() {
+        None => match crate::paths::home_dir() {
             Some(home) => (home, false),
             None => {
                 return vec![
@@ -1572,7 +1572,10 @@ fn use_env_roots(home_dir: &Option<String>) -> bool {
 }
 
 fn resolve_effective_home_dir(home_dir: &Option<String>) -> Option<PathBuf> {
-    home_dir.as_ref().map(PathBuf::from).or_else(dirs::home_dir)
+    home_dir
+        .as_ref()
+        .map(PathBuf::from)
+        .or_else(crate::paths::home_dir)
 }
 
 fn model_usage_includes_client(entry: &tokscale_core::ModelUsage, client: &str) -> bool {
@@ -3818,7 +3821,7 @@ fn run_clients_command(json: bool, home_dir: Option<String>) -> Result<()> {
     let scanner_settings = tui::settings::load_scanner_settings_for_home(&explicit_home_dir);
     let home_dir = explicit_home_dir
         .map(PathBuf::from)
-        .or_else(dirs::home_dir)
+        .or_else(crate::paths::home_dir)
         .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
     let home_dir_str = home_dir.to_string_lossy().to_string();
 
@@ -6194,8 +6197,8 @@ fn run_headless_command(
         final_args.push("--json".to_string());
     }
 
-    let home_dir =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+    let home_dir = crate::paths::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
     let headless_roots = get_headless_roots(&home_dir);
 
     let output_path = if let Some(custom_output) = output {
@@ -8073,7 +8076,7 @@ mod tests {
     #[test]
     fn write_light_cache_refuses_when_home_dir_set() {
         // --home rebinds the scan root; DataLoader::load currently ignores
-        // this field and resolves home from dirs::home_dir() with
+        // this field and resolves home from crate::paths::home_dir() with
         // use_env_roots=true, so the printed --light report is built from
         // <home> while a naive cache write would store data scanned from
         // the default home. Refuse the write to avoid that drift.

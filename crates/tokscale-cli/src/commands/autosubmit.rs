@@ -963,7 +963,7 @@ fn render_scheduler_spec(
 }
 
 fn render_launchd_spec(exe: &Path, settings: &AutosubmitSettings) -> Result<SchedulerSpec> {
-    let home = dirs::home_dir().context("Could not determine home directory")?;
+    let home = crate::paths::home_dir().context("Could not determine home directory")?;
     render_launchd_spec_for_home(exe, settings, &home)
 }
 
@@ -1066,7 +1066,7 @@ fn systemd_user_dir() -> Result<PathBuf> {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(dirs::config_dir)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".config")));
+        .or_else(|| crate::paths::home_dir().map(|home| home.join(".config")));
     Ok(config_dir
         .context("Could not determine XDG config directory")?
         .join("systemd")

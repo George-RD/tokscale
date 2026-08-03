@@ -48,7 +48,7 @@ struct Window {
 }
 
 fn credentials_path() -> std::path::PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let home = crate::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     home.join(".claude").join(".credentials.json")
 }
 

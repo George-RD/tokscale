@@ -245,7 +245,10 @@ fn load_with_environment(
 /// or unreadable config files are ignored so usage reporting remains available.
 pub fn load_for_home(home_dir: Option<&Path>) -> OpenCodeModelNameResolver {
     let use_env_roots = home_dir.is_none();
-    let Some(home_dir) = home_dir.map(Path::to_path_buf).or_else(dirs::home_dir) else {
+    let Some(home_dir) = home_dir
+        .map(Path::to_path_buf)
+        .or_else(crate::paths::home_dir)
+    else {
         return OpenCodeModelNameResolver::default();
     };
 

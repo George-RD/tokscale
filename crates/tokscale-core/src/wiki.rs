@@ -114,7 +114,7 @@ impl WikiDb {
     pub fn default_path() -> PathBuf {
         let config_dir = dirs::config_dir()
             .unwrap_or_else(|| {
-                dirs::home_dir()
+                crate::paths::home_dir()
                     .unwrap_or_else(|| PathBuf::from("."))
                     .join(".config")
             })

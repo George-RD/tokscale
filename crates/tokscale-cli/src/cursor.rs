@@ -28,7 +28,7 @@ fn build_cursor_http_client() -> Result<reqwest::Client> {
 }
 
 fn home_dir() -> Result<PathBuf> {
-    dirs::home_dir().context("Could not determine home directory")
+    crate::paths::home_dir().context("Could not determine home directory")
 }
 
 fn cursor_credentials_path(home_dir: &Path) -> PathBuf {

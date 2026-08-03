@@ -71,14 +71,14 @@ fn credentials_paths() -> Vec<std::path::PathBuf> {
         .filter(|home| !home.trim().is_empty())
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
-            dirs::home_dir()
+            crate::paths::home_dir()
                 .map(|h| h.join(".kimi-code"))
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
         });
     paths.push(kimi_code_home.join("credentials").join("kimi-code.json"));
 
     // 2) kimi-cli
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::paths::home_dir() {
         paths.push(
             home.join(".kimi")
                 .join("credentials")
@@ -376,7 +376,7 @@ mod tests {
         // The blank-equals-unset assertion below needs no such guard -- both
         // sides take the same branch whichever it is, which is the property
         // this test actually exists to prove.
-        if dirs::home_dir().is_some() {
+        if crate::paths::home_dir().is_some() {
             assert!(
                 unset.ends_with(".kimi-code/credentials/kimi-code.json"),
                 "unset lookup no longer defaults to ~/.kimi-code: {unset:?}"

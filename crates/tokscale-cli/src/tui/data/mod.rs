@@ -360,7 +360,7 @@ impl DataLoader {
         group_by: &GroupBy,
         include_synthetic: bool,
     ) -> Result<UsageData> {
-        let home = dirs::home_dir()
+        let home = crate::paths::home_dir()
             .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
             .to_string_lossy()
             .to_string();
@@ -409,7 +409,7 @@ impl DataLoader {
         include_synthetic: bool,
         pricing: &tokscale_core::pricing::PricingService,
     ) -> Result<UsageData> {
-        let home = dirs::home_dir()
+        let home = crate::paths::home_dir()
             .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
             .to_string_lossy()
             .to_string();
@@ -1481,7 +1481,7 @@ mod tests {
         include_synthetic: bool,
         pricing: Option<&PricingService>,
     ) -> Result<UsageData> {
-        let home = dirs::home_dir()
+        let home = crate::paths::home_dir()
             .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
             .to_string_lossy()
             .to_string();

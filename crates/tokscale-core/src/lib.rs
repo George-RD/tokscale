@@ -591,7 +591,7 @@ pub fn get_home_dir_string(home_dir_option: &Option<String>) -> Result<String, S
     home_dir_option
         .clone()
         .or_else(|| std::env::var("HOME").ok())
-        .or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().into_owned()))
+        .or_else(|| crate::paths::home_dir().map(|p| p.to_string_lossy().into_owned()))
         .ok_or_else(|| {
             "HOME directory not specified and could not determine home directory".to_string()
         })
