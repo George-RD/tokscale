@@ -47,10 +47,11 @@ const RESELLER_PROVIDER_PREFIXES: &[&str] = &[
     "orcarouter/",
 ];
 
-// Bare brand tokens ("claude", "anthropic") are blocked because they contain
-// no model information: a fuzzy hit from them can land on any model of the
-// brand (e.g. retired `claude-2.1` eroding to `claude` and billing at an
-// opus-fast key), so such a match is never trustworthy.
+// Bare brand tokens ("claude", "anthropic", "gemini") are blocked because they
+// contain no model information: a fuzzy hit from them can land on any model of
+// the brand (e.g. retired `claude-2.1` eroding to `claude` and billing at an
+// opus-fast key, or `gemini-default` eroding to `gemini` and landing on a
+// native-audio preview key), so such a match is never trustworthy.
 //
 // Generic English words ("model", "router") are blocked for the same reason:
 // they carry no model identity, yet substring-match real priced keys
@@ -65,6 +66,7 @@ const FUZZY_BLOCKLIST: &[&str] = &[
     "base",
     "claude",
     "anthropic",
+    "gemini",
     "model",
     "router",
 ];
@@ -3181,6 +3183,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn incomplete_unhinted_result_does_not_replace_provider_pricing() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "azure/gpt-fallback-guard".into(),
+            ModelPricing {
+                input_cost_per_token: Some(1.0),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "gpt-fallback-guard".into(),
+            ModelPricing {
+                output_cost_per_token: Some(2.0),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let usage = TokenBreakdown {
+            input: 1,
+            output: 1,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        };
+
+        // Neither row covers both populated buckets. Retain the provider row
+        // rather than replacing it with an unhinted row that silently prices
+        // the input bucket at zero.
+        assert_eq!(
+            lookup.calculate_cost_with_provider("gpt-fallback-guard", Some("azure"), &usage),
+            1.0
+        );
+    }
     #[test]
     fn test_provider_hint_normalizes_openai_codex_alias() {
         let mut litellm = HashMap::new();

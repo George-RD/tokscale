@@ -526,6 +526,19 @@ mod tests {
         assert_eq!(message.provider_id, "google");
     }
 
+    // The generic routing label is preserved verbatim. It is not a concrete
+    // billable model id, so submit can exclude it instead of inventing a cost.
+    #[test]
+    fn gemini_default_response_model_is_preserved() {
+        let blob = build_gen_metadata_with_model("gemini-default");
+        let mut seen = HashSet::new();
+
+        let message = parse_gen_metadata(&blob, "session", 1_000, &mut seen).unwrap();
+
+        assert_eq!(message.model_id, "gemini-default");
+        assert_eq!(message.provider_id, "google");
+    }
+
     #[test]
     fn per_generation_timestamp_overrides_session_fallback() {
         // chatModel.#9.#4 = {#1: seconds, #2: nanos} is the per-turn wall-clock
