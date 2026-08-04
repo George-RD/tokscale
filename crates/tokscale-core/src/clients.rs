@@ -739,13 +739,30 @@ impl Default for ClientCounts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use serial_test::serial;
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
+    // These tests mutate process-global environment variables, so they take
+    // `#[serial]` rather than the private `Mutex` they used to share. The
+    // mutex made them exclusive with each other but not with the rest of the
+    // crate, which serializes on `serial_test` — two disjoint domains over one
+    // set of variables. `test_path_root_config_*` restores its snapshot of
+    // `TOKSCALE_CONFIG_DIR` on the way out, which is a *clear* when the
+    // developer has none set, and that clear landed in the middle of the
+    // pricing cache tests that redirect the same variable: they went on
+    // asserting against a temp path the code was no longer writing to while
+    // the real `~/.config/tokscale/cache` took the write. One domain is the
+    // only arrangement that holds, so nothing here may reintroduce a second.
+    // The tests this module serializes restore through `EnvGuard` rather than a
+    // trailing restore call: a failing assertion panics before such a call
+    // runs, and `#[serial]` prevents overlap, not inheritance — so a redirect
+    // would leak into every later test in the process. `paths::tests` documents
+    // the same trap.
+    use crate::paths::test_env::EnvGuard;
 
+    // Retained for the env tests below that predate this module's move to one
+    // serialization domain. New tests should capture an `EnvGuard` instead;
+    // this pairing is only panic-safe when nothing between it and the restore
+    // can fail.
     fn restore_env(var: &str, previous: Option<String>) {
         match previous {
             Some(value) => unsafe { std::env::set_var(var, value) },
@@ -808,48 +825,38 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_reasonix_stats_prefers_state_home_then_reasonix_home() {
-        let _guard = env_lock().lock().unwrap();
-        let state_previous = std::env::var("REASONIX_STATE_HOME").ok();
-        let home_previous = std::env::var("REASONIX_HOME").ok();
-        unsafe {
-            std::env::set_var("REASONIX_HOME", "/custom/reasonix-home");
-            std::env::set_var("REASONIX_STATE_HOME", "/custom/reasonix-state");
-        }
+        let mut env = EnvGuard::capture(&["REASONIX_STATE_HOME", "REASONIX_HOME"]);
+        env.set("REASONIX_HOME", "/custom/reasonix-home");
+        env.set("REASONIX_STATE_HOME", "/custom/reasonix-state");
         let client = ClientId::Reasonix;
         assert_eq!(
             client.data().resolve_path("/tmp/home"),
             "/custom/reasonix-state/stats"
         );
-        unsafe { std::env::remove_var("REASONIX_STATE_HOME") };
+        env.remove("REASONIX_STATE_HOME");
         assert_eq!(
             client.data().resolve_path("/tmp/home"),
             "/custom/reasonix-home/stats"
         );
-        restore_env("REASONIX_STATE_HOME", state_previous);
-        restore_env("REASONIX_HOME", home_previous);
     }
 
     #[test]
+    #[serial]
     fn test_reasonix_stats_normalizes_env_roots_and_ignores_blank_values() {
-        let _guard = env_lock().lock().unwrap();
-        let state_previous = std::env::var("REASONIX_STATE_HOME").ok();
-        let home_previous = std::env::var("REASONIX_HOME").ok();
+        let mut env = EnvGuard::capture(&["REASONIX_STATE_HOME", "REASONIX_HOME"]);
         let client = ClientId::Reasonix;
 
-        unsafe {
-            std::env::set_var("REASONIX_STATE_HOME", "  ~/reasonix-state  ");
-            std::env::set_var("REASONIX_HOME", "/unused/reasonix-home");
-        }
+        env.set("REASONIX_STATE_HOME", "  ~/reasonix-state  ");
+        env.set("REASONIX_HOME", "/unused/reasonix-home");
         assert_eq!(
             client.data().resolve_path("/tmp/home"),
             "/tmp/home/reasonix-state/stats"
         );
 
-        unsafe {
-            std::env::set_var("REASONIX_STATE_HOME", " \t ");
-            std::env::set_var("REASONIX_HOME", " relative-reasonix ");
-        }
+        env.set("REASONIX_STATE_HOME", " \t ");
+        env.set("REASONIX_HOME", " relative-reasonix ");
         let expected = std::env::current_dir()
             .expect("test process has a current directory")
             .join("relative-reasonix")
@@ -857,38 +864,33 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(client.data().resolve_path("/tmp/home"), expected);
-
-        restore_env("REASONIX_STATE_HOME", state_previous);
-        restore_env("REASONIX_HOME", home_previous);
     }
 
     #[test]
+    #[serial]
     fn test_reasonix_stats_expands_environment_references_before_normalizing_paths() {
-        let _guard = env_lock().lock().unwrap();
-        let state_previous = std::env::var("REASONIX_STATE_HOME").ok();
-        let root_previous = std::env::var("TOKSCALE_REASONIX_TEST_ROOT").ok();
-        let unset_previous = std::env::var("TOKSCALE_REASONIX_TEST_UNSET").ok();
+        let mut env = EnvGuard::capture(&[
+            "REASONIX_STATE_HOME",
+            "TOKSCALE_REASONIX_TEST_ROOT",
+            "TOKSCALE_REASONIX_TEST_UNSET",
+        ]);
         let client = ClientId::Reasonix;
 
-        unsafe {
-            std::env::set_var("TOKSCALE_REASONIX_TEST_ROOT", "~/reasonix-state");
-            std::env::remove_var("TOKSCALE_REASONIX_TEST_UNSET");
-            std::env::set_var(
-                "REASONIX_STATE_HOME",
-                "${TOKSCALE_REASONIX_TEST_ROOT}/nested",
-            );
-        }
+        env.set("TOKSCALE_REASONIX_TEST_ROOT", "~/reasonix-state");
+        env.remove("TOKSCALE_REASONIX_TEST_UNSET");
+        env.set(
+            "REASONIX_STATE_HOME",
+            "${TOKSCALE_REASONIX_TEST_ROOT}/nested",
+        );
         assert_eq!(
             client.data().resolve_path("/tmp/home"),
             "/tmp/home/reasonix-state/nested/stats"
         );
 
-        unsafe {
-            std::env::set_var(
-                "REASONIX_STATE_HOME",
-                "${TOKSCALE_REASONIX_TEST_UNSET:-relative-reasonix}",
-            );
-        }
+        env.set(
+            "REASONIX_STATE_HOME",
+            "${TOKSCALE_REASONIX_TEST_UNSET:-relative-reasonix}",
+        );
         let expected = std::env::current_dir()
             .expect("test process has a current directory")
             .join("relative-reasonix")
@@ -896,21 +898,14 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(client.data().resolve_path("/tmp/home"), expected);
-
-        restore_env("REASONIX_STATE_HOME", state_previous);
-        restore_env("TOKSCALE_REASONIX_TEST_ROOT", root_previous);
-        restore_env("TOKSCALE_REASONIX_TEST_UNSET", unset_previous);
     }
 
     #[test]
+    #[serial]
     fn test_reasonix_stats_ignores_env_roots_when_requested() {
-        let _guard = env_lock().lock().unwrap();
-        let state_previous = std::env::var("REASONIX_STATE_HOME").ok();
-        let home_previous = std::env::var("REASONIX_HOME").ok();
-        unsafe {
-            std::env::set_var("REASONIX_STATE_HOME", "/custom/reasonix-state");
-            std::env::set_var("REASONIX_HOME", "/custom/reasonix-home");
-        }
+        let mut env = EnvGuard::capture(&["REASONIX_STATE_HOME", "REASONIX_HOME"]);
+        env.set("REASONIX_STATE_HOME", "/custom/reasonix-state");
+        env.set("REASONIX_HOME", "/custom/reasonix-home");
 
         assert_eq!(
             ClientId::Reasonix
@@ -918,69 +913,58 @@ mod tests {
                 .resolve_path_with_env_strategy("/tmp/home", false),
             "/tmp/home/.reasonix/stats"
         );
-
-        restore_env("REASONIX_STATE_HOME", state_previous);
-        restore_env("REASONIX_HOME", home_previous);
     }
 
     #[test]
+    #[serial]
     fn test_kimchi_defaults_to_home_agent_dir_without_env_override() {
-        let _guard = env_lock().lock().unwrap();
-        let previous = std::env::var("KIMCHI_CODING_AGENT_DIR").ok();
-        unsafe { std::env::remove_var("KIMCHI_CODING_AGENT_DIR") };
+        let mut env = EnvGuard::capture(&["KIMCHI_CODING_AGENT_DIR"]);
+        env.remove("KIMCHI_CODING_AGENT_DIR");
 
         let client = ClientId::from_str("kimchi").expect("kimchi client should be registered");
         assert_eq!(
             client.data().resolve_path("/tmp/home"),
             "/tmp/home/.config/kimchi/harness/sessions"
         );
-
-        restore_env("KIMCHI_CODING_AGENT_DIR", previous);
     }
 
     #[test]
+    #[serial]
     fn test_kimchi_honors_agent_dir_env_override() {
-        let _guard = env_lock().lock().unwrap();
-        let previous = std::env::var("KIMCHI_CODING_AGENT_DIR").ok();
-        unsafe { std::env::set_var("KIMCHI_CODING_AGENT_DIR", "/custom/kimchi-agent") };
+        let mut env = EnvGuard::capture(&["KIMCHI_CODING_AGENT_DIR"]);
+        env.set("KIMCHI_CODING_AGENT_DIR", "/custom/kimchi-agent");
 
         let client = ClientId::from_str("kimchi").expect("kimchi client should be registered");
         assert_eq!(
             client.data().resolve_path("/tmp/home"),
             "/custom/kimchi-agent/sessions"
         );
-
-        restore_env("KIMCHI_CODING_AGENT_DIR", previous);
     }
 
     #[test]
+    #[serial]
     fn test_senpi_defaults_to_home_agent_dir_without_env_override() {
-        let _guard = env_lock().lock().unwrap();
-        let previous = std::env::var("SENPI_CODING_AGENT_DIR").ok();
-        unsafe { std::env::remove_var("SENPI_CODING_AGENT_DIR") };
+        let mut env = EnvGuard::capture(&["SENPI_CODING_AGENT_DIR"]);
+        env.remove("SENPI_CODING_AGENT_DIR");
 
         let client = ClientId::from_str("senpi").expect("senpi client should be registered");
         assert_eq!(
             client.data().resolve_path("/tmp/home"),
             "/tmp/home/.senpi/agent/sessions"
         );
-
-        restore_env("SENPI_CODING_AGENT_DIR", previous);
     }
 
     #[test]
+    #[serial]
     fn test_senpi_honors_agent_dir_env_override() {
-        let _guard = env_lock().lock().unwrap();
-        let previous = std::env::var("SENPI_CODING_AGENT_DIR").ok();
-        unsafe { std::env::set_var("SENPI_CODING_AGENT_DIR", "/custom/senpi-agent") };
+        let mut env = EnvGuard::capture(&["SENPI_CODING_AGENT_DIR"]);
+        env.set("SENPI_CODING_AGENT_DIR", "/custom/senpi-agent");
 
         let client = ClientId::from_str("senpi").expect("senpi client should be registered");
         assert_eq!(
             client.data().resolve_path("/tmp/home"),
             "/custom/senpi-agent/sessions"
         );
-
-        restore_env("SENPI_CODING_AGENT_DIR", previous);
     }
 
     #[test]
@@ -1110,8 +1094,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_path_root_xdg_data_uses_env_var_when_set() {
-        let _guard = env_lock().lock().unwrap();
         let previous = std::env::var("XDG_DATA_HOME").ok();
         unsafe { std::env::set_var("XDG_DATA_HOME", "/tmp/xdg-data-home") };
 
@@ -1122,8 +1106,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_path_root_xdg_data_falls_back_when_unset() {
-        let _guard = env_lock().lock().unwrap();
         let previous = std::env::var("XDG_DATA_HOME").ok();
         unsafe { std::env::remove_var("XDG_DATA_HOME") };
 
@@ -1134,8 +1118,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_path_root_xdg_data_ignores_env_when_disabled() {
-        let _guard = env_lock().lock().unwrap();
         let previous = std::env::var("XDG_DATA_HOME").ok();
         unsafe { std::env::set_var("XDG_DATA_HOME", "/tmp/xdg-data-home") };
 
@@ -1146,8 +1130,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_path_root_config_uses_override_when_set() {
-        let _guard = env_lock().lock().unwrap();
         let previous_override = std::env::var("TOKSCALE_CONFIG_DIR").ok();
         let previous_xdg = std::env::var("XDG_CONFIG_HOME").ok();
         unsafe {
@@ -1164,8 +1148,8 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    #[serial]
     fn test_path_root_config_uses_xdg_config_home_when_override_unset() {
-        let _guard = env_lock().lock().unwrap();
         let previous_override = std::env::var("TOKSCALE_CONFIG_DIR").ok();
         let previous_xdg = std::env::var("XDG_CONFIG_HOME").ok();
         unsafe {
@@ -1182,13 +1166,13 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "windows")]
+    #[serial]
     fn test_path_root_config_uses_dirs_config_dir_on_windows() {
         // Windows must resolve PathRoot::Config to the same root that
         // paths::get_config_dir() and get_antigravity_cache_dir() use,
         // i.e. dirs::config_dir() (= %APPDATA%\tokscale). Hardcoding
         // {home}/.config/tokscale would diverge from the writer side
         // and silently hide synced Antigravity data from reports.
-        let _guard = env_lock().lock().unwrap();
         let previous_override = std::env::var("TOKSCALE_CONFIG_DIR").ok();
         unsafe {
             std::env::remove_var("TOKSCALE_CONFIG_DIR");
@@ -1209,8 +1193,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_path_root_config_ignores_env_when_disabled() {
-        let _guard = env_lock().lock().unwrap();
         let previous_override = std::env::var("TOKSCALE_CONFIG_DIR").ok();
         let previous_xdg = std::env::var("XDG_CONFIG_HOME").ok();
         unsafe {
@@ -1234,8 +1218,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_path_root_env_var_uses_env_when_set() {
-        let _guard = env_lock().lock().unwrap();
         let var = "TOKSCALE_TEST_PATH_ROOT";
         let previous = std::env::var(var).ok();
         unsafe { std::env::set_var(var, "/tmp/custom-root") };
@@ -1251,8 +1235,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_path_root_env_var_falls_back_when_unset() {
-        let _guard = env_lock().lock().unwrap();
         let var = "TOKSCALE_TEST_PATH_ROOT";
         let previous = std::env::var(var).ok();
         unsafe { std::env::remove_var(var) };
@@ -1268,8 +1252,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_path_root_env_var_ignores_env_when_disabled() {
-        let _guard = env_lock().lock().unwrap();
         let var = "TOKSCALE_TEST_PATH_ROOT";
         let previous = std::env::var(var).ok();
         unsafe { std::env::set_var(var, "/tmp/custom-root") };
@@ -1328,8 +1312,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_gjc_data_dir_path() {
-        let _guard = env_lock().lock().unwrap();
         let var = "GJC_CODING_AGENT_DIR";
         let previous = std::env::var(var).ok();
         // Env unset (cleared): resolves under home/.gjc/agent/sessions.
@@ -1400,8 +1384,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_zed_data_dir_path() {
-        let _guard = env_lock().lock().unwrap();
         let previous = std::env::var("XDG_DATA_HOME").ok();
         unsafe { std::env::remove_var("XDG_DATA_HOME") };
 

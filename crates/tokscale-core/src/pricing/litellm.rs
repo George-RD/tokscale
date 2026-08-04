@@ -498,8 +498,25 @@ pub async fn fetch() -> Result<PricingDataset, String> {
     fetch_inner(PRICING_URL, true).await
 }
 
-async fn fetch_inner(url: &str, use_cache: bool) -> Result<PricingDataset, String> {
-    if use_cache {
+/// `use_disk_cache` governs BOTH halves of the on-disk cache — the read below
+/// and the write at the end. It used to gate only the read, so a caller that
+/// asked for a fresh fetch still published the result to
+/// `~/.config/tokscale/cache/pricing-litellm.json`. Any fixture-server test
+/// that fetched successfully therefore published its stub over the real
+/// multi-thousand-model dataset for a full TTL, and while it was clobbered
+/// LiteLLM contributed nothing to pricing lookups (#1021, #1035).
+///
+/// Gating the write here rather than isolating the tests behind
+/// `TOKSCALE_CONFIG_DIR`: the override is process-global, so it only protects
+/// the tests that remember to set it, and the next fixture-server test added
+/// without it silently reintroduces the bug. A flag on the function makes the
+/// opt-out total and local — the caller that declined the cache cannot write to
+/// it by construction. The override still earns its keep in the regression
+/// test, where it is the only way to observe the write without touching the
+/// developer's real cache. No production caller wants read-bypass-with-write:
+/// `fetch()` is the sole one and it passes `true`.
+async fn fetch_inner(url: &str, use_disk_cache: bool) -> Result<PricingDataset, String> {
+    if use_disk_cache {
         if let Some(cached) = load_cached() {
             return Ok(cached);
         }
@@ -515,12 +532,14 @@ async fn fetch_inner(url: &str, use_cache: bool) -> Result<PricingDataset, Strin
     if data.is_empty() {
         return Err("LiteLLM returned no usable pricing rows".to_string());
     }
-    if let Err(e) = cache::save_cache(CACHE_FILENAME, &data) {
-        eprintln!(
-            "[tokscale] Warning: Failed to cache LiteLLM pricing at {}: {}",
-            cache::get_cache_path(CACHE_FILENAME).display(),
-            e
-        );
+    if use_disk_cache {
+        if let Err(e) = cache::save_cache(CACHE_FILENAME, &data) {
+            eprintln!(
+                "[tokscale] Warning: Failed to cache LiteLLM pricing at {}: {}",
+                cache::get_cache_path(CACHE_FILENAME).display(),
+                e
+            );
+        }
     }
     Ok(data)
 }
@@ -528,9 +547,12 @@ async fn fetch_inner(url: &str, use_cache: bool) -> Result<PricingDataset, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::test_env::EnvGuard;
+    use serial_test::serial;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+    use tempfile::TempDir;
 
     /// Serve one 200 response whose body is well-formed JSON that does not fit
     /// `PricingDataset` (a string where an f64 is expected) — the shape an
@@ -779,6 +801,64 @@ mod tests {
         assert_eq!(
             pricing.cache_read_input_token_cost_above_272k_tokens,
             Some(0.000001)
+        );
+    }
+
+    /// `use_disk_cache` used to gate only the cache READ while the write ran
+    /// unconditionally, so every fixture-server test in this module wrote its
+    /// two-row fixture over the developer's real
+    /// `~/.config/tokscale/cache/pricing-litellm.json`, evicting the genuine
+    /// multi-thousand-model LiteLLM dataset for a full TTL. A clobbered cache
+    /// contributes nothing to pricing lookups, which is exactly the spurious
+    /// "pricing is unavailable for submitted token usage" submit failure
+    /// reported in #1021 and #1035 — `cargo test` was manufacturing the bug.
+    ///
+    /// The assertion redirects `TOKSCALE_CONFIG_DIR` at a `TempDir` instead of
+    /// probing the developer's home. `cache::get_cache_path` resolves through
+    /// `paths::get_config_dir()` either way, so a write that would have landed
+    /// in the real cache lands in the temp dir here: observable without the
+    /// test depending on — or risking — whatever the developer's home contains.
+    /// The `starts_with` assertion is what makes that substitution honest; if
+    /// the redirect ever stopped taking effect the test would otherwise pass
+    /// vacuously while the real cache was still being overwritten.
+    ///
+    /// `#[serial]` is load-bearing for the same reason. `TOKSCALE_CONFIG_DIR`
+    /// is process-global, so a concurrent test that restores its own snapshot
+    /// of it clears this redirect mid-run; the path captured at the top then
+    /// stops being the path the code would write to, and the final assertion
+    /// checks an empty temp dir while the real cache is clobbered. The
+    /// `assert_eq!` after the fetch catches that breach directly instead of
+    /// letting it read as a pass.
+    #[tokio::test]
+    #[serial]
+    async fn a_fetch_with_caching_disabled_writes_no_cache_file() {
+        let temp_config = TempDir::new().unwrap();
+        let mut env = EnvGuard::capture(&["TOKSCALE_CONFIG_DIR"]);
+        env.set("TOKSCALE_CONFIG_DIR", temp_config.path());
+
+        let cache_path = cache::get_cache_path(CACHE_FILENAME);
+        assert!(
+            cache_path.starts_with(temp_config.path()),
+            "the config-dir redirect must be in effect or this test proves nothing: {}",
+            cache_path.display()
+        );
+
+        let url = pricing_server(r#"{"usable":{"input_cost_per_token":0.000005}}"#);
+        let data = fetch_inner(&url, false)
+            .await
+            .expect("the fixture serves one usable base-priced row");
+        assert!(data.contains_key("usable"), "the fetch itself must succeed");
+
+        assert_eq!(
+            cache::get_cache_path(CACHE_FILENAME),
+            cache_path,
+            "the redirect moved while the fetch ran, so the assertion below would check a path the fetch never targeted"
+        );
+
+        assert!(
+            !cache_path.exists(),
+            "a fetch that opted out of the cache must not write it, but {} was created",
+            cache_path.display()
         );
     }
 }
