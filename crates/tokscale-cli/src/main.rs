@@ -5497,28 +5497,28 @@ fn report_excluded_tokenless_rows(excluded: &[ExcludedTokenlessRow]) {
     println!();
 }
 
-fn report_unpriced_submission_exclusions(
-    excluded: &[tokscale_core::UnpricedSubmissionExclusion],
-    has_remaining_usage: bool,
+fn report_unpriced_submission_usage(
+    unpriced: &[tokscale_core::UnpricedSubmissionUsage],
+    dropped: bool,
 ) {
     use colored::Colorize;
 
-    for row in excluded {
-        let remaining_usage_message = if has_remaining_usage {
-            " Remaining priced usage will be submitted."
+    for row in unpriced {
+        let treatment = if dropped {
+            "excluded from this submission"
         } else {
-            ""
+            "submitted at $0.00"
         };
         println!(
             "{}",
             format!(
-                "  Warning: excluded {} unpriced {}/{} message(s) ({} tokens): {}.{}",
+                "  Warning: {} unpriced {}/{} message(s) ({} tokens) {}: {}.",
                 row.message_count,
                 row.provider_id,
                 row.model_id,
                 format_tokens_with_commas(row.total_tokens),
+                treatment,
                 row.reason,
-                remaining_usage_message,
             )
             .yellow()
         );
@@ -5694,10 +5694,7 @@ fn run_submit_command(
     // left out, so a single legacy charge can't block the whole submission.
     let excluded_rows = exclude_tokenless_cost_contributions(&mut graph_result);
     report_excluded_tokenless_rows(&excluded_rows);
-    report_unpriced_submission_exclusions(
-        &graph_result.unpriced_submission_exclusions,
-        graph_result.summary.total_tokens > 0,
-    );
+    report_unpriced_submission_usage(&graph_result.unpriced_submission_usage, prune_unpriced);
 
     println!("{}", "  Data to submit:".white());
     println!(
@@ -5739,8 +5736,10 @@ fn run_submit_command(
     println!();
 
     if graph_result.summary.total_tokens == 0 {
+        // Reporting success here would tell the user their usage is on the
+        // leaderboard when nothing was sent.
         println!("{}", "  No usage data found to submit.\n".yellow());
-        return Ok(());
+        return Err(anyhow::anyhow!("no token-bearing usage found to submit"));
     }
 
     if dry_run {
@@ -6630,7 +6629,7 @@ mod tests {
             years: calculate_years(&contributions),
             contributions,
             time_metrics: None,
-            unpriced_submission_exclusions: Vec::new(),
+            unpriced_submission_usage: Vec::new(),
         }
     }
 

@@ -1763,11 +1763,13 @@ fn test_graph_fresh_cursor_cache_skips_auto_sync_warning() {
 #[test]
 fn test_submit_cursor_explicit_missing_cache_reports_setup_warning_text() {
     let tmp = create_empty_fixture_dir();
+    // No cache means no usage, and a submission with nothing in it is an error
+    // — but the setup warning still has to say how to fix that.
     cmd_with_home(tmp.path())
         .env("TOKSCALE_API_TOKEN", "test-token")
         .args(["submit", "--client", "cursor", "--dry-run"])
         .assert()
-        .success()
+        .failure()
         .stderr(predicate::str::contains("Cursor usage requires"))
         .stderr(predicate::str::contains("tokscale cursor login"));
 }
@@ -3518,7 +3520,7 @@ fn test_root_with_group_by() {
 }
 
 #[test]
-fn test_submit_offline_without_pricing_cache_fails() {
+fn test_submit_offline_without_pricing_cache_reports_unpriced_usage() {
     let tmp = create_temp_fixture_dir_without_pricing_cache();
     write_fake_credentials(tmp.path());
     let unpriced_dir = tmp
@@ -3544,25 +3546,28 @@ fn test_submit_offline_without_pricing_cache_fails() {
         .args(["submit", "--client", "opencode", "--dry-run"])
         .output()
         .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !output.status.success(),
-        "submit should fail for genuinely unpriced token usage; stdout: {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    // Verify failure is from pricing fetch, not from auth or argument errors
-    assert!(
-        !stderr.contains("Not logged in"),
-        "submit failed due to auth, not pricing: {stderr}"
+        output.status.success(),
+        "an id nothing can price must not block a submission; stderr: {stderr}"
     );
     assert!(
-        stderr.contains("error") || stderr.contains("Error"),
-        "stderr should contain a pricing/network error: {stderr}"
+        stdout.contains(
+            "1 unpriced unknown_provider/genuinely-unpriced-model message(s) (1 tokens) submitted at $0.00"
+        ),
+        "the zero-cost row has to be reported: {stdout}"
+    );
+    // The rest of the fixture is priced from bundled data, with no network and
+    // no pricing cache, and still reaches the summary.
+    assert!(
+        stdout.contains("Total tokens: 3,951"),
+        "priced usage must survive alongside it: {stdout}"
     );
 }
 
 #[test]
-fn test_submit_excluding_only_generic_gemini_usage_does_not_promise_submission() {
+fn test_submit_reports_generic_routing_label_usage_at_zero_cost() {
     let tmp = create_empty_fixture_dir();
     let message_dir = tmp
         .path()
@@ -3588,14 +3593,15 @@ fn test_submit_excluding_only_generic_gemini_usage_does_not_promise_submission()
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "excluded 1 unpriced google/gemini-default message(s) (1 tokens)",
+            "1 unpriced google/gemini-default message(s) (1 tokens) submitted at $0.00",
         ))
-        .stdout(predicate::str::contains("Remaining priced usage will be submitted.").not())
-        .stdout(predicate::str::contains("No usage data found to submit."));
+        .stdout(predicate::str::contains("Total tokens: 1"))
+        .stdout(predicate::str::contains("Total cost: $0.00"))
+        .stdout(predicate::str::contains("No usage data found to submit.").not());
 }
 
-/// A concrete model with no published price aborts the submission by default,
-/// and the rejection has to name the flag that gets the user unstuck.
+/// Unpriced usage is submitted at zero cost by default; `--prune-unpriced`
+/// leaves it out, which here empties the submission.
 #[test]
 fn test_submit_prunes_concrete_unpriced_models_only_when_asked() {
     let tmp = create_empty_fixture_dir();
@@ -3621,11 +3627,11 @@ fn test_submit_prunes_concrete_unpriced_models_only_when_asked() {
         .env("TOKSCALE_API_TOKEN", "test-token")
         .args(["submit", "--client", "opencode", "--dry-run"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "unknown_provider/genuinely-unpriced-model",
+        .success()
+        .stdout(predicate::str::contains(
+            "1 unpriced unknown_provider/genuinely-unpriced-model message(s) (1 tokens) submitted at $0.00",
         ))
-        .stderr(predicate::str::contains("--prune-unpriced"));
+        .stdout(predicate::str::contains("Total tokens: 1"));
 
     cmd_with_home(tmp.path())
         .env("TOKSCALE_API_TOKEN", "test-token")
@@ -3637,11 +3643,10 @@ fn test_submit_prunes_concrete_unpriced_models_only_when_asked() {
             "--prune-unpriced",
         ])
         .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "excluded 1 unpriced unknown_provider/genuinely-unpriced-model message(s) (1 tokens)",
-        ))
-        .stdout(predicate::str::contains("No usage data found to submit."));
+        .failure()
+        .stderr(predicate::str::contains(
+            "no token-bearing usage found to submit",
+        ));
 }
 // ── gjc client filter tests ────────────────────────────────────────────────
 
