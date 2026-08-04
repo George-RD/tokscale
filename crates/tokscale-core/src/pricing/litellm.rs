@@ -276,11 +276,10 @@ pub async fn fetch() -> Result<PricingDataset, String> {
 /// `use_disk_cache` governs BOTH halves of the on-disk cache — the read below
 /// and the write at the end. It used to gate only the read, so a caller that
 /// asked for a fresh fetch still published the result to
-/// `~/.config/tokscale/cache/pricing-litellm.json`. Every test in this module
-/// passes `false` against a local fixture, so `cargo test` replaced the real
-/// multi-thousand-model dataset with a two-row stub for a full TTL, and while
-/// it was clobbered LiteLLM contributed nothing to pricing lookups (#1021,
-/// #1035).
+/// `~/.config/tokscale/cache/pricing-litellm.json`. Any fixture-server test
+/// that fetched successfully therefore published its stub over the real
+/// multi-thousand-model dataset for a full TTL, and while it was clobbered
+/// LiteLLM contributed nothing to pricing lookups (#1021, #1035).
 ///
 /// Gating the write here rather than isolating the tests behind
 /// `TOKSCALE_CONFIG_DIR`: the override is process-global, so it only protects
