@@ -129,10 +129,29 @@ const fn e(
     }
 }
 
-/// Mirror of `PricingService::filter_litellm_data`: github_copilot/ entries
-/// use subscription pricing ($0.00) and are excluded from lookups.
+/// Mirror of `PricingService::filter_litellm_data`: rows with no usable base
+/// rate are dropped, and nothing else is.
+///
+/// This used to mirror a blanket `github_copilot/` prefix exclusion. GitHub
+/// moved Copilot to usage-based AI Credits at published per-token rates on
+/// 2026-06-01, and the prefix guard was discarding the only `github_copilot/`
+/// rows that carry real rates, so production dropped it. Keeping the mirror in
+/// step matters: a divergent filter here makes this test assert invariants
+/// against a dataset the binary never sees.
+///
+/// `ModelPricing::has_any_usable_base_rate` is crate-private, so the predicate
+/// is spelled out here rather than called.
 fn filter_litellm(mut data: HashMap<String, ModelPricing>) -> HashMap<String, ModelPricing> {
-    data.retain(|key, _| !key.to_lowercase().starts_with("github_copilot/"));
+    data.retain(|_, pricing| {
+        [
+            pricing.input_cost_per_token,
+            pricing.output_cost_per_token,
+            pricing.cache_creation_input_token_cost,
+            pricing.cache_read_input_token_cost,
+        ]
+        .into_iter()
+        .any(|rate| rate.is_some_and(|rate| rate.is_finite() && rate >= 0.0))
+    });
     data
 }
 

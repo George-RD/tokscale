@@ -19,12 +19,6 @@ pub use litellm::ModelPricing;
 
 static PRICING_SERVICE: OnceCell<Arc<PricingService>> = OnceCell::const_new();
 
-// @keep: documents non-obvious filtering behavior — without this, the next person
-// will wonder why github_copilot entries disappear from the pricing data.
-/// Provider prefixes in LiteLLM data that use subscription-based pricing ($0.00)
-/// and should be excluded from pay-per-token cost estimation.
-const EXCLUDED_LITELLM_PREFIXES: &[&str] = &["github_copilot/"];
-
 // @keep: explains why we do not just print the error.
 /// Flatten an error and its `source()` chain into one line.
 ///
@@ -84,20 +78,35 @@ impl PricingService {
         }
     }
 
-    // @keep: the retain logic is non-trivial (lowercase + prefix match); this doc
-    // explains *why* these entries are dropped, not just *what* the code does.
-    /// Filter out LiteLLM entries from subscription-based providers (e.g. github_copilot/)
-    /// whose $0.00 pricing is meaningless for per-token cost estimation.
+    // @keep: records why the `github_copilot/` prefix filter that used to live
+    // here is gone, so nobody reinstates it from the old "subscription pricing"
+    // premise.
+    /// Drop LiteLLM rows that publish no usable base rate.
+    ///
+    /// `github_copilot/` rows were previously discarded wholesale on the theory
+    /// that Copilot is subscription-billed at $0.00. That premise expired on
+    /// 2026-06-01, when GitHub moved Copilot from premium-request billing to
+    /// usage-based AI Credits (1 credit = $0.01) charged at published per-token
+    /// rates; the legacy premium-request scheme now covers only annual Pro/Pro+
+    /// subscribers who stayed on it.
+    ///
+    /// The guard had also stopped describing the data. Of the 33
+    /// `github_copilot/` rows in LiteLLM's live dataset (accessed 2026-08-05),
+    /// 31 carry `input_cost_per_token: null` — not 0.0 — and are dropped by the
+    /// retain below regardless of any prefix. The guard's only live effect was
+    /// discarding the two rows that DO carry rates,
+    /// `github_copilot/mai-code-1-flash` and `github_copilot/mai-code-1-flash-internal`,
+    /// both at $0.75/$4.50 per 1M — exactly GitHub's published MAI-Code-1-Flash
+    /// rate. It was throwing away the only correct data it touched.
+    ///
+    /// GitHub's authoritative rate table (prices per 1M tokens):
+    /// <https://raw.githubusercontent.com/github/docs/main/data/tables/copilot/models-and-pricing.yml>
+    /// rendered at
+    /// <https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing>
+    /// (accessed 2026-08-05).
     fn filter_litellm_data(
         mut data: HashMap<String, ModelPricing>,
     ) -> HashMap<String, ModelPricing> {
-        data.retain(|key, _| {
-            let lower = key.to_lowercase();
-            let included_provider = !EXCLUDED_LITELLM_PREFIXES
-                .iter()
-                .any(|prefix| lower.starts_with(prefix));
-            included_provider
-        });
         data.retain(|_, pricing| pricing.has_any_usable_base_rate());
         data
     }
@@ -908,8 +917,64 @@ mod tests {
         assert_eq!(result.pricing.input_cost_per_token, Some(0.000009));
     }
 
+    // Regression: GitHub moved Copilot off premium-request billing onto
+    // usage-based AI Credits at published per-token rates on 2026-06-01, so a
+    // `github_copilot/` row is no longer a meaningless $0.00 subscription
+    // placeholder. The blanket prefix filter discarded the only two rows in
+    // that namespace that carry real rates.
     #[test]
-    fn test_filter_excludes_github_copilot() {
+    fn litellm_github_copilot_rows_with_real_rates_survive_filtering() {
+        let mut data = HashMap::new();
+        data.insert(
+            "github_copilot/mai-code-1-flash".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(7.5e-7),
+                output_cost_per_token: Some(4.5e-6),
+                ..Default::default()
+            },
+        );
+        // 31 of the 33 live `github_copilot/` rows look like this: every rate
+        // null, already dropped by the usable-base-rate retain.
+        data.insert(
+            "github_copilot/gpt-5.2".to_string(),
+            ModelPricing::default(),
+        );
+
+        let filtered = PricingService::filter_litellm_data(data);
+
+        assert!(!filtered.contains_key("github_copilot/gpt-5.2"));
+        let flash = filtered
+            .get("github_copilot/mai-code-1-flash")
+            .expect("a github_copilot row carrying GitHub's published rate must survive");
+        assert_eq!(flash.input_cost_per_token, Some(7.5e-7));
+        assert_eq!(flash.output_cost_per_token, Some(4.5e-6));
+    }
+
+    #[test]
+    fn litellm_github_copilot_flash_prices_at_githubs_published_rate() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "github_copilot/mai-code-1-flash".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(7.5e-7),
+                output_cost_per_token: Some(4.5e-6),
+                ..Default::default()
+            },
+        );
+        let service = PricingService::from_cached_datasets(Some(litellm), None, None).unwrap();
+
+        let result = service
+            .lookup_with_source("github_copilot/mai-code-1-flash", None)
+            .expect("MAI-Code-1-Flash must price from LiteLLM");
+        assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.matched_key, "github_copilot/mai-code-1-flash");
+        // GitHub publishes $0.75 / $4.50 per 1M for MAI-Code-1-Flash.
+        let cost = service.calculate_cost("github_copilot/mai-code-1-flash", 1_000_000, 0, 0, 0, 0);
+        assert!((cost - 0.75).abs() < 1e-9, "unexpected cost: {cost}");
+    }
+
+    #[test]
+    fn test_filter_drops_rows_without_a_usable_base_rate() {
         let mut data = HashMap::new();
         data.insert(
             "github_copilot/gpt-5.3-codex".into(),
@@ -1362,14 +1427,12 @@ mod tests {
     }
 
     #[test]
-    fn test_from_cached_datasets_filters_subscription_only_litellm_entries() {
+    fn test_from_cached_datasets_filters_unpriced_litellm_entries() {
         let mut litellm = HashMap::new();
+        // Live shape for 31 of the 33 `github_copilot/` rows: every rate null.
         litellm.insert(
             "github_copilot/gpt-5.3-codex".into(),
-            ModelPricing {
-                input_cost_per_token: Some(0.0),
-                ..Default::default()
-            },
+            ModelPricing::default(),
         );
         litellm.insert(
             "gpt-5.2".into(),
