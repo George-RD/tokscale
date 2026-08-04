@@ -5515,12 +5515,25 @@ fn format_unpriced_submission_warning(row: &tokscale_core::UnpricedSubmissionUsa
         ),
     };
 
+    // A client-reported cost is never zeroed, so this is normally empty. When
+    // it is not, money is leaving the submission and the user has to hear it
+    // from us rather than notice a smaller total on the leaderboard.
+    let discarded = if row.discarded_cost > 0.0 {
+        format!(
+            ", discarding the {} of partial pricing they carried",
+            format_currency(row.discarded_cost)
+        )
+    } else {
+        String::new()
+    };
+
     format!(
-        "  Warning: {} unpriced {}/{} message(s) ({} tokens) submitted at $0.00: {}.",
+        "  Warning: {} unpriced {}/{} message(s) ({} tokens) submitted at $0.00{}: {}.",
         row.message_count,
         row.provider_id,
         row.model_id,
         format_tokens_with_commas(row.total_tokens),
+        discarded,
         explanation,
     )
 }
@@ -6480,6 +6493,7 @@ mod tests {
             model_id: model_id.to_string(),
             message_count: 3,
             total_tokens: 12_345,
+            discarded_cost: 0.0,
             cause,
         }
     }
@@ -6502,6 +6516,27 @@ mod tests {
         );
         assert!(warning.contains("names a routing decision"), "{warning}");
         assert!(!warning.contains("custom-pricing.json"), "{warning}");
+        assert!(!warning.contains("discarding"), "{warning}");
+    }
+
+    // Zeroing a row that already carried a partial estimate really does delete
+    // money from the submission, and that is the one thing the warning cannot
+    // leave out.
+    #[test]
+    fn warning_names_the_cost_zeroing_discarded() {
+        let mut row = unpriced_row(
+            "friendli",
+            "K-EXAONE-236B-A23B",
+            tokscale_core::UnpricedUsageCause::NoPublishedPrice,
+        );
+        row.discarded_cost = 0.25;
+
+        let warning = format_unpriced_submission_warning(&row);
+
+        assert!(
+            warning.contains("discarding the $0.25 of partial pricing they carried"),
+            "{warning}"
+        );
     }
 
     // A concrete model without a price is actionable, and the warning is the

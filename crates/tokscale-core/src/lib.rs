@@ -505,12 +505,18 @@ pub struct GraphResult {
 /// measures tokens, and no price is invented for them — and this is what the
 /// CLI reports so the zeros are never silent. Under `--strict-pricing` such a
 /// row fails the submission instead and this report stays empty.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct UnpricedSubmissionUsage {
     pub provider_id: String,
     pub model_id: String,
     pub message_count: usize,
     pub total_tokens: i64,
+    /// Cost these rows carried before they were zeroed, which is money the
+    /// submission no longer reports. Normally 0.0 — a client-reported cost is
+    /// never zeroed — but a partly priced row can hold an estimate that covers
+    /// some of its token buckets and not others, and dropping that silently is
+    /// how a leaderboard total quietly shrinks.
+    pub discarded_cost: f64,
     pub cause: UnpricedUsageCause,
 }
 
@@ -3121,6 +3127,24 @@ fn is_generic_routing_label(provider_id: &str, model_id: &str) -> bool {
     })
 }
 
+/// True when this row's cost is one the client itself reported rather than one
+/// tokscale computed, so zeroing the row would delete money somebody was
+/// really billed.
+///
+/// `CostSource::ProviderReported` is the explicit marker, but only the handful
+/// of parsers that were taught to set it use it. Cursor's usage CSV carries
+/// the amount Cursor charged in its `Cost` column and hands it straight to
+/// `UnifiedMessage::new`, which leaves `cost_source` at its `Unknown` default —
+/// so the marker alone misses a whole client's real spend. The general shape,
+/// rather than a Cursor special case, is a cost that the pricing pass did not
+/// produce: `apply_pricing_if_available` is the only thing that writes a
+/// computed cost and it always stamps `CostSource::Estimated`, so a positive
+/// cost carrying any other source came from the client.
+fn carries_client_reported_cost(message: &UnifiedMessage) -> bool {
+    message.has_authoritative_cost()
+        || (message.cost > 0.0 && message.cost_source != CostSource::Estimated)
+}
+
 /// True when nothing can put a price on this row's tokens. `covers_usage` is
 /// all-or-nothing per token bucket, so this also catches a model that does
 /// publish a price but has no rate for one of the buckets the row used.
@@ -3133,7 +3157,7 @@ fn is_unpriced_submission_usage(
     pricing: &pricing::PricingService,
 ) -> bool {
     message.tokens.total() > 0
-        && !message.has_authoritative_cost()
+        && !carries_client_reported_cost(message)
         && !pricing.covers_usage_with_provider(
             &message.model_id,
             Some(&message.provider_id),
@@ -3159,7 +3183,7 @@ fn zero_cost_unpriced_submission_messages(
     let mut submitted = Vec::with_capacity(messages.len());
     let mut unpriced: std::collections::BTreeMap<
         (String, String),
-        (usize, i64, UnpricedUsageCause),
+        (usize, i64, f64, UnpricedUsageCause),
     > = std::collections::BTreeMap::new();
 
     for mut message in messages {
@@ -3170,9 +3194,10 @@ fn zero_cost_unpriced_submission_messages(
 
         let entry = unpriced
             .entry((message.provider_id.clone(), message.model_id.clone()))
-            .or_insert((0, 0, unpriced_usage_cause(&message)));
+            .or_insert((0, 0, 0.0, unpriced_usage_cause(&message)));
         entry.0 += 1;
         entry.1 = entry.1.saturating_add(message.tokens.total());
+        entry.2 += message.cost.max(0.0);
 
         // Zeroed rather than left as-is: `covers_usage` fails per bucket, so a
         // partially priced row can still carry a cost that prices some of its
@@ -3185,12 +3210,13 @@ fn zero_cost_unpriced_submission_messages(
     let unpriced = unpriced
         .into_iter()
         .map(
-            |((provider_id, model_id), (message_count, total_tokens, cause))| {
+            |((provider_id, model_id), (message_count, total_tokens, discarded_cost, cause))| {
                 UnpricedSubmissionUsage {
                     provider_id,
                     model_id,
                     message_count,
                     total_tokens,
+                    discarded_cost,
                     cause,
                 }
             },
@@ -8474,8 +8500,89 @@ mod tests {
                 model_id: "K-EXAONE-236B-A23B".to_string(),
                 message_count: 1,
                 total_tokens: 6,
+                discarded_cost: 0.0,
                 cause: UnpricedUsageCause::NoPublishedPrice,
             }]
+        );
+    }
+
+    // Cursor bills the row and writes what it charged into the CSV's `Cost`
+    // column, but reports the model as `auto` — a routing label nothing can
+    // price. Zeroing it deletes real money the user was charged, so the cost
+    // the client reported has to survive the submission policy.
+    #[test]
+    fn submission_keeps_the_cost_a_cursor_csv_row_reports_for_a_routing_label() {
+        let csv = concat!(
+            "Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),",
+            "Cache Read,Output Tokens,Total Tokens,Cost\n",
+            r#""2025-11-13T18:36:05.846Z","Included","auto","No","28342","775","105891","21282","156290","0.19""#,
+        );
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("usage.csv");
+        std::fs::write(&file_path, csv).unwrap();
+        let messages = crate::sessions::cursor::parse_cursor_file(&file_path);
+        assert_eq!(messages.len(), 1, "fixture must parse to one row");
+        assert!((messages[0].cost - 0.19).abs() < 1e-9);
+
+        let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
+        let graph = build_graph_from_messages(
+            messages,
+            Some(&pricing),
+            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("a client-costed row is submittable");
+
+        assert!(
+            (graph.summary.total_cost - 0.19).abs() < 1e-9,
+            "Cursor's own charge must reach the leaderboard, got {}",
+            graph.summary.total_cost
+        );
+        assert!(
+            graph.unpriced_submission_usage.is_empty(),
+            "a row the client priced is not unpriced: {:?}",
+            graph.unpriced_submission_usage
+        );
+    }
+
+    // Nothing zeroes a cost silently. A row that carried a partial estimate is
+    // the one case where zeroing really does drop money, so the report has to
+    // carry the amount for the CLI to say so.
+    #[test]
+    fn submission_reports_the_cost_zeroing_actually_discards() {
+        let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
+        let mut partly_priced = UnifiedMessage::new(
+            "synthetic",
+            "half-priced-model",
+            "friendli",
+            "partial",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 10,
+                cache_read: 10,
+                ..Default::default()
+            },
+            0.0,
+        );
+        partly_priced.cost = 0.25;
+        partly_priced.mark_estimated_cost();
+
+        let graph = build_graph_from_messages(
+            vec![partly_priced],
+            Some(&pricing),
+            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("a partly priced row is submittable at zero cost");
+
+        assert_eq!(graph.summary.total_cost, 0.0);
+        assert_eq!(graph.unpriced_submission_usage.len(), 1);
+        assert!(
+            (graph.unpriced_submission_usage[0].discarded_cost - 0.25).abs() < 1e-9,
+            "{:?}",
+            graph.unpriced_submission_usage[0]
         );
     }
 
@@ -8542,8 +8649,11 @@ mod tests {
             },
             0.0,
         );
-        // A cost a partial pricing pass could have left behind.
+        // A cost a partial pricing pass could have left behind, stamped the way
+        // `apply_pricing_if_available` stamps one. The stamp is what separates
+        // it from a cost the client reported, which is never zeroed.
         unpriced.cost = 0.42;
+        unpriced.mark_estimated_cost();
         // Priced upstream by `apply_pricing_if_available`, as the parse
         // pipeline does before a graph is built.
         let priced = UnifiedMessage::new(
@@ -8660,6 +8770,7 @@ mod tests {
                 model_id: "gemini-default".to_string(),
                 message_count: 1,
                 total_tokens: 18,
+                discarded_cost: 0.0,
                 cause: UnpricedUsageCause::GenericRoutingLabel,
             }
         );
@@ -8886,6 +8997,7 @@ mod tests {
                 model_id: "K-EXAONE-236B-A23B".to_string(),
                 message_count: 1,
                 total_tokens: 6,
+                discarded_cost: 0.0,
                 cause: UnpricedUsageCause::NoPublishedPrice,
             }]
         );
@@ -8976,6 +9088,7 @@ mod tests {
                 model_id: "gemini-default".to_string(),
                 message_count: 1,
                 total_tokens: 18,
+                discarded_cost: 0.0,
                 cause: UnpricedUsageCause::GenericRoutingLabel,
             }]
         );
