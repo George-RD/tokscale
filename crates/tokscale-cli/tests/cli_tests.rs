@@ -3622,6 +3622,22 @@ fn test_submit_fails_fast_on_unpriced_usage_only_with_strict_pricing() {
         }"#,
     )
     .unwrap();
+    // A priced row alongside it, so the default run has something to report in
+    // the summary. Without one the unpriced row is the whole submission and the
+    // assertions never see the path a real user is on.
+    fs::write(
+        message_dir.join("priced.json"),
+        r#"{
+            "id": "priced",
+            "sessionID": "unpriced",
+            "role": "assistant",
+            "modelID": "gpt-4o",
+            "providerID": "openai",
+            "tokens": { "input": 1000, "output": 500, "reasoning": 0, "cache": { "read": 0, "write": 0 } },
+            "time": { "created": 1736510400000.0 }
+        }"#,
+    )
+    .unwrap();
 
     cmd_with_home(tmp.path())
         .env("TOKSCALE_API_TOKEN", "test-token")
@@ -3631,7 +3647,11 @@ fn test_submit_fails_fast_on_unpriced_usage_only_with_strict_pricing() {
         .stdout(predicate::str::contains(
             "1 unpriced unknown_provider/genuinely-unpriced-model message(s) (1 tokens) submitted at $0.00",
         ))
-        .stdout(predicate::str::contains("Total tokens: 1"));
+        .stdout(predicate::str::contains("custom-pricing.json"))
+        // 1,500 priced tokens plus the single zero-cost one, and a cost that
+        // comes only from the priced row.
+        .stdout(predicate::str::contains("Total tokens: 1,501"))
+        .stdout(predicate::str::contains("Total cost: $0.01"));
 
     cmd_with_home(tmp.path())
         .env("TOKSCALE_API_TOKEN", "test-token")
