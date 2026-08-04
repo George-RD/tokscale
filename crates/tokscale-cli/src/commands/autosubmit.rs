@@ -181,6 +181,10 @@ struct StatusOutput {
     managed_executable_stale: bool,
     last_run_at_ms: Option<i64>,
     last_error: Option<String>,
+    /// What the last successful run submitted at $0.00, if anything. A
+    /// scheduled run's warnings go nowhere a user reads, so this is where a
+    /// drop in recorded spend can be traced back to.
+    last_zero_cost_usage: Option<String>,
 }
 
 pub fn enable(args: AutosubmitEnableArgs) -> Result<()> {
@@ -221,6 +225,10 @@ where
         scheduler: Some(scheduler.as_str().to_string()),
         last_run_at_ms: previous_settings.autosubmit.last_run_at_ms,
         last_error: None,
+        // Carried, not cleared, alongside the run it describes: the zeroed
+        // usage it names is already on the leaderboard, and re-enabling with
+        // different filters does not undo that.
+        last_zero_cost_usage: previous_settings.autosubmit.last_zero_cost_usage.clone(),
         managed_executable: None,
         managed_executable_version: None,
     };
@@ -386,6 +394,9 @@ pub fn status(json: bool) -> Result<()> {
     if let Some(error) = autosubmit.last_error {
         println!("  Last error: {error}");
     }
+    if let Some(zero_cost) = autosubmit.last_zero_cost_usage {
+        println!("  Submitted at $0.00: {zero_cost}");
+    }
     Ok(())
 }
 
@@ -434,10 +445,16 @@ pub fn load_run_config(
     Ok((settings, decision))
 }
 
-pub fn record_run_success(now_ms: i64) -> Result<()> {
+/// Records a finished run, including any usage it submitted at $0.00.
+///
+/// `zero_cost_usage` is written in the same save as the timestamp rather than
+/// by a second call, so the note can never describe a different run than the
+/// one whose time is recorded beside it.
+pub fn record_run_success(now_ms: i64, zero_cost_usage: Option<&str>) -> Result<()> {
     let mut settings = crate::tui::settings::Settings::load();
     settings.autosubmit.last_run_at_ms = Some(now_ms);
     settings.autosubmit.last_error = None;
+    settings.autosubmit.last_zero_cost_usage = zero_cost_usage.map(str::to_string);
     settings.save()
 }
 
@@ -636,6 +653,7 @@ fn status_output(settings: &AutosubmitSettings) -> StatusOutput {
         managed_executable_stale: managed_executable_is_stale(settings),
         last_run_at_ms: settings.last_run_at_ms,
         last_error: settings.last_error.clone(),
+        last_zero_cost_usage: settings.last_zero_cost_usage.clone(),
     }
 }
 
@@ -2511,6 +2529,34 @@ mod tests {
             kiritimati, niue,
             "two pins 25 hours apart can never share a calendar date — equal \
              values mean the host clock was read instead of the pin"
+        );
+    }
+
+    /// A scheduled run prints its zero-cost warning to the stdout of a process
+    /// nobody is watching. Without a copy in the run state, a user whose spend
+    /// dropped has no way left to find out why.
+    #[test]
+    #[serial_test::serial]
+    fn a_successful_run_records_what_it_submitted_at_zero_cost() {
+        let temp = TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set("TOKSCALE_CONFIG_DIR", temp.path());
+
+        record_run_success(1_736_510_400_000, Some("2,500,000 tokens at $0.00")).unwrap();
+
+        let recorded = crate::tui::settings::Settings::load().autosubmit;
+        assert_eq!(
+            recorded.last_zero_cost_usage.as_deref(),
+            Some("2,500,000 tokens at $0.00")
+        );
+
+        // And it describes the last run, not every run that ever happened: a
+        // stale note would send the user chasing a gap that is already closed.
+        record_run_success(1_736_600_000_000, None).unwrap();
+        assert_eq!(
+            crate::tui::settings::Settings::load()
+                .autosubmit
+                .last_zero_cost_usage,
+            None
         );
     }
 

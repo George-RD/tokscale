@@ -840,6 +840,7 @@ fn main() -> Result<()> {
                 no_pricing_outage_check,
                 mode: SubmitMode::Interactive,
             })
+            .map(|_| ())
         }
         Some(Commands::Autosubmit { subcommand }) => {
             reject_unsupported_home_override(&cli.home, "autosubmit")?;
@@ -5578,6 +5579,53 @@ fn describe_submission_error(error: tokscale_core::SubmissionError) -> anyhow::E
     }
 }
 
+/// Condenses what a submission zeroed into one line worth persisting.
+///
+/// The per-row warnings are written for someone reading a terminal as the
+/// submission happens. This is for someone reading `autosubmit status` weeks
+/// later after noticing their spend fell, so it names the ids, the token
+/// volume behind them, and any cost the zeroing actually discarded.
+fn format_zero_cost_submission_note(
+    unpriced: &[tokscale_core::UnpricedSubmissionUsage],
+) -> Option<String> {
+    if unpriced.is_empty() {
+        return None;
+    }
+
+    let total_tokens: i64 = unpriced
+        .iter()
+        .fold(0i64, |sum, row| sum.saturating_add(row.total_tokens));
+    let discarded_cost: f64 = unpriced.iter().map(|row| row.discarded_cost).sum();
+    let ids = unpriced
+        .iter()
+        .map(|row| {
+            format!(
+                "{}/{} ({} tokens)",
+                row.provider_id,
+                row.model_id,
+                format_tokens_with_commas(row.total_tokens)
+            )
+        })
+        .collect::<Vec<String>>()
+        .join(", ");
+
+    let discarded = if discarded_cost > 0.0 {
+        format!(
+            ", discarding {} of partial pricing",
+            format_currency(discarded_cost)
+        )
+    } else {
+        String::new()
+    };
+
+    Some(format!(
+        "{} tokens nothing could price were submitted at $0.00{}: {}",
+        format_tokens_with_commas(total_tokens),
+        discarded,
+        ids
+    ))
+}
+
 fn report_unpriced_submission_usage(
     unpriced: &[tokscale_core::UnpricedSubmissionUsage],
     dry_run: bool,
@@ -5646,9 +5694,13 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
                 no_pricing_outage_check: false,
                 mode: SubmitMode::Autosubmit,
             }) {
-                Ok(()) => {
+                Ok(outcome) => {
+                    // The warnings this run printed went to the stdout of a
+                    // scheduled process. Recording what it zeroed is the only
+                    // way a drop in recorded spend stays traceable afterwards.
                     commands::autosubmit::record_run_success(
                         chrono::Utc::now().timestamp_millis(),
+                        format_zero_cost_submission_note(&outcome.zero_cost_usage).as_deref(),
                     )?;
                     Ok(())
                 }
@@ -5677,7 +5729,17 @@ struct SubmitCommandOptions {
     mode: SubmitMode,
 }
 
-fn run_submit_command(options: SubmitCommandOptions) -> Result<()> {
+/// What a finished submission leaves for its caller to record.
+///
+/// An interactive run has already told the user everything on screen. An
+/// unattended one has not told anybody anything, so it needs the facts back.
+#[derive(Default)]
+struct SubmitOutcome {
+    /// Usage that went to the server at $0.00 because nothing could price it.
+    zero_cost_usage: Vec<tokscale_core::UnpricedSubmissionUsage>,
+}
+
+fn run_submit_command(options: SubmitCommandOptions) -> Result<SubmitOutcome> {
     use colored::Colorize;
     use std::io::IsTerminal;
     use tokio::runtime::Runtime;
@@ -5838,12 +5900,12 @@ fn run_submit_command(options: SubmitCommandOptions) -> Result<()> {
         // scheduled submission stuck every time it fired before the user
         // started working.
         println!("{}", "  No usage data found to submit.\n".yellow());
-        return Ok(());
+        return Ok(SubmitOutcome::default());
     }
 
     if dry_run {
         println!("{}", "  Dry run - not submitting data.\n".yellow());
-        return Ok(());
+        return Ok(SubmitOutcome::default());
     }
 
     println!("{}", "  Submitting to server...".bright_black());
@@ -5966,7 +6028,9 @@ fn run_submit_command(options: SubmitCommandOptions) -> Result<()> {
         spawn_warm_tui_cache_detached();
     }
 
-    Ok(())
+    Ok(SubmitOutcome {
+        zero_cost_usage: graph_result.unpriced_submission_usage,
+    })
 }
 
 fn spawn_warm_tui_cache_detached() {
@@ -6553,6 +6617,39 @@ mod tests {
             discarded_cost: 0.0,
             cause,
         }
+    }
+
+    // What an unattended run leaves behind has to name the ids, the volume and
+    // any money the zeroing discarded — that note is the whole record of why
+    // the user's spend moved.
+    #[test]
+    fn zero_cost_note_names_the_ids_and_the_cost_it_discarded() {
+        let mut discarding = unpriced_row(
+            "friendli",
+            "K-EXAONE-236B-A23B",
+            tokscale_core::UnpricedUsageCause::NoPublishedPrice,
+        );
+        discarding.discarded_cost = 0.25;
+        let routed = unpriced_row(
+            "cursor",
+            "auto",
+            tokscale_core::UnpricedUsageCause::GenericRoutingLabel,
+        );
+
+        let note = format_zero_cost_submission_note(&[discarding, routed])
+            .expect("a run that zeroed usage has something to record");
+
+        assert!(note.contains("24,690 tokens"), "{note}");
+        assert!(note.contains("friendli/K-EXAONE-236B-A23B"), "{note}");
+        assert!(note.contains("cursor/auto"), "{note}");
+        assert!(note.contains("$0.25"), "{note}");
+    }
+
+    // Nothing zeroed is the normal run, and recording "nothing happened" every
+    // time buries the run that did zero something.
+    #[test]
+    fn zero_cost_note_is_absent_when_nothing_was_zeroed() {
+        assert_eq!(format_zero_cost_submission_note(&[]), None);
     }
 
     // A routing label is nobody's fault and nothing the user can act on, so the

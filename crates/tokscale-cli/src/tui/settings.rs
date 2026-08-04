@@ -123,6 +123,16 @@ pub struct AutosubmitSettings {
     pub last_run_at_ms: Option<i64>,
     #[serde(default)]
     pub last_error: Option<String>,
+    /// What the last successful run submitted at $0.00 because nothing could
+    /// price it.
+    ///
+    /// A scheduled run writes its warnings to the stdout of a process nobody
+    /// reads, so without this a user whose recorded spend dropped has no way to
+    /// find out which usage was zeroed or when. Describes the most recent run
+    /// only — cleared by a run that zeroed nothing, the same way `last_error`
+    /// is cleared by a run that succeeded.
+    #[serde(default)]
+    pub last_zero_cost_usage: Option<String>,
 }
 
 impl Default for AutosubmitSettings {
@@ -143,6 +153,7 @@ impl Default for AutosubmitSettings {
             managed_executable_version: None,
             last_run_at_ms: None,
             last_error: None,
+            last_zero_cost_usage: None,
         }
     }
 }
