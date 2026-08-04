@@ -752,6 +752,17 @@ mod tests {
     // asserting against a temp path the code was no longer writing to while
     // the real `~/.config/tokscale/cache` took the write. One domain is the
     // only arrangement that holds, so nothing here may reintroduce a second.
+    // The tests this module serializes restore through `EnvGuard` rather than a
+    // trailing restore call: a failing assertion panics before such a call
+    // runs, and `#[serial]` prevents overlap, not inheritance — so a redirect
+    // would leak into every later test in the process. `paths::tests` documents
+    // the same trap.
+    use crate::paths::test_env::EnvGuard;
+
+    // Retained for the env tests below that predate this module's move to one
+    // serialization domain. New tests should capture an `EnvGuard` instead;
+    // this pairing is only panic-safe when nothing between it and the restore
+    // can fail.
     fn restore_env(var: &str, previous: Option<String>) {
         match previous {
             Some(value) => unsafe { std::env::set_var(var, value) },
@@ -816,46 +827,36 @@ mod tests {
     #[test]
     #[serial]
     fn test_reasonix_stats_prefers_state_home_then_reasonix_home() {
-        let state_previous = std::env::var("REASONIX_STATE_HOME").ok();
-        let home_previous = std::env::var("REASONIX_HOME").ok();
-        unsafe {
-            std::env::set_var("REASONIX_HOME", "/custom/reasonix-home");
-            std::env::set_var("REASONIX_STATE_HOME", "/custom/reasonix-state");
-        }
+        let mut env = EnvGuard::capture(&["REASONIX_STATE_HOME", "REASONIX_HOME"]);
+        env.set("REASONIX_HOME", "/custom/reasonix-home");
+        env.set("REASONIX_STATE_HOME", "/custom/reasonix-state");
         let client = ClientId::Reasonix;
         assert_eq!(
             client.data().resolve_path("/tmp/home"),
             "/custom/reasonix-state/stats"
         );
-        unsafe { std::env::remove_var("REASONIX_STATE_HOME") };
+        env.remove("REASONIX_STATE_HOME");
         assert_eq!(
             client.data().resolve_path("/tmp/home"),
             "/custom/reasonix-home/stats"
         );
-        restore_env("REASONIX_STATE_HOME", state_previous);
-        restore_env("REASONIX_HOME", home_previous);
     }
 
     #[test]
     #[serial]
     fn test_reasonix_stats_normalizes_env_roots_and_ignores_blank_values() {
-        let state_previous = std::env::var("REASONIX_STATE_HOME").ok();
-        let home_previous = std::env::var("REASONIX_HOME").ok();
+        let mut env = EnvGuard::capture(&["REASONIX_STATE_HOME", "REASONIX_HOME"]);
         let client = ClientId::Reasonix;
 
-        unsafe {
-            std::env::set_var("REASONIX_STATE_HOME", "  ~/reasonix-state  ");
-            std::env::set_var("REASONIX_HOME", "/unused/reasonix-home");
-        }
+        env.set("REASONIX_STATE_HOME", "  ~/reasonix-state  ");
+        env.set("REASONIX_HOME", "/unused/reasonix-home");
         assert_eq!(
             client.data().resolve_path("/tmp/home"),
             "/tmp/home/reasonix-state/stats"
         );
 
-        unsafe {
-            std::env::set_var("REASONIX_STATE_HOME", " \t ");
-            std::env::set_var("REASONIX_HOME", " relative-reasonix ");
-        }
+        env.set("REASONIX_STATE_HOME", " \t ");
+        env.set("REASONIX_HOME", " relative-reasonix ");
         let expected = std::env::current_dir()
             .expect("test process has a current directory")
             .join("relative-reasonix")
@@ -863,38 +864,33 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(client.data().resolve_path("/tmp/home"), expected);
-
-        restore_env("REASONIX_STATE_HOME", state_previous);
-        restore_env("REASONIX_HOME", home_previous);
     }
 
     #[test]
     #[serial]
     fn test_reasonix_stats_expands_environment_references_before_normalizing_paths() {
-        let state_previous = std::env::var("REASONIX_STATE_HOME").ok();
-        let root_previous = std::env::var("TOKSCALE_REASONIX_TEST_ROOT").ok();
-        let unset_previous = std::env::var("TOKSCALE_REASONIX_TEST_UNSET").ok();
+        let mut env = EnvGuard::capture(&[
+            "REASONIX_STATE_HOME",
+            "TOKSCALE_REASONIX_TEST_ROOT",
+            "TOKSCALE_REASONIX_TEST_UNSET",
+        ]);
         let client = ClientId::Reasonix;
 
-        unsafe {
-            std::env::set_var("TOKSCALE_REASONIX_TEST_ROOT", "~/reasonix-state");
-            std::env::remove_var("TOKSCALE_REASONIX_TEST_UNSET");
-            std::env::set_var(
-                "REASONIX_STATE_HOME",
-                "${TOKSCALE_REASONIX_TEST_ROOT}/nested",
-            );
-        }
+        env.set("TOKSCALE_REASONIX_TEST_ROOT", "~/reasonix-state");
+        env.remove("TOKSCALE_REASONIX_TEST_UNSET");
+        env.set(
+            "REASONIX_STATE_HOME",
+            "${TOKSCALE_REASONIX_TEST_ROOT}/nested",
+        );
         assert_eq!(
             client.data().resolve_path("/tmp/home"),
             "/tmp/home/reasonix-state/nested/stats"
         );
 
-        unsafe {
-            std::env::set_var(
-                "REASONIX_STATE_HOME",
-                "${TOKSCALE_REASONIX_TEST_UNSET:-relative-reasonix}",
-            );
-        }
+        env.set(
+            "REASONIX_STATE_HOME",
+            "${TOKSCALE_REASONIX_TEST_UNSET:-relative-reasonix}",
+        );
         let expected = std::env::current_dir()
             .expect("test process has a current directory")
             .join("relative-reasonix")
@@ -902,21 +898,14 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(client.data().resolve_path("/tmp/home"), expected);
-
-        restore_env("REASONIX_STATE_HOME", state_previous);
-        restore_env("TOKSCALE_REASONIX_TEST_ROOT", root_previous);
-        restore_env("TOKSCALE_REASONIX_TEST_UNSET", unset_previous);
     }
 
     #[test]
     #[serial]
     fn test_reasonix_stats_ignores_env_roots_when_requested() {
-        let state_previous = std::env::var("REASONIX_STATE_HOME").ok();
-        let home_previous = std::env::var("REASONIX_HOME").ok();
-        unsafe {
-            std::env::set_var("REASONIX_STATE_HOME", "/custom/reasonix-state");
-            std::env::set_var("REASONIX_HOME", "/custom/reasonix-home");
-        }
+        let mut env = EnvGuard::capture(&["REASONIX_STATE_HOME", "REASONIX_HOME"]);
+        env.set("REASONIX_STATE_HOME", "/custom/reasonix-state");
+        env.set("REASONIX_HOME", "/custom/reasonix-home");
 
         assert_eq!(
             ClientId::Reasonix
@@ -924,69 +913,58 @@ mod tests {
                 .resolve_path_with_env_strategy("/tmp/home", false),
             "/tmp/home/.reasonix/stats"
         );
-
-        restore_env("REASONIX_STATE_HOME", state_previous);
-        restore_env("REASONIX_HOME", home_previous);
     }
 
     #[test]
     #[serial]
     fn test_kimchi_defaults_to_home_agent_dir_without_env_override() {
-        let previous = std::env::var("KIMCHI_CODING_AGENT_DIR").ok();
-        unsafe { std::env::remove_var("KIMCHI_CODING_AGENT_DIR") };
+        let mut env = EnvGuard::capture(&["KIMCHI_CODING_AGENT_DIR"]);
+        env.remove("KIMCHI_CODING_AGENT_DIR");
 
         let client = ClientId::from_str("kimchi").expect("kimchi client should be registered");
         assert_eq!(
             client.data().resolve_path("/tmp/home"),
             "/tmp/home/.config/kimchi/harness/sessions"
         );
-
-        restore_env("KIMCHI_CODING_AGENT_DIR", previous);
     }
 
     #[test]
     #[serial]
     fn test_kimchi_honors_agent_dir_env_override() {
-        let previous = std::env::var("KIMCHI_CODING_AGENT_DIR").ok();
-        unsafe { std::env::set_var("KIMCHI_CODING_AGENT_DIR", "/custom/kimchi-agent") };
+        let mut env = EnvGuard::capture(&["KIMCHI_CODING_AGENT_DIR"]);
+        env.set("KIMCHI_CODING_AGENT_DIR", "/custom/kimchi-agent");
 
         let client = ClientId::from_str("kimchi").expect("kimchi client should be registered");
         assert_eq!(
             client.data().resolve_path("/tmp/home"),
             "/custom/kimchi-agent/sessions"
         );
-
-        restore_env("KIMCHI_CODING_AGENT_DIR", previous);
     }
 
     #[test]
     #[serial]
     fn test_senpi_defaults_to_home_agent_dir_without_env_override() {
-        let previous = std::env::var("SENPI_CODING_AGENT_DIR").ok();
-        unsafe { std::env::remove_var("SENPI_CODING_AGENT_DIR") };
+        let mut env = EnvGuard::capture(&["SENPI_CODING_AGENT_DIR"]);
+        env.remove("SENPI_CODING_AGENT_DIR");
 
         let client = ClientId::from_str("senpi").expect("senpi client should be registered");
         assert_eq!(
             client.data().resolve_path("/tmp/home"),
             "/tmp/home/.senpi/agent/sessions"
         );
-
-        restore_env("SENPI_CODING_AGENT_DIR", previous);
     }
 
     #[test]
     #[serial]
     fn test_senpi_honors_agent_dir_env_override() {
-        let previous = std::env::var("SENPI_CODING_AGENT_DIR").ok();
-        unsafe { std::env::set_var("SENPI_CODING_AGENT_DIR", "/custom/senpi-agent") };
+        let mut env = EnvGuard::capture(&["SENPI_CODING_AGENT_DIR"]);
+        env.set("SENPI_CODING_AGENT_DIR", "/custom/senpi-agent");
 
         let client = ClientId::from_str("senpi").expect("senpi client should be registered");
         assert_eq!(
             client.data().resolve_path("/tmp/home"),
             "/custom/senpi-agent/sessions"
         );
-
-        restore_env("SENPI_CODING_AGENT_DIR", previous);
     }
 
     #[test]
