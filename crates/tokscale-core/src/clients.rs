@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathRoot {
     Home,
+    ReasonixHome,
     XdgData,
     Config,
     EnvVar {
@@ -13,6 +14,36 @@ impl PathRoot {
     pub fn resolve_with_env_strategy(&self, home_dir: &str, use_env_roots: bool) -> String {
         match self {
             PathRoot::Home => home_dir.to_string(),
+            PathRoot::ReasonixHome => {
+                if use_env_roots {
+                    if let Some(state_home) =
+                        clean_reasonix_env_dir("REASONIX_STATE_HOME", home_dir)
+                    {
+                        return state_home;
+                    }
+                    if let Some(home) = clean_reasonix_env_dir("REASONIX_HOME", home_dir) {
+                        return home;
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    if use_env_roots {
+                        if let Some(config_dir) = dirs::config_dir() {
+                            return config_dir.join("reasonix").to_string_lossy().into_owned();
+                        }
+                    }
+                    return std::path::Path::new(home_dir)
+                        .join("AppData")
+                        .join("Roaming")
+                        .join("reasonix")
+                        .to_string_lossy()
+                        .into_owned();
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    format!("{home_dir}/.reasonix")
+                }
+            }
             PathRoot::XdgData => {
                 if use_env_roots {
                     std::env::var("XDG_DATA_HOME")
@@ -73,6 +104,74 @@ impl PathRoot {
     pub fn resolve(&self, home_dir: &str) -> String {
         self.resolve_with_env_strategy(home_dir, true)
     }
+}
+
+fn clean_reasonix_env_dir(name: &str, home_dir: &str) -> Option<String> {
+    let value = std::env::var(name).ok()?;
+    let value = expand_reasonix_env_vars(value.trim());
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let path = if value == "~" {
+        std::path::PathBuf::from(home_dir)
+    } else if let Some(relative) = value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\"))
+    {
+        std::path::Path::new(home_dir).join(relative)
+    } else {
+        std::path::PathBuf::from(value)
+    };
+
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    Some(path.to_string_lossy().into_owned())
+}
+
+// Match Reasonix's config expansion for ${VAR} and ${VAR:-default}. This must
+// happen before tilde and relative-path handling because either expansion may
+// produce one of those forms.
+fn expand_reasonix_env_vars(value: &str) -> String {
+    let mut expanded = String::with_capacity(value.len());
+    let mut remainder = value;
+
+    while let Some(start) = remainder.find("${") {
+        expanded.push_str(&remainder[..start]);
+        let reference = &remainder[start + 2..];
+        let Some(end) = reference.find('}') else {
+            expanded.push_str(&remainder[start..]);
+            return expanded;
+        };
+
+        let expression = &reference[..end];
+        let (name, default) = expression
+            .split_once(":-")
+            .map_or((expression, None), |(name, default)| (name, Some(default)));
+        let is_valid_name = name.chars().enumerate().all(|(index, character)| {
+            (character == '_' || character.is_ascii_alphabetic())
+                || (index > 0 && character.is_ascii_digit())
+        });
+
+        if is_valid_name && !name.is_empty() {
+            match std::env::var(name) {
+                Ok(env_value) if !env_value.is_empty() => expanded.push_str(&env_value),
+                _ => expanded.push_str(default.unwrap_or_default()),
+            }
+        } else {
+            expanded.push_str("${");
+            expanded.push_str(expression);
+            expanded.push('}');
+        }
+        remainder = &reference[end + 1..];
+    }
+
+    expanded.push_str(remainder);
+    expanded
 }
 
 #[derive(Debug, Clone)]
@@ -592,6 +691,18 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // Reasonix stores authoritative provider usage as daily append-only JSONL
+    // records under `<state root>/stats/`. Transcript JSONL is intentionally
+    // excluded: it lacks exact token counters and overlaps these records.
+    Reasonix = 42 => {
+        id: "reasonix",
+        root: PathRoot::ReasonixHome,
+        relative: "stats",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -644,7 +755,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 42);
+        assert_eq!(ClientId::COUNT, 43);
     }
 
     #[test]
@@ -679,6 +790,137 @@ mod tests {
         assert!(client.data().parse_local);
         assert!(client.data().submit_default);
         assert!(!client.data().headless);
+    }
+
+    #[test]
+    fn test_reasonix_client_registered_as_local_session_source() {
+        let client = ClientId::from_str("reasonix").expect("reasonix client should be registered");
+        assert_eq!(
+            client
+                .data()
+                .resolve_path_with_env_strategy("/tmp/home", false),
+            "/tmp/home/.reasonix/stats"
+        );
+        assert_eq!(client.data().pattern, "*.jsonl");
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
+        assert!(!client.data().headless);
+    }
+
+    #[test]
+    fn test_reasonix_stats_prefers_state_home_then_reasonix_home() {
+        let _guard = env_lock().lock().unwrap();
+        let state_previous = std::env::var("REASONIX_STATE_HOME").ok();
+        let home_previous = std::env::var("REASONIX_HOME").ok();
+        unsafe {
+            std::env::set_var("REASONIX_HOME", "/custom/reasonix-home");
+            std::env::set_var("REASONIX_STATE_HOME", "/custom/reasonix-state");
+        }
+        let client = ClientId::Reasonix;
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            "/custom/reasonix-state/stats"
+        );
+        unsafe { std::env::remove_var("REASONIX_STATE_HOME") };
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            "/custom/reasonix-home/stats"
+        );
+        restore_env("REASONIX_STATE_HOME", state_previous);
+        restore_env("REASONIX_HOME", home_previous);
+    }
+
+    #[test]
+    fn test_reasonix_stats_normalizes_env_roots_and_ignores_blank_values() {
+        let _guard = env_lock().lock().unwrap();
+        let state_previous = std::env::var("REASONIX_STATE_HOME").ok();
+        let home_previous = std::env::var("REASONIX_HOME").ok();
+        let client = ClientId::Reasonix;
+
+        unsafe {
+            std::env::set_var("REASONIX_STATE_HOME", "  ~/reasonix-state  ");
+            std::env::set_var("REASONIX_HOME", "/unused/reasonix-home");
+        }
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            "/tmp/home/reasonix-state/stats"
+        );
+
+        unsafe {
+            std::env::set_var("REASONIX_STATE_HOME", " \t ");
+            std::env::set_var("REASONIX_HOME", " relative-reasonix ");
+        }
+        let expected = std::env::current_dir()
+            .expect("test process has a current directory")
+            .join("relative-reasonix")
+            .join("stats")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(client.data().resolve_path("/tmp/home"), expected);
+
+        restore_env("REASONIX_STATE_HOME", state_previous);
+        restore_env("REASONIX_HOME", home_previous);
+    }
+
+    #[test]
+    fn test_reasonix_stats_expands_environment_references_before_normalizing_paths() {
+        let _guard = env_lock().lock().unwrap();
+        let state_previous = std::env::var("REASONIX_STATE_HOME").ok();
+        let root_previous = std::env::var("TOKSCALE_REASONIX_TEST_ROOT").ok();
+        let unset_previous = std::env::var("TOKSCALE_REASONIX_TEST_UNSET").ok();
+        let client = ClientId::Reasonix;
+
+        unsafe {
+            std::env::set_var("TOKSCALE_REASONIX_TEST_ROOT", "~/reasonix-state");
+            std::env::remove_var("TOKSCALE_REASONIX_TEST_UNSET");
+            std::env::set_var(
+                "REASONIX_STATE_HOME",
+                "${TOKSCALE_REASONIX_TEST_ROOT}/nested",
+            );
+        }
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            "/tmp/home/reasonix-state/nested/stats"
+        );
+
+        unsafe {
+            std::env::set_var(
+                "REASONIX_STATE_HOME",
+                "${TOKSCALE_REASONIX_TEST_UNSET:-relative-reasonix}",
+            );
+        }
+        let expected = std::env::current_dir()
+            .expect("test process has a current directory")
+            .join("relative-reasonix")
+            .join("stats")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(client.data().resolve_path("/tmp/home"), expected);
+
+        restore_env("REASONIX_STATE_HOME", state_previous);
+        restore_env("TOKSCALE_REASONIX_TEST_ROOT", root_previous);
+        restore_env("TOKSCALE_REASONIX_TEST_UNSET", unset_previous);
+    }
+
+    #[test]
+    fn test_reasonix_stats_ignores_env_roots_when_requested() {
+        let _guard = env_lock().lock().unwrap();
+        let state_previous = std::env::var("REASONIX_STATE_HOME").ok();
+        let home_previous = std::env::var("REASONIX_HOME").ok();
+        unsafe {
+            std::env::set_var("REASONIX_STATE_HOME", "/custom/reasonix-state");
+            std::env::set_var("REASONIX_HOME", "/custom/reasonix-home");
+        }
+
+        assert_eq!(
+            ClientId::Reasonix
+                .data()
+                .resolve_path_with_env_strategy("/tmp/home", false),
+            "/tmp/home/.reasonix/stats"
+        );
+
+        restore_env("REASONIX_STATE_HOME", state_previous);
+        restore_env("REASONIX_HOME", home_previous);
     }
 
     #[test]

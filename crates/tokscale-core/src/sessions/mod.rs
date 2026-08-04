@@ -38,6 +38,7 @@ pub mod opencode;
 pub mod opencodereview;
 pub mod pi;
 pub mod qwen;
+pub mod reasonix;
 pub mod roocode;
 pub mod senpi;
 pub mod synthetic;

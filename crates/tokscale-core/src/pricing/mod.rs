@@ -498,6 +498,40 @@ mod tests {
         assert!((cost - 1.925).abs() < 1e-9, "unexpected cost: {cost}");
     }
 
+    #[test]
+    fn reasonix_uses_the_inferred_upstream_provider_for_pricing() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "deepseek/reasonix-fixture".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(2e-6),
+                output_cost_per_token: Some(8e-6),
+                ..Default::default()
+            },
+        );
+        let service = PricingService::new(litellm, HashMap::new());
+        let usage = TokenBreakdown {
+            input: 1_000,
+            output: 1_000,
+            ..Default::default()
+        };
+
+        assert!(service.covers_usage_with_provider(
+            "opencode/reasonix-fixture",
+            Some("deepseek"),
+            &usage,
+        ));
+        assert!(
+            (service.calculate_cost_with_provider(
+                "opencode/reasonix-fixture",
+                Some("deepseek"),
+                &usage,
+            ) - 0.01)
+                .abs()
+                < 1e-12
+        );
+    }
+
     // The two rows must be the same deal before one lends the other a rate.
     // `azure_ai/grok-code-fast-1` bills $3.50/$17.50 per million with no
     // cache-read rate while the canonical `xai/` row bills $0.20/$1.50 with

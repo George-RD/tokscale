@@ -511,6 +511,20 @@ impl SourceFingerprint {
         Self::check_kimi_path_with_mode(path, cached, ContentHashMode::SamplesOnly)
     }
 
+    /// Stats are append-only JSONL; use bounded samples to avoid hashing a
+    /// growing daily log on every warm scan.
+    pub(crate) fn check_reasonix_path_samples_only(
+        path: &Path,
+        cached: Option<&Self>,
+    ) -> Option<FingerprintStatus> {
+        Self::check_path_with_related_mode(
+            path,
+            std::iter::empty(),
+            cached,
+            ContentHashMode::SamplesOnly,
+        )
+    }
+
     fn check_kimi_path_with_mode(
         path: &Path,
         cached: Option<&Self>,
@@ -912,6 +926,9 @@ fn parser_version(client: ClientId) -> u32 {
         // v1->v2: Kimchi's Pi-compatible messages now carry stable namespaced
         // deduplication keys.
         ClientId::Kimchi => 2,
+        // Initial Reasonix implementation. The fingerprint samples the
+        // append-only stats JSONL source so appended records are reparsed.
+        ClientId::Reasonix => 1,
         // v1->v2: per-model token attribution now comes from
         // session_model_usage instead of crediting the whole session to
         // sessions.model, and dedup keys are namespaced per (session, model).
@@ -2373,6 +2390,29 @@ mod tests {
         std::fs::write(&events_path, b"event-2\n").unwrap();
         let updated_events = SourceFingerprint::from_grok_path(&updates_path).unwrap();
         assert_ne!(with_events, updated_events);
+    }
+
+    #[test]
+    fn test_reasonix_stats_fingerprint_tracks_appends() {
+        let dir = TempDir::new().unwrap();
+        let session_path = dir.path().join("2026-08-04.jsonl");
+        std::fs::write(&session_path, b"{\"total\":1}\n").unwrap();
+
+        let initial = match SourceFingerprint::check_reasonix_path_samples_only(&session_path, None)
+        {
+            Some(FingerprintStatus::Changed(fingerprint)) => fingerprint,
+            _ => panic!("uncached Reasonix session must produce a fingerprint"),
+        };
+        assert!(matches!(
+            SourceFingerprint::check_reasonix_path_samples_only(&session_path, Some(&initial)),
+            Some(FingerprintStatus::Unchanged)
+        ));
+
+        std::fs::write(&session_path, b"{\"total\":1}\n{\"total\":2}\n").unwrap();
+        match SourceFingerprint::check_reasonix_path_samples_only(&session_path, Some(&initial)) {
+            Some(FingerprintStatus::Changed(fingerprint)) => fingerprint,
+            _ => panic!("Reasonix stats append must invalidate"),
+        };
     }
 
     #[test]

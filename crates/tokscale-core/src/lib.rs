@@ -1695,6 +1695,27 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
+    let reasonix_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Reasonix)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source_with_fingerprint(
+                message_cache::CacheIdentity::for_client(ClientId::Reasonix),
+                path,
+                &source_cache,
+                pricing,
+                message_cache::SourceFingerprint::check_reasonix_path_samples_only,
+                sessions::reasonix::parse_reasonix_file,
+            )
+        })
+        .collect();
+    for outcome in reasonix_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     let senpi_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Senpi)
         .par_iter()
@@ -3616,6 +3637,22 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let kimchi_count = kimchi_msgs.len() as i32;
     counts.set(ClientId::Kimchi, kimchi_count);
     messages.extend(kimchi_msgs);
+
+    let reasonix_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::Reasonix)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::reasonix::parse_reasonix_file(path)
+                .into_iter()
+                .map(|message| unified_to_parsed(&message))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let reasonix_count = reasonix_msgs.iter().fold(0_i32, |count, message| {
+        count.saturating_add(message.message_count)
+    });
+    counts.set(ClientId::Reasonix, reasonix_count);
+    messages.extend(reasonix_msgs);
 
     let senpi_msgs: Vec<ParsedMessage> = scan_result
         .get(ClientId::Senpi)
@@ -10459,6 +10496,34 @@ mod tests {
         assert!(dates.contains(&local_date(thread_created + 2000)));
         assert!(dates.contains(&local_date(ledger_timestamp)));
     }
+
+    #[test]
+    fn test_parse_local_clients_reasonix_counts_reported_requests() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let stats_dir = temp_dir.path().join(".reasonix/stats");
+        std::fs::create_dir_all(&stats_dir).unwrap();
+        std::fs::write(
+            stats_dir.join("2026-08-04.jsonl"),
+            "{\"ts\":\"2026-08-04T09:10:11Z\",\"model\":\"deepseek/chat\",\"prompt\":100,\"completion\":20,\"total\":120,\"requests\":3}\n",
+        )
+        .unwrap();
+
+        let parsed = parse_local_clients(LocalParseOptions {
+            home_dir: Some(temp_dir.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["reasonix".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+        })
+        .unwrap();
+
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].message_count, 3);
+        assert_eq!(parsed.counts.get(ClientId::Reasonix), 3);
+    }
+
     #[test]
     fn test_retain_for_requested_clients_gjc_superset_of_9router() {
         let gjc_requested: HashSet<&str> = HashSet::from(["gjc"]);
