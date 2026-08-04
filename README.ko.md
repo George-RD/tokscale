@@ -1823,7 +1823,7 @@ Tokscale은 [LiteLLM의 가격 데이터베이스](https://github.com/BerriAI/li
 
 **Sakana Fugu 가격**: Fugu Ultra 비용은 Sakana가 공개한 종량제(pay-as-you-go) 요율로 추정하며, `fugu` 라우터 모델은 실제로 오케스트레이션한 기반 모델의 가변 요율이 곧 그 비용이므로 의도적으로 가격을 책정하지 않습니다.
 
-**GitHub Copilot 가격**: GitHub는 Copilot 사용량을 AI Credits로 [자체 공개 토큰당 요율](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing)에 따라 청구합니다. 어떤 업스트림 데이터셋에도 없는 Copilot 모델(현재는 `oswe-vscode-prime`, "Raptor mini")에 대해 Tokscale은 GitHub의 요율을 내장 오버라이드로 포함하며 소스 라벨 `GitHub`으로 보고합니다. 이 오버라이드는 모든 업스트림 소스와 퍼지 매칭 이후에 확인되므로, 업스트림 데이터셋이 해당 모델을 수록하는 즉시 양보합니다. 반대 방향의 사례가 두 개 있습니다. GitHub Copilot의 `gpt-5.2`와 `gpt-5.2-codex`는 의도적으로 가격을 책정하지 않습니다. GitHub이 두 모델에 대한 Copilot 요율을 전혀 공개하지 않으며, 공개된 유일한 요율이 OpenAI 직접 정가와 바이트 단위로 동일한 값, 즉 Copilot 구독자가 실제로 청구받는 금액이 아니라 벤더 패스스루 견적이기 때문입니다. 이 두 모델의 사용량은 틀린 것이 확실한 요율로 청구하는 대신 제출에서 제외하고 사용자에게 보고합니다.
+**GitHub Copilot 가격**: GitHub는 Copilot 사용량을 AI Credits로 [자체 공개 토큰당 요율](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing)에 따라 청구합니다. 어떤 업스트림 데이터셋에도 없는 Copilot 모델(현재는 `oswe-vscode-prime`, "Raptor mini")에 대해 Tokscale은 GitHub의 요율을 내장 오버라이드로 포함하며 소스 라벨 `GitHub`으로 보고합니다. 이 오버라이드는 모든 업스트림 소스와 퍼지 매칭 이후에 확인되므로, 업스트림 데이터셋이 해당 모델을 수록하는 즉시 양보합니다.
 
 **캐싱**: 가격 데이터는 1시간 TTL로 디스크에 캐시되어 빠른 시작을 보장합니다:
 - LiteLLM 캐시: `~/.config/tokscale/cache/pricing-litellm.json`

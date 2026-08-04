@@ -13,114 +13,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 
-use crate::{provider_identity, TokenBreakdown};
+use crate::TokenBreakdown;
 
 pub use litellm::ModelPricing;
 
 static PRICING_SERVICE: OnceCell<Arc<PricingService>> = OnceCell::const_new();
-
-/// Copilot-served models whose only available rates are an upstream vendor's,
-/// not GitHub's, and which therefore must resolve to no price at all.
-///
-/// models.dev's Copilot catalog generally tracks GitHub's own published table —
-/// 24 of its 29 `github-copilot/*` entries match it exactly, and
-/// `github-copilot/grok-4.5` proves the sourcing by carrying GitHub's $0.50/1M
-/// cache-read rate rather than xAI's native $0.30. These two are the exception:
-/// they are absent from GitHub's table entirely, and their models.dev rates
-/// ($1.75 / $14.00 / $0.175 per 1M) are byte-identical to models.dev's own
-/// `openai/gpt-5.2` row. That is an OpenAI passthrough quote, not what a
-/// Copilot subscriber is billed under AI Credits.
-///
-/// Withholding a price is the conservative failure mode, but only because
-/// `exclude_generic_unpriced_submission_messages` pairs this refusal with an
-/// exclusion arm keyed on the same predicate: the row is dropped from the
-/// submission and reported, instead of reaching `validate_priced_messages` and
-/// erroring the whole submission. A wrongly priced row, by contrast, silently
-/// corrupts a public spend leaderboard. Do not add an id here without checking
-/// that pairing still holds — an unpriced id with no exclusion arm blocks
-/// submission entirely. This mirrors the reasoning that leaves Sakana's `fugu`
-/// router unpriced in `build_sakana_overrides`.
-///
-/// GitHub's rate table:
-/// <https://raw.githubusercontent.com/github/docs/main/data/tables/copilot/models-and-pricing.yml>
-/// (accessed 2026-08-05).
-const COPILOT_VENDOR_PASSTHROUGH_MODELS: &[&str] = &["gpt-5.2", "gpt-5.2-codex"];
-
-/// Reasoning-effort decorations that `PricingLookup` strips before it resolves
-/// a key, listed here so the guard strips exactly the same set.
-///
-/// `strip_parenthesized_reasoning_tier` handles the `model(high)` spelling;
-/// these are the dashed spelling that `normalize_model_name` folds away. If the
-/// guard matched the raw id instead, `gpt-5.2-codex(high)` and
-/// `gpt-5.2-codex-high` would sail past it and then normalize straight onto the
-/// passthrough row — the wrong price by a spelling technicality.
-const REASONING_TIER_SUFFIXES: &[&str] = &[
-    "-minimal", "-low", "-medium", "-high", "-xhigh", "-auto", "-none",
-];
-
-/// Whether the lookup arguments identify one of the Copilot passthrough models
-/// above **and** carry enough provenance to know the request is Copilot's.
-///
-/// Two argument shapes carry that provenance, and both occur:
-///
-/// 1. `model_id` is namespaced — `github-copilot/gpt-5.2` (models.dev's
-///    spelling) or `github_copilot/gpt-5.2` (LiteLLM's). Both are recognized
-///    because the two datasets disagree and either can reach a lookup.
-/// 2. `model_id` is bare and `provider_id` canonicalizes to `github_copilot`.
-///    `tests/fixtures/local_model_ids.txt` lines 73 and 76 are harvested from
-///    real sessions and carry exactly this shape for both ids, so it is not
-///    hypothetical.
-///
-/// WHAT THIS DELIBERATELY DOES NOT COVER, and why. The first-party Copilot
-/// parsers (`sessions/copilot.rs`, `copilot_vscode.rs`, `copilot_desktop.rs`)
-/// derive `provider_id` from the model NAME —
-/// `inferred_provider_from_model(&model_id).unwrap_or("github-copilot")` — and
-/// that helper answers `openai` for anything containing `gpt`. A Copilot VS
-/// Code record for gpt-5.2 therefore reaches this function as exactly
-/// `("gpt-5.2", Some("openai"))`: byte-identical to a genuine direct-OpenAI
-/// gpt-5.2 record, which must keep its correct $1.75/$14.00 OpenAI rate.
-///
-/// What actually separates the two cases is which client wrote the session
-/// file, and that is information this layer never receives — `model_id` and
-/// `provider_id` are the only arguments, and `UnifiedMessage::client` is not
-/// among them. So the discriminator cannot be reconstructed here at any level
-/// of cleverness; firing on `("gpt-5.2", Some("openai"))` would unprice every
-/// direct OpenAI user to catch the Copilot ones. Restoring that shape's
-/// provenance is a parser change (stop collapsing Copilot's provider to the
-/// upstream vendor), with its own cache-version bump and its own effect on
-/// provider attribution, and it belongs in its own commit rather than being
-/// smuggled in behind a pricing guard.
-///
-/// Deliberately narrow otherwise: after tier stripping the terminal segment
-/// must EQUAL one of the two ids, so the other 27 `github-copilot/*` entries —
-/// and ids like `gpt-5.2-codex-max` that GitHub may yet publish a rate for —
-/// keep pricing normally.
-pub(crate) fn is_copilot_vendor_passthrough(model_id: &str, provider_id: Option<&str>) -> bool {
-    let lower = model_id.trim().to_lowercase();
-    let scoped_by_key =
-        lower.starts_with("github-copilot/") || lower.starts_with("github_copilot/");
-    let terminal = if scoped_by_key {
-        lower.split('/').next_back().unwrap_or(&lower)
-    } else {
-        lower.as_str()
-    };
-
-    let copilot_scoped = scoped_by_key
-        || provider_id.is_some_and(|provider| {
-            provider_identity::canonical_provider(provider).as_deref() == Some("github_copilot")
-        });
-    if !copilot_scoped {
-        return false;
-    }
-
-    let base = crate::strip_parenthesized_reasoning_tier(terminal).unwrap_or(terminal);
-    let base = REASONING_TIER_SUFFIXES
-        .iter()
-        .find_map(|suffix| base.strip_suffix(suffix))
-        .unwrap_or(base);
-
-    COPILOT_VENDOR_PASSTHROUGH_MODELS.contains(&base)
-}
 
 // @keep: explains why we do not just print the error.
 /// Flatten an error and its `source()` chain into one line.
@@ -177,25 +74,10 @@ impl PricingService {
                 openrouter_data,
                 Self::build_cursor_overrides(),
                 Self::build_sakana_overrides(),
-                Self::filter_models_dev_data(models_dev_data),
+                models_dev_data,
             ),
             github: Self::build_github_overrides(),
         }
-    }
-
-    /// Drop the Copilot vendor-passthrough rows before they can be indexed.
-    ///
-    /// The resolution guard in `lookup_with_source_and_provider` is what makes
-    /// these ids unpriced; this removes them from the dataset as well so they
-    /// cannot leak in sideways. `PricingLookup` builds a model-part index over
-    /// models.dev keys, and `gpt-5.2` in that index could otherwise resolve to
-    /// `github-copilot/gpt-5.2` for a lookup that never mentions Copilot at
-    /// all.
-    fn filter_models_dev_data(
-        mut data: HashMap<String, ModelPricing>,
-    ) -> HashMap<String, ModelPricing> {
-        data.retain(|key, _| !is_copilot_vendor_passthrough(key, None));
-        data
     }
 
     // @keep: records why the `github_copilot/` prefix filter that used to live
@@ -554,18 +436,6 @@ impl PricingService {
             Some(_) => {}
         }
 
-        // Refusing here, rather than only dropping the dataset rows, is what
-        // makes the refusal stick: the lookup chain strips an unrecognized
-        // `github-copilot/` prefix and retries the terminal segment, so a
-        // suppressed row would otherwise fall straight through to the
-        // `openai/gpt-5.2` quote it was copied from — the same wrong number by
-        // another route. It sits below the custom pass on purpose: a user who
-        // writes their own rate for these ids has stated an intent we should
-        // not override.
-        if is_copilot_vendor_passthrough(model_id, provider_id) {
-            return None;
-        }
-
         if let Some(result) =
             self.lookup
                 .lookup_with_source_and_provider(model_id, force_source, provider_id)
@@ -619,10 +489,6 @@ impl PricingService {
             );
         }
 
-        if is_copilot_vendor_passthrough(model_id, provider_id) {
-            return 0.0;
-        }
-
         if let Some(result) = self.github_override_for_unresolved(model_id, provider_id) {
             return compute_cost(
                 &result.pricing,
@@ -646,10 +512,6 @@ impl PricingService {
     ) -> bool {
         if let Some(result) = self.custom.lookup_with_key(model_id) {
             return result.pricing.covers_usage(usage);
-        }
-
-        if is_copilot_vendor_passthrough(model_id, provider_id) {
-            return false;
         }
 
         if let Some(result) = self.github_override_for_unresolved(model_id, provider_id) {
@@ -1185,9 +1047,20 @@ mod tests {
         assert_eq!(result.pricing.input_cost_per_token, Some(0.000009));
     }
 
-    /// models.dev rows shaped like the live Copilot catalog: the two vendor
-    /// passthrough entries, the `openai/` row they were copied from, and two
-    /// entries that do track GitHub's own published numbers.
+    /// models.dev rows copied verbatim from the live dataset (accessed
+    /// 2026-08-05): the two `gpt-5.2` Copilot entries, the `openai/` row whose
+    /// rates they duplicate, and two entries that track GitHub's own published
+    /// numbers.
+    ///
+    /// The duplication is real and unresolved. `github-copilot/gpt-5.2` and
+    /// `-codex` are absent from GitHub's rate table, and models.dev quotes them
+    /// at OpenAI's direct list price rather than at a Copilot rate — so tokscale
+    /// currently bills Copilot gpt-5.2 usage at a passthrough number. Suppressing
+    /// it needs the originating client threaded into the pricing decision — the
+    /// `(model_id, provider_id)` pair this layer receives cannot tell a Copilot
+    /// gpt-5.2 record from a direct-OpenAI one, because the Copilot parsers set
+    /// `provider_id` to `openai` for any id containing `gpt`. This fixture is
+    /// kept ready for that attempt.
     fn copilot_models_dev() -> HashMap<String, ModelPricing> {
         let openai_passthrough = ModelPricing {
             input_cost_per_token: Some(1.75e-6),
@@ -1236,92 +1109,10 @@ mod tests {
         )
     }
 
-    // `github-copilot/gpt-5.2` and `-codex` are absent from GitHub's published
-    // rate table, and models.dev prices them byte-identically to its own
-    // `openai/gpt-5.2` row — vendor passthrough, not what a Copilot subscriber
-    // is billed. Pricing them silently corrupts a public spend leaderboard;
-    // leaving them unpriced merely excludes and reports the row.
-    #[test]
-    fn copilot_gpt_5_2_passthrough_rows_resolve_to_no_price() {
-        let service = copilot_service();
-        let usage = TokenBreakdown {
-            input: 1_000_000,
-            output: 100_000,
-            ..Default::default()
-        };
-
-        for model in ["github-copilot/gpt-5.2", "github-copilot/gpt-5.2-codex"] {
-            assert!(
-                service.lookup_with_source(model, None).is_none(),
-                "{model} must not resolve to a price"
-            );
-            assert!(
-                !service.covers_usage_with_provider(model, None, &usage),
-                "{model} must report as unpriced so submission excludes it"
-            );
-            let cost = service.calculate_cost_with_provider(model, None, &usage);
-            assert_eq!(cost, 0.0, "{model} priced at {cost}");
-        }
-    }
-
-    // The bare id plus a `github-copilot` provider is one of the two shapes
-    // that carry Copilot provenance into the lookup, and it is real:
-    // `tests/fixtures/local_model_ids.txt` lines 73 and 76 are harvested from
-    // live sessions and carry exactly it. Suppressing only the slash-qualified
-    // spelling would leave that path open.
-    #[test]
-    fn copilot_gpt_5_2_stays_unpriced_under_a_provider_hint() {
-        let service = copilot_service();
-
-        for model in ["gpt-5.2", "gpt-5.2-codex"] {
-            assert!(
-                service
-                    .lookup_with_source_and_provider(model, None, Some("github-copilot"))
-                    .is_none(),
-                "{model} under a github-copilot hint must not resolve to a price"
-            );
-        }
-    }
-
-    // `PricingLookup` strips reasoning-effort decorations before it resolves a
-    // key, so a guard that matched the raw id would let the decorated spellings
-    // normalize onto the passthrough row it just refused. The `openai` half of
-    // each pair proves the escape route is real rather than theoretical: the
-    // same decorated id does resolve once Copilot provenance is absent.
-    #[test]
-    fn copilot_gpt_5_2_stays_unpriced_through_reasoning_tier_spellings() {
-        let service = copilot_service();
-
-        for model in [
-            "gpt-5.2(high)",
-            "gpt-5.2-codex(high)",
-            "gpt-5.2-codex-high",
-            "GPT-5.2-Codex(xhigh)",
-        ] {
-            assert!(
-                service
-                    .lookup_with_source_and_provider(model, None, Some("github-copilot"))
-                    .is_none(),
-                "{model} under a github-copilot hint must not resolve to a price"
-            );
-            let scoped = format!("github-copilot/{model}");
-            assert!(
-                service.lookup_with_source(&scoped, None).is_none(),
-                "{scoped} must not resolve to a price"
-            );
-
-            let openai = service
-                .lookup_with_source_and_provider(model, None, Some("openai"))
-                .unwrap_or_else(|| {
-                    panic!("{model} must still normalize onto OpenAI's own row without Copilot")
-                });
-            assert_eq!(openai.pricing.input_cost_per_token, Some(1.75e-6));
-        }
-    }
-
-    // Guard against over-suppression: the other 27 `github-copilot/*` entries
-    // track GitHub's table and must keep pricing, as must `openai/gpt-5.2`
-    // itself for actual OpenAI usage.
+    // models.dev's `github-copilot/*` rows are the only Copilot prices anyone
+    // publishes, and they must keep resolving under both the namespaced key and
+    // a bare id plus provider hint, as must `openai/gpt-5.2` for actual OpenAI
+    // usage.
     #[test]
     fn other_copilot_models_and_openai_gpt_5_2_still_price() {
         let service = copilot_service();
@@ -1343,48 +1134,6 @@ mod tests {
             .expect("OpenAI's own gpt-5.2 must keep pricing");
         assert_eq!(openai.matched_key, "openai/gpt-5.2");
         assert_eq!(openai.pricing.input_cost_per_token, Some(1.75e-6));
-    }
-
-    // The tier strip must not become a prefix match. `gpt-5.2-codex-max` is not
-    // one of the two suppressed ids, and `-max` is not a reasoning tier, so it
-    // keeps resolving — if GitHub publishes a rate for it, tokscale must use it.
-    #[test]
-    fn copilot_suppression_does_not_extend_to_sibling_ids() {
-        let mut data = copilot_models_dev();
-        data.insert(
-            "github-copilot/gpt-5.2-codex-max".into(),
-            ModelPricing {
-                input_cost_per_token: Some(4e-6),
-                output_cost_per_token: Some(2e-5),
-                ..Default::default()
-            },
-        );
-        let service =
-            custom_service_with_models_dev(HashMap::new(), HashMap::new(), HashMap::new(), data);
-
-        let result = service
-            .lookup_with_source_and_provider("gpt-5.2-codex-max", None, Some("github-copilot"))
-            .expect("gpt-5.2-codex-max is not a suppressed id and must price");
-        assert_eq!(result.pricing.input_cost_per_token, Some(4e-6));
-    }
-
-    // The crux the guard cannot resolve, pinned so nobody "fixes" it here by
-    // unpricing every direct OpenAI user. The first-party Copilot parsers set
-    // `provider_id = inferred_provider_from_model(&model_id)`, which answers
-    // `openai` for anything containing `gpt`, so a Copilot VS Code gpt-5.2
-    // record and a direct OpenAI gpt-5.2 record reach this layer as the same
-    // two arguments. The client that wrote the session file is what separates
-    // them, and it is not passed here. Restoring that provenance is a parser
-    // change, not a pricing change.
-    #[test]
-    fn copilot_provider_erased_to_openai_is_indistinguishable_and_stays_priced() {
-        let service = copilot_service();
-
-        let result = service
-            .lookup_with_source_and_provider("gpt-5.2", None, Some("openai"))
-            .expect("this tuple is also genuine direct-OpenAI usage and must stay priced");
-        assert_eq!(result.matched_key, "openai/gpt-5.2");
-        assert!(!is_copilot_vendor_passthrough("gpt-5.2", Some("openai")));
     }
 
     // Regression: GitHub moved Copilot off premium-request billing onto

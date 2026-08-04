@@ -1784,7 +1784,7 @@ Tokscaleは[LiteLLMの価格データベース](https://github.com/BerriAI/litel
 
 **Sakana Fugu価格**: Fugu UltraのコストはSakanaが公開している従量課金（pay-as-you-go）レートから推定します。`fugu`ルーターモデルは、実際にオーケストレーションした基盤モデルの変動レートがそのままコストになるため、意図的に価格を設定していません。
 
-**GitHub Copilot価格**: GitHubはCopilotの使用量をAI Creditsとして[自社が公開するトークン単価](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing)で課金します。どのアップストリームデータセットにも存在しないCopilotモデル（現時点では`oswe-vscode-prime`、「Raptor mini」）については、TokscaleがGitHubのレートを組み込みオーバーライドとして持ち、ソースラベル`GitHub`として報告します。このオーバーライドはすべてのアップストリームソースとファジーマッチングの後にチェックされるため、アップストリームデータセットがそのモデルを収録した時点で譲ります。逆のケースが2つあります。GitHub Copilotの`gpt-5.2`と`gpt-5.2-codex`は意図的に価格を設定していません。GitHubがこの2つに対するCopilotレートをまったく公開しておらず、公開されている唯一のレートがOpenAIの直販価格とバイト単位で同一、つまりCopilot加入者が実際に請求される額ではなくベンダーのパススルー見積もりだからです。この2つの使用量は、誤りと分かっているレートで課金する代わりに、送信から除外してユーザーに報告します。
+**GitHub Copilot価格**: GitHubはCopilotの使用量をAI Creditsとして[自社が公開するトークン単価](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing)で課金します。どのアップストリームデータセットにも存在しないCopilotモデル（現時点では`oswe-vscode-prime`、「Raptor mini」）については、TokscaleがGitHubのレートを組み込みオーバーライドとして持ち、ソースラベル`GitHub`として報告します。このオーバーライドはすべてのアップストリームソースとファジーマッチングの後にチェックされるため、アップストリームデータセットがそのモデルを収録した時点で譲ります。
 
 **キャッシュ**: 価格データは1時間TTLでディスクにキャッシュされ、高速な起動を確保します：
 - LiteLLMキャッシュ: `~/.config/tokscale/cache/pricing-litellm.json`
