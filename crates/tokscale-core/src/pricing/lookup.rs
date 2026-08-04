@@ -61,6 +61,15 @@ const RESELLER_PROVIDER_PREFIXES: &[&str] = &[
 // id whose only fuzzy-eligible remnant after suffix stripping is the word
 // `model` (e.g. `model-zero-usage-v1` -> stripped `model`) misprices at the
 // router key's rate. See `fuzzy_match_does_not_resolve_generic_model_token`.
+//
+// This list is deliberately not mirrored into `GENERIC_ROUTING_LABELS`. The two
+// answer different questions: this one is about what a *stripped remnant* may
+// fuzzy-match, that one is about ids a client reports *verbatim*. `claude`,
+// `anthropic`, `gemini`, `model` and `router` are blocked here without a table
+// entry for the same reason. An id that lands here without one is submitted at
+// zero cost and reported as a model with no published price — which is the
+// right message: unlike `auto`, a bare family token is one a user can pin down
+// in `custom-pricing.json` if a client ever reports it as a model id.
 const FUZZY_BLOCKLIST: &[&str] = &[
     "auto",
     "mini",

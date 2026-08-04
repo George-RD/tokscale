@@ -3089,18 +3089,29 @@ const ANY_PROVIDER: &str = "*";
 /// names something real, so the user can add a `custom-pricing.json` entry or
 /// have the price published. Both classes submit at zero cost; only the reason
 /// differs.
+///
+/// The provider column is compared literally. Provider segments that went
+/// through `canonicalize_provider_segment` are lowercased with dashes replaced
+/// by underscores, so an entry written with a dash can silently match nothing —
+/// write the underscored form, or use `ANY_PROVIDER` when the label is generic
+/// whoever reports it.
 const GENERIC_ROUTING_LABELS: &[(&str, &str)] = &[
     // Antigravity's Gemini CLI records the routed family, not the model.
     ("google", "gemini-default"),
-    // Antigravity, when the client could not resolve the turn's model (#1035).
-    ("antigravity", "unknown"),
+    // A client that could not resolve the turn's model at all (#1035). Which
+    // provider it reports alongside is incidental — the model is unknown either
+    // way.
+    (ANY_PROVIDER, "unknown"),
     // "Auto" model pickers resolve server-side, and the bare label is emitted
-    // by every client that offers one — Cursor (#1013), Kiro, Copilot,
-    // WorkBuddy — so pinning it to a single provider would leave the rest
-    // aborting their submissions.
+    // by every client that offers one — Cursor (#1013), Copilot, WorkBuddy —
+    // and Kiro uses it as its literal unknown-model placeholder. Pinning it to
+    // one provider would leave the rest unexplained.
     (ANY_PROVIDER, "auto"),
     // Codex picks the reviewer model for `codex review` server-side (#1013).
-    ("openai", "codex-auto-review"),
+    // Not pinned to `openai`: the Codex parser takes the provider from the
+    // session's `model_provider` verbatim, so a user on Azure reports
+    // `azure/codex-auto-review` and would otherwise miss this table.
+    (ANY_PROVIDER, "codex-auto-review"),
 ];
 
 fn is_generic_routing_label(provider_id: &str, model_id: &str) -> bool {
@@ -8703,6 +8714,13 @@ mod tests {
                 label("cursor", "cursor", "auto"),
                 label("copilot", "github-copilot", "auto"),
                 label("codex", "openai", "codex-auto-review"),
+                // The Codex parser takes the provider from the session's
+                // `model_provider` verbatim, so the same reviewer label arrives
+                // under whatever provider the user configured.
+                label("codex", "azure", "codex-auto-review"),
+                // And a client that could not resolve its model reports
+                // `unknown` under its own provider id, not antigravity's.
+                label("copilot", "github-copilot", "unknown"),
                 concrete,
             ],
             Some(&pricing),
@@ -8712,8 +8730,8 @@ mod tests {
         )
         .expect("generic routing labels must not block fully priced submission usage");
 
-        // Five labels at 18 tokens each, plus the priced row.
-        assert_eq!(graph.summary.total_tokens, 103);
+        // Seven labels at 18 tokens each, plus the priced row.
+        assert_eq!(graph.summary.total_tokens, 139);
         assert_eq!(graph.summary.total_cost, 13e-6);
         let reported: Vec<(String, String)> = graph
             .unpriced_submission_usage
@@ -8724,11 +8742,20 @@ mod tests {
             reported,
             vec![
                 ("antigravity".to_string(), "unknown".to_string()),
+                ("azure".to_string(), "codex-auto-review".to_string()),
                 ("cursor".to_string(), "auto".to_string()),
                 ("github-copilot".to_string(), "auto".to_string()),
+                ("github-copilot".to_string(), "unknown".to_string()),
                 ("google".to_string(), "gemini-default".to_string()),
                 ("openai".to_string(), "codex-auto-review".to_string()),
             ]
+        );
+        assert!(
+            graph
+                .unpriced_submission_usage
+                .iter()
+                .all(|row| row.cause == UnpricedUsageCause::GenericRoutingLabel),
+            "every id in the table is a routing label, not a model a user can price"
         );
         assert!(graph
             .unpriced_submission_usage
