@@ -25,6 +25,7 @@ struct ReasonixStat {
     reasoning: i64,
     #[serde(default)]
     cache_hit: i64,
+    cache_miss: Option<i64>,
     #[serde(default)]
     total: i64,
     #[serde(default)]
@@ -36,16 +37,8 @@ struct ReasonixStat {
 fn split_model_ref(model_ref: &str) -> (String, String) {
     let model_ref = model_ref.trim();
     if let Some((provider, model)) = model_ref.split_once('/') {
-        // Reasonix may label an upstream model with its OpenCode-compatible
-        // routing surface. Preserve the real provider for pricing/grouping.
-        if matches!(provider, "opencode" | "openrouter" | "router") {
-            if let Some(inferred) = inferred_provider_from_model(model) {
-                return (inferred.to_string(), model.to_string());
-            }
-        }
-        if let Some(provider) = canonical_provider(provider) {
-            return (provider, model.to_string());
-        }
+        let provider = canonical_provider(provider).unwrap_or_else(|| provider.to_string());
+        return (provider, model.to_string());
     }
     let provider = inferred_provider_from_model(model_ref)
         .unwrap_or("reasonix")
@@ -68,17 +61,23 @@ pub fn parse_reasonix_file(path: &Path) -> Vec<UnifiedMessage> {
         .filter_map(|(line_index, line)| {
             let line = line.ok()?;
             let record: ReasonixStat = serde_json::from_str(line.trim()).ok()?;
-            if record.turn || record.model.trim().is_empty() || record.total <= 0 {
+            if record.turn
+                || record.model.trim().is_empty()
+                || (record.total <= 0 && record.requests <= 0)
+            {
                 return None;
             }
             let timestamp = parse_timestamp_value(&record.ts)?;
             let (provider_id, model_id) = split_model_ref(&record.model);
             let cache_read = non_negative(record.cache_hit);
             let raw_input = non_negative(record.prompt);
-            // Cache misses may be reported independently of the prompt
-            // total, so they must not replace ordinary input. Preserve the
-            // complete request total by subtracting only cache hits.
-            let input = raw_input.saturating_sub(cache_read);
+            // An explicit nonzero cache miss is Reasonix's authoritative
+            // ordinary-input bucket. Older records omit it, so derive that
+            // bucket from prompt tokens and cache hits in that case.
+            let input = match record.cache_miss {
+                Some(cache_miss) if cache_miss != 0 => non_negative(cache_miss),
+                _ => raw_input.saturating_sub(cache_read),
+            };
             let reasoning = non_negative(record.reasoning).min(non_negative(record.completion));
             let tokens = TokenBreakdown {
                 input,
@@ -87,10 +86,6 @@ pub fn parse_reasonix_file(path: &Path) -> Vec<UnifiedMessage> {
                 cache_write: 0,
                 reasoning,
             };
-            if tokens.total() <= 0 {
-                return None;
-            }
-
             let mut message = UnifiedMessage::new_with_dedup(
                 "reasonix",
                 model_id,
@@ -124,7 +119,7 @@ mod tests {
         std::fs::write(
             file.path(),
             concat!(
-                "{\"ts\":\"2026-08-04T09:10:11Z\",\"model\":\"opencode/deepseek-v4\",\"prompt\":100,\"completion\":20,\"reasoning\":5,\"cache_hit\":30,\"cache_miss\":10,\"total\":120,\"requests\":1}\n",
+                "{\"ts\":\"2026-08-04T09:10:11Z\",\"model\":\"opencode/deepseek-v4\",\"prompt\":100,\"completion\":20,\"reasoning\":5,\"cache_hit\":30,\"cache_miss\":70,\"total\":120,\"requests\":1}\n",
                 "{\"ts\":\"2026-08-04T09:11:11Z\",\"turn\":true}\n",
             ),
         )
@@ -134,7 +129,7 @@ mod tests {
         assert_eq!(messages.len(), 1);
         let message = &messages[0];
         assert_eq!(message.client, "reasonix");
-        assert_eq!(message.provider_id, "deepseek");
+        assert_eq!(message.provider_id, "opencode");
         assert_eq!(message.model_id, "deepseek-v4");
         assert_eq!(message.tokens.input, 70);
         assert_eq!(message.tokens.output, 15);
@@ -171,13 +166,17 @@ mod tests {
             ("deepseek".into(), "chat".into())
         );
         assert_eq!(
+            split_model_ref("openrouter/google/gemini-2.5-pro"),
+            ("openrouter".into(), "google/gemini-2.5-pro".into())
+        );
+        assert_eq!(
             split_model_ref("claude-sonnet-4"),
             ("anthropic".into(), "claude-sonnet-4".into())
         );
     }
 
     #[test]
-    fn preserves_totals_when_cache_miss_disagrees_with_prompt_input() {
+    fn preserves_explicit_cache_miss_when_it_disagrees_with_prompt_input() {
         let file = NamedTempFile::new().unwrap();
         std::fs::write(
             file.path(),
@@ -187,8 +186,23 @@ mod tests {
 
         let messages = parse_reasonix_file(file.path());
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].tokens.input, 70);
+        assert_eq!(messages[0].tokens.input, 10);
         assert_eq!(messages[0].tokens.cache_read, 30);
+        assert_eq!(messages[0].tokens.total(), 60);
+    }
+
+    #[test]
+    fn falls_back_to_prompt_minus_cache_hit_when_cache_miss_is_absent() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            "{\"ts\":\"2026-08-04T09:10:11Z\",\"model\":\"deepseek/chat\",\"prompt\":100,\"completion\":20,\"cache_hit\":30,\"total\":120}\n",
+        )
+        .unwrap();
+
+        let messages = parse_reasonix_file(file.path());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 70);
         assert_eq!(messages[0].tokens.total(), 120);
     }
 
@@ -213,5 +227,23 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3, 1, i32::MAX]
         );
+    }
+
+    #[test]
+    fn preserves_tokenless_request_counts_but_skips_plain_zero_rows() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            concat!(
+                "{\"ts\":\"2026-08-04T09:10:11Z\",\"model\":\"deepseek/chat\",\"total\":0,\"requests\":2}\n",
+                "{\"ts\":\"2026-08-04T09:11:11Z\",\"model\":\"deepseek/chat\",\"total\":0}\n",
+            ),
+        )
+        .unwrap();
+
+        let messages = parse_reasonix_file(file.path());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.total(), 0);
+        assert_eq!(messages[0].message_count, 2);
     }
 }
