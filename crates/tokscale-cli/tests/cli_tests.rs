@@ -3600,10 +3600,10 @@ fn test_submit_reports_generic_routing_label_usage_at_zero_cost() {
         .stdout(predicate::str::contains("No usage data found to submit.").not());
 }
 
-/// Unpriced usage is submitted at zero cost by default; `--prune-unpriced`
-/// leaves it out, which here empties the submission.
+/// Unpriced usage is submitted at zero cost by default; `--strict-pricing` is
+/// the opt-in that fails the submission instead.
 #[test]
-fn test_submit_prunes_concrete_unpriced_models_only_when_asked() {
+fn test_submit_fails_fast_on_unpriced_usage_only_with_strict_pricing() {
     let tmp = create_empty_fixture_dir();
     let message_dir = tmp
         .path()
@@ -3640,13 +3640,14 @@ fn test_submit_prunes_concrete_unpriced_models_only_when_asked() {
             "--client",
             "opencode",
             "--dry-run",
-            "--prune-unpriced",
+            "--strict-pricing",
         ])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "no token-bearing usage found to submit",
-        ));
+            "unknown_provider/genuinely-unpriced-model",
+        ))
+        .stderr(predicate::str::contains("--strict-pricing"));
 }
 // ── gjc client filter tests ────────────────────────────────────────────────
 

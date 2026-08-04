@@ -503,8 +503,8 @@ pub struct GraphResult {
 /// Token-bearing usage nothing can price, aggregated per (provider, model).
 /// The tokens are submitted with a cost of exactly 0.0 — a token leaderboard
 /// measures tokens, and no price is invented for them — and this is what the
-/// CLI reports so the zeros are never silent. Under `--prune-unpriced` the same
-/// rows are left out entirely instead.
+/// CLI reports so the zeros are never silent. Under `--strict-pricing` such a
+/// row fails the submission instead and this report stays empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnpricedSubmissionUsage {
     pub provider_id: String,
@@ -2961,12 +2961,19 @@ pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, S
 #[derive(Clone, Copy)]
 enum GraphPricingRequirement {
     Lenient,
-    Submission {
-        /// Leave unpriced usage out of the submission instead of submitting it
-        /// at zero cost. Opt-in, because such a row names tokens that really
-        /// ran: dropping it by default would delete real usage.
-        prune_unpriced: bool,
-    },
+    Submission(SubmissionPricingMode),
+}
+
+/// What a submission does when nothing can price some of its usage.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SubmissionPricingMode {
+    /// Submit those tokens with a cost of exactly 0.0 and report them. The
+    /// default: the tokens are real, and the alternative is deleting usage or
+    /// blocking a whole batch over an id nobody publishes a price for.
+    ReportUnpriced,
+    /// Fail the submission instead, for a user who wants a cost-complete
+    /// submission or none at all (`--strict-pricing`).
+    Strict,
 }
 
 async fn generate_graph_with_loaded_pricing(
@@ -3018,25 +3025,20 @@ fn build_graph_from_messages(
 ) -> Result<GraphResult, String> {
     let (filtered, unpriced_submission_usage) = match pricing_requirement {
         GraphPricingRequirement::Lenient => (filtered, Vec::new()),
-        GraphPricingRequirement::Submission { prune_unpriced } => {
+        GraphPricingRequirement::Submission(mode) => {
             // Without pricing data every row would look unpriced, so a whole
             // submission would silently go out at zero cost. That is a loading
             // failure, not a fact about the usage.
             let pricing = pricing.ok_or("pricing data is unavailable for submission")?;
-            let action = if prune_unpriced {
-                UnpricedSubmissionAction::Drop
-            } else {
-                UnpricedSubmissionAction::SubmitAtZeroCost
+            let (submitted, unpriced) = match mode {
+                SubmissionPricingMode::Strict => {
+                    validate_priced_messages(&filtered, Some(pricing))?;
+                    (filtered, Vec::new())
+                }
+                SubmissionPricingMode::ReportUnpriced => {
+                    zero_cost_unpriced_submission_messages(filtered, pricing)
+                }
             };
-            let (submitted, unpriced) =
-                resolve_unpriced_submission_messages(filtered, pricing, action);
-            if action == UnpricedSubmissionAction::Drop {
-                // Post-condition on the drop pass: nothing unpriced may survive
-                // it. The two predicates are separate code paths, and a row
-                // that slipped through would be submitted at a cost nothing
-                // published.
-                validate_priced_messages(&submitted, Some(pricing))?;
-            }
             if !submitted.iter().any(|message| message.tokens.total() > 0) {
                 return Err(EMPTY_SUBMISSION_ERROR.to_string());
             }
@@ -3108,17 +3110,6 @@ fn is_generic_routing_label(provider_id: &str, model_id: &str) -> bool {
     })
 }
 
-/// What a submission does with a token-bearing row nothing can price.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum UnpricedSubmissionAction {
-    /// Submit the tokens with a cost of exactly 0.0. The default: the tokens
-    /// are real and a token leaderboard counts them, while the cost stays a
-    /// number nobody made up.
-    SubmitAtZeroCost,
-    /// Leave the row out of the submission entirely (`--prune-unpriced`).
-    Drop,
-}
-
 /// True when nothing can put a price on this row's tokens. `covers_usage` is
 /// all-or-nothing per token bucket, so this also catches a model that does
 /// publish a price but has no rate for one of the buckets the row used.
@@ -3147,13 +3138,12 @@ fn unpriced_usage_cause(message: &UnifiedMessage) -> UnpricedUsageCause {
     }
 }
 
-/// Applies `action` to every token-bearing row nothing can price and reports
+/// Zeroes the cost of every token-bearing row nothing can price and reports
 /// them aggregated per (provider, model), so a real submission names a handful
 /// of ids rather than printing one line per message.
-fn resolve_unpriced_submission_messages(
+fn zero_cost_unpriced_submission_messages(
     messages: Vec<UnifiedMessage>,
     pricing: &pricing::PricingService,
-    action: UnpricedSubmissionAction,
 ) -> (Vec<UnifiedMessage>, Vec<UnpricedSubmissionUsage>) {
     let mut submitted = Vec::with_capacity(messages.len());
     let mut unpriced: std::collections::BTreeMap<
@@ -3173,14 +3163,12 @@ fn resolve_unpriced_submission_messages(
         entry.0 += 1;
         entry.1 = entry.1.saturating_add(message.tokens.total());
 
-        if action == UnpricedSubmissionAction::SubmitAtZeroCost {
-            // Zeroed rather than left as-is: `covers_usage` fails per bucket,
-            // so a partially priced row can still carry a cost that prices some
-            // of its tokens and not others. Submitting that would understate
-            // spend with a number that looks authoritative.
-            message.cost = 0.0;
-            submitted.push(message);
-        }
+        // Zeroed rather than left as-is: `covers_usage` fails per bucket, so a
+        // partially priced row can still carry a cost that prices some of its
+        // tokens and not others. Submitting that would understate spend with a
+        // number that looks authoritative.
+        message.cost = 0.0;
+        submitted.push(message);
     }
 
     let unpriced = unpriced
@@ -3245,22 +3233,15 @@ pub async fn generate_graph(options: ReportOptions) -> Result<GraphResult, Strin
         .await
 }
 
-pub async fn generate_submission_graph(options: ReportOptions) -> Result<GraphResult, String> {
-    generate_submission_graph_with_pruning(options, false).await
-}
-
-/// `prune_unpriced` leaves usage nothing can price out of the submission
-/// instead of submitting it at zero cost. Callers pass `false` unless the user
-/// asked for it.
-pub async fn generate_submission_graph_with_pruning(
+pub async fn generate_submission_graph(
     options: ReportOptions,
-    prune_unpriced: bool,
+    mode: SubmissionPricingMode,
 ) -> Result<GraphResult, String> {
     let pricing = pricing::PricingService::get_or_init().await?;
     generate_graph_with_loaded_pricing(
         options,
         Some(&pricing),
-        GraphPricingRequirement::Submission { prune_unpriced },
+        GraphPricingRequirement::Submission(mode),
     )
     .await
 }
@@ -3321,8 +3302,11 @@ fn validate_priced_messages(
         .collect::<Vec<String>>()
         .join(", ");
 
+    // Only reachable under --strict-pricing, so the way out is to stop asking
+    // for it: the same usage submits at $0.00 by default.
     Err(format!(
-        "pricing is unavailable for submitted token usage: {summary}"
+        "--strict-pricing: no published price covers this submitted token usage: {summary}. \
+         Re-run without --strict-pricing to submit these tokens at $0.00."
     ))
 }
 
@@ -4448,9 +4432,9 @@ mod tests {
         normalize_model_for_grouping, parse_all_messages_with_pricing_with_env_strategy,
         parse_local_clients, parsed_to_unified, paths, pricing, retain_for_requested_clients,
         scanner, select_local_parse_pricing, unified_to_parsed, validate_priced_messages, ClientId,
-        GraphPricingRequirement, GroupBy, LocalParseOptions, ReportOptions, TokenBreakdown,
-        UnifiedMessage, UnpricedSubmissionUsage, UnpricedUsageCause, EMPTY_SUBMISSION_ERROR,
-        UNKNOWN_WORKSPACE_LABEL,
+        GraphPricingRequirement, GroupBy, LocalParseOptions, ReportOptions, SubmissionPricingMode,
+        TokenBreakdown, UnifiedMessage, UnpricedSubmissionUsage, UnpricedUsageCause,
+        EMPTY_SUBMISSION_ERROR, UNKNOWN_WORKSPACE_LABEL,
     };
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
@@ -8425,9 +8409,7 @@ mod tests {
         let submission = build_graph_from_messages(
             vec![message],
             Some(&pricing),
-            GraphPricingRequirement::Submission {
-                prune_unpriced: false,
-            },
+            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8466,9 +8448,7 @@ mod tests {
         let graph = build_graph_from_messages(
             vec![message],
             Some(&pricing),
-            GraphPricingRequirement::Submission {
-                prune_unpriced: false,
-            },
+            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8511,9 +8491,7 @@ mod tests {
         let graph = build_graph_from_messages(
             vec![message],
             Some(&pricing),
-            GraphPricingRequirement::Submission {
-                prune_unpriced: false,
-            },
+            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8573,9 +8551,7 @@ mod tests {
         let graph = build_graph_from_messages(
             vec![unpriced, priced],
             Some(&pricing),
-            GraphPricingRequirement::Submission {
-                prune_unpriced: false,
-            },
+            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8607,9 +8583,7 @@ mod tests {
         let error = build_graph_from_messages(
             vec![cost_only],
             Some(&pricing),
-            GraphPricingRequirement::Submission {
-                prune_unpriced: false,
-            },
+            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8658,9 +8632,7 @@ mod tests {
         let graph = build_graph_from_messages(
             vec![generic, concrete],
             Some(&pricing),
-            GraphPricingRequirement::Submission {
-                prune_unpriced: false,
-            },
+            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8734,9 +8706,7 @@ mod tests {
                 concrete,
             ],
             Some(&pricing),
-            GraphPricingRequirement::Submission {
-                prune_unpriced: false,
-            },
+            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8787,9 +8757,7 @@ mod tests {
         let graph = build_graph_from_messages(
             vec![message],
             Some(&pricing),
-            GraphPricingRequirement::Submission {
-                prune_unpriced: false,
-            },
+            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8823,9 +8791,7 @@ mod tests {
         let graph = build_graph_from_messages(
             vec![message],
             Some(&pricing),
-            GraphPricingRequirement::Submission {
-                prune_unpriced: false,
-            },
+            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8836,10 +8802,10 @@ mod tests {
         assert_eq!(graph.summary.total_cost, 0.25);
     }
 
-    // Unpriced usage is submitted at zero cost by default; `--prune-unpriced`
-    // is the opt-in that leaves it out of the submission entirely.
+    // Unpriced usage is submitted at zero cost by default; `--strict-pricing`
+    // is the opt-in for a user who wants a cost-complete submission or none.
     #[test]
-    fn submission_prunes_unpriced_models_only_when_requested() {
+    fn submission_strict_pricing_fails_fast_on_unpriced_usage() {
         let mut litellm = HashMap::new();
         litellm.insert(
             "gpt-4o".to_string(),
@@ -8877,34 +8843,17 @@ mod tests {
             ),
         ];
 
-        let kept = build_graph_from_messages(
+        let reported = build_graph_from_messages(
             messages.clone(),
             Some(&pricing),
-            GraphPricingRequirement::Submission {
-                prune_unpriced: false,
-            },
+            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
-        .expect("pruning must stay opt-in");
-        assert_eq!(kept.summary.total_tokens, 19);
-
-        let graph = build_graph_from_messages(
-            messages,
-            Some(&pricing),
-            GraphPricingRequirement::Submission {
-                prune_unpriced: true,
-            },
-            std::time::Instant::now(),
-            &crate::bucket_tz::BucketTimezone::Local,
-        )
-        .expect("pruning submits everything that is priced");
-
-        assert_eq!(graph.summary.total_tokens, 13);
-        assert_eq!(graph.contributions[0].clients.len(), 1);
-        assert_eq!(graph.contributions[0].clients[0].model_id, "gpt-4o");
+        .expect("failing fast must stay opt-in");
+        assert_eq!(reported.summary.total_tokens, 19);
         assert_eq!(
-            graph.unpriced_submission_usage,
+            reported.unpriced_submission_usage,
             vec![UnpricedSubmissionUsage {
                 provider_id: "friendli".to_string(),
                 model_id: "K-EXAONE-236B-A23B".to_string(),
@@ -8913,11 +8862,27 @@ mod tests {
                 cause: UnpricedUsageCause::NoPublishedPrice,
             }]
         );
+
+        let error = build_graph_from_messages(
+            messages,
+            Some(&pricing),
+            GraphPricingRequirement::Submission(SubmissionPricingMode::Strict),
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect_err("strict pricing rejects a batch it cannot fully price");
+
+        assert!(error.contains("friendli/K-EXAONE-236B-A23B"), "{error}");
+        assert!(
+            error.contains("--strict-pricing"),
+            "the rejection must name the flag that caused it: {error}"
+        );
     }
 
-    // Pruning drops usage nothing can price, not usage the client priced.
+    // Strict pricing rejects usage nothing can price, not usage the client
+    // priced: a client-reported cost is a price, just not one from a table.
     #[test]
-    fn submission_pruning_keeps_client_reported_costs() {
+    fn submission_strict_pricing_accepts_client_reported_costs() {
         let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
         let mut message = UnifiedMessage::new(
             "cursor",
@@ -8936,9 +8901,7 @@ mod tests {
         let graph = build_graph_from_messages(
             vec![message],
             Some(&pricing),
-            GraphPricingRequirement::Submission {
-                prune_unpriced: true,
-            },
+            GraphPricingRequirement::Submission(SubmissionPricingMode::Strict),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8971,9 +8934,7 @@ mod tests {
         let graph = build_graph_from_messages(
             vec![message],
             Some(&pricing),
-            GraphPricingRequirement::Submission {
-                prune_unpriced: false,
-            },
+            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )

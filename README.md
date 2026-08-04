@@ -522,8 +522,10 @@ tokscale submit --client opencode,claude --since 2024-01-01
 # Preview what would be submitted (dry run)
 tokscale submit --dry-run
 
-# Drop usage from models with no published price instead of aborting
-tokscale submit --prune-unpriced
+# Usage that no published price covers — a routing label like `auto`, a model
+# nothing prices, or a model priced for some token buckets but not the ones it
+# used — is submitted at $0.00 and reported. Fail the submission instead:
+tokscale submit --strict-pricing
 
 # Logout
 tokscale logout

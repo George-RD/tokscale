@@ -520,8 +520,10 @@ tokscale submit --client opencode,claude --since 2024-01-01
 # 제출될 내용 미리보기 (드라이 런)
 tokscale submit --dry-run
 
-# 가격 정보가 없는 모델의 사용량은 중단하지 말고 제외하고 제출
-tokscale submit --prune-unpriced
+# 공개 가격으로 계산할 수 없는 사용량(`auto` 같은 라우팅 라벨, 가격이 공개되지 않은
+# 모델, 사용한 토큰 종류의 가격만 없는 모델)은 기본적으로 $0.00으로 제출되고 경고로
+# 보고됩니다. 그렇게 하는 대신 제출 전체를 실패시키려면:
+tokscale submit --strict-pricing
 
 # 로그아웃
 tokscale logout

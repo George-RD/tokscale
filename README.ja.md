@@ -524,8 +524,10 @@ tokscale submit --client opencode,claude --since 2024-01-01
 # 送信内容をプレビュー（ドライラン）
 tokscale submit --dry-run
 
-# 価格情報がないモデルの使用量は中止せず除外して送信
-tokscale submit --prune-unpriced
+# 公開価格で計算できない使用量（`auto` などのルーティングラベル、価格が公開されて
+# いないモデル、使用したトークン種別の価格だけが欠けているモデル）は既定で $0.00 と
+# して送信され、警告として報告されます。代わりに送信全体を失敗させる場合:
+tokscale submit --strict-pricing
 
 # ログアウト
 tokscale logout

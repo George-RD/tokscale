@@ -520,8 +520,9 @@ tokscale submit --client opencode,claude --since 2024-01-01
 # 预览将要提交的内容（试运行）
 tokscale submit --dry-run
 
-# 排除没有公开定价的模型用量后继续提交，而不是中断
-tokscale submit --prune-unpriced
+# 没有公开定价可覆盖的用量（如 `auto` 这类路由标签、无公开价格的模型，或仅缺少所用
+# token 类型价格的模型）默认按 $0.00 提交并给出提示。若希望直接让整次提交失败：
+tokscale submit --strict-pricing
 
 # 登出
 tokscale logout

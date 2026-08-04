@@ -269,9 +269,9 @@ enum Commands {
         dry_run: bool,
         #[arg(
             long,
-            help = "Drop usage from models with no published price instead of aborting, and report what was dropped"
+            help = "Fail instead of submitting usage that no published price covers at $0.00 (also catches a model priced for some token buckets but not the ones it used)"
         )]
-        prune_unpriced: bool,
+        strict_pricing: bool,
     },
     #[command(about = "Manage periodic usage submission")]
     Autosubmit {
@@ -812,7 +812,7 @@ fn main() -> Result<()> {
             clients,
             date,
             dry_run,
-            prune_unpriced,
+            strict_pricing,
         }) => {
             reject_unsupported_home_override(&cli.home, "submit")?;
             let (since, until) = build_date_filter(&date, &cli.home);
@@ -823,15 +823,15 @@ fn main() -> Result<()> {
             // defaultClients view filter (which may exclude clients they still want
             // to upload). Pass an explicit empty defaults slice.
             let clients = build_client_filter_with_defaults(clients, &[]);
-            run_submit_command(
+            run_submit_command(SubmitCommandOptions {
                 clients,
                 since,
                 until,
                 year,
                 dry_run,
-                prune_unpriced,
-                SubmitMode::Interactive,
-            )
+                strict_pricing,
+                mode: SubmitMode::Interactive,
+            })
         }
         Some(Commands::Autosubmit { subcommand }) => {
             reject_unsupported_home_override(&cli.home, "autosubmit")?;
@@ -5500,17 +5500,9 @@ fn report_excluded_tokenless_rows(excluded: &[ExcludedTokenlessRow]) {
 /// The two causes get the same zero-cost treatment and different advice: a
 /// routing label can never have a price, while a concrete model without one is
 /// something the user can fix.
-fn format_unpriced_submission_warning(
-    row: &tokscale_core::UnpricedSubmissionUsage,
-    dropped: bool,
-) -> String {
+fn format_unpriced_submission_warning(row: &tokscale_core::UnpricedSubmissionUsage) -> String {
     use tokscale_core::UnpricedUsageCause;
 
-    let treatment = if dropped {
-        "excluded from this submission"
-    } else {
-        "submitted at $0.00"
-    };
     let explanation = match row.cause {
         UnpricedUsageCause::GenericRoutingLabel => {
             "this id names a routing decision rather than a model, so no price can exist for it"
@@ -5524,27 +5516,20 @@ fn format_unpriced_submission_warning(
     };
 
     format!(
-        "  Warning: {} unpriced {}/{} message(s) ({} tokens) {}: {}.",
+        "  Warning: {} unpriced {}/{} message(s) ({} tokens) submitted at $0.00: {}.",
         row.message_count,
         row.provider_id,
         row.model_id,
         format_tokens_with_commas(row.total_tokens),
-        treatment,
         explanation,
     )
 }
 
-fn report_unpriced_submission_usage(
-    unpriced: &[tokscale_core::UnpricedSubmissionUsage],
-    dropped: bool,
-) {
+fn report_unpriced_submission_usage(unpriced: &[tokscale_core::UnpricedSubmissionUsage]) {
     use colored::Colorize;
 
     for row in unpriced {
-        println!(
-            "{}",
-            format_unpriced_submission_warning(row, dropped).yellow()
-        );
+        println!("{}", format_unpriced_submission_warning(row).yellow());
     }
 }
 
@@ -5585,17 +5570,19 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
             };
 
             let (clients, since, until, year) = commands::autosubmit::submit_filters(&settings);
-            // Autosubmit stays strict: an unattended run must not silently
-            // start dropping usage the user never agreed to drop.
-            match run_submit_command(
+            // An unattended run reports unpriced usage the same way an
+            // interactive one does. Failing the run instead would leave a
+            // scheduled submission silently broken for weeks over one id
+            // nobody publishes a price for.
+            match run_submit_command(SubmitCommandOptions {
                 clients,
                 since,
                 until,
                 year,
-                false,
-                false,
-                SubmitMode::Autosubmit,
-            ) {
+                dry_run: false,
+                strict_pricing: false,
+                mode: SubmitMode::Autosubmit,
+            }) {
                 Ok(()) => {
                     commands::autosubmit::record_run_success(
                         chrono::Utc::now().timestamp_millis(),
@@ -5612,19 +5599,34 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
     }
 }
 
-fn run_submit_command(
+/// Named fields rather than a positional argument list: `dry_run` and
+/// `strict_pricing` are adjacent bools, and transposing them compiles clean
+/// while turning a dry run into a real submission.
+struct SubmitCommandOptions {
     clients: Option<Vec<String>>,
     since: Option<String>,
     until: Option<String>,
     year: Option<String>,
     dry_run: bool,
-    prune_unpriced: bool,
+    strict_pricing: bool,
     mode: SubmitMode,
-) -> Result<()> {
+}
+
+fn run_submit_command(options: SubmitCommandOptions) -> Result<()> {
     use colored::Colorize;
     use std::io::IsTerminal;
     use tokio::runtime::Runtime;
-    use tokscale_core::{generate_submission_graph_with_pruning, GroupBy, ReportOptions};
+    use tokscale_core::{generate_submission_graph, GroupBy, ReportOptions, SubmissionPricingMode};
+
+    let SubmitCommandOptions {
+        clients,
+        since,
+        until,
+        year,
+        dry_run,
+        strict_pricing,
+        mode,
+    } = options;
 
     let auth_token = match auth::resolve_api_token() {
         Some(token) => token,
@@ -5692,7 +5694,7 @@ fn run_submit_command(
     let rt = Runtime::new()?;
     let mut graph_result = rt
         .block_on(async {
-            generate_submission_graph_with_pruning(
+            generate_submission_graph(
                 ReportOptions {
                     home_dir: None,
                     use_env_roots: true,
@@ -5703,7 +5705,11 @@ fn run_submit_command(
                     group_by: GroupBy::default(),
                     scanner_settings: tui::settings::load_scanner_settings(),
                 },
-                prune_unpriced,
+                if strict_pricing {
+                    SubmissionPricingMode::Strict
+                } else {
+                    SubmissionPricingMode::ReportUnpriced
+                },
             )
             .await
         })
@@ -5717,7 +5723,7 @@ fn run_submit_command(
     // left out, so a single legacy charge can't block the whole submission.
     let excluded_rows = exclude_tokenless_cost_contributions(&mut graph_result);
     report_excluded_tokenless_rows(&excluded_rows);
-    report_unpriced_submission_usage(&graph_result.unpriced_submission_usage, prune_unpriced);
+    report_unpriced_submission_usage(&graph_result.unpriced_submission_usage);
 
     println!("{}", "  Data to submit:".white());
     println!(
@@ -6482,14 +6488,11 @@ mod tests {
     // warning must not send them looking for a price that cannot exist.
     #[test]
     fn generic_routing_label_warning_offers_no_remedy() {
-        let warning = format_unpriced_submission_warning(
-            &unpriced_row(
-                "amazon-bedrock",
-                "auto",
-                tokscale_core::UnpricedUsageCause::GenericRoutingLabel,
-            ),
-            false,
-        );
+        let warning = format_unpriced_submission_warning(&unpriced_row(
+            "amazon-bedrock",
+            "auto",
+            tokscale_core::UnpricedUsageCause::GenericRoutingLabel,
+        ));
 
         assert!(
             warning.contains(
@@ -6505,14 +6508,11 @@ mod tests {
     // only place the user learns which id to add.
     #[test]
     fn unpublished_price_warning_names_the_model_and_the_fix() {
-        let warning = format_unpriced_submission_warning(
-            &unpriced_row(
-                "friendli",
-                "K-EXAONE-236B-A23B",
-                tokscale_core::UnpricedUsageCause::NoPublishedPrice,
-            ),
-            false,
-        );
+        let warning = format_unpriced_submission_warning(&unpriced_row(
+            "friendli",
+            "K-EXAONE-236B-A23B",
+            tokscale_core::UnpricedUsageCause::NoPublishedPrice,
+        ));
 
         assert!(
             warning.contains(
