@@ -4441,3 +4441,228 @@ fn test_auto_pinning_does_not_shadow_a_legacy_settings_file_it_cannot_open() {
         "and the legacy file itself must be left alone"
     );
 }
+
+// ── zero-rate custom pricing override visibility ───────────────────────────
+//
+// The helpers below drive the real binary rather than the pure formatting
+// functions in main.rs, because those functions being correct says nothing
+// about whether anything calls them. Both of these fail if the call site that
+// wires them into `pricing list-overrides` or `submit` is removed.
+
+/// Write a `custom-pricing.json` covering the four cases the listing has to
+/// distinguish: fully free, free on one side only, fully priced except for a
+/// $0.00 cache-read rate, and fully priced.
+fn write_zero_rate_override_file(base: &Path) {
+    let config_dir = base.join(".config/tokscale");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("custom-pricing.json"),
+        r#"{
+            "models": {
+                "fully-free-model": {
+                    "input_cost_per_million_tokens": 0,
+                    "output_cost_per_million_tokens": 0
+                },
+                "free-input-paid-output": {
+                    "input_cost_per_million_tokens": 0,
+                    "output_cost_per_million_tokens": 15.00
+                },
+                "hidden-free-cache-read": {
+                    "input_cost_per_million_tokens": 15.00,
+                    "output_cost_per_million_tokens": 75.00,
+                    "cache_read_input_token_cost_per_million_tokens": 0
+                },
+                "fully-priced-model": {
+                    "input_cost_per_million_tokens": 2.00,
+                    "output_cost_per_million_tokens": 8.00
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_pricing_list_overrides_names_zero_rates_it_finds() {
+    let tmp = create_empty_fixture_dir();
+    write_zero_rate_override_file(tmp.path());
+
+    let output = cmd_with_home(tmp.path())
+        .args(["pricing", "list-overrides"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("fully-free-model (declared free: $0.00)"),
+        "a model with every declared rate at $0.00 is free: {stdout}"
+    );
+    assert!(
+        stdout.contains("free-input-paid-output (declared $0.00: input)"),
+        "output bills $15.00/1M, so only the input rate may be called free: {stdout}"
+    );
+    assert!(
+        !stdout.contains("free-input-paid-output (declared free"),
+        "a half-free override must never be labelled a free model: {stdout}"
+    );
+    assert!(
+        stdout.contains("hidden-free-cache-read (declared $0.00: cache read)"),
+        "a $0.00 cache-read rate is the highest-leverage zero and must be named: {stdout}"
+    );
+    assert!(
+        !stdout.contains("fully-priced-model (declared"),
+        "a fully priced override carries no marker: {stdout}"
+    );
+}
+
+#[test]
+fn test_pricing_list_overrides_json_reports_zero_rates_it_finds() {
+    let tmp = create_empty_fixture_dir();
+    write_zero_rate_override_file(tmp.path());
+
+    let output = cmd_with_home(tmp.path())
+        .args(["pricing", "list-overrides", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    let entry = |model_id: &str| -> serde_json::Value {
+        json["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["modelId"] == model_id)
+            .unwrap_or_else(|| panic!("{model_id} missing from listing"))
+            .clone()
+    };
+
+    assert_eq!(
+        entry("fully-free-model")["zeroRateFields"],
+        serde_json::json!(["input", "output"])
+    );
+    assert_eq!(
+        entry("fully-free-model")["declaresFreeModel"],
+        serde_json::json!(true)
+    );
+
+    assert_eq!(
+        entry("free-input-paid-output")["zeroRateFields"],
+        serde_json::json!(["input"])
+    );
+    assert_eq!(
+        entry("free-input-paid-output")["declaresFreeModel"],
+        serde_json::json!(false),
+        "an override that bills $15.00/1M on output does not declare a free model"
+    );
+
+    assert_eq!(
+        entry("hidden-free-cache-read")["zeroRateFields"],
+        serde_json::json!(["cache read"])
+    );
+
+    assert_eq!(
+        entry("fully-priced-model")["zeroRateFields"],
+        serde_json::json!([]),
+        "both fields stay present when nothing is zeroed so a consumer can tell \
+         them apart from an older build that never emitted them"
+    );
+    assert_eq!(
+        entry("fully-priced-model")["declaresFreeModel"],
+        serde_json::json!(false)
+    );
+}
+
+#[test]
+fn test_submit_dry_run_names_zero_rate_override_on_submitted_model() {
+    let tmp = create_empty_fixture_dir();
+    write_zero_rate_override_file(tmp.path());
+
+    let session = tmp
+        .path()
+        .join(".local/share/opencode/storage/message/session1");
+    fs::create_dir_all(&session).unwrap();
+    // 500M cache-read tokens priced at the override's $0.00: about $750 of
+    // real Opus spend that never reaches the leaderboard.
+    fs::write(
+        session.join("msg_cache_read.json"),
+        r#"{
+            "id": "msg_cache_read",
+            "sessionID": "session1",
+            "role": "assistant",
+            "modelID": "hidden-free-cache-read",
+            "providerID": "anthropic",
+            "tokens": {
+                "input": 1000,
+                "output": 500,
+                "reasoning": 0,
+                "cache": { "read": 500000000, "write": 0 }
+            },
+            "time": { "created": 1736510400000.0 }
+        }"#,
+    )
+    .unwrap();
+
+    let output = cmd_with_home(tmp.path())
+        .env("TOKSCALE_API_TOKEN", "test-token")
+        .args(["submit", "--client", "opencode", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("custom-pricing.json sets $0.00 rates for 1 model(s)"),
+        "submit must warn before it prints the totals: {stdout}"
+    );
+    assert!(
+        stdout.contains("hidden-free-cache-read (declared $0.00: cache read)"),
+        "the warning must name the model and the rate it zeroes: {stdout}"
+    );
+    assert!(
+        !stdout.contains("declared free"),
+        "input and output are priced, so this model is not free: {stdout}"
+    );
+}
+
+#[test]
+fn test_submit_dry_run_is_quiet_without_zero_rate_overrides() {
+    let tmp = create_empty_fixture_dir();
+    write_zero_rate_override_file(tmp.path());
+
+    let session = tmp
+        .path()
+        .join(".local/share/opencode/storage/message/session1");
+    fs::create_dir_all(&session).unwrap();
+    fs::write(
+        session.join("msg_priced.json"),
+        r#"{
+            "id": "msg_priced",
+            "sessionID": "session1",
+            "role": "assistant",
+            "modelID": "fully-priced-model",
+            "providerID": "anthropic",
+            "tokens": {
+                "input": 1000,
+                "output": 500,
+                "reasoning": 0,
+                "cache": { "read": 0, "write": 0 }
+            },
+            "time": { "created": 1736510400000.0 }
+        }"#,
+    )
+    .unwrap();
+
+    cmd_with_home(tmp.path())
+        .env("TOKSCALE_API_TOKEN", "test-token")
+        .args(["submit", "--client", "opencode", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("custom-pricing.json sets $0.00").not());
+}
