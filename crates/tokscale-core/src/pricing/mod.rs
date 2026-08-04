@@ -31,10 +31,15 @@ static PRICING_SERVICE: OnceCell<Arc<PricingService>> = OnceCell::const_new();
 /// `openai/gpt-5.2` row. That is an OpenAI passthrough quote, not what a
 /// Copilot subscriber is billed under AI Credits.
 ///
-/// Withholding a price is the conservative failure mode: an unpriced row is
-/// excluded from submission and reported to the user, whereas a wrongly priced
-/// row silently corrupts a public spend leaderboard. This mirrors the reasoning
-/// that leaves Sakana's `fugu` router unpriced in `build_sakana_overrides`.
+/// Withholding a price is the conservative failure mode, but only because
+/// `exclude_generic_unpriced_submission_messages` pairs this refusal with an
+/// exclusion arm keyed on the same predicate: the row is dropped from the
+/// submission and reported, instead of reaching `validate_priced_messages` and
+/// erroring the whole submission. A wrongly priced row, by contrast, silently
+/// corrupts a public spend leaderboard. Do not add an id here without checking
+/// that pairing still holds — an unpriced id with no exclusion arm blocks
+/// submission entirely. This mirrors the reasoning that leaves Sakana's `fugu`
+/// router unpriced in `build_sakana_overrides`.
 ///
 /// GitHub's rate table:
 /// <https://raw.githubusercontent.com/github/docs/main/data/tables/copilot/models-and-pricing.yml>
@@ -90,7 +95,7 @@ const REASONING_TIER_SUFFIXES: &[&str] = &[
 /// must EQUAL one of the two ids, so the other 27 `github-copilot/*` entries —
 /// and ids like `gpt-5.2-codex-max` that GitHub may yet publish a rate for —
 /// keep pricing normally.
-fn is_copilot_vendor_passthrough(model_id: &str, provider_id: Option<&str>) -> bool {
+pub(crate) fn is_copilot_vendor_passthrough(model_id: &str, provider_id: Option<&str>) -> bool {
     let lower = model_id.trim().to_lowercase();
     let scoped_by_key =
         lower.starts_with("github-copilot/") || lower.starts_with("github_copilot/");

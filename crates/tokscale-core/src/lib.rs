@@ -3030,6 +3030,20 @@ fn build_graph_from_messages(
 const GEMINI_DEFAULT_UNPRICED_REASON: &str =
     "generic routing label has no authoritative model-to-price mapping";
 
+/// Why the Copilot vendor-passthrough ids are dropped from a submission rather
+/// than aborting it.
+///
+/// `pricing::is_copilot_vendor_passthrough` withholds a price for these on
+/// purpose (GitHub publishes no Copilot rate, and the only rate anyone
+/// publishes is an OpenAI passthrough quote). Without an exclusion arm that
+/// deliberate refusal would reach `validate_priced_messages`, which errors the
+/// entire submission on any unpriced token-bearing message — turning "submits
+/// at a wrong price" into "cannot submit at all" for every Copilot gpt-5.2
+/// user. That is a worse outcome than the mispricing, so these rows are
+/// excluded and reported, exactly as the generic Gemini routing label is.
+const COPILOT_VENDOR_PASSTHROUGH_UNPRICED_REASON: &str =
+    "GitHub publishes no Copilot rate for this model and the only published rate is an upstream vendor passthrough";
+
 fn exclude_generic_unpriced_submission_messages(
     messages: Vec<UnifiedMessage>,
     pricing: Option<&pricing::PricingService>,
@@ -3039,24 +3053,41 @@ fn exclude_generic_unpriced_submission_messages(
     };
 
     let mut submitted = Vec::with_capacity(messages.len());
-    let mut exclusions: std::collections::BTreeMap<(String, String), (usize, i64)> =
+    let mut exclusions: std::collections::BTreeMap<(String, String), (usize, i64, &'static str)> =
         std::collections::BTreeMap::new();
 
     for message in messages {
-        let is_unpriced_gemini_default = message.tokens.total() > 0
+        let unpriced = message.tokens.total() > 0
             && !message.has_authoritative_cost()
-            && message.provider_id.eq_ignore_ascii_case("google")
-            && message.model_id.eq_ignore_ascii_case("gemini-default")
             && !pricing.covers_usage_with_provider(
                 &message.model_id,
                 Some(&message.provider_id),
                 &message.tokens,
             );
 
-        if is_unpriced_gemini_default {
+        // Only usage tokscale itself declines to price is excluded. Anything
+        // else unpriced still falls through to `validate_priced_messages` and
+        // aborts, because that is a gap in the pricing data rather than a
+        // decision, and silently dropping it would understate real spend.
+        let excluded_reason = if !unpriced {
+            None
+        } else if message.provider_id.eq_ignore_ascii_case("google")
+            && message.model_id.eq_ignore_ascii_case("gemini-default")
+        {
+            Some(GEMINI_DEFAULT_UNPRICED_REASON)
+        } else if pricing::is_copilot_vendor_passthrough(
+            &message.model_id,
+            Some(&message.provider_id),
+        ) {
+            Some(COPILOT_VENDOR_PASSTHROUGH_UNPRICED_REASON)
+        } else {
+            None
+        };
+
+        if let Some(reason) = excluded_reason {
             let entry = exclusions
                 .entry((message.provider_id.clone(), message.model_id.clone()))
-                .or_default();
+                .or_insert((0, 0, reason));
             entry.0 += 1;
             entry.1 = entry.1.saturating_add(message.tokens.total());
         } else {
@@ -3066,15 +3097,17 @@ fn exclude_generic_unpriced_submission_messages(
 
     let exclusions = exclusions
         .into_iter()
-        .map(|((provider_id, model_id), (message_count, total_tokens))| {
-            UnpricedSubmissionExclusion {
-                provider_id,
-                model_id,
-                message_count,
-                total_tokens,
-                reason: GEMINI_DEFAULT_UNPRICED_REASON,
-            }
-        })
+        .map(
+            |((provider_id, model_id), (message_count, total_tokens, reason))| {
+                UnpricedSubmissionExclusion {
+                    provider_id,
+                    model_id,
+                    message_count,
+                    total_tokens,
+                    reason,
+                }
+            },
+        )
         .collect();
     (submitted, exclusions)
 }
@@ -4327,8 +4360,8 @@ mod tests {
         parse_local_clients, parsed_to_unified, paths, pricing, retain_for_requested_clients,
         scanner, select_local_parse_pricing, unified_to_parsed, validate_priced_messages, ClientId,
         GraphPricingRequirement, GroupBy, LocalParseOptions, ReportOptions, TokenBreakdown,
-        UnifiedMessage, UnpricedSubmissionExclusion, GEMINI_DEFAULT_UNPRICED_REASON,
-        UNKNOWN_WORKSPACE_LABEL,
+        UnifiedMessage, UnpricedSubmissionExclusion, COPILOT_VENDOR_PASSTHROUGH_UNPRICED_REASON,
+        GEMINI_DEFAULT_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL,
     };
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
@@ -8373,6 +8406,99 @@ mod tests {
                 reason: GEMINI_DEFAULT_UNPRICED_REASON,
             }
         );
+    }
+
+    // Withholding a price for the Copilot vendor-passthrough ids must not turn
+    // "submits at a wrong price" into "cannot submit at all". Without the
+    // exclusion arm, one Copilot gpt-5.2 message aborts the whole submission.
+    #[test]
+    fn submission_excludes_suppressed_copilot_passthrough_but_keeps_priceable_usage() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-4o".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(1e-6),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let copilot = UnifiedMessage::new(
+            "opencode",
+            "gpt-5.2",
+            "github-copilot",
+            "copilot",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 7,
+                cache_read: 11,
+                ..Default::default()
+            },
+            0.0,
+        );
+        let concrete = UnifiedMessage::new(
+            "synthetic",
+            "gpt-4o",
+            "openai",
+            "concrete",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 13,
+                ..Default::default()
+            },
+            0.0,
+        );
+
+        let graph = build_graph_from_messages(
+            vec![copilot, concrete],
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("a deliberately unpriced Copilot id must not abort the submission");
+
+        assert_eq!(graph.summary.total_tokens, 13);
+        assert_eq!(
+            graph.unpriced_submission_exclusions,
+            vec![UnpricedSubmissionExclusion {
+                provider_id: "github-copilot".to_string(),
+                model_id: "gpt-5.2".to_string(),
+                message_count: 1,
+                total_tokens: 18,
+                reason: COPILOT_VENDOR_PASSTHROUGH_UNPRICED_REASON,
+            }]
+        );
+    }
+
+    // The exclusion is keyed on the same predicate as the pricing refusal, so
+    // a Copilot id that is NOT suppressed and is genuinely unpriceable still
+    // aborts — the allowance covers only what tokscale itself withheld.
+    #[test]
+    fn submission_still_rejects_unpriced_copilot_models_outside_the_suppression() {
+        let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
+        let copilot = UnifiedMessage::new(
+            "opencode",
+            "some-unknown-copilot-model",
+            "github-copilot",
+            "copilot",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 5,
+                ..Default::default()
+            },
+            0.0,
+        );
+
+        let error = build_graph_from_messages(
+            vec![copilot],
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect_err("an unpriced Copilot id we did not suppress must still be rejected");
+
+        assert!(error.contains("github-copilot/some-unknown-copilot-model"));
     }
 
     #[test]
