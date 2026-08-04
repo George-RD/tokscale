@@ -527,6 +527,18 @@ tokscale submit --dry-run
 # used — is submitted at $0.00 and reported. Fail the submission instead:
 tokscale submit --strict-pricing
 
+# `auto` and `codex-auto-review` name a routing decision rather than a model, so
+# no price can exist for them and their tokens are submitted at $0.00. If you use
+# Kiro or Copilot, which report `auto` for most turns, your recorded spend will
+# drop on your next submit: the earlier figure put a price on a guess about which
+# model ran.
+
+# A submission whose price-needing usage is mostly uncoverable is refused, because
+# that is what a pricing outage looks like from here and the server overwrites the
+# cost it already recorded for those days with $0.00. If your usage genuinely has
+# no published price, submit it anyway:
+tokscale submit --no-pricing-outage-check
+
 # Logout
 tokscale logout
 ```

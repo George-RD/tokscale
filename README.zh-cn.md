@@ -524,6 +524,15 @@ tokscale submit --dry-run
 # token 类型价格的模型）默认按 $0.00 提交并给出提示。若希望直接让整次提交失败：
 tokscale submit --strict-pricing
 
+# `auto` 和 `codex-auto-review` 指的是路由决策而不是模型，因此不可能有价格，这些 token
+# 会按 $0.00 提交。如果你使用 Kiro 或 Copilot（它们把大部分回合都报告为 `auto`），下次
+# 提交后已记录的花费会下降：此前的金额是为“猜测运行了哪个模型”定的价。
+
+# 如果一次提交中需要定价的用量大部分都无法定价，提交会被拒绝：从这里看它与定价数据故障
+# 无法区分，而服务端会用 $0.00 覆盖这些日期已记录的花费。若你的用量确实没有公开价格，
+# 可以照常提交：
+tokscale submit --no-pricing-outage-check
+
 # 登出
 tokscale logout
 ```

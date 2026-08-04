@@ -2964,10 +2964,15 @@ pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, S
     })
 }
 
+/// The pricing service rides inside `Submission` rather than being passed
+/// beside it: a submission cannot be built without one, and an `Option` there
+/// forces a branch on a state that never happens — which then has to invent an
+/// error for it, and the only error to hand said "pricing outage" about
+/// something that is not one.
 #[derive(Clone, Copy)]
-enum GraphPricingRequirement {
+enum GraphPricingRequirement<'a> {
     Lenient,
-    Submission(SubmissionPricingMode),
+    Submission(&'a pricing::PricingService, SubmissionPricingMode),
 }
 
 /// What a submission does when nothing can price some of its usage.
@@ -2999,7 +3004,7 @@ impl SubmissionPricingMode {
 async fn generate_graph_with_loaded_pricing(
     options: ReportOptions,
     pricing: Option<&pricing::PricingService>,
-    pricing_requirement: GraphPricingRequirement,
+    pricing_requirement: GraphPricingRequirement<'_>,
 ) -> Result<GraphResult, SubmissionError> {
     let start = Instant::now();
 
@@ -3027,50 +3032,31 @@ async fn generate_graph_with_loaded_pricing(
     let bucket_timezone =
         bucket_tz::BucketTimezone::from_scanner_settings(&options.scanner_settings);
 
-    build_graph_from_messages(
-        filtered,
-        pricing,
-        pricing_requirement,
-        start,
-        &bucket_timezone,
-    )
+    build_graph_from_messages(filtered, pricing_requirement, start, &bucket_timezone)
 }
 
 fn build_graph_from_messages(
     filtered: Vec<UnifiedMessage>,
-    pricing: Option<&pricing::PricingService>,
-    pricing_requirement: GraphPricingRequirement,
+    pricing_requirement: GraphPricingRequirement<'_>,
     start: Instant,
     bucket_timezone: &bucket_tz::BucketTimezone,
 ) -> Result<GraphResult, SubmissionError> {
     let (filtered, unpriced_submission_usage) = match pricing_requirement {
         GraphPricingRequirement::Lenient => (filtered, Vec::new()),
-        GraphPricingRequirement::Submission(mode) => {
-            let pricing = pricing.ok_or(SubmissionError::PricingDataUnavailable(
-                UncoverablePricingShare {
-                    priceable_tokens: 0,
-                    uncoverable_tokens: 0,
-                },
-            ))?;
+        GraphPricingRequirement::Submission(pricing, mode) => {
             if mode.checks_for_a_pricing_outage() {
                 reject_submission_priced_by_an_outage(&filtered, pricing)?;
             }
-            let (submitted, unpriced) = match mode {
+            match mode {
                 SubmissionPricingMode::Strict => {
-                    validate_priced_messages(&filtered, Some(pricing))?;
+                    validate_priced_messages(&filtered, pricing)?;
                     (filtered, Vec::new())
                 }
                 SubmissionPricingMode::ReportUnpriced
                 | SubmissionPricingMode::ReportUnpricedWithoutOutageCheck => {
                     zero_cost_unpriced_submission_messages(filtered, pricing)
                 }
-            };
-            // A range with no token-bearing usage in it is an idle range, not
-            // a failure: `ReportUnpriced` drops nothing, so this is only ever
-            // true when the input was already empty. Whether the submission
-            // would have been all zeros because pricing broke is a different
-            // question, asked above.
-            (submitted, unpriced)
+            }
         }
     };
 
@@ -3152,7 +3138,9 @@ impl std::fmt::Display for SubmissionError {
                 "no published price covers {:.0}% of this submission's token usage \
                  ({} of {} tokens that need one), so it would report $0.00 for usage \
                  that has a real cost",
-                share.percent(),
+                // Rounded down, so the sentence never claims 100% while naming
+                // the tokens that were priced in the same breath.
+                share.percent().floor(),
                 share.uncoverable_tokens,
                 share.priceable_tokens,
             ),
@@ -3460,7 +3448,7 @@ pub async fn generate_submission_graph(
     generate_graph_with_loaded_pricing(
         options,
         Some(&pricing),
-        GraphPricingRequirement::Submission(mode),
+        GraphPricingRequirement::Submission(&pricing, mode),
     )
     .await
 }
@@ -3478,17 +3466,8 @@ pub async fn generate_local_graph_report(options: ReportOptions) -> Result<Graph
 
 fn validate_priced_messages(
     messages: &[UnifiedMessage],
-    pricing: Option<&pricing::PricingService>,
+    pricing: &pricing::PricingService,
 ) -> Result<(), SubmissionError> {
-    let Some(pricing) = pricing else {
-        return Err(SubmissionError::PricingDataUnavailable(
-            UncoverablePricingShare {
-                priceable_tokens: 0,
-                uncoverable_tokens: 0,
-            },
-        ));
-    };
-
     // Counted rather than listed per message: a real submission repeats the
     // same handful of ids thousands of times, and the raw list buried the
     // actionable model names under hundreds of kilobytes of output (#1013).
@@ -5969,7 +5948,7 @@ mod tests {
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].cost, 0.0);
             assert!(messages[0].has_authoritative_cost());
-            assert!(validate_priced_messages(&messages, Some(&pricing)).is_ok());
+            assert!(validate_priced_messages(&messages, &pricing).is_ok());
         }
 
         match original_home {
@@ -8538,7 +8517,7 @@ mod tests {
         );
         reported.mark_provider_reported_cost();
 
-        assert!(validate_priced_messages(&[covered, reported], Some(&pricing)).is_ok());
+        assert!(validate_priced_messages(&[covered, reported], &pricing).is_ok());
     }
 
     #[test]
@@ -8557,7 +8536,7 @@ mod tests {
         );
         let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
 
-        let error = validate_priced_messages(&[message], Some(&pricing))
+        let error = validate_priced_messages(&[message], &pricing)
             .unwrap_err()
             .to_string();
         assert!(error.contains("provider/unlisted-model"));
@@ -8590,7 +8569,7 @@ mod tests {
         ];
         let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
 
-        let error = validate_priced_messages(&messages, Some(&pricing))
+        let error = validate_priced_messages(&messages, &pricing)
             .unwrap_err()
             .to_string();
 
@@ -8675,7 +8654,6 @@ mod tests {
 
         let report = build_graph_from_messages(
             messages.clone(),
-            Some(&pricing),
             GraphPricingRequirement::Lenient,
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
@@ -8683,8 +8661,7 @@ mod tests {
         .expect("reporting graphs should retain unpriced usage");
         let submission = build_graph_from_messages(
             messages,
-            Some(&pricing),
-            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            GraphPricingRequirement::Submission(&pricing, SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8723,8 +8700,7 @@ mod tests {
 
         let graph = build_graph_from_messages(
             vec![message, priced_gpt_4o_row(1_000, 0.01)],
-            Some(&pricing),
-            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            GraphPricingRequirement::Submission(&pricing, SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8769,8 +8745,7 @@ mod tests {
 
         let error = build_graph_from_messages(
             vec![message],
-            Some(&outage),
-            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            GraphPricingRequirement::Submission(&outage, SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8809,8 +8784,7 @@ mod tests {
 
         let graph = build_graph_from_messages(
             vec![priced, uncoverable],
-            Some(&pricing),
-            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            GraphPricingRequirement::Submission(&pricing, SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8841,8 +8815,7 @@ mod tests {
 
         let graph = build_graph_from_messages(
             vec![message],
-            Some(&outage),
-            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            GraphPricingRequirement::Submission(&outage, SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8876,8 +8849,7 @@ mod tests {
         let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
         let graph = build_graph_from_messages(
             messages,
-            Some(&pricing),
-            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            GraphPricingRequirement::Submission(&pricing, SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8919,8 +8891,7 @@ mod tests {
 
         let graph = build_graph_from_messages(
             vec![partly_priced, priced_gpt_4o_row(1_000, 0.01)],
-            Some(&pricing),
-            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            GraphPricingRequirement::Submission(&pricing, SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8957,8 +8928,7 @@ mod tests {
 
         let graph = build_graph_from_messages(
             vec![message],
-            Some(&pricing),
-            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            GraphPricingRequirement::Submission(&pricing, SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -9007,8 +8977,7 @@ mod tests {
 
         let error = build_graph_from_messages(
             vec![covered, uncoverable],
-            Some(&pricing),
-            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            GraphPricingRequirement::Submission(&pricing, SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -9043,8 +9012,8 @@ mod tests {
 
         let graph = build_graph_from_messages(
             vec![uncoverable],
-            Some(&pricing),
             GraphPricingRequirement::Submission(
+                &pricing,
                 SubmissionPricingMode::ReportUnpricedWithoutOutageCheck,
             ),
             std::time::Instant::now(),
@@ -9094,8 +9063,7 @@ mod tests {
 
         let graph = build_graph_from_messages(
             vec![routed, covered],
-            Some(&pricing),
-            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            GraphPricingRequirement::Submission(&pricing, SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -9156,8 +9124,7 @@ mod tests {
 
         let graph = build_graph_from_messages(
             vec![unpriced, priced],
-            Some(&pricing),
-            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            GraphPricingRequirement::Submission(&pricing, SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -9190,8 +9157,7 @@ mod tests {
 
         let graph = build_graph_from_messages(
             vec![cost_only],
-            Some(&pricing),
-            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            GraphPricingRequirement::Submission(&pricing, SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -9201,8 +9167,7 @@ mod tests {
 
         let empty = build_graph_from_messages(
             Vec::new(),
-            Some(&pricing),
-            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            GraphPricingRequirement::Submission(&pricing, SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -9250,8 +9215,7 @@ mod tests {
 
         let graph = build_graph_from_messages(
             vec![generic, concrete],
-            Some(&pricing),
-            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            GraphPricingRequirement::Submission(&pricing, SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -9332,8 +9296,7 @@ mod tests {
                 label("copilot", "github-copilot", "unknown"),
                 concrete,
             ],
-            Some(&pricing),
-            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            GraphPricingRequirement::Submission(&pricing, SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -9392,8 +9355,7 @@ mod tests {
 
         let graph = build_graph_from_messages(
             vec![message],
-            Some(&pricing),
-            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            GraphPricingRequirement::Submission(&pricing, SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -9426,8 +9388,7 @@ mod tests {
 
         let graph = build_graph_from_messages(
             vec![message],
-            Some(&pricing),
-            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            GraphPricingRequirement::Submission(&pricing, SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -9481,8 +9442,7 @@ mod tests {
 
         let reported = build_graph_from_messages(
             messages.clone(),
-            Some(&pricing),
-            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            GraphPricingRequirement::Submission(&pricing, SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -9502,8 +9462,7 @@ mod tests {
 
         let error = build_graph_from_messages(
             messages,
-            Some(&pricing),
-            GraphPricingRequirement::Submission(SubmissionPricingMode::Strict),
+            GraphPricingRequirement::Submission(&pricing, SubmissionPricingMode::Strict),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -9543,8 +9502,7 @@ mod tests {
 
         let graph = build_graph_from_messages(
             vec![message],
-            Some(&pricing),
-            GraphPricingRequirement::Submission(SubmissionPricingMode::Strict),
+            GraphPricingRequirement::Submission(&pricing, SubmissionPricingMode::Strict),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -9576,8 +9534,7 @@ mod tests {
 
         let graph = build_graph_from_messages(
             vec![message],
-            Some(&pricing),
-            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            GraphPricingRequirement::Submission(&pricing, SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -9614,7 +9571,7 @@ mod tests {
             0.0,
         );
 
-        assert!(validate_priced_messages(&[message], Some(&pricing)).is_ok());
+        assert!(validate_priced_messages(&[message], &pricing).is_ok());
     }
 
     #[test]
@@ -9642,10 +9599,7 @@ mod tests {
 
         assert!(validate_priced_messages(
             &filtered,
-            Some(&pricing::PricingService::new(
-                HashMap::new(),
-                HashMap::new()
-            ))
+            &pricing::PricingService::new(HashMap::new(), HashMap::new())
         )
         .is_ok());
     }
@@ -9697,34 +9651,21 @@ mod tests {
             )
         };
 
+        assert!(validate_priced_messages(&[usage("input-only", 1, 0, 0, 0, 0)], &pricing).is_ok());
+        assert!(validate_priced_messages(&[usage("input-only", 0, 1, 0, 0, 0)], &pricing).is_err());
+        assert!(validate_priced_messages(&[usage("output-only", 0, 1, 1, 0, 0)], &pricing).is_ok());
         assert!(
-            validate_priced_messages(&[usage("input-only", 1, 0, 0, 0, 0)], Some(&pricing)).is_ok()
+            validate_priced_messages(&[usage("output-only", 1, 0, 0, 0, 0)], &pricing).is_err()
         );
         assert!(
-            validate_priced_messages(&[usage("input-only", 0, 1, 0, 0, 0)], Some(&pricing))
-                .is_err()
+            validate_priced_messages(&[usage("output-only", 0, 0, 0, 1, 0)], &pricing).is_err()
         );
         assert!(
-            validate_priced_messages(&[usage("output-only", 0, 1, 1, 0, 0)], Some(&pricing))
-                .is_ok()
+            validate_priced_messages(&[usage("output-only", 0, 0, 0, 0, 1)], &pricing).is_err()
         );
         assert!(
-            validate_priced_messages(&[usage("output-only", 1, 0, 0, 0, 0)], Some(&pricing))
-                .is_err()
+            validate_priced_messages(&[usage("tier-only", 300_000, 0, 0, 0, 0)], &pricing).is_err()
         );
-        assert!(
-            validate_priced_messages(&[usage("output-only", 0, 0, 0, 1, 0)], Some(&pricing))
-                .is_err()
-        );
-        assert!(
-            validate_priced_messages(&[usage("output-only", 0, 0, 0, 0, 1)], Some(&pricing))
-                .is_err()
-        );
-        assert!(validate_priced_messages(
-            &[usage("tier-only", 300_000, 0, 0, 0, 0)],
-            Some(&pricing)
-        )
-        .is_err());
     }
 
     #[test]

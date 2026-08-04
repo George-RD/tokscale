@@ -5567,7 +5567,8 @@ fn describe_submission_error(error: tokscale_core::SubmissionError) -> anyhow::E
     match error {
         tokscale_core::SubmissionError::PricingDataUnavailable(_) => anyhow::anyhow!(
             "{error}. Nothing was submitted, so your recorded spend is untouched. \
-             Check your network connection and run this again. \
+             Check your network connection and run this again, or price these \
+             models yourself in custom-pricing.json, which needs no network. \
              If your usage really has no published price, re-run with \
              --no-pricing-outage-check to submit it at $0.00."
         ),
@@ -6759,6 +6760,9 @@ mod tests {
             message.contains("your recorded spend is untouched"),
             "{message}"
         );
+        // A machine that cannot reach the network cannot fix this by checking
+        // the network. Local prices are the remedy that works from there.
+        assert!(message.contains("custom-pricing.json"), "{message}");
     }
 
     // The guard cannot tell a user whose usage is genuinely unpriceable from a
