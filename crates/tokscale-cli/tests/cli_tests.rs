@@ -3546,8 +3546,11 @@ fn test_root_with_group_by() {
     assert_eq!(json["groupBy"].as_str().unwrap(), "model");
 }
 
+/// Every pricing source failing at once is not a fact about the usage. Left
+/// alone it zeroes every row that needs a price and uploads the user's whole
+/// history at $0.00, and the server stores what it is sent.
 #[test]
-fn test_submit_offline_without_pricing_cache_reports_unpriced_usage() {
+fn test_submit_without_any_pricing_data_aborts_instead_of_submitting_zeros() {
     let tmp = create_temp_fixture_dir_without_pricing_cache();
     write_fake_credentials(tmp.path());
     let unpriced_dir = tmp
@@ -3573,23 +3576,41 @@ fn test_submit_offline_without_pricing_cache_reports_unpriced_usage() {
         .args(["submit", "--client", "opencode", "--dry-run"])
         .output()
         .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a total pricing outage must not submit; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("no pricing data could be loaded"),
+        "the failure has to name the cause: {stderr}"
+    );
+    assert!(
+        stderr.contains("your recorded spend is untouched"),
+        "and say the leaderboard was left alone: {stderr}"
+    );
+}
+
+/// The counterpart: an outage that costs the submission nothing still submits.
+/// Every row here carries the cost OpenCode reported, so no price was needed.
+#[test]
+fn test_submit_offline_without_pricing_cache_submits_client_costed_usage() {
+    let tmp = create_temp_fixture_dir_without_pricing_cache();
+    write_fake_credentials(tmp.path());
+
+    let output = offline_cmd_with_home(tmp.path())
+        .args(["submit", "--client", "opencode", "--dry-run"])
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "an id nothing can price must not block a submission; stderr: {stderr}"
+        "usage the client already costed needs no pricing fetch; stderr: {stderr}"
     );
     assert!(
-        stdout.contains(
-            "1 unpriced unknown_provider/genuinely-unpriced-model message(s) (1 tokens) submitted at $0.00"
-        ),
-        "the zero-cost row has to be reported: {stdout}"
-    );
-    // The rest of the fixture is priced from bundled data, with no network and
-    // no pricing cache, and still reaches the summary.
-    assert!(
-        stdout.contains("Total tokens: 3,951"),
-        "priced usage must survive alongside it: {stdout}"
+        stdout.contains("Total tokens: 3,950"),
+        "the fixture's usage must survive the outage: {stdout}"
     );
 }
 

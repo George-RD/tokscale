@@ -2986,7 +2986,7 @@ async fn generate_graph_with_loaded_pricing(
     options: ReportOptions,
     pricing: Option<&pricing::PricingService>,
     pricing_requirement: GraphPricingRequirement,
-) -> Result<GraphResult, String> {
+) -> Result<GraphResult, SubmissionError> {
     let start = Instant::now();
 
     let home_dir = get_home_dir_string(&options.home_dir)?;
@@ -3028,14 +3028,12 @@ fn build_graph_from_messages(
     pricing_requirement: GraphPricingRequirement,
     start: Instant,
     bucket_timezone: &bucket_tz::BucketTimezone,
-) -> Result<GraphResult, String> {
+) -> Result<GraphResult, SubmissionError> {
     let (filtered, unpriced_submission_usage) = match pricing_requirement {
         GraphPricingRequirement::Lenient => (filtered, Vec::new()),
         GraphPricingRequirement::Submission(mode) => {
-            // Without pricing data every row would look unpriced, so a whole
-            // submission would silently go out at zero cost. That is a loading
-            // failure, not a fact about the usage.
-            let pricing = pricing.ok_or("pricing data is unavailable for submission")?;
+            let pricing = pricing.ok_or(SubmissionError::PricingDataUnavailable)?;
+            reject_submission_priced_by_an_outage(&filtered, pricing)?;
             let (submitted, unpriced) = match mode {
                 SubmissionPricingMode::Strict => {
                     validate_priced_messages(&filtered, Some(pricing))?;
@@ -3046,7 +3044,7 @@ fn build_graph_from_messages(
                 }
             };
             if !submitted.iter().any(|message| message.tokens.total() > 0) {
-                return Err(EMPTY_SUBMISSION_ERROR.to_string());
+                return Err(SubmissionError::Report(EMPTY_SUBMISSION_ERROR.to_string()));
             }
             (submitted, unpriced)
         }
@@ -3080,6 +3078,79 @@ fn build_graph_from_messages(
 /// for one would tell the user their usage is on the leaderboard when nothing
 /// was sent.
 const EMPTY_SUBMISSION_ERROR: &str = "no token-bearing usage found to submit";
+
+/// Why a submission could not be built.
+///
+/// Typed rather than a bare string so the CLI can attach its own advice — and
+/// so a pricing outage cannot be mistaken for a report that merely came out
+/// empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmissionError {
+    /// No published pricing dataset loaded at all, and the submission holds
+    /// usage that needs one. Every such row would be reported at $0.00 and the
+    /// server stores what it is sent, so a transient network failure would
+    /// overwrite the user's recorded spend with zeros.
+    PricingDataUnavailable,
+    /// Anything else, already phrased for the user.
+    Report(String),
+}
+
+impl std::fmt::Display for SubmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PricingDataUnavailable => f.write_str(
+                "no pricing data could be loaded, so this submission would report $0.00 \
+                 for usage that has a real cost",
+            ),
+            Self::Report(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for SubmissionError {}
+
+impl From<String> for SubmissionError {
+    fn from(message: String) -> Self {
+        Self::Report(message)
+    }
+}
+
+/// Refuses a submission whose zeros would be an artifact of a pricing outage
+/// rather than a fact about the usage.
+///
+/// The three published pricing sources each degrade to a stale cache and then
+/// to nothing, which is what keeps one source's outage from blocking every
+/// command (#1002). When *all* of them come up empty — a fresh machine, or a
+/// cleared cache, with no route to the network — every row that needs a price
+/// looks unpriced, gets zeroed, and uploads at $0.00 over the top of whatever
+/// the leaderboard already recorded.
+///
+/// Only usage that a working pricing service could have priced counts here. A
+/// generic routing label has no price whether or not the fetch succeeded, and
+/// a client-reported cost never needed one, so neither is evidence of an
+/// outage and neither loses anything by being submitted.
+fn reject_submission_priced_by_an_outage(
+    messages: &[UnifiedMessage],
+    pricing: &pricing::PricingService,
+) -> Result<(), SubmissionError> {
+    if pricing.has_published_pricing_data() {
+        return Ok(());
+    }
+
+    let priceable_usage_was_zeroed = messages.iter().any(|message| {
+        is_unpriced_submission_usage(message, pricing)
+            && matches!(
+                unpriced_usage_cause(message),
+                UnpricedUsageCause::NoPublishedPrice
+            )
+    });
+
+    if priceable_usage_was_zeroed {
+        return Err(SubmissionError::PricingDataUnavailable);
+    }
+
+    Ok(())
+}
 
 /// Provider column value for labels that are generic no matter who reports
 /// them.
@@ -3268,12 +3339,13 @@ pub async fn generate_graph(options: ReportOptions) -> Result<GraphResult, Strin
     let pricing = pricing::PricingService::get_or_init().await?;
     generate_graph_with_loaded_pricing(options, Some(&pricing), GraphPricingRequirement::Lenient)
         .await
+        .map_err(|error| error.to_string())
 }
 
 pub async fn generate_submission_graph(
     options: ReportOptions,
     mode: SubmissionPricingMode,
-) -> Result<GraphResult, String> {
+) -> Result<GraphResult, SubmissionError> {
     let pricing = pricing::PricingService::get_or_init().await?;
     generate_graph_with_loaded_pricing(
         options,
@@ -3291,14 +3363,15 @@ pub async fn generate_local_graph_report(options: ReportOptions) -> Result<Graph
         GraphPricingRequirement::Lenient,
     )
     .await
+    .map_err(|error| error.to_string())
 }
 
 fn validate_priced_messages(
     messages: &[UnifiedMessage],
     pricing: Option<&pricing::PricingService>,
-) -> Result<(), String> {
+) -> Result<(), SubmissionError> {
     let Some(pricing) = pricing else {
-        return Err("pricing data is unavailable for submission".to_string());
+        return Err(SubmissionError::PricingDataUnavailable);
     };
 
     // Counted rather than listed per message: a real submission repeats the
@@ -3341,10 +3414,10 @@ fn validate_priced_messages(
 
     // Only reachable under --strict-pricing, so the way out is to stop asking
     // for it: the same usage submits at $0.00 by default.
-    Err(format!(
+    Err(SubmissionError::Report(format!(
         "--strict-pricing: no published price covers this submitted token usage: {summary}. \
          Re-run without --strict-pricing to submit these tokens at $0.00."
-    ))
+    )))
 }
 
 fn filter_messages_for_report(
@@ -4469,9 +4542,9 @@ mod tests {
         normalize_model_for_grouping, parse_all_messages_with_pricing_with_env_strategy,
         parse_local_clients, parsed_to_unified, paths, pricing, retain_for_requested_clients,
         scanner, select_local_parse_pricing, unified_to_parsed, validate_priced_messages, ClientId,
-        GraphPricingRequirement, GroupBy, LocalParseOptions, ReportOptions, SubmissionPricingMode,
-        TokenBreakdown, UnifiedMessage, UnpricedSubmissionUsage, UnpricedUsageCause,
-        EMPTY_SUBMISSION_ERROR, UNKNOWN_WORKSPACE_LABEL,
+        GraphPricingRequirement, GroupBy, LocalParseOptions, ReportOptions, SubmissionError,
+        SubmissionPricingMode, TokenBreakdown, UnifiedMessage, UnpricedSubmissionUsage,
+        UnpricedUsageCause, EMPTY_SUBMISSION_ERROR, UNKNOWN_WORKSPACE_LABEL,
     };
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
@@ -8370,7 +8443,9 @@ mod tests {
         );
         let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
 
-        let error = validate_priced_messages(&[message], Some(&pricing)).unwrap_err();
+        let error = validate_priced_messages(&[message], Some(&pricing))
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("provider/unlisted-model"));
     }
 
@@ -8401,7 +8476,9 @@ mod tests {
         ];
         let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
 
-        let error = validate_priced_messages(&messages, Some(&pricing)).unwrap_err();
+        let error = validate_priced_messages(&messages, Some(&pricing))
+            .unwrap_err()
+            .to_string();
 
         assert_eq!(error.matches("provider/repeated-model").count(), 1);
         assert_eq!(error.matches("provider/single-model").count(), 1);
@@ -8419,6 +8496,27 @@ mod tests {
         );
     }
 
+    /// A pricing service whose published data loaded and simply does not list
+    /// the model under test.
+    ///
+    /// `PricingService::new(HashMap::new(), HashMap::new())` is a different
+    /// situation with the same symptom: it is the shape of a machine where
+    /// every pricing source failed, and a submission refuses to price usage
+    /// against it. Tests about a model nobody publishes a rate for need a
+    /// service that is working.
+    fn pricing_service_missing_the_model_under_test() -> pricing::PricingService {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-4o".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(1e-6),
+                output_cost_per_token: Some(2e-6),
+                ..Default::default()
+            },
+        );
+        pricing::PricingService::new(litellm, HashMap::new())
+    }
+
     #[test]
     fn only_submission_graphs_report_unpriced_usage() {
         let message = UnifiedMessage::new(
@@ -8433,7 +8531,7 @@ mod tests {
             },
             0.0,
         );
-        let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
+        let pricing = pricing_service_missing_the_model_under_test();
 
         let report = build_graph_from_messages(
             vec![message.clone()],
@@ -8467,7 +8565,7 @@ mod tests {
     // that tells the user they can do something about it (#1013, #1021).
     #[test]
     fn submission_submits_unpriced_concrete_model_at_zero_cost() {
-        let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
+        let pricing = pricing_service_missing_the_model_under_test();
         let message = UnifiedMessage::new(
             "synthetic",
             "K-EXAONE-236B-A23B",
@@ -8503,6 +8601,125 @@ mod tests {
                 discarded_cost: 0.0,
                 cause: UnpricedUsageCause::NoPublishedPrice,
             }]
+        );
+    }
+
+    // The scenario is a fresh machine, or one whose cache was cleared, that
+    // cannot reach the network: LiteLLM, OpenRouter and models.dev all come up
+    // empty. Every row then looks unpriced, and submitting would upload the
+    // user's whole history at $0.00 over the top of the spend the leaderboard
+    // already holds.
+    #[test]
+    fn submission_aborts_when_no_pricing_data_loaded_at_all() {
+        let outage = pricing::PricingService::new(HashMap::new(), HashMap::new());
+        let message = UnifiedMessage::new(
+            "claude",
+            "claude-sonnet-4-20250514",
+            "anthropic",
+            "history",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 2_000_000,
+                output: 500_000,
+                ..Default::default()
+            },
+            0.0,
+        );
+
+        let error = build_graph_from_messages(
+            vec![message],
+            Some(&outage),
+            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect_err("a pricing outage must not submit a whole history at $0.00");
+
+        assert_eq!(error, SubmissionError::PricingDataUnavailable);
+        assert!(
+            error
+                .to_string()
+                .contains("no pricing data could be loaded"),
+            "the message has to name the cause: {error}"
+        );
+    }
+
+    // The counterpart, and the reason the guard cannot simply be "something is
+    // unpriced": pricing that loaded and merely does not list one long-tail
+    // model is a normal, submittable state.
+    #[test]
+    fn submission_with_loaded_pricing_still_submits_models_it_cannot_cover() {
+        let pricing = pricing_service_missing_the_model_under_test();
+        let priced = UnifiedMessage::new(
+            "synthetic",
+            "gpt-4o",
+            "openai",
+            "priced",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 1_000_000,
+                ..Default::default()
+            },
+            1.0,
+        );
+        let uncoverable = UnifiedMessage::new(
+            "synthetic",
+            "K-EXAONE-236B-A23B",
+            "friendli",
+            "uncoverable",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 7,
+                ..Default::default()
+            },
+            0.0,
+        );
+
+        let graph = build_graph_from_messages(
+            vec![priced, uncoverable],
+            Some(&pricing),
+            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("a working pricing service must not be treated as an outage");
+
+        assert_eq!(graph.summary.total_tokens, 1_000_007);
+        assert_eq!(graph.summary.total_cost, 1.0);
+        assert_eq!(graph.unpriced_submission_usage.len(), 1);
+    }
+
+    // A routing label has no price whether or not the fetch succeeded, so it is
+    // not evidence of an outage and must not turn one into a failed submission.
+    #[test]
+    fn submission_without_pricing_data_still_submits_routing_labels() {
+        let outage = pricing::PricingService::new(HashMap::new(), HashMap::new());
+        let message = UnifiedMessage::new(
+            "antigravity-cli",
+            "gemini-default",
+            "google",
+            "routed",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 9,
+                ..Default::default()
+            },
+            0.0,
+        );
+
+        let graph = build_graph_from_messages(
+            vec![message],
+            Some(&outage),
+            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("a routing label loses nothing to a pricing outage");
+
+        assert_eq!(graph.summary.total_tokens, 9);
+        assert_eq!(
+            graph.unpriced_submission_usage[0].cause,
+            UnpricedUsageCause::GenericRoutingLabel
         );
     }
 
@@ -8551,7 +8768,7 @@ mod tests {
     // carry the amount for the CLI to say so.
     #[test]
     fn submission_reports_the_cost_zeroing_actually_discards() {
-        let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
+        let pricing = pricing_service_missing_the_model_under_test();
         let mut partly_priced = UnifiedMessage::new(
             "synthetic",
             "half-priced-model",
@@ -8710,7 +8927,7 @@ mod tests {
         )
         .expect_err("a submission with no tokens must not report success");
 
-        assert_eq!(error, EMPTY_SUBMISSION_ERROR);
+        assert_eq!(error.to_string(), EMPTY_SUBMISSION_ERROR);
     }
 
     #[test]
@@ -9009,7 +9226,8 @@ mod tests {
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
-        .expect_err("strict pricing rejects a batch it cannot fully price");
+        .expect_err("strict pricing rejects a batch it cannot fully price")
+        .to_string();
 
         assert!(error.contains("friendli/K-EXAONE-236B-A23B"), "{error}");
         assert!(

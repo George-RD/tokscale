@@ -5538,6 +5538,20 @@ fn format_unpriced_submission_warning(row: &tokscale_core::UnpricedSubmissionUsa
     )
 }
 
+/// Turns a submission failure into the message the user sees.
+///
+/// Core states the fact; the advice that goes with it is the CLI's, because
+/// the fix is phrased in terms of what the user just ran.
+fn describe_submission_error(error: tokscale_core::SubmissionError) -> anyhow::Error {
+    match error {
+        tokscale_core::SubmissionError::PricingDataUnavailable => anyhow::anyhow!(
+            "{error}. Nothing was submitted, so your recorded spend is untouched. \
+             Check your network connection and run this again."
+        ),
+        other => anyhow::anyhow!(other),
+    }
+}
+
 fn report_unpriced_submission_usage(unpriced: &[tokscale_core::UnpricedSubmissionUsage]) {
     use colored::Colorize;
 
@@ -5726,7 +5740,7 @@ fn run_submit_command(options: SubmitCommandOptions) -> Result<()> {
             )
             .await
         })
-        .map_err(|e| anyhow::anyhow!(e))?;
+        .map_err(describe_submission_error)?;
 
     // Preserve local-calendar contributions here. The API validator owns the
     // UTC+ timezone buffer; client-side UTC capping silently drops current-day
