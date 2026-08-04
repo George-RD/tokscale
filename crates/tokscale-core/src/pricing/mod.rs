@@ -295,6 +295,33 @@ impl PricingService {
         })
     }
 
+    /// Whether an upstream resolution actually names the model that was asked
+    /// for, or merely guessed at it.
+    ///
+    /// The override lane is otherwise last-resort, and stays that way: an
+    /// upstream row FOR THIS MODEL always wins. But "the chain returned
+    /// something" is not the same claim. models.dev spells the namespace
+    /// `github-copilot/`, which is not one of the lookup's known provider
+    /// prefixes, so a `github-copilot/<id>` request walks past every exact
+    /// stage and reaches fuzzy matching — where the `github_copilot/` rows this
+    /// branch stopped filtering out are a word-boundary match on the namespace
+    /// tokens alone. `github-copilot/oswe-vscode-prime` came back as
+    /// `github_copilot/mai-code-1-flash`: a different model, at $0.75/$4.50
+    /// instead of GitHub's published $0.25/$2.00, labelled `LiteLLM`.
+    ///
+    /// So an upstream answer outranks the override only when its matched key
+    /// resolves to the same terminal model id. Comparing terminal segments
+    /// rather than whole keys keeps `github_copilot/oswe-vscode-prime` and a
+    /// bare `oswe-vscode-prime` both counting as the real thing.
+    fn upstream_names_same_model(upstream: &LookupResult, override_key: &str) -> bool {
+        upstream
+            .matched_key
+            .to_lowercase()
+            .rsplit('/')
+            .next()
+            .is_some_and(|terminal| terminal == override_key)
+    }
+
     async fn fetch_inner() -> Result<Self, String> {
         let (litellm_result, openrouter_data, models_dev_result) = tokio::join!(
             litellm::fetch(),
@@ -436,21 +463,25 @@ impl PricingService {
             Some(_) => {}
         }
 
-        if let Some(result) =
+        let upstream =
             self.lookup
-                .lookup_with_source_and_provider(model_id, force_source, provider_id)
-        {
-            return Some(result);
-        }
+                .lookup_with_source_and_provider(model_id, force_source, provider_id);
 
-        // Built-in GitHub-published rates are the last resort, so a real
-        // upstream row always wins. `force_source` names an upstream dataset,
-        // and answering it from a built-in override would misreport where the
-        // number came from.
+        // Built-in GitHub-published rates are the last resort, so an upstream
+        // row for this model always wins — see `upstream_names_same_model` for
+        // why "the chain answered" is a weaker test than that. `force_source`
+        // names an upstream dataset, and answering it from a built-in override
+        // would misreport where the number came from.
         if force_source.is_none() {
-            return self.lookup_github_override(model_id);
+            if let Some(github) = self.lookup_github_override(model_id) {
+                if !upstream.as_ref().is_some_and(|result| {
+                    Self::upstream_names_same_model(result, &github.matched_key)
+                }) {
+                    return Some(github);
+                }
+            }
         }
-        None
+        upstream
     }
 
     pub fn calculate_cost(
@@ -523,25 +554,30 @@ impl PricingService {
     }
 
     /// The built-in GitHub override for `model_id`, but only when the upstream
-    /// chain cannot resolve it at all.
+    /// chain has no row for that model.
     ///
     /// `calculate_cost_with_provider` and `covers_usage_with_provider` delegate
     /// to `PricingLookup`, which applies cross-row rate borrowing and OpenAI's
     /// full-request tiering on top of a resolution — so the override cannot be
-    /// substituted for that path, only consulted when it yields nothing.
+    /// substituted for that path, only consulted when it yields nothing for the
+    /// model in question. This is the second entry point into the override and
+    /// applies the same `upstream_names_same_model` test as
+    /// `lookup_with_source_and_provider`; scoping only one of them would leave
+    /// the cost path billing a fuzzy guess.
     fn github_override_for_unresolved(
         &self,
         model_id: &str,
         provider_id: Option<&str>,
     ) -> Option<LookupResult> {
+        let github = self.lookup_github_override(model_id)?;
         if self
             .lookup
             .lookup_with_provider(model_id, provider_id)
-            .is_some()
+            .is_some_and(|upstream| Self::upstream_names_same_model(&upstream, &github.matched_key))
         {
             return None;
         }
-        self.lookup_github_override(model_id)
+        Some(github)
     }
 
     fn lookup_custom(&self, model_id: &str) -> Option<LookupResult> {
@@ -1169,6 +1205,11 @@ mod tests {
         assert_eq!(flash.output_cost_per_token, Some(4.5e-6));
     }
 
+    // The one `github_copilot/` row a user is actually likely to hit, end to
+    // end. The rates are LiteLLM's live values for it (accessed 2026-08-05) and
+    // match GitHub's published MAI-Code-1-Flash rate of $0.75 / $4.50 / $0.075
+    // per 1M; asserting the resolved cost rather than just the row's survival
+    // is what proves the recovered row is reachable through a real lookup.
     #[test]
     fn litellm_github_copilot_flash_prices_at_githubs_published_rate() {
         let mut litellm = HashMap::new();
@@ -1177,19 +1218,44 @@ mod tests {
             ModelPricing {
                 input_cost_per_token: Some(7.5e-7),
                 output_cost_per_token: Some(4.5e-6),
+                cache_read_input_token_cost: Some(7.5e-8),
                 ..Default::default()
             },
         );
         let service = PricingService::from_cached_datasets(Some(litellm), None, None).unwrap();
+        let usage = TokenBreakdown {
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_read: 1_000_000,
+            ..Default::default()
+        };
 
         let result = service
             .lookup_with_source("github_copilot/mai-code-1-flash", None)
             .expect("MAI-Code-1-Flash must price from LiteLLM");
         assert_eq!(result.source, "LiteLLM");
         assert_eq!(result.matched_key, "github_copilot/mai-code-1-flash");
-        // GitHub publishes $0.75 / $4.50 per 1M for MAI-Code-1-Flash.
-        let cost = service.calculate_cost("github_copilot/mai-code-1-flash", 1_000_000, 0, 0, 0, 0);
-        assert!((cost - 0.75).abs() < 1e-9, "unexpected cost: {cost}");
+
+        assert!(service.covers_usage_with_provider(
+            "github_copilot/mai-code-1-flash",
+            Some("github-copilot"),
+            &usage
+        ));
+        let cost = service.calculate_cost_with_provider(
+            "github_copilot/mai-code-1-flash",
+            Some("github-copilot"),
+            &usage,
+        );
+        assert!((cost - (0.75 + 4.5 + 0.075)).abs() < 1e-9, "cost: {cost}");
+
+        // The shape a session log carries: the bare id, with Copilot as the
+        // provider. It has to reach the same row, or recovering the row from
+        // the prefix filter buys nothing for real usage.
+        let bare = service
+            .lookup_with_source_and_provider("mai-code-1-flash", None, Some("github-copilot"))
+            .expect("the bare id under a Copilot provider must reach the same row");
+        assert_eq!(bare.matched_key, "github_copilot/mai-code-1-flash");
+        assert_eq!(bare.pricing.input_cost_per_token, Some(7.5e-7));
     }
 
     #[test]
@@ -1661,41 +1727,110 @@ mod tests {
         assert_eq!(result.pricing.output_cost_per_token_above_272k_tokens, None);
     }
 
+    // Both Copilot namespace spellings, against a dataset that carries the
+    // `github_copilot/mai-code-1-flash` row this branch stopped filtering out.
+    // With an empty dataset this passes for the wrong reason: models.dev's
+    // dashed `github-copilot/` spelling is not one of the lookup's known
+    // provider prefixes, so it reaches the fuzzy stage, where the only
+    // `github_copilot/` row in the data is a word-boundary match for the
+    // namespace tokens. Raptor mini then bills at MAI-Code-1-Flash's
+    // $0.75/$4.50 under a `LiteLLM` label.
     #[test]
     fn test_github_override_resolves_copilot_scoped_oswe_vscode_prime() {
-        let service = PricingService::new(HashMap::new(), HashMap::new());
-        let result = service
-            .lookup_with_source("github-copilot/oswe-vscode-prime", None)
-            .expect("the copilot-scoped spelling must resolve too");
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "github_copilot/mai-code-1-flash".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(7.5e-7),
+                output_cost_per_token: Some(4.5e-6),
+                cache_read_input_token_cost: Some(7.5e-8),
+                ..Default::default()
+            },
+        );
+        let service = PricingService::from_cached_datasets(Some(litellm), None, None).unwrap();
+        let usage = TokenBreakdown {
+            input: 1_000_000,
+            ..Default::default()
+        };
 
-        assert_eq!(result.source, "GitHub");
-        assert_eq!(result.matched_key, "oswe-vscode-prime");
+        for model in [
+            "github-copilot/oswe-vscode-prime",
+            "github_copilot/oswe-vscode-prime",
+        ] {
+            let result = service
+                .lookup_with_source(model, None)
+                .unwrap_or_else(|| panic!("{model} must resolve to GitHub's Raptor mini rate"));
+            assert_eq!(result.source, "GitHub", "{model}");
+            assert_eq!(result.matched_key, "oswe-vscode-prime", "{model}");
+            assert_eq!(result.pricing.input_cost_per_token, Some(2.5e-7), "{model}");
+
+            let cost = service.calculate_cost_with_provider(model, None, &usage);
+            assert!(
+                (cost - 0.25).abs() < 1e-9,
+                "{model} billed {cost}, want 0.25"
+            );
+        }
+
+        // MAI-Code-1-Flash itself is untouched: it still resolves to its own
+        // LiteLLM row at its own rate.
+        let flash = service
+            .lookup_with_source("github_copilot/mai-code-1-flash", None)
+            .expect("MAI-Code-1-Flash must keep resolving to its own row");
+        assert_eq!(flash.source, "LiteLLM");
+        assert_eq!(flash.pricing.input_cost_per_token, Some(7.5e-7));
     }
 
     // The rates are GitHub's only inside GitHub's namespace. Stripping any
     // namespace would hand Raptor mini's rate — and a `GitHub` source label
     // asserting GitHub published it for that key — to ids GitHub says nothing
     // about.
+    //
+    // Both entry points into the override are checked. `lookup_with_source` is
+    // one; `calculate_cost_with_provider` and `covers_usage_with_provider`
+    // reach it separately through `github_override_for_unresolved`, so a scope
+    // applied to only one of them would still bill a foreign namespace at
+    // GitHub's rate.
     #[test]
     fn test_github_override_rejects_foreign_namespaces() {
         let service = PricingService::new(HashMap::new(), HashMap::new());
+        let usage = TokenBreakdown {
+            input: 1_000_000,
+            output: 100_000,
+            ..Default::default()
+        };
 
         for model in [
             "openai/oswe-vscode-prime",
             "anthropic/oswe-vscode-prime",
             "some-router/openai/oswe-vscode-prime",
         ] {
+            let cost = service.calculate_cost_with_provider(model, None, &usage);
+            assert_eq!(cost, 0.0, "{model} was billed at GitHub's rate: {cost}");
+            assert!(
+                !service.covers_usage_with_provider(model, None, &usage),
+                "{model} must not report as covered by GitHub's rate"
+            );
             assert!(
                 service.lookup_with_source(model, None).is_none(),
                 "{model} is not GitHub's key and must not receive GitHub's rate"
             );
         }
 
-        // LiteLLM's underscore spelling of the same namespace stays accepted.
-        let litellm_spelling = service
-            .lookup_with_source("github_copilot/oswe-vscode-prime", None)
-            .expect("LiteLLM's namespace spelling must still resolve");
-        assert_eq!(litellm_spelling.matched_key, "oswe-vscode-prime");
+        // Both Copilot namespace spellings stay accepted, on every path.
+        for model in [
+            "github-copilot/oswe-vscode-prime",
+            "github_copilot/oswe-vscode-prime",
+        ] {
+            let result = service
+                .lookup_with_source(model, None)
+                .unwrap_or_else(|| panic!("{model} is GitHub's own namespace and must resolve"));
+            assert_eq!(result.source, "GitHub");
+            assert_eq!(result.matched_key, "oswe-vscode-prime");
+            assert!(service.covers_usage_with_provider(model, None, &usage));
+            let cost = service.calculate_cost_with_provider(model, None, &usage);
+            let expected = 1_000_000.0 * 2.5e-7 + 100_000.0 * 2e-6;
+            assert!((cost - expected).abs() < 1e-10, "{model} cost: {cost}");
+        }
     }
 
     #[test]
