@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathRoot {
     Home,
+    ReasonixHome,
     XdgData,
     Config,
     EnvVar {
@@ -13,6 +14,31 @@ impl PathRoot {
     pub fn resolve_with_env_strategy(&self, home_dir: &str, use_env_roots: bool) -> String {
         match self {
             PathRoot::Home => home_dir.to_string(),
+            PathRoot::ReasonixHome => {
+                if use_env_roots {
+                    if let Some(state_home) = std::env::var_os("REASONIX_STATE_HOME") {
+                        if !state_home.is_empty() {
+                            return state_home.to_string_lossy().into_owned();
+                        }
+                    }
+                    if let Some(home) = std::env::var_os("REASONIX_HOME") {
+                        if !home.is_empty() {
+                            return home.to_string_lossy().into_owned();
+                        }
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    return std::path::Path::new(home_dir)
+                        .join("AppData/Roaming/reasonix")
+                        .to_string_lossy()
+                        .into_owned();
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    format!("{home_dir}/.reasonix")
+                }
+            }
             PathRoot::XdgData => {
                 if use_env_roots {
                     std::env::var("XDG_DATA_HOME")
@@ -592,6 +618,18 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // Reasonix stores authoritative provider usage as daily append-only JSONL
+    // records under `<state root>/stats/`. Transcript JSONL is intentionally
+    // excluded: it lacks exact token counters and overlaps these records.
+    Reasonix = 42 => {
+        id: "reasonix",
+        root: PathRoot::ReasonixHome,
+        relative: "stats",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -644,7 +682,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 42);
+        assert_eq!(ClientId::COUNT, 43);
     }
 
     #[test]
@@ -679,6 +717,42 @@ mod tests {
         assert!(client.data().parse_local);
         assert!(client.data().submit_default);
         assert!(!client.data().headless);
+    }
+
+    #[test]
+    fn test_reasonix_client_registered_as_local_session_source() {
+        let client = ClientId::from_str("reasonix").expect("reasonix client should be registered");
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            "/tmp/home/.reasonix/stats"
+        );
+        assert_eq!(client.data().pattern, "*.jsonl");
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
+        assert!(!client.data().headless);
+    }
+
+    #[test]
+    fn test_reasonix_stats_prefers_state_home_then_reasonix_home() {
+        let _guard = env_lock().lock().unwrap();
+        let state_previous = std::env::var("REASONIX_STATE_HOME").ok();
+        let home_previous = std::env::var("REASONIX_HOME").ok();
+        unsafe {
+            std::env::set_var("REASONIX_HOME", "/custom/reasonix-home");
+            std::env::set_var("REASONIX_STATE_HOME", "/custom/reasonix-state");
+        }
+        let client = ClientId::Reasonix;
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            "/custom/reasonix-state/stats"
+        );
+        unsafe { std::env::remove_var("REASONIX_STATE_HOME") };
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            "/custom/reasonix-home/stats"
+        );
+        restore_env("REASONIX_STATE_HOME", state_previous);
+        restore_env("REASONIX_HOME", home_previous);
     }
 
     #[test]

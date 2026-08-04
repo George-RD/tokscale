@@ -1076,6 +1076,7 @@ pub enum ClientFilter {
     #[value(alias = "auggie")]
     Augment,
     Kimchi,
+    Reasonix,
     Synthetic,
 }
 
@@ -1128,6 +1129,7 @@ impl ClientFilter {
             Self::Senpi => "senpi",
             Self::Augment => "augment",
             Self::Kimchi => "kimchi",
+            Self::Reasonix => "reasonix",
             Self::Synthetic => "synthetic",
         }
     }
@@ -1183,6 +1185,7 @@ impl ClientFilter {
             Self::Senpi => Some(ClientId::Senpi),
             Self::Augment => Some(ClientId::Augment),
             Self::Kimchi => Some(ClientId::Kimchi),
+            Self::Reasonix => Some(ClientId::Reasonix),
             Self::Synthetic => None,
         }
     }
@@ -1234,6 +1237,7 @@ impl ClientFilter {
             ClientId::Senpi => Self::Senpi,
             ClientId::Augment => Self::Augment,
             ClientId::Kimchi => Self::Kimchi,
+            ClientId::Reasonix => Self::Reasonix,
         }
     }
 
