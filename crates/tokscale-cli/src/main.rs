@@ -267,6 +267,11 @@ enum Commands {
             help = "Show what would be submitted without actually submitting"
         )]
         dry_run: bool,
+        #[arg(
+            long,
+            help = "Drop usage from models with no published price instead of aborting, and report what was dropped"
+        )]
+        prune_unpriced: bool,
     },
     #[command(about = "Manage periodic usage submission")]
     Autosubmit {
@@ -807,6 +812,7 @@ fn main() -> Result<()> {
             clients,
             date,
             dry_run,
+            prune_unpriced,
         }) => {
             reject_unsupported_home_override(&cli.home, "submit")?;
             let (since, until) = build_date_filter(&date, &cli.home);
@@ -823,6 +829,7 @@ fn main() -> Result<()> {
                 until,
                 year,
                 dry_run,
+                prune_unpriced,
                 SubmitMode::Interactive,
             )
         }
@@ -5555,7 +5562,17 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
             };
 
             let (clients, since, until, year) = commands::autosubmit::submit_filters(&settings);
-            match run_submit_command(clients, since, until, year, false, SubmitMode::Autosubmit) {
+            // Autosubmit stays strict: an unattended run must not silently
+            // start dropping usage the user never agreed to drop.
+            match run_submit_command(
+                clients,
+                since,
+                until,
+                year,
+                false,
+                false,
+                SubmitMode::Autosubmit,
+            ) {
                 Ok(()) => {
                     commands::autosubmit::record_run_success(
                         chrono::Utc::now().timestamp_millis(),
@@ -5578,12 +5595,13 @@ fn run_submit_command(
     until: Option<String>,
     year: Option<String>,
     dry_run: bool,
+    prune_unpriced: bool,
     mode: SubmitMode,
 ) -> Result<()> {
     use colored::Colorize;
     use std::io::IsTerminal;
     use tokio::runtime::Runtime;
-    use tokscale_core::{generate_submission_graph, GroupBy, ReportOptions};
+    use tokscale_core::{generate_submission_graph_with_pruning, GroupBy, ReportOptions};
 
     let auth_token = match auth::resolve_api_token() {
         Some(token) => token,
@@ -5651,16 +5669,19 @@ fn run_submit_command(
     let rt = Runtime::new()?;
     let mut graph_result = rt
         .block_on(async {
-            generate_submission_graph(ReportOptions {
-                home_dir: None,
-                use_env_roots: true,
-                clients,
-                since,
-                until,
-                year,
-                group_by: GroupBy::default(),
-                scanner_settings: tui::settings::load_scanner_settings(),
-            })
+            generate_submission_graph_with_pruning(
+                ReportOptions {
+                    home_dir: None,
+                    use_env_roots: true,
+                    clients,
+                    since,
+                    until,
+                    year,
+                    group_by: GroupBy::default(),
+                    scanner_settings: tui::settings::load_scanner_settings(),
+                },
+                prune_unpriced,
+            )
             .await
         })
         .map_err(|e| anyhow::anyhow!(e))?;

@@ -520,6 +520,9 @@ tokscale submit --client opencode,claude --since 2024-01-01
 # 预览将要提交的内容（试运行）
 tokscale submit --dry-run
 
+# 排除没有公开定价的模型用量后继续提交，而不是中断
+tokscale submit --prune-unpriced
+
 # 登出
 tokscale logout
 ```

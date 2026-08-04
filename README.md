@@ -522,6 +522,9 @@ tokscale submit --client opencode,claude --since 2024-01-01
 # Preview what would be submitted (dry run)
 tokscale submit --dry-run
 
+# Drop usage from models with no published price instead of aborting
+tokscale submit --prune-unpriced
+
 # Logout
 tokscale logout
 ```

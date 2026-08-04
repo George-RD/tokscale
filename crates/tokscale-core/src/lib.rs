@@ -500,8 +500,9 @@ pub struct GraphResult {
     pub unpriced_submission_exclusions: Vec<UnpricedSubmissionExclusion>,
 }
 
-/// Token-bearing usage excluded only from a submission because its generic
-/// routing label has no authoritative model-to-price mapping.
+/// Token-bearing usage left out of a submission because nothing can price it:
+/// a generic routing label, or — under `--prune-unpriced` — a concrete model
+/// with no published price. `reason` says which.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnpricedSubmissionExclusion {
     pub provider_id: String,
@@ -2943,7 +2944,12 @@ pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, S
 #[derive(Clone, Copy)]
 enum GraphPricingRequirement {
     Lenient,
-    Submission,
+    Submission {
+        /// Drop concrete models with no published price instead of rejecting
+        /// the batch. Opt-in, because such an id names a model that really
+        /// ran: dropping it by default would understate real usage.
+        prune_unpriced: bool,
+    },
 }
 
 async fn generate_graph_with_loaded_pricing(
@@ -2995,9 +3001,16 @@ fn build_graph_from_messages(
 ) -> Result<GraphResult, String> {
     let (filtered, unpriced_submission_exclusions) = match pricing_requirement {
         GraphPricingRequirement::Lenient => (filtered, Vec::new()),
-        GraphPricingRequirement::Submission => {
-            let (submitted, exclusions) =
+        GraphPricingRequirement::Submission { prune_unpriced } => {
+            let (submitted, mut exclusions) =
                 exclude_generic_unpriced_submission_messages(filtered, pricing);
+            let submitted = if prune_unpriced {
+                let (kept, pruned) = prune_unpriced_submission_messages(submitted, pricing);
+                exclusions.extend(pruned);
+                kept
+            } else {
+                submitted
+            };
             validate_priced_messages(&submitted, pricing)?;
             (submitted, exclusions)
         }
@@ -3029,6 +3042,8 @@ fn build_graph_from_messages(
 
 const GENERIC_ROUTING_LABEL_UNPRICED_REASON: &str =
     "generic routing label has no authoritative model-to-price mapping";
+
+const PRUNED_UNPRICED_MODEL_REASON: &str = "no published price, dropped by --prune-unpriced";
 
 /// Provider column value for labels that are generic no matter who reports
 /// them.
@@ -3067,6 +3082,34 @@ fn exclude_generic_unpriced_submission_messages(
     messages: Vec<UnifiedMessage>,
     pricing: Option<&pricing::PricingService>,
 ) -> (Vec<UnifiedMessage>, Vec<UnpricedSubmissionExclusion>) {
+    exclude_unpriced_submission_messages(
+        messages,
+        pricing,
+        GENERIC_ROUTING_LABEL_UNPRICED_REASON,
+        |message| is_generic_routing_label(&message.provider_id, &message.model_id),
+    )
+}
+
+fn prune_unpriced_submission_messages(
+    messages: Vec<UnifiedMessage>,
+    pricing: Option<&pricing::PricingService>,
+) -> (Vec<UnifiedMessage>, Vec<UnpricedSubmissionExclusion>) {
+    exclude_unpriced_submission_messages(messages, pricing, PRUNED_UNPRICED_MODEL_REASON, |_| true)
+}
+
+/// Splits off the token-bearing rows nothing can price, aggregated per
+/// (provider, model) so a real submission reports a handful of ids rather than
+/// one line per message. `is_excludable` decides which unpriced rows may go;
+/// the rest stay and `validate_priced_messages` rejects them.
+///
+/// A row with a client-reported cost is never excluded by either caller: the
+/// client already knows what it charged, so dropping it would understate spend.
+fn exclude_unpriced_submission_messages(
+    messages: Vec<UnifiedMessage>,
+    pricing: Option<&pricing::PricingService>,
+    reason: &'static str,
+    is_excludable: impl Fn(&UnifiedMessage) -> bool,
+) -> (Vec<UnifiedMessage>, Vec<UnpricedSubmissionExclusion>) {
     let Some(pricing) = pricing else {
         return (messages, Vec::new());
     };
@@ -3076,18 +3119,16 @@ fn exclude_generic_unpriced_submission_messages(
         std::collections::BTreeMap::new();
 
     for message in messages {
-        // A label is only dropped when it is genuinely unpriced: a client that
-        // reports its own cost has already answered what the label cannot.
-        let is_unpriced_routing_label = message.tokens.total() > 0
+        let is_excluded = message.tokens.total() > 0
             && !message.has_authoritative_cost()
-            && is_generic_routing_label(&message.provider_id, &message.model_id)
+            && is_excludable(&message)
             && !pricing.covers_usage_with_provider(
                 &message.model_id,
                 Some(&message.provider_id),
                 &message.tokens,
             );
 
-        if is_unpriced_routing_label {
+        if is_excluded {
             let entry = exclusions
                 .entry((message.provider_id.clone(), message.model_id.clone()))
                 .or_default();
@@ -3106,7 +3147,7 @@ fn exclude_generic_unpriced_submission_messages(
                 model_id,
                 message_count,
                 total_tokens,
-                reason: GENERIC_ROUTING_LABEL_UNPRICED_REASON,
+                reason,
             }
         })
         .collect();
@@ -3159,9 +3200,23 @@ pub async fn generate_graph(options: ReportOptions) -> Result<GraphResult, Strin
 }
 
 pub async fn generate_submission_graph(options: ReportOptions) -> Result<GraphResult, String> {
+    generate_submission_graph_with_pruning(options, false).await
+}
+
+/// `prune_unpriced` drops concrete models with no published price and reports
+/// them alongside the generic routing labels, instead of failing the whole
+/// submission. Callers pass `false` unless the user asked for it.
+pub async fn generate_submission_graph_with_pruning(
+    options: ReportOptions,
+    prune_unpriced: bool,
+) -> Result<GraphResult, String> {
     let pricing = pricing::PricingService::get_or_init().await?;
-    generate_graph_with_loaded_pricing(options, Some(&pricing), GraphPricingRequirement::Submission)
-        .await
+    generate_graph_with_loaded_pricing(
+        options,
+        Some(&pricing),
+        GraphPricingRequirement::Submission { prune_unpriced },
+    )
+    .await
 }
 
 pub async fn generate_local_graph_report(options: ReportOptions) -> Result<GraphResult, String> {
@@ -3233,8 +3288,12 @@ fn validate_priced_messages(
         .collect::<Vec<String>>()
         .join(", ");
 
+    // Naming the flag here is the whole self-service path: the ids are only
+    // knowable at runtime, so a user who hits this has no other way to learn
+    // that dropping them is an option (#1013, #1021).
     Err(format!(
-        "pricing is unavailable for submitted token usage: {summary}"
+        "pricing is unavailable for submitted token usage: {summary}. \
+         Re-run with --prune-unpriced to drop this usage and submit the rest."
     ))
 }
 
@@ -4362,7 +4421,7 @@ mod tests {
         scanner, select_local_parse_pricing, unified_to_parsed, validate_priced_messages, ClientId,
         GraphPricingRequirement, GroupBy, LocalParseOptions, ReportOptions, TokenBreakdown,
         UnifiedMessage, UnpricedSubmissionExclusion, GENERIC_ROUTING_LABEL_UNPRICED_REASON,
-        UNKNOWN_WORKSPACE_LABEL,
+        PRUNED_UNPRICED_MODEL_REASON, UNKNOWN_WORKSPACE_LABEL,
     };
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
@@ -8337,7 +8396,9 @@ mod tests {
         let submission_error = build_graph_from_messages(
             vec![message],
             Some(&pricing),
-            GraphPricingRequirement::Submission,
+            GraphPricingRequirement::Submission {
+                prune_unpriced: false,
+            },
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8387,7 +8448,9 @@ mod tests {
         let graph = build_graph_from_messages(
             vec![generic, concrete],
             Some(&pricing),
-            GraphPricingRequirement::Submission,
+            GraphPricingRequirement::Submission {
+                prune_unpriced: false,
+            },
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8461,7 +8524,9 @@ mod tests {
                 concrete,
             ],
             Some(&pricing),
-            GraphPricingRequirement::Submission,
+            GraphPricingRequirement::Submission {
+                prune_unpriced: false,
+            },
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8512,7 +8577,9 @@ mod tests {
         let graph = build_graph_from_messages(
             vec![message],
             Some(&pricing),
-            GraphPricingRequirement::Submission,
+            GraphPricingRequirement::Submission {
+                prune_unpriced: false,
+            },
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8544,7 +8611,9 @@ mod tests {
         let graph = build_graph_from_messages(
             vec![message],
             Some(&pricing),
-            GraphPricingRequirement::Submission,
+            GraphPricingRequirement::Submission {
+                prune_unpriced: false,
+            },
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
@@ -8573,13 +8642,131 @@ mod tests {
         let error = build_graph_from_messages(
             vec![concrete],
             Some(&pricing),
-            GraphPricingRequirement::Submission,
+            GraphPricingRequirement::Submission {
+                prune_unpriced: false,
+            },
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
         .expect_err("concrete unpriced models must remain a submission error");
 
         assert!(error.contains("google/gemini-3.5-pro"));
+        assert!(
+            error.contains("--prune-unpriced"),
+            "the rejection must name the flag that resolves it: {error}"
+        );
+    }
+
+    // A concrete unpriced model names something that really ran, so it stays a
+    // hard error by default; `--prune-unpriced` is the opt-in that trades that
+    // usage away to get the rest of the batch submitted (#1013, #1021).
+    #[test]
+    fn submission_prunes_unpriced_concrete_models_only_when_requested() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-4o".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(1e-6),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let messages = vec![
+            UnifiedMessage::new(
+                "synthetic",
+                "K-EXAONE-236B-A23B",
+                "friendli",
+                "unpriced",
+                1_736_510_400_000,
+                TokenBreakdown {
+                    input: 4,
+                    output: 2,
+                    ..Default::default()
+                },
+                0.0,
+            ),
+            UnifiedMessage::new(
+                "synthetic",
+                "gpt-4o",
+                "openai",
+                "priced",
+                1_736_510_400_000,
+                TokenBreakdown {
+                    input: 13,
+                    ..Default::default()
+                },
+                0.0,
+            ),
+        ];
+
+        build_graph_from_messages(
+            messages.clone(),
+            Some(&pricing),
+            GraphPricingRequirement::Submission {
+                prune_unpriced: false,
+            },
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect_err("pruning must stay opt-in");
+
+        let graph = build_graph_from_messages(
+            messages,
+            Some(&pricing),
+            GraphPricingRequirement::Submission {
+                prune_unpriced: true,
+            },
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("pruning submits everything that is priced");
+
+        assert_eq!(graph.summary.total_tokens, 13);
+        assert_eq!(graph.contributions[0].clients.len(), 1);
+        assert_eq!(graph.contributions[0].clients[0].model_id, "gpt-4o");
+        assert_eq!(
+            graph.unpriced_submission_exclusions,
+            vec![UnpricedSubmissionExclusion {
+                provider_id: "friendli".to_string(),
+                model_id: "K-EXAONE-236B-A23B".to_string(),
+                message_count: 1,
+                total_tokens: 6,
+                reason: PRUNED_UNPRICED_MODEL_REASON,
+            }]
+        );
+    }
+
+    // Pruning drops usage nothing can price, not usage the client priced.
+    #[test]
+    fn submission_pruning_keeps_client_reported_costs() {
+        let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
+        let mut message = UnifiedMessage::new(
+            "cursor",
+            "some-bundled-model",
+            "cursor",
+            "reported",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 9,
+                ..Default::default()
+            },
+            0.5,
+        );
+        message.mark_provider_reported_cost();
+
+        let graph = build_graph_from_messages(
+            vec![message],
+            Some(&pricing),
+            GraphPricingRequirement::Submission {
+                prune_unpriced: true,
+            },
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("client-priced usage is submittable");
+
+        assert!(graph.unpriced_submission_exclusions.is_empty());
+        assert_eq!(graph.summary.total_tokens, 9);
     }
 
     #[test]

@@ -520,6 +520,9 @@ tokscale submit --client opencode,claude --since 2024-01-01
 # 제출될 내용 미리보기 (드라이 런)
 tokscale submit --dry-run
 
+# 가격 정보가 없는 모델의 사용량은 중단하지 말고 제외하고 제출
+tokscale submit --prune-unpriced
+
 # 로그아웃
 tokscale logout
 ```

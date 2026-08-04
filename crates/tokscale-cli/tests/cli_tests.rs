@@ -3593,6 +3593,56 @@ fn test_submit_excluding_only_generic_gemini_usage_does_not_promise_submission()
         .stdout(predicate::str::contains("Remaining priced usage will be submitted.").not())
         .stdout(predicate::str::contains("No usage data found to submit."));
 }
+
+/// A concrete model with no published price aborts the submission by default,
+/// and the rejection has to name the flag that gets the user unstuck.
+#[test]
+fn test_submit_prunes_concrete_unpriced_models_only_when_asked() {
+    let tmp = create_empty_fixture_dir();
+    let message_dir = tmp
+        .path()
+        .join(".local/share/opencode/storage/message/unpriced");
+    fs::create_dir_all(&message_dir).unwrap();
+    fs::write(
+        message_dir.join("unpriced.json"),
+        r#"{
+            "id": "unpriced",
+            "sessionID": "unpriced",
+            "role": "assistant",
+            "modelID": "genuinely-unpriced-model",
+            "providerID": "unknown-provider",
+            "tokens": { "input": 1, "output": 0, "reasoning": 0, "cache": { "read": 0, "write": 0 } },
+            "time": { "created": 1736510400000.0 }
+        }"#,
+    )
+    .unwrap();
+
+    cmd_with_home(tmp.path())
+        .env("TOKSCALE_API_TOKEN", "test-token")
+        .args(["submit", "--client", "opencode", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "unknown_provider/genuinely-unpriced-model",
+        ))
+        .stderr(predicate::str::contains("--prune-unpriced"));
+
+    cmd_with_home(tmp.path())
+        .env("TOKSCALE_API_TOKEN", "test-token")
+        .args([
+            "submit",
+            "--client",
+            "opencode",
+            "--dry-run",
+            "--prune-unpriced",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "excluded 1 unpriced unknown_provider/genuinely-unpriced-model message(s) (1 tokens)",
+        ))
+        .stdout(predicate::str::contains("No usage data found to submit."));
+}
 // ── gjc client filter tests ────────────────────────────────────────────────
 
 /// Write a gjc session JSONL file at
