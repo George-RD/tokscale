@@ -47,14 +47,16 @@ const RESELLER_PROVIDER_PREFIXES: &[&str] = &[
     "orcarouter/",
 ];
 
-// Bare brand tokens ("claude", "anthropic", "gemini") are blocked because they
-// contain no model information: a fuzzy hit from them can land on any model of
-// the brand (e.g. retired `claude-2.1` eroding to `claude` and billing at an
-// opus-fast key, or `gemini-default` eroding to `gemini` and landing on a
-// native-audio preview key), so such a match is never trustworthy.
+// Bare brand tokens ("claude", "anthropic", "gemini", "codex") are blocked
+// because they contain no model information: a fuzzy hit from them can land on
+// any model of the brand (e.g. retired `claude-2.1` eroding to `claude` and
+// billing at an opus-fast key, `gemini-default` eroding to `gemini` and landing
+// on a native-audio preview key, or `codex-auto-review` eroding to `codex` and
+// landing on `openai/gpt-5.1-codex-mini` — #1013), so such a match is never
+// trustworthy.
 //
-// Generic English words ("model", "router") are blocked for the same reason:
-// they carry no model identity, yet substring-match real priced keys
+// Generic English words ("model", "router", "auto") are blocked for the same
+// reason: they carry no model identity, yet substring-match real priced keys
 // (`azure_ai/model_router`, `kilo/switchpoint/router`). Without this guard an
 // id whose only fuzzy-eligible remnant after suffix stripping is the word
 // `model` (e.g. `model-zero-usage-v1` -> stripped `model`) misprices at the
@@ -67,6 +69,7 @@ const FUZZY_BLOCKLIST: &[&str] = &[
     "claude",
     "anthropic",
     "gemini",
+    "codex",
     "model",
     "router",
 ];
@@ -953,6 +956,9 @@ impl PricingLookup {
     /// this (see `lookup_auto`), otherwise a hinted lookup leaks to a different
     /// provider's canonical key.
     fn exact_match_openrouter_model_part(&self, model_id: &str) -> Option<LookupResult> {
+        if is_identityless_token(model_id) {
+            return None;
+        }
         let key = self.openrouter_model_part.get(model_id)?;
         let pricing = self.openrouter.get(key)?;
         lookup_result_if_usable(pricing, "OpenRouter", key)
@@ -967,6 +973,9 @@ impl PricingLookup {
                     matched_key: key.clone(),
                 });
             }
+        }
+        if is_identityless_token(model_id) {
+            return None;
         }
         if let Some(key) = self.models_dev_model_part.get(model_id) {
             if let Some(pricing) = self.models_dev.get(key) {
@@ -2070,7 +2079,19 @@ fn is_fuzzy_eligible(model_id: &str) -> bool {
     if model_id.len() < MIN_FUZZY_MATCH_LEN {
         return false;
     }
-    !FUZZY_BLOCKLIST.contains(&model_id)
+    !is_identityless_token(model_id)
+}
+
+/// True for the `FUZZY_BLOCKLIST` tokens — ids that name no model.
+///
+/// Fuzzy matching is not the only door into the misresolution the blocklist
+/// exists to prevent: a model-PART match borrows the key of whatever provider
+/// happens to own a model by that name, which is safe for an id carrying model
+/// identity and never safe for one of these. `auto` reached models.dev's
+/// `morph/auto` that way — an unrelated vendor's model at real rates — so
+/// Cursor's server-side routing was billed at Morph's prices (#1013).
+fn is_identityless_token(model_id: &str) -> bool {
+    FUZZY_BLOCKLIST.contains(&model_id)
 }
 
 /// Attempts to find a model by progressively stripping trailing segments.
@@ -4810,6 +4831,83 @@ mod tests {
         // can land on any model of the brand, so they are blocklisted.
         assert!(!is_fuzzy_eligible("claude"));
         assert!(!is_fuzzy_eligible("anthropic"));
+        assert!(!is_fuzzy_eligible("codex"));
+    }
+
+    // Regression (#1013): `cursor/auto` names Cursor's server-side routing, but
+    // the models.dev model-part index resolved the bare token to `morph/auto` —
+    // an unrelated vendor's real model at real rates — so Cursor's auto mode was
+    // billed at Morph's prices. The model-part index is the second door into the
+    // misresolution the FUZZY_BLOCKLIST already closed for fuzzy matching.
+    #[test]
+    fn generic_auto_token_does_not_borrow_another_vendors_auto_key() {
+        let morph_auto = ModelPricing {
+            input_cost_per_token: Some(8.5e-7),
+            output_cost_per_token: Some(1.55e-6),
+            ..Default::default()
+        };
+        let mut models_dev = HashMap::new();
+        models_dev.insert("morph/auto".to_string(), morph_auto.clone());
+        models_dev.insert("morph/morph-v3-large".to_string(), morph_auto);
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "openrouter/auto".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(1e-6),
+                output_cost_per_token: Some(2e-6),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            openrouter,
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        assert!(lookup
+            .lookup_with_provider("auto", Some("cursor"))
+            .is_none());
+        assert!(lookup.lookup("auto").is_none());
+        // Ids that erode to the bare token must not misresolve either.
+        assert!(lookup.lookup("auto-review").is_none());
+
+        // A model-part match is still how a concrete id finds its key.
+        assert_eq!(
+            lookup.lookup("morph-v3-large").unwrap().matched_key,
+            "morph/morph-v3-large"
+        );
+    }
+
+    // Regression (#1013): `openai/codex-auto-review` is the model Codex picks
+    // for a review run, not a model. It eroded to the bare family token `codex`
+    // and fuzzy-matched `openai/gpt-5.1-codex-mini`.
+    #[test]
+    fn generic_codex_review_label_does_not_fuzzy_match_a_codex_model() {
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "openai/gpt-5.1-codex-mini".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(2.5e-7),
+                output_cost_per_token: Some(2e-6),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(HashMap::new(), openrouter, HashMap::new());
+
+        assert!(lookup
+            .lookup_with_provider("codex-auto-review", Some("openai"))
+            .is_none());
+        assert!(lookup.lookup("codex-auto-review").is_none());
+        assert!(lookup.lookup("codex").is_none());
+
+        // The concrete model the label used to steal its price from still
+        // resolves under its own id.
+        assert_eq!(
+            lookup.lookup("gpt-5.1-codex-mini").unwrap().matched_key,
+            "openai/gpt-5.1-codex-mini"
+        );
     }
 
     // =========================================================================
