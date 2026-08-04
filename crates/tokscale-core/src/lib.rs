@@ -3027,8 +3027,41 @@ fn build_graph_from_messages(
     Ok(result)
 }
 
-const GEMINI_DEFAULT_UNPRICED_REASON: &str =
+const GENERIC_ROUTING_LABEL_UNPRICED_REASON: &str =
     "generic routing label has no authoritative model-to-price mapping";
+
+/// Provider column value for labels that are generic no matter who reports
+/// them.
+const ANY_PROVIDER: &str = "*";
+
+/// Ids that name a routing *decision* instead of a model. No price can ever
+/// exist for them, because they do not identify what actually ran — pricing
+/// one bills a guess. A submission drops and reports these rows rather than
+/// rejecting the whole batch over them (#1013, #1021, #1035).
+///
+/// Contrast with a concrete model that merely has no published price: that id
+/// names something real, so dropping it silently would understate usage. Those
+/// stay a submission error.
+const GENERIC_ROUTING_LABELS: &[(&str, &str)] = &[
+    // Antigravity's Gemini CLI records the routed family, not the model.
+    ("google", "gemini-default"),
+    // Antigravity, when the client could not resolve the turn's model (#1035).
+    ("antigravity", "unknown"),
+    // "Auto" model pickers resolve server-side, and the bare label is emitted
+    // by every client that offers one — Cursor (#1013), Kiro, Copilot,
+    // WorkBuddy — so pinning it to a single provider would leave the rest
+    // aborting their submissions.
+    (ANY_PROVIDER, "auto"),
+    // Codex picks the reviewer model for `codex review` server-side (#1013).
+    ("openai", "codex-auto-review"),
+];
+
+fn is_generic_routing_label(provider_id: &str, model_id: &str) -> bool {
+    GENERIC_ROUTING_LABELS.iter().any(|(provider, model)| {
+        (*provider == ANY_PROVIDER || provider_id.eq_ignore_ascii_case(provider))
+            && model_id.eq_ignore_ascii_case(model)
+    })
+}
 
 fn exclude_generic_unpriced_submission_messages(
     messages: Vec<UnifiedMessage>,
@@ -3043,17 +3076,18 @@ fn exclude_generic_unpriced_submission_messages(
         std::collections::BTreeMap::new();
 
     for message in messages {
-        let is_unpriced_gemini_default = message.tokens.total() > 0
+        // A label is only dropped when it is genuinely unpriced: a client that
+        // reports its own cost has already answered what the label cannot.
+        let is_unpriced_routing_label = message.tokens.total() > 0
             && !message.has_authoritative_cost()
-            && message.provider_id.eq_ignore_ascii_case("google")
-            && message.model_id.eq_ignore_ascii_case("gemini-default")
+            && is_generic_routing_label(&message.provider_id, &message.model_id)
             && !pricing.covers_usage_with_provider(
                 &message.model_id,
                 Some(&message.provider_id),
                 &message.tokens,
             );
 
-        if is_unpriced_gemini_default {
+        if is_unpriced_routing_label {
             let entry = exclusions
                 .entry((message.provider_id.clone(), message.model_id.clone()))
                 .or_default();
@@ -3072,7 +3106,7 @@ fn exclude_generic_unpriced_submission_messages(
                 model_id,
                 message_count,
                 total_tokens,
-                reason: GEMINI_DEFAULT_UNPRICED_REASON,
+                reason: GENERIC_ROUTING_LABEL_UNPRICED_REASON,
             }
         })
         .collect();
@@ -4327,7 +4361,7 @@ mod tests {
         parse_local_clients, parsed_to_unified, paths, pricing, retain_for_requested_clients,
         scanner, select_local_parse_pricing, unified_to_parsed, validate_priced_messages, ClientId,
         GraphPricingRequirement, GroupBy, LocalParseOptions, ReportOptions, TokenBreakdown,
-        UnifiedMessage, UnpricedSubmissionExclusion, GEMINI_DEFAULT_UNPRICED_REASON,
+        UnifiedMessage, UnpricedSubmissionExclusion, GENERIC_ROUTING_LABEL_UNPRICED_REASON,
         UNKNOWN_WORKSPACE_LABEL,
     };
     use serial_test::serial;
@@ -8370,9 +8404,154 @@ mod tests {
                 model_id: "gemini-default".to_string(),
                 message_count: 1,
                 total_tokens: 18,
-                reason: GEMINI_DEFAULT_UNPRICED_REASON,
+                reason: GENERIC_ROUTING_LABEL_UNPRICED_REASON,
             }
         );
+    }
+
+    // Regression: #1013, #1021, #1035. Every id in the generic-routing-label
+    // table names a router decision rather than a model, so a submission drops
+    // and reports it instead of aborting on the whole batch.
+    #[test]
+    fn submission_excludes_every_generic_routing_label_but_keeps_priceable_usage() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-4o".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(1e-6),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let label = |client: &str, provider: &str, model: &str| {
+            UnifiedMessage::new(
+                client,
+                model,
+                provider,
+                model,
+                1_736_510_400_000,
+                TokenBreakdown {
+                    input: 7,
+                    cache_read: 11,
+                    ..Default::default()
+                },
+                0.0,
+            )
+        };
+        let concrete = UnifiedMessage::new(
+            "synthetic",
+            "gpt-4o",
+            "openai",
+            "concrete",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 13,
+                ..Default::default()
+            },
+            0.0,
+        );
+
+        let graph = build_graph_from_messages(
+            vec![
+                label("antigravity-cli", "google", "gemini-default"),
+                label("antigravity-cli", "antigravity", "unknown"),
+                label("cursor", "cursor", "auto"),
+                label("copilot", "github-copilot", "auto"),
+                label("codex", "openai", "codex-auto-review"),
+                concrete,
+            ],
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("generic routing labels must not block fully priced submission usage");
+
+        assert_eq!(graph.summary.total_tokens, 13);
+        assert_eq!(graph.contributions[0].clients.len(), 1);
+        assert_eq!(graph.contributions[0].clients[0].model_id, "gpt-4o");
+        let excluded: Vec<(String, String)> = graph
+            .unpriced_submission_exclusions
+            .iter()
+            .map(|row| (row.provider_id.clone(), row.model_id.clone()))
+            .collect();
+        assert_eq!(
+            excluded,
+            vec![
+                ("antigravity".to_string(), "unknown".to_string()),
+                ("cursor".to_string(), "auto".to_string()),
+                ("github-copilot".to_string(), "auto".to_string()),
+                ("google".to_string(), "gemini-default".to_string()),
+                ("openai".to_string(), "codex-auto-review".to_string()),
+            ]
+        );
+        assert!(graph
+            .unpriced_submission_exclusions
+            .iter()
+            .all(|row| row.message_count == 1 && row.total_tokens == 18));
+    }
+
+    // Clients spell the same label with different casing (`Auto` in Cursor's
+    // exports), so the table matches case-insensitively.
+    #[test]
+    fn submission_matches_generic_routing_labels_case_insensitively() {
+        let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
+        let message = UnifiedMessage::new(
+            "cursor",
+            "Auto",
+            "Cursor",
+            "mixed-case",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 5,
+                ..Default::default()
+            },
+            0.0,
+        );
+
+        let graph = build_graph_from_messages(
+            vec![message],
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("casing must not decide whether a routing label is excluded");
+
+        assert_eq!(graph.unpriced_submission_exclusions.len(), 1);
+        assert_eq!(graph.summary.total_tokens, 0);
+    }
+
+    // A client that reports its own cost has already answered the question the
+    // label cannot: dropping the row would understate real spend.
+    #[test]
+    fn submission_keeps_generic_routing_label_with_client_reported_cost() {
+        let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
+        let mut message = UnifiedMessage::new(
+            "cursor",
+            "auto",
+            "cursor",
+            "reported",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 9,
+                ..Default::default()
+            },
+            0.25,
+        );
+        message.mark_provider_reported_cost();
+
+        let graph = build_graph_from_messages(
+            vec![message],
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("a client-priced routing label is submittable");
+
+        assert!(graph.unpriced_submission_exclusions.is_empty());
+        assert_eq!(graph.summary.total_tokens, 9);
     }
 
     #[test]
