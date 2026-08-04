@@ -1207,7 +1207,24 @@ rustc --version
 cargo --version
 ```
 
-Docker or Podman can substitute for both — see [Container Setup](#container-setup) below.
+### How to Run
+
+After following the [Development Setup](#development-setup), you can:
+
+```bash
+# Build native module (optional but recommended)
+bun run build:core
+
+# Run in development mode (launches TUI)
+cd packages/cli && bun src/index.ts
+
+# Or use legacy CLI mode
+cd packages/cli && bun src/index.ts --light
+```
+
+<details>
+
+<summary>Run with self-hosting</summary>
 
 ### Container Setup
 
@@ -1271,20 +1288,7 @@ The defaults (`tokscale`/`tokscale`/`tokscale`) are for local dev only.
 
 Because one reusable image must emit the runtime `APP_URL` in page metadata and social cards, the root layout is request-dynamic. This intentionally trades full-route static/ISR output for correct per-deployment public origins; data fetches still use their existing cache tags and revalidation policies.
 
-### How to Run (without containers)
-
-After following the [Development Setup](#development-setup), you can:
-
-```bash
-# Build native module (optional but recommended)
-bun run build:core
-
-# Run in development mode (launches TUI)
-cd packages/cli && bun src/index.ts
-
-# Or use legacy CLI mode
-cd packages/cli && bun src/index.ts --light
-```
+</details>
 
 <details>
 <summary>Advanced Development</summary>
