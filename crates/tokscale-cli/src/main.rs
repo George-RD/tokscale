@@ -5497,6 +5497,43 @@ fn report_excluded_tokenless_rows(excluded: &[ExcludedTokenlessRow]) {
     println!();
 }
 
+/// The two causes get the same zero-cost treatment and different advice: a
+/// routing label can never have a price, while a concrete model without one is
+/// something the user can fix.
+fn format_unpriced_submission_warning(
+    row: &tokscale_core::UnpricedSubmissionUsage,
+    dropped: bool,
+) -> String {
+    use tokscale_core::UnpricedUsageCause;
+
+    let treatment = if dropped {
+        "excluded from this submission"
+    } else {
+        "submitted at $0.00"
+    };
+    let explanation = match row.cause {
+        UnpricedUsageCause::GenericRoutingLabel => {
+            "this id names a routing decision rather than a model, so no price can exist for it"
+                .to_string()
+        }
+        UnpricedUsageCause::NoPublishedPrice => format!(
+            "no published price covers this usage; add {} to your custom-pricing.json \
+             or report the model at https://github.com/junhoyeo/tokscale/issues so it can be priced",
+            row.model_id
+        ),
+    };
+
+    format!(
+        "  Warning: {} unpriced {}/{} message(s) ({} tokens) {}: {}.",
+        row.message_count,
+        row.provider_id,
+        row.model_id,
+        format_tokens_with_commas(row.total_tokens),
+        treatment,
+        explanation,
+    )
+}
+
 fn report_unpriced_submission_usage(
     unpriced: &[tokscale_core::UnpricedSubmissionUsage],
     dropped: bool,
@@ -5504,23 +5541,9 @@ fn report_unpriced_submission_usage(
     use colored::Colorize;
 
     for row in unpriced {
-        let treatment = if dropped {
-            "excluded from this submission"
-        } else {
-            "submitted at $0.00"
-        };
         println!(
             "{}",
-            format!(
-                "  Warning: {} unpriced {}/{} message(s) ({} tokens) {}: {}.",
-                row.message_count,
-                row.provider_id,
-                row.model_id,
-                format_tokens_with_commas(row.total_tokens),
-                treatment,
-                row.reason,
-            )
-            .yellow()
+            format_unpriced_submission_warning(row, dropped).yellow()
         );
     }
 }
@@ -6440,6 +6463,69 @@ mod tests {
         calculate_summary, calculate_years, ClientContribution, DailyContribution, DailyTotals,
         GraphMeta, GraphResult, TokenBreakdown,
     };
+
+    fn unpriced_row(
+        provider_id: &str,
+        model_id: &str,
+        cause: tokscale_core::UnpricedUsageCause,
+    ) -> tokscale_core::UnpricedSubmissionUsage {
+        tokscale_core::UnpricedSubmissionUsage {
+            provider_id: provider_id.to_string(),
+            model_id: model_id.to_string(),
+            message_count: 3,
+            total_tokens: 12_345,
+            cause,
+        }
+    }
+
+    // A routing label is nobody's fault and nothing the user can act on, so the
+    // warning must not send them looking for a price that cannot exist.
+    #[test]
+    fn generic_routing_label_warning_offers_no_remedy() {
+        let warning = format_unpriced_submission_warning(
+            &unpriced_row(
+                "amazon-bedrock",
+                "auto",
+                tokscale_core::UnpricedUsageCause::GenericRoutingLabel,
+            ),
+            false,
+        );
+
+        assert!(
+            warning.contains(
+                "3 unpriced amazon-bedrock/auto message(s) (12,345 tokens) submitted at $0.00"
+            ),
+            "{warning}"
+        );
+        assert!(warning.contains("names a routing decision"), "{warning}");
+        assert!(!warning.contains("custom-pricing.json"), "{warning}");
+    }
+
+    // A concrete model without a price is actionable, and the warning is the
+    // only place the user learns which id to add.
+    #[test]
+    fn unpublished_price_warning_names_the_model_and_the_fix() {
+        let warning = format_unpriced_submission_warning(
+            &unpriced_row(
+                "friendli",
+                "K-EXAONE-236B-A23B",
+                tokscale_core::UnpricedUsageCause::NoPublishedPrice,
+            ),
+            false,
+        );
+
+        assert!(
+            warning.contains(
+                "3 unpriced friendli/K-EXAONE-236B-A23B message(s) (12,345 tokens) submitted at $0.00"
+            ),
+            "{warning}"
+        );
+        assert!(warning.contains("custom-pricing.json"), "{warning}");
+        assert!(
+            warning.contains("add K-EXAONE-236B-A23B"),
+            "the id to add has to appear verbatim: {warning}"
+        );
+    }
 
     #[test]
     fn test_parse_variant_arg_accepts_known_values() {

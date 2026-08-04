@@ -503,16 +503,30 @@ pub struct GraphResult {
 /// Token-bearing usage nothing can price, aggregated per (provider, model).
 /// The tokens are submitted with a cost of exactly 0.0 — a token leaderboard
 /// measures tokens, and no price is invented for them — and this is what the
-/// CLI reports so the zeros are never silent. `reason` says why the row could
-/// not be priced. Under `--prune-unpriced` the same rows are left out entirely
-/// instead.
+/// CLI reports so the zeros are never silent. Under `--prune-unpriced` the same
+/// rows are left out entirely instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnpricedSubmissionUsage {
     pub provider_id: String,
     pub model_id: String,
     pub message_count: usize,
     pub total_tokens: i64,
-    pub reason: &'static str,
+    pub cause: UnpricedUsageCause,
+}
+
+/// Why nothing could price a row. The two cases are submitted identically and
+/// differ only in what the user can do about them, which is the whole reason
+/// the report keeps them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnpricedUsageCause {
+    /// The id names a routing decision — or a parser's unknown-model
+    /// placeholder — rather than a model, so no price can ever exist for it.
+    /// There is nothing the user can do.
+    GenericRoutingLabel,
+    /// A concrete model whose price no source tokscale reads publishes, or
+    /// publishes for only some of the token buckets the usage filled. The user
+    /// can add a `custom-pricing.json` entry or have the price published.
+    NoPublishedPrice,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3054,11 +3068,6 @@ fn build_graph_from_messages(
     Ok(result)
 }
 
-const GENERIC_ROUTING_LABEL_UNPRICED_REASON: &str =
-    "generic routing label has no authoritative model-to-price mapping";
-
-const UNPUBLISHED_MODEL_PRICE_REASON: &str = "no published price covers this usage";
-
 /// A submission that carries no tokens is not a submission. Reporting success
 /// for one would tell the user their usage is on the leaderboard when nothing
 /// was sent.
@@ -3130,11 +3139,11 @@ fn is_unpriced_submission_usage(
         )
 }
 
-fn unpriced_submission_reason(message: &UnifiedMessage) -> &'static str {
+fn unpriced_usage_cause(message: &UnifiedMessage) -> UnpricedUsageCause {
     if is_generic_routing_label(&message.provider_id, &message.model_id) {
-        GENERIC_ROUTING_LABEL_UNPRICED_REASON
+        UnpricedUsageCause::GenericRoutingLabel
     } else {
-        UNPUBLISHED_MODEL_PRICE_REASON
+        UnpricedUsageCause::NoPublishedPrice
     }
 }
 
@@ -3147,8 +3156,10 @@ fn resolve_unpriced_submission_messages(
     action: UnpricedSubmissionAction,
 ) -> (Vec<UnifiedMessage>, Vec<UnpricedSubmissionUsage>) {
     let mut submitted = Vec::with_capacity(messages.len());
-    let mut unpriced: std::collections::BTreeMap<(String, String), (usize, i64, &'static str)> =
-        std::collections::BTreeMap::new();
+    let mut unpriced: std::collections::BTreeMap<
+        (String, String),
+        (usize, i64, UnpricedUsageCause),
+    > = std::collections::BTreeMap::new();
 
     for mut message in messages {
         if !is_unpriced_submission_usage(&message, pricing) {
@@ -3158,7 +3169,7 @@ fn resolve_unpriced_submission_messages(
 
         let entry = unpriced
             .entry((message.provider_id.clone(), message.model_id.clone()))
-            .or_insert((0, 0, unpriced_submission_reason(&message)));
+            .or_insert((0, 0, unpriced_usage_cause(&message)));
         entry.0 += 1;
         entry.1 = entry.1.saturating_add(message.tokens.total());
 
@@ -3175,13 +3186,13 @@ fn resolve_unpriced_submission_messages(
     let unpriced = unpriced
         .into_iter()
         .map(
-            |((provider_id, model_id), (message_count, total_tokens, reason))| {
+            |((provider_id, model_id), (message_count, total_tokens, cause))| {
                 UnpricedSubmissionUsage {
                     provider_id,
                     model_id,
                     message_count,
                     total_tokens,
-                    reason,
+                    cause,
                 }
             },
         )
@@ -4438,9 +4449,8 @@ mod tests {
         parse_local_clients, parsed_to_unified, paths, pricing, retain_for_requested_clients,
         scanner, select_local_parse_pricing, unified_to_parsed, validate_priced_messages, ClientId,
         GraphPricingRequirement, GroupBy, LocalParseOptions, ReportOptions, TokenBreakdown,
-        UnifiedMessage, UnpricedSubmissionUsage, EMPTY_SUBMISSION_ERROR,
-        GENERIC_ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL,
-        UNPUBLISHED_MODEL_PRICE_REASON,
+        UnifiedMessage, UnpricedSubmissionUsage, UnpricedUsageCause, EMPTY_SUBMISSION_ERROR,
+        UNKNOWN_WORKSPACE_LABEL,
     };
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
@@ -8473,7 +8483,7 @@ mod tests {
                 model_id: "K-EXAONE-236B-A23B".to_string(),
                 message_count: 1,
                 total_tokens: 6,
-                reason: UNPUBLISHED_MODEL_PRICE_REASON,
+                cause: UnpricedUsageCause::NoPublishedPrice,
             }]
         );
     }
@@ -8512,8 +8522,8 @@ mod tests {
         assert_eq!(graph.summary.total_tokens, 165);
         assert_eq!(graph.summary.total_cost, 0.0);
         assert_eq!(
-            graph.unpriced_submission_usage[0].reason,
-            GENERIC_ROUTING_LABEL_UNPRICED_REASON
+            graph.unpriced_submission_usage[0].cause,
+            UnpricedUsageCause::GenericRoutingLabel
         );
     }
 
@@ -8667,7 +8677,7 @@ mod tests {
                 model_id: "gemini-default".to_string(),
                 message_count: 1,
                 total_tokens: 18,
-                reason: GENERIC_ROUTING_LABEL_UNPRICED_REASON,
+                cause: UnpricedUsageCause::GenericRoutingLabel,
             }
         );
     }
@@ -8900,7 +8910,7 @@ mod tests {
                 model_id: "K-EXAONE-236B-A23B".to_string(),
                 message_count: 1,
                 total_tokens: 6,
-                reason: UNPUBLISHED_MODEL_PRICE_REASON,
+                cause: UnpricedUsageCause::NoPublishedPrice,
             }]
         );
     }
@@ -8978,7 +8988,7 @@ mod tests {
                 model_id: "gemini-default".to_string(),
                 message_count: 1,
                 total_tokens: 18,
-                reason: GENERIC_ROUTING_LABEL_UNPRICED_REASON,
+                cause: UnpricedUsageCause::GenericRoutingLabel,
             }]
         );
     }
