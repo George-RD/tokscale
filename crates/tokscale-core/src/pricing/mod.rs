@@ -80,7 +80,8 @@ impl PricingService {
                 Self::build_cursor_overrides(),
                 Self::build_sakana_overrides(),
                 models_dev_data,
-            ),
+            )
+            .with_friendli_overrides(Self::build_friendli_overrides()),
         }
     }
 
@@ -188,6 +189,67 @@ impl PricingService {
                 input_cost_per_token_above_272k_tokens: Some(1e-5),
                 output_cost_per_token_above_272k_tokens: Some(4.5e-5),
                 cache_read_input_token_cost_above_272k_tokens: Some(1e-6),
+                ..Default::default()
+            },
+        );
+        overrides
+    }
+
+    // @keep: FriendliAI-sourced pricing for `K-EXAONE-236B-A23B`, which no
+    // upstream dataset carries: it is absent from OpenRouter's live catalog,
+    // absent from models.dev, and LiteLLM has only two stale
+    // `friendliai/meta-llama-3.1-*` rows (#1035). Reports source label
+    // "FriendliAI" and is consulted at the same precedence as the Cursor and
+    // Sakana overrides in PricingLookup — after the exact/normalized/prefix
+    // upstream matches, before the fuzzy stage — so a real upstream entry
+    // always wins if one ever appears.
+    //
+    // Rates source: https://friendli.ai/api/public/model-apis, the JSON
+    // endpoint that generates https://friendli.ai/pricing (the pricing page
+    // itself is a client-side React shell whose static HTML carries no
+    // numbers). Corroborated by that page ("$0.2 Input / $0.1 Cached Input /
+    // $0.8 Output") and by
+    // https://friendli.ai/models/LGAI-EXAONE/K-EXAONE-236B-A23B. All three are
+    // FriendliAI-controlled and mutually consistent (accessed 2026-08-05):
+    //   input $0.20/1M, output $0.80/1M, cache-read $0.10/1M.
+    //
+    // These are the SERVERLESS per-token rates ("priceUnitType": "TOKEN", base
+    // URL https://api.friendli.ai/serverless/v1), not FriendliAI's dedicated
+    // endpoint product, which bills per GPU-hour. A per-GPU-hour figure must
+    // never be converted into a per-token rate here — the conversion depends on
+    // throughput the session log does not record.
+    //
+    // NOTE: cache-WRITE is deliberately None. FriendliAI publishes no cache
+    // creation rate, and an omitted rate is an absence, not a zero.
+    //
+    // NOTE: there is deliberately NO `*_above_*` long-context field. The
+    // payload carries exactly one context-length tier
+    // ("contextLengthTier": {"tier": 0, "minInputTokens": 0, "maxInputTokens":
+    // null}) spanning the full 262,144-token window, so the base rate is the
+    // only rate. This is the structural difference from `fugu-ultra`, which
+    // genuinely publishes a second >272K tier.
+    //
+    // CONTRADICTING SOURCE: llm-stats.com lists this model via FriendliAI at
+    // $0.60/1M input and $1.00/1M output — 3x the input rate and 1.25x the
+    // output rate recorded here. FriendliAI's own figure is used because
+    // FriendliAI is the party that actually bills for the endpoint; the
+    // third-party aggregator cites no source for its numbers. Recorded rather
+    // than dropped so a future maintainer seeing the discrepancy knows it was
+    // considered.
+    //
+    // NOTE: the payload also carries "deprecationDate":
+    // "2026-08-20T00:00:00.000Z". Historical sessions still have to price
+    // correctly, so the override remains right, but expect it to go stale
+    // after that date rather than be maintained.
+    fn build_friendli_overrides() -> HashMap<String, ModelPricing> {
+        let mut overrides = HashMap::with_capacity(1);
+        overrides.insert(
+            "friendli/LGAI-EXAONE/K-EXAONE-236B-A23B".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(2e-7),
+                output_cost_per_token: Some(8e-7),
+                cache_read_input_token_cost: Some(1e-7),
+                cache_creation_input_token_cost: None,
                 ..Default::default()
             },
         );
@@ -1587,5 +1649,74 @@ mod tests {
 
         let expected = 1_000_000.0 * 0.000002 + 100_000.0 * 0.000008;
         assert!((cost - expected).abs() < 1e-10);
+    }
+
+    const K_EXAONE_ID: &str = "friendli/LGAI-EXAONE/K-EXAONE-236B-A23B";
+
+    #[test]
+    fn test_friendli_prices_k_exaone() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let result = service.lookup_with_source(K_EXAONE_ID, None).unwrap();
+
+        assert_eq!(result.source, "FriendliAI");
+        assert_eq!(result.matched_key, K_EXAONE_ID);
+        assert_eq!(result.pricing.input_cost_per_token, Some(2e-7));
+        assert_eq!(result.pricing.output_cost_per_token, Some(8e-7));
+        assert_eq!(result.pricing.cache_read_input_token_cost, Some(1e-7));
+        // FriendliAI publishes no cache-WRITE rate, so it stays absent rather
+        // than being guessed at.
+        assert_eq!(result.pricing.cache_creation_input_token_cost, None);
+    }
+
+    #[test]
+    fn test_friendli_k_exaone_has_no_long_context_tier() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let pricing = service
+            .lookup_with_source(K_EXAONE_ID, None)
+            .unwrap()
+            .pricing;
+
+        // One flat tier spans the whole 262,144-token window, so every tiered
+        // field must stay None; a populated one would invent a second rate.
+        assert_eq!(pricing.input_cost_per_token_above_128k_tokens, None);
+        assert_eq!(pricing.input_cost_per_token_above_200k_tokens, None);
+        assert_eq!(pricing.input_cost_per_token_above_256k_tokens, None);
+        assert_eq!(pricing.input_cost_per_token_above_272k_tokens, None);
+        assert_eq!(pricing.output_cost_per_token_above_128k_tokens, None);
+        assert_eq!(pricing.output_cost_per_token_above_200k_tokens, None);
+        assert_eq!(pricing.output_cost_per_token_above_256k_tokens, None);
+        assert_eq!(pricing.output_cost_per_token_above_272k_tokens, None);
+        assert_eq!(pricing.cache_read_input_token_cost_above_200k_tokens, None);
+        assert_eq!(pricing.cache_read_input_token_cost_above_272k_tokens, None);
+    }
+
+    #[test]
+    fn test_friendli_k_exaone_cost_is_flat_across_the_context_window() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        // Well past 272K input tokens: without a tier the base rate still applies.
+        let cost = service.calculate_cost(K_EXAONE_ID, 300_000, 10_000, 50_000, 0, 0);
+        let expected = 300_000.0 * 2e-7 + 10_000.0 * 8e-7 + 50_000.0 * 1e-7;
+        assert!(
+            (cost - expected).abs() < 1e-10,
+            "got {cost}, want {expected}"
+        );
+    }
+
+    #[test]
+    fn test_friendli_yields_to_litellm_exact() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            K_EXAONE_ID.to_lowercase(),
+            ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.002),
+                ..Default::default()
+            },
+        );
+        let service = PricingService::new(litellm, HashMap::new());
+        let result = service.lookup_with_source(K_EXAONE_ID, None).unwrap();
+
+        assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.pricing.input_cost_per_token, Some(0.001));
     }
 }

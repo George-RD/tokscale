@@ -113,6 +113,7 @@ pub struct PricingLookup {
     openrouter: HashMap<String, ModelPricing>,
     cursor: HashMap<String, ModelPricing>,
     sakana: HashMap<String, ModelPricing>,
+    friendli: HashMap<String, ModelPricing>,
     models_dev: HashMap<String, ModelPricing>,
     litellm_keys: Vec<String>,
     openrouter_keys: Vec<String>,
@@ -126,6 +127,7 @@ pub struct PricingLookup {
     models_dev_model_part: HashMap<String, String>,
     cursor_lower: HashMap<String, String>,
     sakana_lower: HashMap<String, String>,
+    friendli_lower: HashMap<String, String>,
     lookup_cache: RwLock<HashMap<String, Option<CachedResult>>>,
 }
 
@@ -245,6 +247,7 @@ impl PricingLookup {
             openrouter,
             cursor,
             sakana,
+            friendli: HashMap::new(),
             models_dev,
             litellm_keys,
             openrouter_keys,
@@ -258,8 +261,24 @@ impl PricingLookup {
             models_dev_model_part,
             cursor_lower,
             sakana_lower,
+            friendli_lower: HashMap::new(),
             lookup_cache: RwLock::new(HashMap::with_capacity(64)),
         }
+    }
+
+    /// Attach the FriendliAI built-in overrides (see `build_friendli_overrides`
+    /// in `pricing/mod.rs`).
+    ///
+    /// Threaded as a post-construction step rather than a sixth constructor
+    /// parameter so `new_with_models_dev`'s shape — and its many call sites —
+    /// stay untouched.
+    pub fn with_friendli_overrides(mut self, friendli: HashMap<String, ModelPricing>) -> Self {
+        self.friendli_lower = friendli
+            .keys()
+            .map(|key| (key.to_lowercase(), key.clone()))
+            .collect();
+        self.friendli = friendli;
+        self
     }
 
     pub fn lookup(&self, model_id: &str) -> Option<LookupResult> {
@@ -641,6 +660,11 @@ impl PricingLookup {
             }
         }
 
+        // FriendliAI built-in overrides, same precedence as Cursor and Sakana.
+        if let Some(result) = self.exact_match_friendli(model_id) {
+            return Some(result);
+        }
+
         if !is_fuzzy_eligible(model_id) {
             return None;
         }
@@ -1006,6 +1030,16 @@ impl PricingLookup {
             }
         }
         None
+    }
+
+    /// The FriendliAI overrides are keyed by their full provider-qualified path
+    /// (`friendli/LGAI-EXAONE/K-EXAONE-236B-A23B`), so unlike the Cursor and
+    /// Sakana matchers there is no terminal-segment fallback: a bare
+    /// `k-exaone-236b-a23b` says nothing about who served it, and the same open
+    /// weights are resold elsewhere at other rates.
+    fn exact_match_friendli(&self, model_id: &str) -> Option<LookupResult> {
+        let key = self.friendli_lower.get(model_id)?;
+        lookup_result_if_usable(self.friendli.get(key)?, "FriendliAI", key)
     }
 
     fn prefix_match_litellm(
