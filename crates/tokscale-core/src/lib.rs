@@ -6485,6 +6485,97 @@ mod tests {
         }
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_warm_cache_removes_synthetic_placeholder_before_submit_validation() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+
+        {
+            let claude_dir = source_home.path().join(".claude/projects/demo");
+            std::fs::create_dir_all(&claude_dir).unwrap();
+            let transcript = claude_dir.join("session.jsonl");
+            std::fs::write(
+                &transcript,
+                r#"{"type":"assistant","timestamp":"2026-06-24T01:00:00.000Z","requestId":"req_live","message":{"id":"live","model":"claude-3-5-sonnet","usage":{"input_tokens":1,"output_tokens":1}}}"#,
+            )
+            .unwrap();
+
+            let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
+            let fingerprint = message_cache::SourceFingerprint::from_claude_code_path_with_home(
+                &transcript,
+                Some(source_home.path()),
+            )
+            .unwrap();
+            let retained = UnifiedMessage::new_with_dedup(
+                "claude",
+                "claude-3-5-sonnet",
+                "anthropic",
+                "session",
+                1_782_259_200_000,
+                TokenBreakdown {
+                    input: 10,
+                    output: 5,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                0.0,
+                Some("old:req_old".to_string()),
+            );
+            let poisoned = UnifiedMessage::new_with_dedup(
+                "claude",
+                "<synthetic>",
+                "unknown",
+                "session",
+                1_782_259_201_000,
+                TokenBreakdown {
+                    input: 100,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                0.0,
+                Some("claude:tool_result:session:tool_result:toolu_1".to_string()),
+            );
+            let mut cache = message_cache::SourceMessageCache::default();
+            cache.insert(message_cache::CachedSourceEntry::new(
+                identity,
+                &transcript,
+                fingerprint,
+                vec![retained, poisoned],
+                Vec::new(),
+                None,
+            ));
+            cache.save_if_dirty();
+
+            let messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["claude".to_string()],
+                None,
+            );
+
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].model_id, "claude-3-5-sonnet");
+            assert_eq!(messages[0].tokens.input, 10);
+
+            let repaired = message_cache::SourceMessageCache::load();
+            let cached = repaired
+                .get(identity, &transcript)
+                .expect("the retained Claude cache entry should remain");
+            assert_eq!(cached.messages.len(), 1);
+            assert_eq!(cached.messages[0].dedup_key.as_deref(), Some("old:req_old"));
+        }
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]

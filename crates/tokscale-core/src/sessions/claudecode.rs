@@ -503,6 +503,11 @@ pub fn parse_claude_file_with_cache_and_home(
     let mut pending_request_start_timestamp_ms: Option<i64> = None;
     let mut last_model: Option<String> = None;
     let mut last_provider_hint: Option<String> = None;
+    // Claude Code writes local API-error and auth notices as assistant messages
+    // with `<synthetic>` rather than an API model. A following tool result has
+    // no model of its own, so it must not inherit that placeholder and turn a
+    // char estimate into unpriceable usage.
+    let mut suppress_unattributed_tool_results = false;
     // Sidechain detection state (resolved lazily on first parseable entry)
     let mut sidechain_agent: Option<String> = None;
     let mut sidechain_detected = false;
@@ -554,6 +559,7 @@ pub fn parse_claude_file_with_cache_and_home(
                         workspace_key: workspace_key.clone(),
                         workspace_label: workspace_label.clone(),
                         sidechain_agent: sidechain_agent.clone(),
+                        suppress_unattributed: suppress_unattributed_tool_results,
                         allow_char_estimate: !is_bare_transcript,
                     },
                 );
@@ -595,6 +601,14 @@ pub fn parse_claude_file_with_cache_and_home(
                 };
 
                 if let Some(model) = message.model.as_deref() {
+                    if is_claude_synthetic_placeholder_model(model) {
+                        last_model = None;
+                        last_provider_hint = None;
+                        pending_request_start_timestamp_ms = None;
+                        suppress_unattributed_tool_results = true;
+                        continue;
+                    }
+                    suppress_unattributed_tool_results = false;
                     last_model = Some(model.to_string());
                     last_provider_hint = message
                         .provider_id
@@ -963,6 +977,9 @@ struct ClaudeToolResultContext<'a> {
     workspace_key: Option<String>,
     workspace_label: Option<String>,
     sidechain_agent: Option<String>,
+    /// A preceding local Claude Code notice used `<synthetic>` instead of an API
+    /// model. A following tool result with no model cannot be attributed safely.
+    suppress_unattributed: bool,
     /// Whether char-based token estimation may be used as a fallback when no
     /// explicit tool-result token count is present. Bare transcripts (see
     /// `is_bare_transcript`) set this to `false` to avoid double-counting
@@ -978,16 +995,13 @@ fn extract_claude_tool_result_message(
     let value: Value = serde_json::from_str(line).ok()?;
     let usage = extract_claude_tool_result_usage(&value, context.allow_char_estimate)?;
 
-    let raw_model = extract_claude_model(&value)
-        .or_else(|| {
-            context
-                .entry
-                .message
-                .as_ref()
-                .and_then(|message| message.model.clone())
-        })
-        .or_else(|| context.last_model.map(str::to_string))
-        .unwrap_or_else(|| "unknown".to_string());
+    let explicit_model = extract_claude_model(&value).or_else(|| {
+        context
+            .entry
+            .message
+            .as_ref()
+            .and_then(|message| message.model.clone())
+    });
     let provider_hint = extract_claude_provider(&value)
         .or_else(|| {
             context
@@ -996,7 +1010,20 @@ fn extract_claude_tool_result_message(
                 .as_ref()
                 .and_then(|message| message.provider_id.clone())
         })
-        .or_else(|| context.entry.provider_id.clone())
+        .or_else(|| context.entry.provider_id.clone());
+    let raw_model = match explicit_model {
+        Some(model) if is_claude_synthetic_placeholder_model(&model) => return None,
+        Some(model) => model,
+        // A provider alone cannot identify a billable model. Suppress every
+        // model-less result after a local synthetic notice rather than emit
+        // another unpriceable `provider/unknown` estimate.
+        None if context.suppress_unattributed => return None,
+        None => context
+            .last_model
+            .map(str::to_string)
+            .unwrap_or_else(|| "unknown".to_string()),
+    };
+    let provider_hint = provider_hint
         .or_else(|| context.last_provider_hint.map(str::to_string))
         .or_else(|| context.default_provider_hint.map(str::to_string));
 
@@ -1209,6 +1236,22 @@ fn estimate_tokens_from_chars(chars: usize) -> i64 {
     chars.div_ceil(4) as i64
 }
 
+fn is_claude_synthetic_placeholder_model(model: &str) -> bool {
+    model.trim().eq_ignore_ascii_case("<synthetic>")
+}
+
+/// Remove Claude Code's local `<synthetic>` placeholder rows from a cached
+/// transcript. These notices are not API usage and old cache entries can
+/// contain a tool-result char estimate attributed to the placeholder.
+///
+/// This lives with the parser rather than the cache so the sentinel definition
+/// stays consistent between cold parsing and cache migration.
+pub(crate) fn remove_synthetic_placeholder_messages(messages: &mut Vec<UnifiedMessage>) -> bool {
+    let message_count = messages.len();
+    messages.retain(|message| !is_claude_synthetic_placeholder_model(&message.model_id));
+    messages.len() != message_count
+}
+
 fn canonicalize_claude_model(model: &str) -> String {
     pricing::aliases::resolve_alias(model)
         .unwrap_or(model)
@@ -1285,7 +1328,15 @@ fn process_claude_headless_line(
                 default_provider_hint,
             );
 
-            state.model = extract_claude_model(&value);
+            let model = extract_claude_model(&value);
+            if model
+                .as_deref()
+                .is_some_and(is_claude_synthetic_placeholder_model)
+            {
+                *state = ClaudeHeadlessState::default();
+                return completed_message;
+            }
+            state.model = model;
             state.provider_id = extract_claude_provider(&value);
             state.timestamp_ms = extract_claude_timestamp(&value).or(state.timestamp_ms);
             if let Some(usage) = value
@@ -1340,6 +1391,9 @@ fn extract_claude_headless_message(
         .get("usage")
         .or_else(|| value.get("message").and_then(|msg| msg.get("usage")))?;
     let raw_model = extract_claude_model(value)?;
+    if is_claude_synthetic_placeholder_model(&raw_model) {
+        return None;
+    }
     let provider_hint = extract_claude_provider(value);
     let provider_id = claude_provider_id(
         &raw_model,
@@ -1565,6 +1619,10 @@ fn finalize_headless_state(
     default_provider_hint: Option<&str>,
 ) -> Option<UnifiedMessage> {
     let raw_model = state.model.clone()?;
+    if is_claude_synthetic_placeholder_model(&raw_model) {
+        *state = ClaudeHeadlessState::default();
+        return None;
+    }
     let provider_id = claude_provider_id(
         &raw_model,
         state.provider_id.as_deref().or(default_provider_hint),
@@ -2250,6 +2308,42 @@ mod tests {
     }
 
     #[test]
+    fn test_synthetic_notice_does_not_seed_an_unmodelled_tool_result() {
+        let content = r#"{"type":"user","timestamp":"2026-06-24T01:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}
+{"type":"assistant","timestamp":"2026-06-24T01:00:01.000Z","isApiErrorMessage":true,"error":"unknown","message":{"id":"m1","role":"assistant","model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[{"type":"text","text":"API Error"}]}}
+{"type":"user","timestamp":"2026-06-24T01:00:02.000Z","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"XXXXXXXXXXXXXXXX"}]}}"#;
+
+        let file = create_test_file(content);
+        let messages = parse_claude_file(file.path());
+
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_synthetic_notice_does_not_hide_an_explicitly_modelled_tool_result() {
+        let content = r#"{"type":"assistant","timestamp":"2026-06-24T01:00:01.000Z","message":{"model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0}}}
+{"type":"user","timestamp":"2026-06-24T01:00:02.000Z","message":{"model":"claude-sonnet-4-6","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"XXXXXXXXXXXXXXXX"}]}}"#;
+
+        let file = create_test_file(content);
+        let messages = parse_claude_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "claude-sonnet-4-6");
+        assert_eq!(messages[0].tokens.input, 4);
+    }
+
+    #[test]
+    fn test_synthetic_notice_does_not_emit_a_provider_only_tool_result() {
+        let content = r#"{"type":"assistant","timestamp":"2026-06-24T01:00:01.000Z","message":{"model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0}}}
+{"type":"user","timestamp":"2026-06-24T01:00:02.000Z","provider":"openrouter","message":{"content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"XXXXXXXXXXXXXXXX"}]}}"#;
+
+        let file = create_test_file(content);
+        let messages = parse_claude_file(file.path());
+
+        assert!(messages.is_empty());
+    }
+
+    #[test]
     fn test_assistant_usage_with_tool_use_is_not_estimated_from_prompt_text() {
         let content = r#"{"type":"assistant","timestamp":"2026-05-27T10:00:00.000Z","message":{"id":"msg_tool_use","model":"claude-sonnet-4-6","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/tmp/large.txt"}}],"usage":{"input_tokens":100,"output_tokens":50}}}"#;
 
@@ -2284,12 +2378,14 @@ mod tests {
         let file = create_test_file(content);
         let messages = parse_claude_file(file.path());
 
-        assert_eq!(messages.len(), 5);
+        assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].provider_id, "anthropic");
         assert_eq!(messages[1].provider_id, "openai");
         assert_eq!(messages[2].provider_id, "google");
         assert_eq!(messages[3].provider_id, "minimax");
-        assert_eq!(messages[4].provider_id, "unknown");
+        assert!(!messages
+            .iter()
+            .any(|message| message.model_id == "<synthetic>"));
     }
 
     #[test]
