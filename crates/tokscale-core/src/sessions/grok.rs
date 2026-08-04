@@ -408,12 +408,21 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
             let event_id = get_path(&value, &["params", "_meta", "eventId"])
                 .and_then(|value| extract_string(Some(value)))
                 .unwrap_or_else(|| format!("turn-{usage_index}"));
+            // `eventId` is not unique: Grok reuses it across usage records, and
+            // identical dedup keys are collapsed downstream, so keying on it
+            // alone merged distinct turns into one. The position of the record
+            // within the file disambiguates them and stays stable across
+            // re-parses of an unchanged file, which the on-disk message cache
+            // this key feeds requires.
             usage_messages.push(message_from_tokens(
                 &metadata,
                 model_id,
                 timestamp,
                 usage.tokens,
-                format!("grok:{}:usage:{}", metadata.session_id, event_id),
+                format!(
+                    "grok:{}:usage:{usage_index}:{event_id}",
+                    metadata.session_id
+                ),
                 true,
             ));
             usage_index = usage_index.saturating_add(1);
@@ -1892,6 +1901,32 @@ mod tests {
     }
 
     #[test]
+    fn keeps_repeated_event_ids_in_distinct_dedup_keys() {
+        let (_temp, path) = write_fixture(
+            &format!(
+                "{}\n{}\n",
+                usage_line("turn-1", 1_700_000_001_000, 10, 1),
+                usage_line("turn-1", 1_700_000_002_000, 20, 2),
+            ),
+            None,
+            None,
+        );
+
+        let messages = parse_grok_updates_file(&path);
+
+        assert_eq!(messages.len(), 2);
+        assert_ne!(messages[0].dedup_key, messages[1].dedup_key);
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some("grok:session-1:usage:0:turn-1")
+        );
+        assert_eq!(
+            messages[1].dedup_key.as_deref(),
+            Some("grok:session-1:usage:1:turn-1")
+        );
+    }
+
+    #[test]
     fn prefers_authoritative_usage_breakdown_when_available() {
         let (_temp, path) = write_fixture(
             r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk","_meta":{"modelId":"grok-4.5"}},"_meta":{"agentTimestampMs":1700000001000}}}
@@ -1911,7 +1946,7 @@ mod tests {
         assert_eq!(messages[0].timestamp, 1700000003000);
         assert_eq!(
             messages[0].dedup_key.as_deref(),
-            Some("grok:session-1:usage:turn-1")
+            Some("grok:session-1:usage:0:turn-1")
         );
     }
 
