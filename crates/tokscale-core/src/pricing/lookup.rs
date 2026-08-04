@@ -71,25 +71,20 @@ const FUZZY_BLOCKLIST: &[&str] = &[
     "router",
 ];
 
-// Routing prefixes that name a bring-your-own-key gateway rather than a billing
-// entity, so nothing under them may be resolved by similarity. `freerouter` is
-// not a provider anyone bills through: it has 0 occurrences across models.dev's
-// 178 providers, is absent from LiteLLM's 2,986 keys, and is absent from
-// OpenRouter. What ships under the name is a cluster of self-hosted BYOK
-// routers, which puts it in exactly the position of bare `fugu` (see
-// `build_sakana_overrides` in pricing/mod.rs) — the effective rate is
-// per-request and is NOT recoverable from the session log, which records only
-// the route.
+// Gateways that name a bring-your-own-key router rather than a billing entity.
+// `freerouter` is not a provider anyone bills through: it has 0 occurrences
+// across models.dev's 178 providers, is absent from LiteLLM's 2,986 keys, and
+// is absent from OpenRouter. What ships under the name is a cluster of
+// self-hosted BYOK routers, which puts it in exactly the position of bare
+// `fugu` (see `build_sakana_overrides` in pricing/mod.rs) — the effective rate
+// is per-request and is NOT recoverable from the session log, which records
+// only the route.
 //
-// Without this guard `freerouter/nvidia/nemotron-3-ultra-550b-a55b` (#1035)
-// erodes to its terminal segment and lands on `kenari/nemotron-3-ultra-550b-a55b`
-// at $0/$0. `kenari.id` is an unrelated Indonesian provider with no connection
-// to freerouter or NVIDIA; it wins on string similarity alone. Zero is a claim
-// ("this was free") that happens to be right only if the user was on a `:free`
-// route, so these ids are left deliberately unpriced instead. An exact upstream
-// key that actually names the route still resolves: the direct lookup on the
-// full id runs before this guard.
-const SIMILARITY_BLOCKED_ROUTER_PREFIXES: &[&str] = &["freerouter/"];
+// The name can arrive as the provider field or as a path segment, and the two
+// are not interchangeable: for the session in #1035 `freerouter` is the
+// PROVIDER, with `nvidia/nemotron-3-ultra-550b-a55b` as the model. Both shapes
+// are recognized (see `similarity_blocked_route`).
+const SIMILARITY_BLOCKED_ROUTERS: &[&str] = &["freerouter"];
 
 // Spellings of the FriendliAI vendor name that a client can put in either the
 // provider field or the leading path segment of a model id. `friendliai` is the
@@ -425,29 +420,33 @@ impl PricingLookup {
             )
         };
 
+        // A route through a BYOK gateway (`freerouter`) may not have the vendor
+        // it named swapped for whichever catalog entry happens to share the
+        // model's name. See `blocked_route_keeps_vendor`.
+        let blocked_route = similarity_blocked_route(lower_ref, provider_id);
+        let keeps_route_vendor = |result: &LookupResult| match &blocked_route {
+            Some(route) => blocked_route_keeps_vendor(route, lower_ref, result),
+            None => true,
+        };
+
         // 1. Try direct lookup
         if let Some(result) = do_lookup(lower_ref) {
             if unsafe_claude_resolution(&result) {
                 return None;
             }
-            return Some(result);
+            if keeps_route_vendor(&result) {
+                return Some(result);
+            }
         }
 
         if parse_provider_scoped_model_path(lower_ref).is_some() {
             return None;
         }
 
-        // The direct lookup above already gave the full id its chance against
-        // every dataset. Everything below erodes the id — stripping the routing
-        // prefix, then suffixes, then leading segments — and each candidate is
-        // re-resolved without the prefix, so `is_fuzzy_eligible` never sees that
-        // the id came from a blocked router. Stop here instead.
-        if has_similarity_blocked_router_prefix(lower_ref) {
-            return None;
-        }
-
         let guarded_lookup = |candidate: &str| {
-            do_lookup(candidate).filter(|result| !unsafe_claude_resolution(result))
+            do_lookup(candidate)
+                .filter(|result| !unsafe_claude_resolution(result))
+                .filter(&keeps_route_vendor)
         };
 
         // 1.5. Generic provider-routing prefix fallback: ids coming from a
@@ -2182,10 +2181,108 @@ fn contains_delimited_major_minor(haystack: &str, major: char) -> bool {
     false
 }
 
-fn has_similarity_blocked_router_prefix(model_id: &str) -> bool {
-    SIMILARITY_BLOCKED_ROUTER_PREFIXES
+/// An id routed through one of `SIMILARITY_BLOCKED_ROUTERS`.
+struct BlockedRoute<'a> {
+    /// The segment naming the vendor the route forwards to — `nvidia` in
+    /// `freerouter/nvidia/nemotron-3-ultra-550b-a55b`. `None` when the id
+    /// carries no vendor segment at all, which makes the route unidentifiable.
+    vendor: Option<&'a str>,
+}
+
+/// Recognizes a BYOK-router route in either shape it reaches the lookup in: the
+/// router as the `provider_id` (what the session in #1035 actually sends, with
+/// `nvidia/nemotron-…` as the model), or as a path segment of the model id.
+///
+/// The path segment is matched anywhere, not just at position 0, so
+/// `myproxy/freerouter/nvidia/…` is treated as the same route wrapped one layer
+/// deeper rather than slipping through.
+fn similarity_blocked_route<'a>(
+    model_id: &'a str,
+    provider_id: Option<&str>,
+) -> Option<BlockedRoute<'a>> {
+    let is_blocked = |name: &str| {
+        SIMILARITY_BLOCKED_ROUTERS
+            .iter()
+            .any(|router| name.eq_ignore_ascii_case(router))
+    };
+
+    let provider_is_blocked = provider_id.is_some_and(is_blocked);
+    if !provider_is_blocked
+        && !SIMILARITY_BLOCKED_ROUTERS
+            .iter()
+            .any(|router| model_id.contains(router))
+    {
+        return None;
+    }
+
+    let segments: Vec<&str> = model_id.split('/').collect();
+    let vendor_index = match segments.iter().position(|segment| is_blocked(segment)) {
+        Some(index) => index + 1,
+        None if provider_is_blocked => 0,
+        None => return None,
+    };
+
+    // A segment is only a vendor if something follows it; the final segment is
+    // the model name, so `freerouter/some-model` names no vendor at all.
+    let vendor = segments
+        .get(vendor_index)
+        .filter(|_| vendor_index + 1 < segments.len())
+        .copied();
+
+    Some(BlockedRoute { vendor })
+}
+
+/// Whether a resolution may stand for a BYOK-router route.
+///
+/// The defect this guards is a vendor swap: `freerouter/nvidia/nemotron-3-ultra-550b-a55b`
+/// (#1035) erodes to its terminal segment and lands on
+/// `kenari/nemotron-3-ultra-550b-a55b` at $0/$0 — `kenari.id` is an unrelated
+/// Indonesian provider with no connection to freerouter or NVIDIA, and it wins
+/// on the model name alone. Zero is a claim ("this was free") that happens to
+/// be right only if the user was on a `:free` route.
+///
+/// So the suppression is aimed at name-alone matching (the model-part and fuzzy
+/// stages), not at erosion as such: exact and prefix-stripped resolutions that
+/// keep the route's own vendor stay intact, and
+/// `freerouter/anthropic/claude-opus-4.6` still resolves to Anthropic's real
+/// list rate. Only a route that identifies no vendor, or whose resolution names
+/// a different one, goes unpriced.
+fn blocked_route_keeps_vendor(
+    route: &BlockedRoute<'_>,
+    queried_id: &str,
+    result: &LookupResult,
+) -> bool {
+    let matched = result.matched_key.to_lowercase();
+
+    // An upstream key that names the route itself is a real price FOR it, not a
+    // guess ABOUT it.
+    if matched == queried_id {
+        return true;
+    }
+
+    let Some(vendor) = route.vendor else {
+        return false;
+    };
+
+    // A key with no provider segment is the model's own canonical entry rather
+    // than some other vendor's resale of it.
+    let Some(matched_provider) = matched.split('/').next().filter(|_| matched.contains('/')) else {
+        return true;
+    };
+
+    let matched_tags = provider_identity::key_provider_tags(&matched);
+    let vendor_tags = provider_identity::provider_tags(vendor);
+    if matched_tags
         .iter()
-        .any(|prefix| model_id.starts_with(prefix))
+        .any(|matched_tag| vendor_tags.iter().any(|tag| tag == matched_tag))
+    {
+        return true;
+    }
+
+    // `provider_identity` returns no tags for vendors it does not know, and two
+    // empty tag lists must not read as agreement — so fall back to comparing the
+    // names literally.
+    matched_provider.eq_ignore_ascii_case(vendor)
 }
 
 fn is_friendli_provider(provider_id: Option<&str>) -> bool {
@@ -2198,9 +2295,6 @@ fn is_friendli_provider(provider_id: Option<&str>) -> bool {
 
 fn is_fuzzy_eligible(model_id: &str) -> bool {
     if model_id.len() < MIN_FUZZY_MATCH_LEN {
-        return false;
-    }
-    if has_similarity_blocked_router_prefix(model_id) {
         return false;
     }
     !FUZZY_BLOCKLIST.contains(&model_id)
@@ -6372,21 +6466,48 @@ mod tests {
                 ..Default::default()
             },
         );
+        // A route that names a vendor the catalog actually carries. Its price
+        // is real and must survive the guard.
+        openrouter.insert(
+            "anthropic/claude-opus-4.6".into(),
+            ModelPricing {
+                input_cost_per_token: Some(5e-6),
+                output_cost_per_token: Some(2.5e-5),
+                ..Default::default()
+            },
+        );
         openrouter
     }
 
-    // Regression (#1035): `freerouter` is a bring-your-own-key router, not a
-    // billing entity, so an id under it must resolve to NO price rather than
-    // erode to its terminal segment and land on `kenari/...` at $0/$0.
-    #[test]
-    fn freerouter_id_does_not_resolve_to_unrelated_provider() {
-        let lookup = PricingLookup::new(
+    fn freerouter_lookup() -> PricingLookup {
+        PricingLookup::new(
             HashMap::new(),
             freerouter_fixture_openrouter(),
             HashMap::new(),
-        );
+        )
+    }
 
-        let result = lookup.lookup("freerouter/nvidia/nemotron-3-ultra-550b-a55b");
+    // Regression (#1035): the reported session carries `freerouter` as the
+    // PROVIDER and `nvidia/nemotron-…` as the model, as separate fields — the
+    // shape the parsers produce and the shape the lookup is called with. The
+    // route must not have its vendor silently swapped for `kenari`, which wins
+    // on the model name alone at $0/$0.
+    #[test]
+    fn freerouter_provider_hint_does_not_resolve_to_unrelated_provider() {
+        let result = freerouter_lookup()
+            .lookup_with_provider("nvidia/nemotron-3-ultra-550b-a55b", Some("freerouter"));
+        assert!(
+            result.is_none(),
+            "freerouter route must be unpriced, got matched_key={:?}",
+            result.map(|r| r.matched_key)
+        );
+    }
+
+    // The same route arriving as one joined path, which is what a client that
+    // bakes the router into the model name emits.
+    #[test]
+    fn freerouter_path_prefix_does_not_resolve_to_unrelated_provider() {
+        let result = freerouter_lookup().lookup("freerouter/nvidia/nemotron-3-ultra-550b-a55b");
         assert!(
             result.is_none(),
             "freerouter id must be unpriced, got matched_key={:?}",
@@ -6394,21 +6515,64 @@ mod tests {
         );
     }
 
-    // The suppression must be scoped to `freerouter` alone: an id routed
-    // through any other prefix still erodes to its terminal segment and
-    // resolves, so this is not a blanket ban on prefix stripping.
+    // The router segment does not have to lead: wrapping the same route one
+    // layer deeper is still the same route.
+    #[test]
+    fn nested_freerouter_segment_does_not_resolve_to_unrelated_provider() {
+        let result =
+            freerouter_lookup().lookup("myproxy/freerouter/nvidia/nemotron-3-ultra-550b-a55b");
+        assert!(
+            result.is_none(),
+            "nested freerouter id must be unpriced, got matched_key={:?}",
+            result.map(|r| r.matched_key)
+        );
+    }
+
+    // A route with no vendor segment at all identifies nothing, so no eroded
+    // candidate may stand in for it — least of all `kenari/...`.
+    #[test]
+    fn unidentifiable_freerouter_route_is_unpriced() {
+        let lookup = freerouter_lookup();
+        for (model_id, provider_id) in [
+            ("nemotron-3-ultra-550b-a55b", Some("freerouter")),
+            ("freerouter/nemotron-3-ultra-550b-a55b", None),
+        ] {
+            let result = lookup.lookup_with_provider(model_id, provider_id);
+            assert!(
+                result.is_none(),
+                "{model_id:?} must be unpriced, got matched_key={:?}",
+                result.map(|r| r.matched_key)
+            );
+        }
+    }
+
+    // The guard suppresses vendor swaps, not pricing. A freerouter route that
+    // names a real provider and model keeps that provider's real upstream rate
+    // — refusing it would turn a correct price into no price.
+    #[test]
+    fn freerouter_route_naming_a_real_vendor_keeps_its_upstream_price() {
+        let lookup = freerouter_lookup();
+        for (model_id, provider_id) in [
+            ("anthropic/claude-opus-4.6", Some("freerouter")),
+            ("freerouter/anthropic/claude-opus-4.6", None),
+        ] {
+            let result = lookup
+                .lookup_with_provider(model_id, provider_id)
+                .unwrap_or_else(|| panic!("{model_id:?} must keep its upstream price"));
+            assert_eq!(result.matched_key, "anthropic/claude-opus-4.6");
+            assert_eq!(result.pricing.input_cost_per_token, Some(5e-6));
+        }
+    }
+
+    // The suppression is scoped to `freerouter`: an id routed through any other
+    // prefix still erodes to its terminal segment, so this is not a blanket ban
+    // on prefix stripping.
     #[test]
     fn unrelated_router_prefix_still_resolves_terminal_segment() {
-        let lookup = PricingLookup::new(
-            HashMap::new(),
-            freerouter_fixture_openrouter(),
-            HashMap::new(),
-        );
-
-        let result = lookup
-            .lookup("someproxy/nvidia/nemotron-3-ultra-550b-a55b")
+        let result = freerouter_lookup()
+            .lookup("someproxy/anthropic/claude-opus-4.6")
             .expect("unrelated router prefix should still resolve");
-        assert_eq!(result.matched_key, "kenari/nemotron-3-ultra-550b-a55b");
+        assert_eq!(result.matched_key, "anthropic/claude-opus-4.6");
     }
 
     // An exact upstream key under the freerouter namespace is still honored:
