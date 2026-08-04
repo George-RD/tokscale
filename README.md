@@ -439,7 +439,8 @@ The pricing lookup uses a multi-step resolution strategy:
 5. **Version Normalization** - Handles version formats (`claude-3-5-sonnet` ↔ `claude-3.5-sonnet`)
 6. **Provider Prefix Matching** - Tries common prefixes (`anthropic/`, `openai/`, etc.)
 7. **Cursor Model Pricing** - Hardcoded pricing for models not yet in LiteLLM/OpenRouter (e.g., `gpt-5.3-codex`)
-8. **Fuzzy Matching** - Word-boundary matching for partial model names
+8. **Vendor Rate Cards** - Hardcoded pricing taken from a vendor's own published rates (Sakana, FriendliAI)
+9. **Fuzzy Matching** - Word-boundary matching for partial model names
 
 ### Custom Pricing Overrides
 
@@ -1956,6 +1957,10 @@ Tokscale fetches real-time pricing from [LiteLLM's pricing database](https://git
 **Cursor Model Pricing**: For very recently released models not yet in either LiteLLM or OpenRouter (e.g., `gpt-5.3-codex`), Tokscale includes hardcoded pricing sourced from [Cursor's model docs](https://cursor.com/en-US/docs/models). These overrides are checked after all upstream sources but before fuzzy matching, so they automatically yield once real upstream pricing becomes available.
 
 **Sakana Fugu Pricing**: Fugu Ultra cost is estimated from Sakana's published pay-as-you-go rates; the `fugu` router model is intentionally left unpriced because its cost is the variable rate of whichever underlying model it orchestrated.
+
+**FriendliAI Pricing**: `LGAI-EXAONE/K-EXAONE-236B-A23B` is priced from [FriendliAI's own serverless rate card](https://friendli.ai/pricing) ($0.20/1M input, $0.80/1M output, $0.10/1M cached input), because no upstream dataset carries it — it is absent from OpenRouter and models.dev, and LiteLLM has only `friendliai/meta-llama-3.1-*` rows. Both the `friendli/` and `friendliai/` spellings resolve, as does the model id on its own when the session reports FriendliAI as the provider. FriendliAI publishes a deprecation date of 2026-08-20 for this model, so expect the entry to go stale after then rather than be maintained; sessions recorded before it still price correctly. Note that llm-stats.com lists the same model at $0.60/1M input and $1.00/1M output — FriendliAI's own figure is used because FriendliAI is the party that actually bills for the endpoint, while the aggregator cites no source for its numbers.
+
+**Unpriced BYOK Routers**: Routes served through `freerouter` are deliberately left unpriced. It is a bring-your-own-key gateway rather than a billing entity, so the effective rate is per-request and is not recoverable from the session log — the same reason bare `fugu` is left alone. Tokscale will not let such a route take the rate of an unrelated provider that merely shares the model's name, so `freerouter/nvidia/nemotron-3-ultra-550b-a55b` is not priced from `kenari/nemotron-3-ultra-550b-a55b` at $0. A freerouter route that names a real provider and model keeps that provider's real price: `freerouter/anthropic/claude-opus-4.6` still resolves to Anthropic's list rate.
 
 **Caching**: Pricing data is cached to disk with 1-hour TTL for fast startup:
 - LiteLLM cache: `~/.config/tokscale/cache/pricing-litellm.json`

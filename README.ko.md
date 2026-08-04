@@ -437,7 +437,8 @@ tokscale pricing list-overrides
 5. **버전 정규화** - 버전 형식 처리 (`claude-3-5-sonnet` ↔ `claude-3.5-sonnet`)
 6. **프로바이더 접두사 매칭** - 일반 접두사 시도 (`anthropic/`, `openai/` 등)
 7. **Cursor 모델 가격** - LiteLLM/OpenRouter에 아직 없는 모델의 하드코딩 가격 (예: `gpt-5.3-codex`)
-8. **퍼지 매칭** - 부분 모델 이름에 대한 단어 경계 매칭
+8. **벤더 공식 요율** - 벤더가 직접 공개한 요율에서 가져온 하드코딩 가격 (Sakana, FriendliAI)
+9. **퍼지 매칭** - 부분 모델 이름에 대한 단어 경계 매칭
 
 ### 사용자 정의 가격 오버라이드
 
@@ -1821,6 +1822,10 @@ Tokscale은 [LiteLLM의 가격 데이터베이스](https://github.com/BerriAI/li
 **Cursor 모델 가격**: LiteLLM과 OpenRouter 모두에 없는 최신 모델(예: `gpt-5.3-codex`)은 [Cursor 모델 문서](https://cursor.com/en-US/docs/models)에서 가져온 하드코딩 가격을 사용합니다. 이 오버라이드는 모든 업스트림 소스 다음에, 퍼지 매칭 이전에 확인되므로 실제 업스트림 가격이 사용 가능해지면 자동으로 양보합니다.
 
 **Sakana Fugu 가격**: Fugu Ultra 비용은 Sakana가 공개한 종량제(pay-as-you-go) 요율로 추정하며, `fugu` 라우터 모델은 실제로 오케스트레이션한 기반 모델의 가변 요율이 곧 그 비용이므로 의도적으로 가격을 책정하지 않습니다.
+
+**FriendliAI 가격**: `LGAI-EXAONE/K-EXAONE-236B-A23B`은 [FriendliAI가 직접 공개한 서버리스 요율표](https://friendli.ai/pricing)(입력 $0.20/1M, 출력 $0.80/1M, 캐시 입력 $0.10/1M)를 사용합니다. 어떤 업스트림 데이터셋도 이 모델을 싣고 있지 않기 때문입니다. OpenRouter와 models.dev에는 없고, LiteLLM에는 이 벤더의 `friendliai/meta-llama-3.1-*` 항목만 있습니다. `friendli/`와 `friendliai/` 표기 모두 해석되며, 세션이 제공자를 FriendliAI로 보고하는 경우에는 모델 ID만으로도 해석됩니다. FriendliAI가 이 모델의 지원 종료일을 2026-08-20으로 공개했으므로 그 이후로는 계속 관리되기보다 오래된 값이 될 것으로 보시면 됩니다(그 이전에 기록된 세션은 계속 정확하게 계산됩니다). 참고로 llm-stats.com은 같은 모델을 입력 $0.60/1M, 출력 $1.00/1M으로 표기하지만, 실제로 이 엔드포인트에 과금하는 주체는 FriendliAI 본인이고 해당 집계 사이트는 수치의 출처를 밝히지 않았기 때문에 FriendliAI 자신의 수치를 사용합니다.
+
+**가격을 매기지 않는 BYOK 라우터**: `freerouter`를 통해 제공된 경로는 의도적으로 가격을 책정하지 않습니다. 과금 주체가 아니라 키를 직접 가져오는(BYOK) 게이트웨이여서 실효 요율이 요청마다 달라지고 세션 로그에서 복원할 수 없기 때문이며, 이는 단독 `fugu`를 그대로 두는 것과 같은 이유입니다. Tokscale은 모델 이름만 우연히 같은 무관한 제공자의 요율을 이런 경로에 적용하지 않으므로, `freerouter/nvidia/nemotron-3-ultra-550b-a55b`에 `kenari/nemotron-3-ultra-550b-a55b`의 $0이 적용되는 일은 없습니다. 실제 제공자와 모델을 명시한 freerouter 경로는 해당 제공자의 실제 가격을 그대로 유지합니다. `freerouter/anthropic/claude-opus-4.6`은 여전히 Anthropic의 정가로 해석됩니다.
 
 **캐싱**: 가격 데이터는 1시간 TTL로 디스크에 캐시되어 빠른 시작을 보장합니다:
 - LiteLLM 캐시: `~/.config/tokscale/cache/pricing-litellm.json`

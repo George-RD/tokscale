@@ -438,7 +438,8 @@ tokscale pricing list-overrides
 5. **版本标准化** - 处理版本格式（`claude-3-5-sonnet` ↔ `claude-3.5-sonnet`）
 6. **提供商前缀匹配** - 尝试常见前缀（`anthropic/`、`openai/` 等）
 7. **Cursor 模型定价** - LiteLLM/OpenRouter 中尚未收录的模型的硬编码定价（例如：`gpt-5.3-codex`）
-8. **模糊匹配** - 部分模型名称的词边界匹配
+8. **厂商官方费率** - 取自厂商自己公布费率的硬编码定价（Sakana、FriendliAI）
+9. **模糊匹配** - 部分模型名称的词边界匹配
 
 ### 自定义价格覆盖
 
@@ -1818,6 +1819,10 @@ Tokscale 从 [LiteLLM 的价格数据库](https://github.com/BerriAI/litellm/blo
 **Cursor 模型定价**：对于 LiteLLM 和 OpenRouter 中都尚未收录的最新模型（例如 `gpt-5.3-codex`），Tokscale 使用从 [Cursor 模型文档](https://cursor.com/en-US/docs/models)获取的硬编码定价。这些覆盖在所有上游来源之后、模糊匹配之前检查，因此当真正的上游定价可用时会自动让步。
 
 **Sakana Fugu 定价**：Fugu Ultra 的成本根据 Sakana 公布的按量付费（pay-as-you-go）费率估算；`fugu` 路由模型有意不定价，因为它的成本就是其所编排的底层模型的浮动费率。
+
+**FriendliAI 定价**：`LGAI-EXAONE/K-EXAONE-236B-A23B` 的价格取自 [FriendliAI 自己的 serverless 费率表](https://friendli.ai/pricing)（输入 $0.20/1M，输出 $0.80/1M，缓存输入 $0.10/1M），因为没有任何上游数据集收录该模型——OpenRouter 和 models.dev 中都没有，LiteLLM 只有该厂商的 `friendliai/meta-llama-3.1-*` 条目。`friendli/` 和 `friendliai/` 两种写法都能解析；当会话把 FriendliAI 报告为提供商时，仅凭模型 ID 也能解析。FriendliAI 公布该模型的弃用日期为 2026-08-20，因此在那之后请预期此条目会过时而非继续维护；此前记录的会话仍会正确计价。另外，llm-stats.com 将同一模型列为输入 $0.60/1M、输出 $1.00/1M——这里采用 FriendliAI 自己的数字，因为实际对该端点计费的是 FriendliAI 本身，而这家聚合站并未给出数据来源。
+
+**不定价的 BYOK 路由器**：经由 `freerouter` 提供的路由有意不定价。它是一个自带密钥（BYOK）网关而非计费主体，因此实际费率按请求变动，无法从会话日志中还原——这与单独的 `fugu` 不定价是同一个理由。Tokscale 不会让这类路由套用一个仅仅是模型名相同的无关提供商的费率，所以 `freerouter/nvidia/nemotron-3-ultra-550b-a55b` 不会按 `kenari/nemotron-3-ultra-550b-a55b` 的 $0 计价。指明了真实提供商与模型的 freerouter 路由则会保留该提供商的真实价格：`freerouter/anthropic/claude-opus-4.6` 仍会解析到 Anthropic 的标价。
 
 **缓存**：价格数据以 1 小时 TTL 缓存到磁盘，确保快速启动：
 - LiteLLM 缓存：`~/.config/tokscale/cache/pricing-litellm.json`
