@@ -3088,6 +3088,10 @@ pub enum SubmissionError {
     /// server stores what it is sent, so a transient network failure would
     /// overwrite the user's recorded spend with zeros.
     PricingDataUnavailable,
+    /// A cost-complete submission was asked for and some usage has no
+    /// published price. The payload names the offending ids; naming the flag
+    /// that asked for this is the CLI's job, because the flag is the CLI's.
+    UnpricedUsage(String),
     /// Anything else, already phrased for the user.
     Report(String),
 }
@@ -3098,6 +3102,10 @@ impl std::fmt::Display for SubmissionError {
             Self::PricingDataUnavailable => f.write_str(
                 "no pricing data could be loaded, so this submission would report $0.00 \
                  for usage that has a real cost",
+            ),
+            Self::UnpricedUsage(summary) => write!(
+                f,
+                "no published price covers this submitted token usage: {summary}"
             ),
             Self::Report(message) => f.write_str(message),
         }
@@ -3409,12 +3417,11 @@ fn validate_priced_messages(
         .collect::<Vec<String>>()
         .join(", ");
 
-    // Only reachable under --strict-pricing, so the way out is to stop asking
-    // for it: the same usage submits at $0.00 by default.
-    Err(SubmissionError::Report(format!(
-        "--strict-pricing: no published price covers this submitted token usage: {summary}. \
-         Re-run without --strict-pricing to submit these tokens at $0.00."
-    )))
+    // Only reachable in `Strict` mode, and the way out of it is to stop asking
+    // for a cost-complete submission: the same usage submits at $0.00 by
+    // default. That advice is phrased in terms of the flag the user typed, so
+    // the CLI adds it (a8dff0a3).
+    Err(SubmissionError::UnpricedUsage(summary))
 }
 
 fn filter_messages_for_report(
@@ -9236,14 +9243,19 @@ mod tests {
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
-        .expect_err("strict pricing rejects a batch it cannot fully price")
-        .to_string();
+        .expect_err("strict pricing rejects a batch it cannot fully price");
 
-        assert!(error.contains("friendli/K-EXAONE-236B-A23B"), "{error}");
         assert!(
-            error.contains("--strict-pricing"),
-            "the rejection must name the flag that caused it: {error}"
+            matches!(error, SubmissionError::UnpricedUsage(_)),
+            "{error:?}"
         );
+        assert!(
+            error.to_string().contains("friendli/K-EXAONE-236B-A23B"),
+            "{error}"
+        );
+        // Naming `--strict-pricing` is the CLI's job: core does not know which
+        // flag, if any, asked for a cost-complete submission (a8dff0a3).
+        assert!(!error.to_string().contains("--strict-pricing"), "{error}");
     }
 
     // Strict pricing rejects usage nothing can price, not usage the client

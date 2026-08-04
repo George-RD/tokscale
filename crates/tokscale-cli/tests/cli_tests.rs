@@ -3656,7 +3656,7 @@ fn test_submit_reports_generic_routing_label_usage_at_zero_cost() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "1 unpriced google/gemini-default message(s) (1 tokens) submitted at $0.00",
+            "1 unpriced google/gemini-default message(s) (1 tokens) would be submitted at $0.00",
         ))
         .stdout(predicate::str::contains("Total tokens: 1"))
         .stdout(predicate::str::contains("Total cost: $0.00"))
@@ -3714,7 +3714,7 @@ fn test_submit_fails_fast_on_unpriced_usage_only_with_strict_pricing() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "1 unpriced unknown_provider/genuinely-unpriced-model message(s) (1 tokens) submitted at $0.00",
+            "1 unpriced unknown_provider/genuinely-unpriced-model message(s) (1 tokens) would be submitted at $0.00",
         ))
         .stdout(predicate::str::contains("custom-pricing.json"))
         // 1,500 priced tokens plus the single zero-cost one, and a cost that

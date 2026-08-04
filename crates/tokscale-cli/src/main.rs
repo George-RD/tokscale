@@ -269,7 +269,7 @@ enum Commands {
         dry_run: bool,
         #[arg(
             long,
-            help = "Fail instead of submitting usage that no published price covers at $0.00 (also catches a model priced for some token buckets but not the ones it used)"
+            help = "Fail the submission when no published price covers some of the usage, instead of submitting that usage at $0.00 (a model priced for some token buckets but not the ones it used counts as uncovered)"
         )]
         strict_pricing: bool,
     },
@@ -5500,7 +5500,14 @@ fn report_excluded_tokenless_rows(excluded: &[ExcludedTokenlessRow]) {
 /// The two causes get the same zero-cost treatment and different advice: a
 /// routing label can never have a price, while a concrete model without one is
 /// something the user can fix.
-fn format_unpriced_submission_warning(row: &tokscale_core::UnpricedSubmissionUsage) -> String {
+///
+/// `dry_run` only changes the tense. Saying usage "was submitted" three lines
+/// above "Dry run - not submitting data." tells the user two opposite things
+/// about the same run.
+fn format_unpriced_submission_warning(
+    row: &tokscale_core::UnpricedSubmissionUsage,
+    dry_run: bool,
+) -> String {
     use tokscale_core::UnpricedUsageCause;
 
     let explanation = match row.cause {
@@ -5528,11 +5535,16 @@ fn format_unpriced_submission_warning(row: &tokscale_core::UnpricedSubmissionUsa
     };
 
     format!(
-        "  Warning: {} unpriced {}/{} message(s) ({} tokens) submitted at $0.00{}: {}.",
+        "  Warning: {} unpriced {}/{} message(s) ({} tokens) {} at $0.00{}: {}.",
         row.message_count,
         row.provider_id,
         row.model_id,
         format_tokens_with_commas(row.total_tokens),
+        if dry_run {
+            "would be submitted"
+        } else {
+            "submitted"
+        },
         discarded,
         explanation,
     )
@@ -5548,15 +5560,25 @@ fn describe_submission_error(error: tokscale_core::SubmissionError) -> anyhow::E
             "{error}. Nothing was submitted, so your recorded spend is untouched. \
              Check your network connection and run this again."
         ),
+        tokscale_core::SubmissionError::UnpricedUsage(_) => anyhow::anyhow!(
+            "--strict-pricing: {error}. \
+             Re-run without --strict-pricing to submit these tokens at $0.00."
+        ),
         other => anyhow::anyhow!(other),
     }
 }
 
-fn report_unpriced_submission_usage(unpriced: &[tokscale_core::UnpricedSubmissionUsage]) {
+fn report_unpriced_submission_usage(
+    unpriced: &[tokscale_core::UnpricedSubmissionUsage],
+    dry_run: bool,
+) {
     use colored::Colorize;
 
     for row in unpriced {
-        println!("{}", format_unpriced_submission_warning(row).yellow());
+        println!(
+            "{}",
+            format_unpriced_submission_warning(row, dry_run).yellow()
+        );
     }
 }
 
@@ -5750,7 +5772,7 @@ fn run_submit_command(options: SubmitCommandOptions) -> Result<()> {
     // left out, so a single legacy charge can't block the whole submission.
     let excluded_rows = exclude_tokenless_cost_contributions(&mut graph_result);
     report_excluded_tokenless_rows(&excluded_rows);
-    report_unpriced_submission_usage(&graph_result.unpriced_submission_usage);
+    report_unpriced_submission_usage(&graph_result.unpriced_submission_usage, dry_run);
 
     println!("{}", "  Data to submit:".white());
     println!(
@@ -6518,11 +6540,14 @@ mod tests {
     // warning must not send them looking for a price that cannot exist.
     #[test]
     fn generic_routing_label_warning_offers_no_remedy() {
-        let warning = format_unpriced_submission_warning(&unpriced_row(
-            "amazon-bedrock",
-            "auto",
-            tokscale_core::UnpricedUsageCause::GenericRoutingLabel,
-        ));
+        let warning = format_unpriced_submission_warning(
+            &unpriced_row(
+                "amazon-bedrock",
+                "auto",
+                tokscale_core::UnpricedUsageCause::GenericRoutingLabel,
+            ),
+            false,
+        );
 
         assert!(
             warning.contains(
@@ -6547,7 +6572,7 @@ mod tests {
         );
         row.discarded_cost = 0.25;
 
-        let warning = format_unpriced_submission_warning(&row);
+        let warning = format_unpriced_submission_warning(&row, false);
 
         assert!(
             warning.contains("discarding the $0.25 of partial pricing they carried"),
@@ -6555,15 +6580,81 @@ mod tests {
         );
     }
 
+    // "submitted at $0.00" three lines above "Dry run - not submitting data."
+    // told the user two opposite things about the same run.
+    #[test]
+    fn dry_run_warning_does_not_claim_anything_was_submitted() {
+        let row = unpriced_row(
+            "friendli",
+            "K-EXAONE-236B-A23B",
+            tokscale_core::UnpricedUsageCause::NoPublishedPrice,
+        );
+
+        let dry = format_unpriced_submission_warning(&row, true);
+
+        assert!(
+            dry.contains("(12,345 tokens) would be submitted at $0.00"),
+            "{dry}"
+        );
+        assert!(
+            format_unpriced_submission_warning(&row, false)
+                .contains("(12,345 tokens) submitted at $0.00"),
+            "a real submission keeps the plain past tense"
+        );
+    }
+
+    // Core states the fact and the CLI owns the flag: the error a user reads
+    // still has to name the flag that produced it.
+    #[test]
+    fn strict_pricing_failure_names_the_flag_the_cli_owns() {
+        let core_error = tokscale_core::SubmissionError::UnpricedUsage(
+            "friendli/K-EXAONE-236B-A23B".to_string(),
+        );
+        assert!(
+            !core_error.to_string().contains("--strict-pricing"),
+            "core must not name a CLI flag: {core_error}"
+        );
+
+        let message = describe_submission_error(core_error).to_string();
+
+        assert!(message.contains("--strict-pricing"), "{message}");
+        assert!(message.contains("friendli/K-EXAONE-236B-A23B"), "{message}");
+        assert!(
+            message.contains("Re-run without --strict-pricing"),
+            "{message}"
+        );
+    }
+
+    // A pricing outage is not a phrasing of "some model has no price", and the
+    // user needs to hear that nothing was uploaded over their recorded spend.
+    #[test]
+    fn pricing_outage_failure_says_nothing_was_submitted() {
+        let message =
+            describe_submission_error(tokscale_core::SubmissionError::PricingDataUnavailable)
+                .to_string();
+
+        assert!(
+            message.contains("no pricing data could be loaded"),
+            "{message}"
+        );
+        assert!(
+            message.contains("your recorded spend is untouched"),
+            "{message}"
+        );
+    }
+
     // A concrete model without a price is actionable, and the warning is the
     // only place the user learns which id to add.
     #[test]
     fn unpublished_price_warning_names_the_model_and_the_fix() {
-        let warning = format_unpriced_submission_warning(&unpriced_row(
-            "friendli",
-            "K-EXAONE-236B-A23B",
-            tokscale_core::UnpricedUsageCause::NoPublishedPrice,
-        ));
+        let warning = format_unpriced_submission_warning(
+            &unpriced_row(
+                "friendli",
+                "K-EXAONE-236B-A23B",
+                tokscale_core::UnpricedUsageCause::NoPublishedPrice,
+            ),
+            false,
+        );
 
         assert!(
             warning.contains(
