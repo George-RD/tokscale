@@ -2,8 +2,70 @@
 
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
+use std::io::BufRead;
 use std::path::Path;
 use std::time::SystemTime;
+
+/// Iterate a reader line by line without letting one undecodable byte discard
+/// the rest of the stream.
+///
+/// `BufRead::lines()` yields `Err(InvalidData)` for any line that is not valid
+/// UTF-8, and the `map_while(Result::ok)` spelling turns that into
+/// end-of-iteration: a single stray byte anywhere in a multi-megabyte session
+/// log silently dropped every record after it (#1031 measured ~2% of an 83MB
+/// Grok `updates.jsonl` surviving). Reading raw bytes up to each newline and
+/// decoding them lossily keeps the cost of a bad byte local to its own line.
+///
+/// Line endings match `lines()`: the trailing `\n` and any preceding `\r` are
+/// stripped, and a final line without a newline is still yielded.
+pub(crate) fn lossy_lines<R: BufRead>(reader: R) -> LossyLines<R> {
+    LossyLines {
+        reader,
+        buf: Vec::new(),
+        at_start: true,
+    }
+}
+
+pub(crate) struct LossyLines<R> {
+    reader: R,
+    buf: Vec<u8>,
+    at_start: bool,
+}
+
+impl<R: BufRead> Iterator for LossyLines<R> {
+    type Item = String;
+
+    fn next(&mut self) -> Option<String> {
+        self.buf.clear();
+        match self.reader.read_until(b'\n', &mut self.buf) {
+            Ok(0) => None,
+            Ok(_) => {
+                if self.buf.last() == Some(&b'\n') {
+                    self.buf.pop();
+                    if self.buf.last() == Some(&b'\r') {
+                        self.buf.pop();
+                    }
+                }
+
+                let mut bytes = self.buf.as_slice();
+                if std::mem::take(&mut self.at_start) {
+                    // A UTF-8 BOM decodes cleanly but leaves U+FEFF glued to the
+                    // front of the first record, where it makes an otherwise
+                    // valid JSON line fail to parse and be skipped in silence.
+                    bytes = bytes.strip_prefix("\u{feff}".as_bytes()).unwrap_or(bytes);
+                }
+
+                Some(String::from_utf8_lossy(bytes).into_owned())
+            }
+            // Decode failures cannot reach this arm — lossy decoding never
+            // fails — so an error here is a hard I/O failure (vanished network
+            // mount, EIO). `read_until` does not consume input when it fails
+            // that way, so skipping and retrying would spin on the same failing
+            // read forever. Stop instead, and keep the lines read so far.
+            Err(_) => None,
+        }
+    }
+}
 
 pub(crate) fn extract_i64(value: Option<&Value>) -> Option<i64> {
     value.and_then(|val| {
@@ -121,6 +183,20 @@ pub(crate) fn back_anchor_timestamp(end: i64, duration: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lossy_lines_survives_undecodable_bytes_and_strips_a_bom() {
+        let raw: &[u8] = b"\xef\xbb\xbffirst\r\nse\xffcond\nthird";
+        let lines: Vec<String> = lossy_lines(raw).collect();
+        assert_eq!(lines, vec!["first", "se\u{fffd}cond", "third"]);
+    }
+
+    #[test]
+    fn lossy_lines_keeps_empty_lines_and_ends_at_eof() {
+        let raw: &[u8] = b"a\n\nb\n";
+        let lines: Vec<String> = lossy_lines(raw).collect();
+        assert_eq!(lines, vec!["a", "", "b"]);
+    }
 
     #[test]
     fn parse_timestamp_value_rejects_zero_and_negative_numbers() {

@@ -11,14 +11,14 @@
 //! write per-inference token breakdowns to `~/.grok/logs/unified.jsonl`.
 
 use super::utils::{
-    extract_i64, extract_string, file_modified_timestamp_ms, parse_timestamp_value,
+    extract_i64, extract_string, file_modified_timestamp_ms, lossy_lines, parse_timestamp_value,
     read_file_or_none,
 };
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::TokenBreakdown;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 const CLIENT_ID: &str = "grok";
@@ -359,7 +359,7 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
     let mut turn_index = 0usize;
     let mut usage_index = 0usize;
 
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
+    for line in lossy_lines(BufReader::new(file)) {
         if line.trim().is_empty() {
             continue;
         }
@@ -408,12 +408,26 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
             let event_id = get_path(&value, &["params", "_meta", "eventId"])
                 .and_then(|value| extract_string(Some(value)))
                 .unwrap_or_else(|| format!("turn-{usage_index}"));
+            // `eventId` is not unique: Grok reuses it across usage records, so
+            // keying on it alone gave distinct turns byte-identical keys. The
+            // Grok lane in `lib.rs` does not collapse duplicate keys today —
+            // it only runs `prefer_unified_log_messages` — so this is not
+            // currently load-bearing, but a per-record-unique key is correct on
+            // its own merits and cheap insurance against any consumer that does
+            // key on it. The position of the record within the file
+            // disambiguates them and stays stable across re-parses of an
+            // unchanged file, which the on-disk message cache this key feeds
+            // requires. Note the key is only unique within one file; it is not
+            // a global identity.
             usage_messages.push(message_from_tokens(
                 &metadata,
                 model_id,
                 timestamp,
                 usage.tokens,
-                format!("grok:{}:usage:{}", metadata.session_id, event_id),
+                format!(
+                    "grok:{}:usage:{usage_index}:{event_id}",
+                    metadata.session_id
+                ),
                 true,
             ));
             usage_index = usage_index.saturating_add(1);
@@ -550,11 +564,7 @@ fn parse_grok_unified_log_snapshot(
     let mut seen = HashSet::new();
     let mut messages = Vec::new();
 
-    for line in BufReader::new(file)
-        .take(prefix_len)
-        .lines()
-        .map_while(Result::ok)
-    {
+    for line in lossy_lines(BufReader::new(file).take(prefix_len)) {
         if line.trim().is_empty() {
             continue;
         }
@@ -763,11 +773,7 @@ fn collect_unified_child_evidence(
     let mut evidence = UnifiedChildEvidence::default();
     let mut generations = HashMap::new();
 
-    for line in BufReader::new(file)
-        .take(prefix_len)
-        .lines()
-        .map_while(Result::ok)
-    {
+    for line in lossy_lines(BufReader::new(file).take(prefix_len)) {
         if line.trim().is_empty() {
             continue;
         }
@@ -1372,7 +1378,7 @@ fn read_events_metadata(path: &Path, metadata: &mut GrokMetadata) {
         return;
     };
 
-    for line in BufReader::new(file).lines().map_while(Result::ok).take(500) {
+    for line in lossy_lines(BufReader::new(file)).take(500) {
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -1493,8 +1499,11 @@ fn hex_value(byte: u8) -> Option<u8> {
 mod tests {
     use super::*;
 
+    /// `updates_jsonl` is taken as bytes so fixtures can contain sequences a
+    /// `&str` cannot hold (undecodable bytes, a UTF-8 BOM); `&str` and `&String`
+    /// still pass through unchanged.
     fn write_fixture(
-        updates_jsonl: &str,
+        updates_jsonl: impl AsRef<[u8]>,
         summary_json: Option<&str>,
         signals_json: Option<&str>,
     ) -> (tempfile::TempDir, PathBuf) {
@@ -1507,7 +1516,7 @@ mod tests {
             .join("session-1");
         std::fs::create_dir_all(&session_dir).unwrap();
         let updates_path = session_dir.join("updates.jsonl");
-        std::fs::write(&updates_path, updates_jsonl).unwrap();
+        std::fs::write(&updates_path, updates_jsonl.as_ref()).unwrap();
         if let Some(summary_json) = summary_json {
             std::fs::write(session_dir.join("summary.json"), summary_json).unwrap();
         }
@@ -1515,6 +1524,13 @@ mod tests {
             std::fs::write(session_dir.join("signals.json"), signals_json).unwrap();
         }
         (temp, updates_path)
+    }
+
+    fn usage_line(event_id: &str, timestamp_ms: i64, input: i64, output: i64) -> String {
+        format!(
+            r#"{{"method":"session/update","params":{{"sessionId":"session-1","update":{{"sessionUpdate":"turn_completed","usage":{{"inputTokens":{input},"outputTokens":{output},"totalTokens":{}}}}},"_meta":{{"eventId":"{event_id}","agentTimestampMs":{timestamp_ms}}}}}}}"#,
+            input + output
+        )
     }
 
     fn write_unified_fixture(unified_jsonl: &str) -> (tempfile::TempDir, PathBuf) {
@@ -1832,6 +1848,77 @@ mod tests {
     }
 
     #[test]
+    fn keeps_parsing_updates_after_an_undecodable_line() {
+        let mut fixture = Vec::new();
+        fixture.extend_from_slice(usage_line("turn-1", 1_700_000_001_000, 10, 1).as_bytes());
+        fixture.push(b'\n');
+        // A lone 0xff can never appear in valid UTF-8, so `BufRead::lines()`
+        // reports this line as `InvalidData`.
+        fixture.extend_from_slice(b"{\"garbage\":\"\xff\xfe\"}\n");
+        for index in 2..=100i64 {
+            fixture.extend_from_slice(
+                usage_line(
+                    &format!("turn-{index}"),
+                    1_700_000_001_000 + index * 1000,
+                    10,
+                    1,
+                )
+                .as_bytes(),
+            );
+            fixture.push(b'\n');
+        }
+
+        let (_temp, path) = write_fixture(&fixture, None, None);
+        let messages = parse_grok_updates_file(&path);
+
+        assert_eq!(messages.len(), 100);
+        assert_eq!(messages.last().unwrap().timestamp, 1_700_000_101_000);
+    }
+
+    #[test]
+    fn parses_first_update_of_a_bom_prefixed_file() {
+        let mut fixture = Vec::new();
+        fixture.extend_from_slice("\u{feff}".as_bytes());
+        fixture.extend_from_slice(usage_line("turn-1", 1_700_000_001_000, 10, 1).as_bytes());
+        fixture.push(b'\n');
+        fixture.extend_from_slice(usage_line("turn-2", 1_700_000_002_000, 20, 2).as_bytes());
+        fixture.push(b'\n');
+
+        let (_temp, path) = write_fixture(&fixture, None, None);
+        let messages = parse_grok_updates_file(&path);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].timestamp, 1_700_000_001_000);
+        assert_eq!(messages[0].tokens.input, 10);
+    }
+
+    #[test]
+    fn keeps_repeated_event_ids_in_distinct_dedup_keys() {
+        let (_temp, path) = write_fixture(
+            &format!(
+                "{}\n{}\n",
+                usage_line("turn-1", 1_700_000_001_000, 10, 1),
+                usage_line("turn-1", 1_700_000_002_000, 20, 2),
+            ),
+            None,
+            None,
+        );
+
+        let messages = parse_grok_updates_file(&path);
+
+        assert_eq!(messages.len(), 2);
+        assert_ne!(messages[0].dedup_key, messages[1].dedup_key);
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some("grok:session-1:usage:0:turn-1")
+        );
+        assert_eq!(
+            messages[1].dedup_key.as_deref(),
+            Some("grok:session-1:usage:1:turn-1")
+        );
+    }
+
+    #[test]
     fn prefers_authoritative_usage_breakdown_when_available() {
         let (_temp, path) = write_fixture(
             r#"{"method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"user_message_chunk","_meta":{"modelId":"grok-4.5"}},"_meta":{"agentTimestampMs":1700000001000}}}
@@ -1851,7 +1938,7 @@ mod tests {
         assert_eq!(messages[0].timestamp, 1700000003000);
         assert_eq!(
             messages[0].dedup_key.as_deref(),
-            Some("grok:session-1:usage:turn-1")
+            Some("grok:session-1:usage:0:turn-1")
         );
     }
 

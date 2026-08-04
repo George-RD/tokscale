@@ -1,8 +1,9 @@
+use super::utils::lossy_lines;
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::provider_identity::inferred_provider_from_model;
 use crate::TokenBreakdown;
 use serde_json::Value;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 pub fn parse_copilot_vscode_sessions(paths: &[PathBuf]) -> Vec<UnifiedMessage> {
@@ -24,7 +25,7 @@ fn parse_file(path: &Path) -> Vec<UnifiedMessage> {
 
     let mut requests: Vec<Value> = Vec::new();
 
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
+    for line in lossy_lines(BufReader::new(file)) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -255,6 +256,30 @@ mod tests {
         assert_eq!(m.tokens.input, 5000);
         assert_eq!(m.tokens.output, 200);
         assert_eq!(m.tokens.reasoning, 100);
+    }
+
+    #[test]
+    fn keeps_parsing_requests_after_an_undecodable_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("chatSessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let path = sessions_dir.join("cccccccc-0000-0000-0000-000000000000.jsonl");
+
+        let mut fixture = Vec::new();
+        fixture.extend_from_slice(br#"{"kind":0,"v":{"requests":[]}}"#);
+        fixture.push(b'\n');
+        // A lone 0xff can never appear in valid UTF-8, so `BufRead::lines()`
+        // reports this line as `InvalidData`.
+        fixture.extend_from_slice(b"{\"kind\":9,\"v\":\"\xff\xfe\"}\n");
+        fixture.extend_from_slice(
+            br#"{"kind":2,"k":["requests"],"v":[{"requestId":"r9","timestamp":1783918310000,"modelId":"copilot/auto","completionTokens":200,"promptTokens":5000,"result":{"metadata":{"promptTokens":5000,"outputTokens":200,"resolvedModel":"gpt-5.3-codex"}}}]}"#,
+        );
+        fixture.push(b'\n');
+        std::fs::write(&path, &fixture).unwrap();
+
+        let messages = parse_copilot_vscode_sessions(&[path]);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 5000);
     }
 
     #[test]
