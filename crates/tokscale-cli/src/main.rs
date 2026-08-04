@@ -5574,6 +5574,24 @@ fn zero_rate_marker(summary: &ZeroRateSummary) -> String {
 /// case-insensitively and after synthetic `/models/` normalization, so several
 /// distinct submitted ids can resolve to one entry — naming the matched key
 /// collapses those to the single line the user would go and edit.
+///
+/// The two sides of the comparison are not the same id, which is why both
+/// matches below are needed. The override that zeroes the money is applied
+/// during costing against the **raw** usage id, while `summary.models` holds
+/// [`tokscale_core::canonical_model_id`] output — lowercased, `-YYYYMMDD`
+/// stripped, `.`→`-` inside claude versions, `anthropic/claude-…` folded.
+/// Matching only the submitted id against the override file therefore misses
+/// exactly the keys canonicalization rewrites, which are the highest-risk ones:
+/// a dated Anthropic id or a dotted claude version zeroes real spend and would
+/// print nothing.
+///
+/// So an override is also named when its key canonicalizes onto a submitted id.
+/// That direction is deliberately the inclusive one: canonicalization is lossy,
+/// so a dated key can canonicalize onto usage that was actually recorded
+/// undated and priced normally, and this will name it anyway. Naming an
+/// override that did not end up applying is a correctable annoyance in the
+/// user's own file; a $0.00 row that prints nothing is the failure this warning
+/// exists to prevent.
 fn zero_rate_overrides_in_submission(
     overrides: &tokscale_core::pricing::custom::CustomPricing,
     submitted_models: &[String],
@@ -5582,17 +5600,33 @@ fn zero_rate_overrides_in_submission(
         return Vec::new();
     }
 
-    let mut named: Vec<(String, ZeroRateSummary)> = submitted_models
+    // BTreeMap: one line per override key, ordered by the key the user reads.
+    let mut named: std::collections::BTreeMap<String, ZeroRateSummary> =
+        std::collections::BTreeMap::new();
+
+    for model_id in submitted_models {
+        let Some(matched) = overrides.lookup_with_key(model_id) else {
+            continue;
+        };
+        if let Some(summary) = ZeroRateSummary::for_pricing(matched.pricing) {
+            named.insert(matched.matched_key.to_string(), summary);
+        }
+    }
+
+    let submitted_canonical: std::collections::HashSet<String> = submitted_models
         .iter()
-        .filter_map(|model_id| {
-            let matched = overrides.lookup_with_key(model_id)?;
-            let summary = ZeroRateSummary::for_pricing(matched.pricing)?;
-            Some((matched.matched_key.to_string(), summary))
-        })
+        .map(|model_id| tokscale_core::canonical_model_id(model_id))
         .collect();
-    named.sort_by(|a, b| a.0.cmp(&b.0));
-    named.dedup_by(|a, b| a.0 == b.0);
-    named
+    for (key, pricing) in overrides.entries() {
+        if !submitted_canonical.contains(&tokscale_core::canonical_model_id(key)) {
+            continue;
+        }
+        if let Some(summary) = ZeroRateSummary::for_pricing(pricing) {
+            named.insert(key.to_string(), summary);
+        }
+    }
+
+    named.into_iter().collect()
 }
 
 /// Warn that part of this submission carries $0.00 rates from the user's own
@@ -6595,20 +6629,75 @@ mod tests {
         assert!(zero_rate_override_submit_warning(&[]).is_none());
     }
 
-    /// Override keys are matched case-insensitively, so two usage rows that
-    /// differ only in casing resolve to one entry in `custom-pricing.json` and
-    /// must be reported as the one entry the user would edit.
+    /// Two gateway spellings of one model normalize onto a single override key,
+    /// so the warning names the one entry the user would edit rather than
+    /// repeating it per submitted id.
+    ///
+    /// Both submitted ids are real Synthetic/Fireworks gateway spellings that
+    /// survive `canonical_model_id` unchanged (it does not strip the gateway
+    /// prefix), so this pair really can appear in one submission.
     #[test]
-    fn one_override_reached_under_two_casings_is_named_once() {
-        let overrides = custom_overrides(&[("free-local-model", Some(0.0), Some(0.0))]);
+    fn one_override_reached_under_two_gateway_spellings_is_named_once() {
+        let overrides = custom_overrides(&[("deepseek-v3-0324", Some(0.0), Some(0.0))]);
         let submitted = vec![
-            "Free-Local-Model".to_string(),
-            "free-local-model".to_string(),
+            tokscale_core::canonical_model_id("accounts/fireworks/models/DeepSeek-V3-0324"),
+            tokscale_core::canonical_model_id("hf:deepseek-ai/DeepSeek-V3-0324"),
         ];
 
         let named = zero_rate_overrides_in_submission(&overrides, &submitted);
         let named_ids: Vec<&str> = named.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(named_ids, ["free-local-model"]);
+        assert_eq!(named_ids, ["deepseek-v3-0324"]);
+    }
+
+    /// The override that zeroed the money is matched on the raw usage id, but
+    /// `summary.models` holds `canonical_model_id` output. Any override key
+    /// canonicalization rewrites — a dated Anthropic id, a dotted claude version
+    /// — therefore zeroes real spend while the two sides never meet, and the
+    /// submission would print no warning at all.
+    ///
+    /// Both keys below are ids their vendors actually publish:
+    /// `claude-sonnet-4-5-20250929` is Anthropic's dated API id, and
+    /// `anthropic/claude-3.5-sonnet` is OpenRouter's dotted slug.
+    #[test]
+    fn overrides_are_named_when_canonicalization_rewrites_their_key() {
+        let overrides = custom_overrides(&[
+            ("claude-sonnet-4-5-20250929", Some(0.0), Some(0.0)),
+            ("anthropic/claude-3.5-sonnet", Some(0.0), Some(0.0)),
+        ]);
+        let submitted = vec![
+            tokscale_core::canonical_model_id("claude-sonnet-4-5-20250929"),
+            tokscale_core::canonical_model_id("anthropic/claude-3.5-sonnet"),
+        ];
+        assert!(
+            !submitted
+                .iter()
+                .any(|id| id == "claude-sonnet-4-5-20250929"),
+            "this test is only meaningful while canonicalization rewrites the key: {submitted:?}"
+        );
+
+        let named = zero_rate_overrides_in_submission(&overrides, &submitted);
+        let named_ids: Vec<&str> = named.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            named_ids,
+            ["anthropic/claude-3.5-sonnet", "claude-sonnet-4-5-20250929"]
+        );
+
+        let warning = zero_rate_override_submit_warning(&named)
+            .expect("an override that zeroed this submission must never be silent");
+        assert!(warning.contains("claude-sonnet-4-5-20250929"), "{warning}");
+        assert!(warning.contains("anthropic/claude-3.5-sonnet"), "{warning}");
+    }
+
+    /// The canonical-space match must not name overrides that are not in the
+    /// submission at all.
+    #[test]
+    fn canonicalized_override_keys_outside_the_submission_stay_unnamed() {
+        let overrides = custom_overrides(&[("claude-opus-4-1-20250805", Some(0.0), Some(0.0))]);
+        let submitted = vec![tokscale_core::canonical_model_id(
+            "claude-sonnet-4-5-20250929",
+        )];
+
+        assert!(zero_rate_overrides_in_submission(&overrides, &submitted).is_empty());
     }
 
     /// An override that zeroes one side of a model still charges real money on

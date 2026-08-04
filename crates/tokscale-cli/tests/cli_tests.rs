@@ -4631,6 +4631,81 @@ fn test_submit_dry_run_names_zero_rate_override_on_submitted_model() {
     );
 }
 
+/// The override match runs against the raw usage id; the submitted model list
+/// holds canonicalized ids. `claude-sonnet-4-5-20250929` is Anthropic's real
+/// dated API id, and canonicalization strips the `-20250929`, so this key zeroes
+/// the money under one identity and is looked up for the warning under another.
+/// Before the warning was keyed on the override side, this submission printed
+/// $0.00 and said nothing.
+#[test]
+fn test_submit_dry_run_names_zero_rate_override_whose_key_canonicalization_rewrites() {
+    let tmp = create_empty_fixture_dir();
+    let config_dir = tmp.path().join(".config/tokscale");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("custom-pricing.json"),
+        r#"{
+            "models": {
+                "claude-sonnet-4-5-20250929": {
+                    "input_cost_per_million_tokens": 0,
+                    "output_cost_per_million_tokens": 0
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let session = tmp
+        .path()
+        .join(".local/share/opencode/storage/message/session1");
+    fs::create_dir_all(&session).unwrap();
+    fs::write(
+        session.join("msg_dated.json"),
+        r#"{
+            "id": "msg_dated",
+            "sessionID": "session1",
+            "role": "assistant",
+            "modelID": "claude-sonnet-4-5-20250929",
+            "providerID": "anthropic",
+            "tokens": {
+                "input": 10000000,
+                "output": 2000000,
+                "reasoning": 0,
+                "cache": { "read": 0, "write": 0 }
+            },
+            "time": { "created": 1736510400000.0 }
+        }"#,
+    )
+    .unwrap();
+
+    let output = cmd_with_home(tmp.path())
+        .env("TOKSCALE_API_TOKEN", "test-token")
+        .args(["submit", "--client", "opencode", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // The override really did apply: 12M tokens of Sonnet usage submitted at $0.00.
+    assert!(
+        stdout.contains("Total cost: $0.00"),
+        "the override zeroes this usage, which is what makes the silence dangerous: {stdout}"
+    );
+    assert!(
+        stdout.contains("custom-pricing.json sets $0.00 rates for 1 model(s)"),
+        "a zeroed submission must never be silent: {stdout}"
+    );
+    assert!(
+        stdout.contains("claude-sonnet-4-5-20250929 (declared free: $0.00)"),
+        "the warning must name the key as written in the user's file: {stdout}"
+    );
+}
+
 /// A skipped override already produces one warning when the pricing service
 /// loads the file. Submit must not read the same file a second time just to
 /// name its zero rates, or every skip warning is printed twice in one run.
