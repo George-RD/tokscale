@@ -151,6 +151,7 @@ In the age of AI-assisted development, **tokens are the new energy**. They power
 - [Development](#development)
   - [Prerequisites](#prerequisites-1)
   - [How to Run](#how-to-run)
+  - [Container Setup](#container-setup)
 - [Supported Platforms](#supported-platforms)
   - [Native Module Targets](#native-module-targets)
   - [Windows Support](#windows-support)
@@ -1269,7 +1270,6 @@ Add equivalent `-v` flags for the clients you use. This keeps the default comman
 ```bash
 make down         # stop all services
 make logs/app     # tail app logs
-make db/migrate   # run pending migrations manually
 make help         # full target list
 ```
 
