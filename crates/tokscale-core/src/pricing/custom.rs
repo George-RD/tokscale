@@ -78,12 +78,20 @@ impl CustomModelPricing {
             "output_cost_per_token",
         )?;
 
-        if !input_cost_per_token.is_some_and(|value| value > 0.0)
-            && !output_cost_per_token.is_some_and(|value| value > 0.0)
-        {
-            return Err(
-                "at least one of input or output pricing must be present and positive".into(),
-            );
+        // Presence only, deliberately not positivity. This guard exists to catch
+        // rows that declare no base rate at all — `{}`, a cache-only row, a
+        // typo'd field name — which `compute_cost` cannot use. A user-declared
+        // $0.00 is a real price (self-hosted endpoints, free tiers) and used to
+        // be rejected here, which left genuinely free models unpriced and
+        // blocked submission (#1021). The two cases are already distinct at the
+        // type level: every field is `Option<f64>`, so a missing key is `None`
+        // and an explicit zero is `Some(0.0)`. Every other rate predicate in the
+        // codebase already accepts `>= 0.0` (`ModelPricing::covers_usage`,
+        // `has_any_usable_base_rate`, `has_any_usable_pricing`); this was the
+        // one that did not. Negative and non-finite values are still rejected
+        // upstream by `validate_non_negative`.
+        if input_cost_per_token.is_none() && output_cost_per_token.is_none() {
+            return Err("at least one of input or output pricing must be present".into());
         }
 
         Ok(ModelPricing {
@@ -241,6 +249,31 @@ impl CustomPricing {
         self.lookup_with_key(model_id).map(|result| result.pricing)
     }
 
+    /// Sorted model ids whose override declares a $0.00 input or output base
+    /// rate.
+    ///
+    /// Declaring a model free is legitimate (self-hosted endpoints, promotional
+    /// tiers) but it is also the one override that can zero out spend on a
+    /// public leaderboard, so callers use this to name those entries instead of
+    /// letting a `$0.00` line blend into the rest of the listing (#1021).
+    pub fn zero_rate_model_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .models
+            .iter()
+            .filter(|(_, pricing)| declares_zero_base_rate(pricing))
+            .map(|(model_id, _)| model_id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Whether the override matching `model_id` declares a $0.00 base rate.
+    /// Resolves through the same raw/normalized matching as [`Self::lookup`],
+    /// so callers can pass a model id straight off a usage row.
+    pub fn declares_zero_rate(&self, model_id: &str) -> bool {
+        self.lookup(model_id).is_some_and(declares_zero_base_rate)
+    }
+
     pub fn lookup_with_key(&self, model_id: &str) -> Option<CustomLookupResult<'_>> {
         let raw_key = model_id.to_lowercase();
         if let Some(pricing) = self.models.get_key_value(&raw_key) {
@@ -306,6 +339,13 @@ impl CustomPricing {
 
         Self { models }
     }
+}
+
+/// A rate of exactly 0.0 that the user typed, as opposed to a rate they left
+/// out: `CustomModelPricing` keeps every field `Option<f64>`, so `Some(0.0)` is
+/// an explicit "this is free" and `None` is "not declared".
+fn declares_zero_base_rate(pricing: &ModelPricing) -> bool {
+    pricing.input_cost_per_token == Some(0.0) || pricing.output_cost_per_token == Some(0.0)
 }
 
 fn base_price(
@@ -657,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn drops_entries_with_zero_prices() {
+    fn keeps_declared_zero_prices_and_drops_negative() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("custom-pricing.json");
         fs::write(
@@ -683,12 +723,127 @@ mod tests {
 
         let loaded = CustomPricing::load_from_path(&path);
 
-        assert!(loaded.lookup("all-zero").is_none());
+        let all_zero = loaded
+            .lookup("all-zero")
+            .expect("a model declared free at $0.00 must load");
+        assert_eq!(all_zero.input_cost_per_token, Some(0.0));
+        assert_eq!(all_zero.output_cost_per_token, Some(0.0));
         assert_eq!(
             loaded.lookup("free-input").unwrap().output_cost_per_token,
             Some(0.000008)
         );
         assert!(loaded.lookup("negative-output").is_none());
+    }
+
+    /// A genuinely free model is the case the escape hatch exists for (#1021):
+    /// the entry must survive loading and come back out of `lookup`, not be
+    /// silently dropped for looking like an empty row.
+    #[test]
+    fn loads_model_declared_free_at_zero() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("custom-pricing.json");
+        fs::write(
+            &path,
+            r#"{
+                "models": {
+                    "free-local-model": {
+                        "input_cost_per_million_tokens": 0,
+                        "output_cost_per_million_tokens": 0,
+                        "notes": "self-hosted, no per-token charge"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let loaded = CustomPricing::load_from_path(&path);
+        let pricing = loaded
+            .lookup("free-local-model")
+            .expect("declared-free model must be returned by lookup");
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(pricing.input_cost_per_token, Some(0.0));
+        assert_eq!(pricing.output_cost_per_token, Some(0.0));
+    }
+
+    /// The user-facing symptom of the old strict-positive rule: a free model
+    /// could not be declared, so its usage stayed unpriced and blocked submit.
+    #[test]
+    fn zero_rate_override_prices_usage_that_would_otherwise_be_unpriced() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("custom-pricing.json");
+        fs::write(
+            &path,
+            r#"{
+                "models": {
+                    "free-local-model": {
+                        "input_cost_per_million_tokens": 0,
+                        "output_cost_per_million_tokens": 0
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let usage = crate::TokenBreakdown {
+            input: 1_000,
+            output: 500,
+            ..Default::default()
+        };
+
+        let without_override = crate::pricing::PricingService::new(HashMap::new(), HashMap::new());
+        assert!(
+            !without_override.covers_usage_with_provider("free-local-model", None, &usage),
+            "no upstream source prices this model, so the override is what must cover it"
+        );
+
+        let with_override = crate::pricing::PricingService::new_with_custom(
+            CustomPricing::load_from_path(&path),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        assert!(
+            with_override.covers_usage_with_provider("free-local-model", None, &usage),
+            "a declared-free override must make submission validation pass"
+        );
+    }
+
+    /// Declaring a model free is now possible, so it must not be possible to do
+    /// it quietly: every zero base rate is reported for the override listing and
+    /// the submit-time warning to name.
+    #[test]
+    fn zero_rate_overrides_are_named_for_visibility() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("custom-pricing.json");
+        fs::write(
+            &path,
+            r#"{
+                "models": {
+                    "free-both": {
+                        "input_cost_per_million_tokens": 0,
+                        "output_cost_per_million_tokens": 0
+                    },
+                    "free-input-only": {
+                        "input_cost_per_million_tokens": 0,
+                        "output_cost_per_million_tokens": 8.00
+                    },
+                    "Paid-Model": {
+                        "input_cost_per_million_tokens": 2.00,
+                        "output_cost_per_million_tokens": 8.00
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let loaded = CustomPricing::load_from_path(&path);
+
+        assert_eq!(
+            loaded.zero_rate_model_ids(),
+            vec!["free-both".to_string(), "free-input-only".to_string()]
+        );
+        assert!(!loaded.declares_zero_rate("paid-model"));
+        assert!(loaded.declares_zero_rate("FREE-BOTH"));
     }
 
     #[test]
