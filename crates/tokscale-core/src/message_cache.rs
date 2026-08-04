@@ -1182,9 +1182,20 @@ impl SourceMessageCache {
                 let path = dir_entry.path();
                 match read_shard(&path, identity) {
                     ShardReadStatus::Loaded(entries) => {
-                        for entry in entries {
+                        for mut entry in entries {
                             let key = CacheKey::from_entry(&entry);
                             if key.shard() == shard_key && entry.identity_is_current() {
+                                if entry.parser_namespace == ClientId::Claude.as_str()
+                                    && crate::sessions::claudecode::remove_synthetic_placeholder_messages(
+                                        &mut entry.messages,
+                                    )
+                                {
+                                    // Do not bump Claude's parser version here: compacted
+                                    // transcripts rely on cached assistant history that a
+                                    // full invalidation cannot recover. Repair only the bad
+                                    // `<synthetic>` rows and persist that narrow migration.
+                                    cache.dirty_keys.insert(key.clone());
+                                }
                                 cache.entries.insert(key, entry);
                             } else {
                                 cache.rewrite_shards.insert(shard_key.clone());
@@ -1207,7 +1218,7 @@ impl SourceMessageCache {
             }
         }
 
-        cache.dirty = !cache.rewrite_shards.is_empty();
+        cache.dirty = !(cache.rewrite_shards.is_empty() && cache.dirty_keys.is_empty());
         cache
     }
 
@@ -1382,6 +1393,11 @@ impl SourceMessageCache {
                         // wholesale — see `absorb_retained_history`.
                         if let Some(stored) = merged_entries.remove(key) {
                             entry.absorb_retained_history(&stored);
+                        }
+                        if entry.parser_namespace == ClientId::Claude.as_str() {
+                            crate::sessions::claudecode::remove_synthetic_placeholder_messages(
+                                &mut entry.messages,
+                            );
                         }
                         merged_entries.insert(key.clone(), entry);
                     }
@@ -3527,6 +3543,122 @@ mod tests {
             Vec::new(),
             None,
         )
+    }
+
+    fn synthetic_placeholder_message(session_id: &str, dedup_key: &str) -> UnifiedMessage {
+        let mut message = keyed_message(ClientId::Claude.as_str(), session_id, dedup_key);
+        message.model_id = " <SYNTHETIC> ".to_string();
+        message.provider_id = "unknown".to_string();
+        message
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_loading_claude_cache_removes_synthetic_placeholder_rows_without_retiring_history() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("conversation.jsonl");
+            std::fs::write(&path, b"{\"id\":\"live\"}\n").unwrap();
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let real_live = keyed_message("claude", "session", "live:req_live");
+            let real_retained = keyed_message("claude", "session", "old:req_old");
+            let synthetic_assistant =
+                synthetic_placeholder_message("session", "synthetic:req_synthetic");
+            let mut synthetic_tool_result = synthetic_placeholder_message(
+                "session",
+                "claude:tool_result:conversation:tool_result:toolu_1",
+            );
+            synthetic_tool_result.tokens.input = 100;
+
+            let mut seed = SourceMessageCache::default();
+            seed.insert(entry_with_messages(
+                identity,
+                &path,
+                vec![
+                    real_live.clone(),
+                    real_retained.clone(),
+                    synthetic_assistant,
+                    synthetic_tool_result,
+                ],
+            ));
+            seed.save_if_dirty();
+
+            let mut repaired = SourceMessageCache::load();
+            let entry = repaired
+                .get(identity, &path)
+                .expect("current Claude cache entry should load");
+            assert_eq!(entry.messages.len(), 2);
+            assert_eq!(
+                entry
+                    .messages
+                    .iter()
+                    .filter_map(|message| message.dedup_key.as_deref())
+                    .collect::<HashSet<_>>(),
+                HashSet::from(["live:req_live", "old:req_old"]),
+                "the targeted migration must retain real live and compacted history"
+            );
+            repaired.save_if_dirty();
+
+            let shard_path = cache_shard_path(identity, &path);
+            assert!(matches!(
+                read_shard(&shard_path, identity),
+                ShardReadStatus::Loaded(entries)
+                    if entries.len() == 1
+                        && entries[0].messages.len() == 2
+                        && entries[0]
+                            .messages
+                            .iter()
+                            .all(|message| message.model_id != " <SYNTHETIC> ")
+            ));
+        }
+
+        restore_cache_env(prev_env);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_cache_save_does_not_restore_synthetic_history_from_another_writer() {
+        let temp_home = TempDir::new().unwrap();
+        let prev_env = sandbox_cache_env(temp_home.path());
+
+        {
+            let source_dir = TempDir::new().unwrap();
+            let path = source_dir.path().join("conversation.jsonl");
+            std::fs::write(&path, b"{\"id\":\"live\"}\n").unwrap();
+            let identity = CacheIdentity::for_client(ClientId::Claude);
+            let real = keyed_message("claude", "session", "live:req_live");
+            let synthetic = synthetic_placeholder_message("session", "synthetic:req_synthetic");
+
+            let mut seed = SourceMessageCache::default();
+            seed.insert(entry_with_messages(
+                identity,
+                &path,
+                vec![real.clone(), synthetic],
+            ));
+            seed.save_if_dirty();
+
+            // Simulate a process that parsed the live source after a compaction
+            // while an old on-disk entry still carries the synthetic notice.
+            // The normal retained-history merge would bring the globally stable
+            // synthetic key back, so sanitation must run after that merge too.
+            let mut fresh_writer = SourceMessageCache::default();
+            fresh_writer.insert(entry_with_messages(identity, &path, vec![real]));
+            fresh_writer.save_if_dirty();
+
+            let shard_path = cache_shard_path(identity, &path);
+            assert!(matches!(
+                read_shard(&shard_path, identity),
+                ShardReadStatus::Loaded(entries)
+                    if entries.len() == 1
+                        && entries[0].messages.len() == 1
+                        && entries[0].messages[0].dedup_key.as_deref() == Some("live:req_live")
+            ));
+        }
+
+        restore_cache_env(prev_env);
     }
 
     /// A Claude entry can hold assistant turns the live transcript no longer
