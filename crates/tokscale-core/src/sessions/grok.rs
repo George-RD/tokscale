@@ -11,14 +11,14 @@
 //! write per-inference token breakdowns to `~/.grok/logs/unified.jsonl`.
 
 use super::utils::{
-    extract_i64, extract_string, file_modified_timestamp_ms, parse_timestamp_value,
+    extract_i64, extract_string, file_modified_timestamp_ms, lossy_lines, parse_timestamp_value,
     read_file_or_none,
 };
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::TokenBreakdown;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 const CLIENT_ID: &str = "grok";
@@ -359,7 +359,7 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
     let mut turn_index = 0usize;
     let mut usage_index = 0usize;
 
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
+    for line in lossy_lines(BufReader::new(file)) {
         if line.trim().is_empty() {
             continue;
         }
@@ -550,11 +550,7 @@ fn parse_grok_unified_log_snapshot(
     let mut seen = HashSet::new();
     let mut messages = Vec::new();
 
-    for line in BufReader::new(file)
-        .take(prefix_len)
-        .lines()
-        .map_while(Result::ok)
-    {
+    for line in lossy_lines(BufReader::new(file).take(prefix_len)) {
         if line.trim().is_empty() {
             continue;
         }
@@ -763,11 +759,7 @@ fn collect_unified_child_evidence(
     let mut evidence = UnifiedChildEvidence::default();
     let mut generations = HashMap::new();
 
-    for line in BufReader::new(file)
-        .take(prefix_len)
-        .lines()
-        .map_while(Result::ok)
-    {
+    for line in lossy_lines(BufReader::new(file).take(prefix_len)) {
         if line.trim().is_empty() {
             continue;
         }
@@ -1372,7 +1364,7 @@ fn read_events_metadata(path: &Path, metadata: &mut GrokMetadata) {
         return;
     };
 
-    for line in BufReader::new(file).lines().map_while(Result::ok).take(500) {
+    for line in lossy_lines(BufReader::new(file)).take(500) {
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -1515,6 +1507,29 @@ mod tests {
             std::fs::write(session_dir.join("signals.json"), signals_json).unwrap();
         }
         (temp, updates_path)
+    }
+
+    /// Byte-level variant of `write_fixture` for fixtures that must contain
+    /// bytes a `&str` cannot hold (undecodable sequences, a UTF-8 BOM).
+    fn write_fixture_bytes(updates_jsonl: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let session_dir = temp
+            .path()
+            .join(".grok")
+            .join("sessions")
+            .join("%2Ftmp%2Fproject")
+            .join("session-1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let updates_path = session_dir.join("updates.jsonl");
+        std::fs::write(&updates_path, updates_jsonl).unwrap();
+        (temp, updates_path)
+    }
+
+    fn usage_line(event_id: &str, timestamp_ms: i64, input: i64, output: i64) -> String {
+        format!(
+            r#"{{"method":"session/update","params":{{"sessionId":"session-1","update":{{"sessionUpdate":"turn_completed","usage":{{"inputTokens":{input},"outputTokens":{output},"totalTokens":{}}}}},"_meta":{{"eventId":"{event_id}","agentTimestampMs":{timestamp_ms}}}}}}}"#,
+            input + output
+        )
     }
 
     fn write_unified_fixture(unified_jsonl: &str) -> (tempfile::TempDir, PathBuf) {
@@ -1829,6 +1844,51 @@ mod tests {
         assert!(messages
             .iter()
             .any(|message| message.session_id == "fallback"));
+    }
+
+    #[test]
+    fn keeps_parsing_updates_after_an_undecodable_line() {
+        let mut fixture = Vec::new();
+        fixture.extend_from_slice(usage_line("turn-1", 1_700_000_001_000, 10, 1).as_bytes());
+        fixture.push(b'\n');
+        // A lone 0xff can never appear in valid UTF-8, so `BufRead::lines()`
+        // reports this line as `InvalidData`.
+        fixture.extend_from_slice(b"{\"garbage\":\"\xff\xfe\"}\n");
+        for index in 2..=100i64 {
+            fixture.extend_from_slice(
+                usage_line(
+                    &format!("turn-{index}"),
+                    1_700_000_001_000 + index * 1000,
+                    10,
+                    1,
+                )
+                .as_bytes(),
+            );
+            fixture.push(b'\n');
+        }
+
+        let (_temp, path) = write_fixture_bytes(&fixture);
+        let messages = parse_grok_updates_file(&path);
+
+        assert_eq!(messages.len(), 100);
+        assert_eq!(messages.last().unwrap().timestamp, 1_700_000_101_000);
+    }
+
+    #[test]
+    fn parses_first_update_of_a_bom_prefixed_file() {
+        let mut fixture = Vec::new();
+        fixture.extend_from_slice("\u{feff}".as_bytes());
+        fixture.extend_from_slice(usage_line("turn-1", 1_700_000_001_000, 10, 1).as_bytes());
+        fixture.push(b'\n');
+        fixture.extend_from_slice(usage_line("turn-2", 1_700_000_002_000, 20, 2).as_bytes());
+        fixture.push(b'\n');
+
+        let (_temp, path) = write_fixture_bytes(&fixture);
+        let messages = parse_grok_updates_file(&path);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].timestamp, 1_700_000_001_000);
+        assert_eq!(messages[0].tokens.input, 10);
     }
 
     #[test]
