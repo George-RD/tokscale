@@ -1198,15 +1198,79 @@ The generated PNG is optimized for sharing on social media. Share your coding jo
 ### Prerequisites
 
 ```bash
-# Bun (required)
+# Bun (required for JS tooling)
 bun --version
 
-# Rust (for native module)
+# Rust (for native CLI binary)
 rustc --version
 cargo --version
 ```
 
-### How to Run
+Docker or Podman can substitute for both — see [Container Setup](#container-setup) below.
+
+### Container Setup
+
+The repo ships a `Makefile` and Docker/Podman Compose stack for a **single-host deployment**. No local Rust or Bun install is required. The stack auto-detects `podman` over `docker`.
+
+**First run** — image builds do not connect to a database. Migrations run when the app container starts, after Compose marks Postgres healthy:
+
+```bash
+make docker/build   # build and tag the frontend image (tokscale:latest)
+make up             # start Postgres and the frontend on http://localhost:3333
+```
+
+`make up` uses the pre-built `tokscale:latest` image — it does not trigger a compose rebuild.
+
+**Subsequent runs** — the image is already built; just start the services:
+
+```bash
+make up
+```
+
+**TUI** — runs independently of the web stack, reading session data directly from host filesystem mounts:
+
+```bash
+make tui/build   # build once
+make tui         # launch
+```
+
+`make tui` runs the container with your current host UID and GID, creates only `~/.config/tokscale` and `~/.cache/tokscale` if needed, and mounts those two directories read-write. Session-data mounts stay read-only, so the container cannot create root-owned files in your client directories. If you call Compose directly instead of `make tui`, set `TOKSCALE_UID=$(id -u)` and `TOKSCALE_GID=$(id -g)` and create those two writable directories yourself.
+
+The default TUI profile deliberately does **not** bind client-data directories: rootful Docker creates a missing bind source as root even for read-only mounts. Opt in only to paths that already exist on your machine, for example:
+
+```bash
+TOKSCALE_UID=$(id -u) TOKSCALE_GID=$(id -g) \
+  docker compose --profile tui run --rm \
+  -v "$HOME/.claude:/home/tokscale/.claude:ro" tui
+```
+
+Add equivalent `-v` flags for the clients you use. This keeps the default command from creating arbitrary host client directories.
+
+**Other common targets:**
+
+```bash
+make down         # stop all services
+make logs/app     # tail app logs
+make db/migrate   # run pending migrations manually
+make help         # full target list
+```
+
+**Custom credentials** — set all four variables together before running `make up`. Compose cannot derive `DATABASE_URL` from the `POSTGRES_*` variables automatically. The hostname `db` is valid only for the app container on the Compose network; do not use it from your host shell or as a Docker build argument:
+
+```bash
+export POSTGRES_USER=myuser
+export POSTGRES_PASSWORD=mypass
+export POSTGRES_DB=mydb
+export DATABASE_URL=postgresql://myuser:mypass@db:5432/mydb
+```
+
+The defaults (`tokscale`/`tokscale`/`tokscale`) are for local dev only.
+
+**Public deployments** — this Compose file binds both ports to loopback and is intended to sit behind a reverse proxy that terminates TLS. Set `APP_URL` to the public HTTPS origin before `make up` (for example, `https://tokscale.example.com`) and configure that URL in the proxy; it drives OAuth redirects, CSRF defaults, canonical metadata, sitemap, and robots at runtime. Keep `DATABASE_SSL=false` only for the bundled local Postgres service. For a managed database, put `DATABASE_URL`, `DATABASE_SSL=require`, `APP_URL`, and optional GitHub OAuth credentials in a protected `.env`/secret store, then run `docker compose -f docker-compose.external-db.yml up -d`. That file has no `db` service or local-database dependency. The sample defaults intentionally do not enable OAuth.
+
+Because one reusable image must emit the runtime `APP_URL` in page metadata and social cards, the root layout is request-dynamic. This intentionally trades full-route static/ISR output for correct per-deployment public origins; data fetches still use their existing cache tags and revalidation policies.
+
+### How to Run (without containers)
 
 After following the [Development Setup](#development-setup), you can:
 

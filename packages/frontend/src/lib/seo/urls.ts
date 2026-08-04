@@ -6,9 +6,39 @@
  * that doesn't match the page's own canonical is a conflicting signal, and the
  * page gets dropped rather than arbitrated.
  *
- * Must stay in sync with `metadataBase` in app/layout.tsx.
+ * Must stay in sync with `metadataBase` in app/layout.tsx and the auth
+ * redirect/CSRF origin resolver.
  */
-export const SITE_URL = "https://tokscale.ai";
+const HOSTED_ORIGIN = "https://tokscale.ai";
+const LOCAL_ORIGIN = "http://localhost:3000";
+
+/**
+ * Resolve the public http(s) origin once for metadata, sitemap, OAuth and
+ * CSRF. A path is intentionally discarded: Tokscale is deployed at an origin,
+ * not below a reverse-proxy path prefix.
+ */
+export function getConfiguredPublicOrigin(value = process.env.APP_URL): string | undefined {
+  if (!value) return undefined;
+
+  try {
+    const url = new URL(value);
+    if (url.protocol === "http:" || url.protocol === "https:") {
+      return url.origin;
+    }
+  } catch {
+    // Fall through to the hosted default rather than emitting unsafe redirects
+    // or invalid canonical URLs from a malformed environment value.
+  }
+
+  return undefined;
+}
+
+export function getPublicOrigin(value = process.env.APP_URL): string {
+  return getConfiguredPublicOrigin(value)
+    ?? (process.env.NODE_ENV === "development" ? LOCAL_ORIGIN : HOSTED_ORIGIN);
+}
+
+export const SITE_URL = getPublicOrigin();
 
 /**
  * The bare origin, with no trailing slash, which is what both consumers emit
@@ -20,7 +50,7 @@ export const SITE_URL = "https://tokscale.ai";
  * `https://tokscale.ai/`; check prod, not dev, if the two ever look different.)
  */
 export function homeUrl(): string {
-  return SITE_URL;
+  return getPublicOrigin();
 }
 
 /**
@@ -36,8 +66,8 @@ export function homeUrl(): string {
  */
 export function leaderboardUrl(view: "users" | "groups" = "users"): string {
   return view === "groups"
-    ? `${SITE_URL}/leaderboard?view=groups`
-    : `${SITE_URL}/leaderboard`;
+    ? `${getPublicOrigin()}/leaderboard?view=groups`
+    : `${getPublicOrigin()}/leaderboard`;
 }
 
 /**
@@ -49,11 +79,11 @@ export function leaderboardUrl(view: "users" | "groups" = "users"): string {
  * a redirect.
  */
 export function profileUrl(username: string): string {
-  return `${SITE_URL}/u/${encodeURIComponent(username)}`;
+  return `${getPublicOrigin()}/u/${encodeURIComponent(username)}`;
 }
 
 export function groupUrl(slug: string): string {
-  return `${SITE_URL}/groups/${encodeURIComponent(slug)}`;
+  return `${getPublicOrigin()}/groups/${encodeURIComponent(slug)}`;
 }
 
 /**
@@ -67,5 +97,5 @@ export const LEGAL_PATHS = ["privacy", "terms", "contact"] as const;
 export type LegalPath = (typeof LEGAL_PATHS)[number];
 
 export function legalUrl(page: LegalPath): string {
-  return `${SITE_URL}/${page}`;
+  return `${getPublicOrigin()}/${page}`;
 }
