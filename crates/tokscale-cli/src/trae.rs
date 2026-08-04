@@ -1140,6 +1140,11 @@ pub mod sync {
             }
 
             let lock_path = cache_dir.join("sync.lock");
+            // Older binaries use this file as a PID-only lock. Preserve a
+            // live legacy record during rolling upgrades: the new OS lock is
+            // not evidence that an older owner has stopped.
+            let legacy_owner =
+                read_legacy_sync_lock(&lock_path).filter(|(pid, _)| pid_is_alive(*pid));
             let mut file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -1167,9 +1172,13 @@ pub mod sync {
                 }
             }
 
+            if let Some((pid, _)) = legacy_owner {
+                anyhow::bail!("another trae sync is in progress (pid {pid}); aborting");
+            }
+
             // Recorded for diagnostics only — the lock above is what excludes.
             let _ = file.set_len(0);
-            let _ = writeln!(file, "{} {}", std::process::id(), Utc::now().timestamp());
+            let _ = writeln!(file, "os {} {}", std::process::id(), Utc::now().timestamp());
 
             Ok(Self { _file: file })
         }
@@ -1178,9 +1187,27 @@ pub mod sync {
     fn read_sync_lock(path: &std::path::Path) -> Option<(u32, u64)> {
         let contents = std::fs::read_to_string(path).ok()?;
         let mut parts = contents.split_whitespace();
+        let first = parts.next()?;
+        let (pid, timestamp) = if first == "os" {
+            (
+                parts.next()?.parse::<u32>().ok()?,
+                parts.next()?.parse::<u64>().ok()?,
+            )
+        } else {
+            (
+                first.parse::<u32>().ok()?,
+                parts.next()?.parse::<u64>().ok()?,
+            )
+        };
+        Some((pid, timestamp))
+    }
+
+    fn read_legacy_sync_lock(path: &std::path::Path) -> Option<(u32, u64)> {
+        let contents = std::fs::read_to_string(path).ok()?;
+        let mut parts = contents.split_whitespace();
         let pid = parts.next()?.parse::<u32>().ok()?;
         let timestamp = parts.next()?.parse::<u64>().ok()?;
-        Some((pid, timestamp))
+        parts.next().is_none().then_some((pid, timestamp))
     }
 
     // ── Main sync logic ────────────────────────────────────────────────────
@@ -1405,6 +1432,28 @@ pub mod sync {
             // The file stays: unlinking it would let a contender lock a
             // different file and defeat the exclusion.
             assert!(cache_dir.join("sync.lock").exists());
+        }
+
+        /// A live PID-only lock belongs to a pre-OS-lock binary. A new
+        /// version must not overwrite it while a rolling upgrade is in
+        /// progress.
+        #[test]
+        fn test_acquire_preserves_a_live_legacy_pid_lock() {
+            let tmp = tempfile::tempdir().unwrap();
+            let cache_dir = tmp.path();
+            let lock_path = cache_dir.join("sync.lock");
+            std::fs::write(&lock_path, format!("{} 1\n", std::process::id())).unwrap();
+
+            let err = SyncLockGuard::acquire(cache_dir).unwrap_err();
+            assert!(
+                err.to_string().contains("another trae sync is in progress"),
+                "a live legacy owner must be preserved, got: {err:#}"
+            );
+            assert_eq!(
+                read_sync_lock(&lock_path).map(|(pid, _)| pid),
+                Some(std::process::id()),
+                "the new binary must not overwrite the legacy owner's record"
+            );
         }
 
         /// Regression (#1010): the old protocol decided ownership from the

@@ -338,6 +338,7 @@ pub fn run_antigravity_purge_cache() -> Result<()> {
     use colored::Colorize;
 
     let cache_dir = get_antigravity_cache_dir()?;
+    let _lock = CacheOperationLockGuard::acquire(&cache_dir, "Antigravity cache operation")?;
     if cache_dir.exists() {
         fs::remove_dir_all(&cache_dir)?;
         println!(
@@ -372,7 +373,55 @@ fn ensure_config_dir() -> Result<()> {
 
 #[derive(Debug)]
 struct SyncLockGuard {
+    _cache_lock: CacheOperationLockGuard,
     _file: std::fs::File,
+}
+
+/// Serializes operations that create or remove the cache directory itself.
+///
+/// `sync.lock` lives inside that directory, so it cannot protect its own
+/// inode from `purge-cache`: removing the directory unlinks a held lock while
+/// a later sync creates and locks a replacement. Keep this lock beside the
+/// cache instead, where purge never removes it.
+#[derive(Debug)]
+struct CacheOperationLockGuard {
+    _file: std::fs::File,
+}
+
+impl CacheOperationLockGuard {
+    fn acquire(cache_dir: &Path, operation: &str) -> Result<Self> {
+        let lock_path = cache_dir.with_extension("lock");
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Failed to create Antigravity lock directory at {}",
+                    parent.display()
+                )
+            })?;
+        }
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| {
+                format!(
+                    "Failed to open Antigravity cache operation lock at {}",
+                    lock_path.display()
+                )
+            })?;
+
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(err) if crate::commands::autosubmit::is_lock_contention(&err) => {
+                anyhow::bail!("Another tokscale {operation} is in progress; aborting")
+            }
+            Err(err) => Err(anyhow::Error::new(err)
+                .context("Failed to acquire Antigravity cache operation lock")),
+        }
+    }
 }
 
 impl SyncLockGuard {
@@ -394,6 +443,7 @@ impl SyncLockGuard {
     /// contender create a fresh file and lock that instead, which is the same
     /// hole in a different shape.
     fn acquire(cache_dir: &Path) -> Result<Self> {
+        let cache_lock = CacheOperationLockGuard::acquire(cache_dir, "antigravity sync")?;
         if !cache_dir.exists() {
             std::fs::create_dir_all(cache_dir).with_context(|| {
                 format!(
@@ -404,6 +454,10 @@ impl SyncLockGuard {
         }
 
         let lock_path = cache_dir.join("sync.lock");
+        // Older binaries use this file as a PID-only lock. They do not hold
+        // the OS lock below, so preserve their ownership during a rolling
+        // upgrade instead of overwriting a live PID record.
+        let legacy_owner = read_legacy_sync_lock(&lock_path).filter(|(pid, _)| pid_is_alive(*pid));
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -436,6 +490,10 @@ impl SyncLockGuard {
             }
         }
 
+        if let Some((pid, _)) = legacy_owner {
+            anyhow::bail!("Another tokscale antigravity sync is in progress (pid {pid}); aborting");
+        }
+
         // Recorded for diagnostics only — the lock above is what excludes.
         let pid = std::process::id();
         let timestamp = SystemTime::now()
@@ -443,18 +501,42 @@ impl SyncLockGuard {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let _ = file.set_len(0);
-        let _ = writeln!(file, "{pid} {timestamp}");
+        let _ = writeln!(file, "os {pid} {timestamp}");
 
-        Ok(SyncLockGuard { _file: file })
+        Ok(SyncLockGuard {
+            _cache_lock: cache_lock,
+            _file: file,
+        })
     }
 }
 
 fn read_sync_lock(path: &Path) -> Option<(u32, u64)> {
     let contents = std::fs::read_to_string(path).ok()?;
     let mut parts = contents.split_whitespace();
+    let first = parts.next()?;
+    let (pid, timestamp) = if first == "os" {
+        (
+            parts.next()?.parse::<u32>().ok()?,
+            parts.next()?.parse::<u64>().ok()?,
+        )
+    } else {
+        (
+            first.parse::<u32>().ok()?,
+            parts.next()?.parse::<u64>().ok()?,
+        )
+    };
+    Some((pid, timestamp))
+}
+
+/// A two-field record is owned by the pre-OS-lock implementation. Newer
+/// versions tag their diagnostics record so a later sync can distinguish its
+/// own released OS lock from a live legacy PID-file owner.
+fn read_legacy_sync_lock(path: &Path) -> Option<(u32, u64)> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let mut parts = contents.split_whitespace();
     let pid = parts.next()?.parse::<u32>().ok()?;
     let timestamp = parts.next()?.parse::<u64>().ok()?;
-    Some((pid, timestamp))
+    parts.next().is_none().then_some((pid, timestamp))
 }
 
 pub fn load_antigravity_manifest() -> Result<AntigravityManifest> {
@@ -3318,5 +3400,53 @@ mod tests {
 
         let (pid, _) = read_sync_lock(&lock_path).expect("readable");
         assert_eq!(pid, std::process::id(), "the new owner must be recorded");
+    }
+
+    /// During a rolling upgrade an older binary still uses `sync.lock` as a
+    /// PID-file lock. The new OS lock is not evidence that the old owner has
+    /// stopped, so its live record must prevent takeover.
+    #[test]
+    #[serial]
+    fn sync_lock_guard_preserves_a_live_legacy_pid_lock() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_dir = temp_dir.path().to_path_buf();
+        let lock_path = cache_dir.join("sync.lock");
+        std::fs::write(&lock_path, format!("{} 1\n", std::process::id())).unwrap();
+
+        let err = SyncLockGuard::acquire(&cache_dir).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Another tokscale antigravity sync is in progress"),
+            "a live legacy owner must be preserved, got: {err:#}"
+        );
+        assert_eq!(
+            read_sync_lock(&lock_path).map(|(pid, _)| pid),
+            Some(std::process::id()),
+            "the new binary must not overwrite the legacy owner's record"
+        );
+    }
+
+    /// `purge-cache` must use a lock outside the cache directory. Otherwise
+    /// it can unlink a sync's held `sync.lock` inode and let another sync lock
+    /// a new file at the same path.
+    #[test]
+    #[serial]
+    fn purge_cache_refuses_while_sync_holds_the_parent_lock() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _env = TestEnvGuard::redirect_to(temp_dir.path());
+        let cache_dir = get_antigravity_cache_dir().unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("manifest.json"), "{}").unwrap();
+
+        let sync = SyncLockGuard::acquire(&cache_dir).unwrap();
+        let err = run_antigravity_purge_cache().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Another tokscale Antigravity cache operation is in progress"),
+            "purge must not unlink an active sync lock, got: {err:#}"
+        );
+        assert!(cache_dir.join("sync.lock").exists());
+        assert!(cache_dir.join("manifest.json").exists());
+        drop(sync);
     }
 }
