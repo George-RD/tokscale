@@ -26,10 +26,119 @@ pub struct ModelPricing {
 }
 
 impl ModelPricing {
+    /// Every rate this row can carry, base rates and long-context tiers alike,
+    /// as one list.
+    ///
+    /// The destructure below deliberately carries no `..` rest pattern: adding
+    /// a field to `ModelPricing` breaks this function at compile time and
+    /// forces the new rate into every predicate that reasons over *all* rates.
+    /// Leaving that to a comment is not safe enough for
+    /// `quotes_zero_for_every_published_rate`, where an overlooked rate is
+    /// treated as zero and a new paid tier would read as free.
+    pub(crate) fn all_rates(&self) -> [Option<f64>; 15] {
+        let Self {
+            input_cost_per_token,
+            input_cost_per_token_above_128k_tokens,
+            input_cost_per_token_above_200k_tokens,
+            input_cost_per_token_above_256k_tokens,
+            input_cost_per_token_above_272k_tokens,
+            output_cost_per_token,
+            output_cost_per_token_above_128k_tokens,
+            output_cost_per_token_above_200k_tokens,
+            output_cost_per_token_above_256k_tokens,
+            output_cost_per_token_above_272k_tokens,
+            cache_creation_input_token_cost,
+            cache_creation_input_token_cost_above_200k_tokens,
+            cache_read_input_token_cost,
+            cache_read_input_token_cost_above_200k_tokens,
+            cache_read_input_token_cost_above_272k_tokens,
+        } = *self;
+
+        [
+            input_cost_per_token,
+            input_cost_per_token_above_128k_tokens,
+            input_cost_per_token_above_200k_tokens,
+            input_cost_per_token_above_256k_tokens,
+            input_cost_per_token_above_272k_tokens,
+            output_cost_per_token,
+            output_cost_per_token_above_128k_tokens,
+            output_cost_per_token_above_200k_tokens,
+            output_cost_per_token_above_256k_tokens,
+            output_cost_per_token_above_272k_tokens,
+            cache_creation_input_token_cost,
+            cache_creation_input_token_cost_above_200k_tokens,
+            cache_read_input_token_cost,
+            cache_read_input_token_cost_above_200k_tokens,
+            cache_read_input_token_cost_above_272k_tokens,
+        ]
+    }
+
+    /// Whether every rate this row publishes is exactly `0.0`, so the buckets
+    /// it never quotes can be read as zero as well.
+    ///
+    /// This is a statement about the row, not about the deal. Rows that quote
+    /// `0.0` for the buckets upstream bothered to list and omit the rest reach
+    /// us from two different worlds and are indistinguishable in the data:
+    /// `kenari/nemotron-3-ultra-550b-a55b` is a genuinely free model, and
+    /// `kenari/claude-opus-4-7` is a premium model whose zeros mean "included
+    /// in your subscription" — both arrive as
+    /// `{input_cost_per_token: 0.0, output_cost_per_token: 0.0}` with null
+    /// cache fields, byte for byte. Nothing in the dataset separates them, so
+    /// tokscale reports both at $0.00 and cannot do better from this input
+    /// alone. If upstream ever publishes a plan/subscription marker, that is
+    /// the signal to split these two cases apart.
+    ///
+    /// That limitation predates this predicate rather than arriving with it:
+    /// `0.0` has always satisfied `valid_rate`, so a plan-priced row already
+    /// covered — and already reported at $0.00 — any usage without cache
+    /// tokens. What this widens is the usage shapes it covers, extending the
+    /// same $0.00 answer to cache-bearing usage instead of aborting the
+    /// submission that carries it (#1021, #1035).
+    ///
+    /// Two conditions, and both matter:
+    ///
+    /// The row must quote base rates for *both* input and output. Those are
+    /// the two buckets every completion populates and every provider prices,
+    /// so quoting zero for both is the strongest signal the data offers. One
+    /// zero rate is not: a row quoting free input while omitting output has
+    /// said nothing about generation, which is where the money is, and
+    /// extrapolating from it would report a paid model at $0.00.
+    ///
+    /// Every rate the row quotes must then be zero, tiers included. A zero
+    /// base rate beside a paid above-128k tier is a promotional tier rather
+    /// than an all-zero row, and keeps the strict coverage check below.
+    fn quotes_zero_for_every_published_rate(&self) -> bool {
+        let quoted_rate =
+            |rate: Option<f64>| rate.is_some_and(|rate| rate.is_finite() && rate >= 0.0);
+        quoted_rate(self.input_cost_per_token)
+            && quoted_rate(self.output_cost_per_token)
+            && self
+                .all_rates()
+                .into_iter()
+                .flatten()
+                // Rejects NaN as well as any real price, so a row carrying an
+                // unusable rate is never mistaken for a published zero.
+                .all(|rate| rate == 0.0)
+    }
+
     /// Whether this row can price every populated token bucket under
     /// `compute_cost`'s current base-rate fallback semantics. Explicit zeroes
     /// are valid prices; a missing base rate is not covered by a later tier.
     pub(crate) fn covers_usage(&self, usage: &crate::TokenBreakdown) -> bool {
+        // A row that quotes zero for every rate it publishes prices the ones
+        // it omits at zero too, so it covers any usage shape. `compute_cost`
+        // already reads an absent rate as 0.0, so this only stops a $0.00
+        // submission being rejected — it changes no total.
+        //
+        // Answering true here deliberately pre-empts `resolve_for_usage`'s
+        // canonical-borrow path (#1013), which exists to fill omitted cache
+        // rates from the unhinted row. Nothing is lost: an all-zero row can
+        // only borrow from a canonical row quoting the same base rates, so
+        // every rate it could take is zero and the total is unchanged.
+        if self.quotes_zero_for_every_published_rate() {
+            return true;
+        }
+
         let valid_rate =
             |rate: Option<f64>| rate.is_some_and(|rate| rate.is_finite() && rate >= 0.0);
         (usage.input <= 0 || valid_rate(self.input_cost_per_token))
@@ -240,6 +349,122 @@ mod pricing_row_tests {
             filled.cache_read_input_token_cost_above_200k_tokens,
             Some(9.9e-7)
         );
+    }
+
+    fn every_bucket_usage() -> TokenBreakdown {
+        TokenBreakdown {
+            input: 1_000,
+            output: 500,
+            cache_read: 2_000,
+            cache_write: 300,
+            reasoning: 200,
+        }
+    }
+
+    // #1021, #1035: a free model whose row omits the redundant cache zeros was
+    // judged unpriced the moment a message carried one cached token, and the
+    // whole submission aborted.
+    #[test]
+    fn a_row_priced_entirely_at_zero_covers_cache_usage_it_never_quotes() {
+        let free = ModelPricing {
+            input_cost_per_token: Some(0.0),
+            output_cost_per_token: Some(0.0),
+            ..Default::default()
+        };
+
+        assert!(free.covers_usage(&every_bucket_usage()));
+    }
+
+    // Absence of data is not a price of zero.
+    #[test]
+    fn a_row_with_no_rates_at_all_covers_nothing() {
+        let empty = ModelPricing::default();
+
+        assert!(!empty.covers_usage(&every_bucket_usage()));
+        assert!(!empty.covers_usage(&cache_read_usage()));
+    }
+
+    // The zero shortcut must never borrow a real rate for a bucket the row
+    // leaves unquoted: that would bill cached tokens at the input price.
+    #[test]
+    fn a_row_charging_for_input_still_does_not_cover_unquoted_cache_reads() {
+        let paid = ModelPricing {
+            input_cost_per_token: Some(1e-6),
+            output_cost_per_token: Some(1e-5),
+            ..Default::default()
+        };
+
+        assert!(!paid.covers_usage(&cache_read_usage()));
+    }
+
+    // A zero base rate beside a paid long-context tier is not an all-zero row,
+    // so the strict rule still applies to the buckets it never quotes.
+    #[test]
+    fn a_zero_base_rate_with_a_paid_tier_does_not_cover_unquoted_cache_reads() {
+        let promotional = ModelPricing {
+            input_cost_per_token: Some(0.0),
+            input_cost_per_token_above_128k_tokens: Some(1e-6),
+            output_cost_per_token: Some(0.0),
+            ..Default::default()
+        };
+
+        assert!(!promotional.covers_usage(&cache_read_usage()));
+    }
+
+    // One zero rate is not enough. A row quoting zero input while saying
+    // nothing about output has said nothing about generation, so the buckets
+    // it omits stay unpriced.
+    #[test]
+    fn a_row_quoting_only_a_zero_input_rate_does_not_cover_output() {
+        let input_only = ModelPricing {
+            input_cost_per_token: Some(0.0),
+            ..Default::default()
+        };
+
+        assert!(!input_only.covers_usage(&every_bucket_usage()));
+        assert!(input_only.covers_usage(&TokenBreakdown {
+            input: 1_000,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        }));
+    }
+
+    // A tier-only row has no base rate to anchor its zeros, so they
+    // must not make it cover usage the pricing path would bill at zero anyway.
+    #[test]
+    fn a_tier_only_zero_row_covers_nothing() {
+        let tier_only = ModelPricing {
+            input_cost_per_token_above_128k_tokens: Some(0.0),
+            ..Default::default()
+        };
+
+        assert!(!tier_only.covers_usage(&every_bucket_usage()));
+    }
+
+    // Covering the usage is only useful if the price that follows is a real
+    // 0.0: an unquoted bucket must not leak a NaN into the leaderboard totals.
+    #[test]
+    fn an_all_zero_row_prices_cache_usage_at_exactly_zero() {
+        let free = ModelPricing {
+            input_cost_per_token: Some(0.0),
+            output_cost_per_token: Some(0.0),
+            ..Default::default()
+        };
+        let usage = every_bucket_usage();
+
+        let cost = crate::pricing::lookup::compute_cost(
+            &free,
+            usage.input,
+            usage.output,
+            usage.cache_read,
+            usage.cache_write,
+            usage.reasoning,
+        );
+
+        assert_eq!(cost, 0.0);
+        assert!(cost.is_finite());
     }
 
     // A bucket the usage does not touch is never filled.
