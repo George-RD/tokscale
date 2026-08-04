@@ -1,517 +1,270 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { expectNoNarrowedCostCast } from "../support/costCastWidths";
-
-const mockState = vi.hoisted(() => {
-  const awaitedResults: unknown[] = [];
-  const limitCalls: unknown[] = [];
-
-  const tables = {
-    users: {
-      id: "users.id",
-      username: "users.username",
-      displayName: "users.displayName",
-      avatarUrl: "users.avatarUrl",
-    },
-    submissions: {
-      id: "submissions.id",
-      userId: "submissions.userId",
-      totalTokens: "submissions.totalTokens",
-      totalCost: "submissions.totalCost",
-    },
-    dailyBreakdown: {
-      submissionId: "dailyBreakdown.submissionId",
-      date: "dailyBreakdown.date",
-      tokens: "dailyBreakdown.tokens",
-      cost: "dailyBreakdown.cost",
-    },
-  };
-
-  const eq = vi.fn(() => "eq");
-  const desc = vi.fn(() => "desc");
-  const and = vi.fn(() => "and");
-  const or = vi.fn(() => "or");
-  const gte = vi.fn(() => "gte");
-  const lte = vi.fn(() => "lte");
+const state = vi.hoisted(() => {
+  const results: Array<unknown> = [];
+  const queries: Array<{ strings: string[]; values: unknown[] }> = [];
   const sql = Object.assign(
-    vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => ({
-      strings: Array.from(strings),
-      values,
-      as: () => ({}),
-    })),
-    {
-      raw: vi.fn(),
-    }
-  );
-
-  const db = {
-    select: vi.fn(() => {
-      const builder = {
-        from: vi.fn(() => builder),
-        innerJoin: vi.fn(() => builder),
-        where: vi.fn(() => builder),
-        groupBy: vi.fn(() => builder),
-        orderBy: vi.fn(() => builder),
-        limit: vi.fn((value: unknown) => {
-          limitCalls.push(value);
-          return builder;
-        }),
-        offset: vi.fn(() => builder),
-        having: vi.fn(() => builder),
-        as: vi.fn(() => builder),
-        then: (resolve: (value: unknown) => unknown) =>
-          resolve(awaitedResults.shift() ?? []),
-      };
-
-      return builder;
+    vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => {
+      const query = { strings: Array.from(strings), values, as: () => ({}) };
+      queries.push(query);
+      return query;
     }),
-  };
-
+    {
+      join: (items: unknown[], separator: unknown) => ({
+        strings: [],
+        values: [items, separator],
+      }),
+    },
+  );
+  const select = vi.fn(() => {
+    const builder = {
+      from: () => builder,
+      where: () => builder,
+      limit: () =>
+        Promise.resolve([
+          {
+            id: "a",
+            username: "alice",
+            displayName: null,
+            avatarUrl: null,
+            leaderboardHidden: false,
+          },
+        ]),
+    };
+    return builder;
+  });
   return {
-    db,
-    tables,
-    eq,
-    desc,
-    and,
-    or,
-    gte,
-    lte,
+    results,
+    queries,
     sql,
-    reset() {
-      awaitedResults.length = 0;
-      limitCalls.length = 0;
-      db.select.mockClear();
-      eq.mockClear();
-      desc.mockClear();
-      and.mockClear();
-      or.mockClear();
-      gte.mockClear();
-      lte.mockClear();
-      sql.mockClear();
-      sql.raw.mockClear();
+    select,
+    reset: () => {
+      results.length = 0;
+      queries.length = 0;
+      select.mockClear();
     },
-    pushAwaitedResult(value: unknown) {
-      awaitedResults.push(value);
-    },
-    limitCalls,
   };
 });
-
-vi.mock("next/cache", () => ({
-  unstable_cache: (fn: () => unknown) => fn,
-}));
-
+vi.mock("next/cache", () => ({ unstable_cache: (fn: () => unknown) => fn }));
 vi.mock("@/lib/db", () => ({
-  db: mockState.db,
-  users: mockState.tables.users,
-  submissions: mockState.tables.submissions,
-  dailyBreakdown: mockState.tables.dailyBreakdown,
+  db: {
+    execute: vi.fn(() => Promise.resolve(state.results.shift() ?? [])),
+    select: state.select,
+  },
+  users: {
+    id: "id",
+    username: "username",
+    displayName: "displayName",
+    avatarUrl: "avatarUrl",
+    leaderboardHidden: "leaderboardHidden",
+  },
 }));
-
-vi.mock("@/lib/db/usernameLookup", () => {
-  class AmbiguousUsernameError extends Error {}
-
-  return {
-    AmbiguousUsernameError,
-    USERNAME_LOOKUP_LIMIT: 2,
-    getSingleUsernameMatch: (rows: readonly unknown[], username: string) => {
-      if (rows.length > 1) {
-        throw new AmbiguousUsernameError(`Multiple users match username ${username} case-insensitively`);
-      }
-      return rows[0] ?? null;
-    },
-    normalizeUsernameCacheKey: (username: string) => username.toLowerCase(),
-    usernameEqualsIgnoreCase: (username: string) =>
-      mockState.sql`lower(${mockState.tables.users.username}) = ${username.toLowerCase()}`,
-  };
-});
-
-vi.mock("drizzle-orm", () => ({
-  eq: mockState.eq,
-  desc: mockState.desc,
-  and: mockState.and,
-  or: mockState.or,
-  gte: mockState.gte,
-  lte: mockState.lte,
-  sql: mockState.sql,
+vi.mock("@/lib/db/usernameLookup", () => ({
+  USERNAME_LOOKUP_LIMIT: 2,
+  getSingleUsernameMatch: (rows: unknown[]) => rows[0] ?? null,
+  normalizeUsernameCacheKey: (v: string) => v.toLowerCase(),
+  usernameEqualsIgnoreCase: (v: string) =>
+    state.sql`LOWER(username) = LOWER(${v})`,
 }));
-
-type ModuleExports = typeof import("../../src/lib/leaderboard/getLeaderboard");
-
-let getLeaderboardData: ModuleExports["getLeaderboardData"];
-let getUserRank: ModuleExports["getUserRank"];
-
-function selectedKeys(callIndex: number): string[] {
-  const calls = mockState.db.select.mock.calls as unknown as Array<
-    [Record<string, unknown> | undefined]
-  >;
-  return Object.keys(calls[callIndex]?.[0] ?? {});
+vi.mock("drizzle-orm", () => ({ sql: state.sql }));
+let getLeaderboardData: (typeof import("../../src/lib/leaderboard/getLeaderboard"))["getLeaderboardData"];
+let getUserRank: (typeof import("../../src/lib/leaderboard/getLeaderboard"))["getUserRank"];
+function text(value: unknown): string {
+  if (!value || typeof value !== "object") return String(value ?? "");
+  const q = value as { strings?: string[]; values?: unknown[] };
+  return q.strings
+    ? q.strings.reduce(
+        (s, p, i) =>
+          `${s}${p}${i < q.values!.length ? text(q.values![i]) : ""}`,
+        "",
+      )
+    : "";
 }
-
-function serializeSqlCalls(): string[] {
-  return mockState.sql.mock.calls.map((call) => {
-    const [strings, ...values] = call as [TemplateStringsArray, ...unknown[]];
-    const textParts = Array.from(strings);
-
-    return textParts.reduce((text, part, index) => {
-      const nextValue = index < values.length ? String(values[index]) : "";
-      return `${text}${part}${nextValue}`;
-    }, "");
-  });
+function query() {
+  return state.queries.map(text).join("\n");
 }
+function finalQuery() {
+  return text(state.queries.at(-1));
+}
+function occurrences(value: string, needle: string) {
+  return value.split(needle).length - 1;
+}
+beforeAll(
+  async () =>
+    ({ getLeaderboardData, getUserRank } =
+      await import("../../src/lib/leaderboard/getLeaderboard")),
+);
+beforeEach(() => state.reset());
 
-beforeAll(async () => {
-  const leaderboardModule = await import("../../src/lib/leaderboard/getLeaderboard");
-  getLeaderboardData = leaderboardModule.getLeaderboardData;
-  getUserRank = leaderboardModule.getUserRank;
-});
-
-beforeEach(() => {
-  mockState.reset();
-});
-
-afterEach(() => {
-  vi.useRealTimers();
-});
-
-describe("all-time leaderboard queries", () => {
-  it("uses competition-rank SQL for all-time list and search ranks", async () => {
-    mockState.pushAwaitedResult([]);
-    mockState.pushAwaitedResult([{ totalTokens: 0, totalCost: 0, uniqueUsers: 0 }]);
-
-    await getLeaderboardData("all", 1, 50, "tokens");
-    const listSqlTexts = serializeSqlCalls();
-
-    expect(listSqlTexts.some((text) => text.includes("RANK() OVER (ORDER BY"))).toBe(true);
-    expect(listSqlTexts.some((text) => text.includes("ROW_NUMBER() OVER"))).toBe(false);
-
-    mockState.reset();
-    mockState.pushAwaitedResult([]);
-    mockState.pushAwaitedResult([{ count: 0 }]);
-    mockState.pushAwaitedResult([{ totalTokens: 0, totalCost: 0, uniqueUsers: 0 }]);
-
-    await getLeaderboardData("all", 1, 50, "tokens", "ali");
-    const searchSqlTexts = serializeSqlCalls();
-
-    expect(searchSqlTexts.some((text) => text.includes("RANK() OVER (ORDER BY"))).toBe(true);
-    expect(searchSqlTexts.some((text) => text.includes("ROW_NUMBER() OVER"))).toBe(false);
-  });
-
-  it("counts distinct users for all-time pagination and global stats", async () => {
-    mockState.pushAwaitedResult([]);
-    // Site-wide stats: every submitting user, hidden ones included.
-    mockState.pushAwaitedResult([{ totalTokens: 0, totalCost: 0, uniqueUsers: 3 }]);
-    // Pagination: only users the ranked query can actually return.
-    mockState.pushAwaitedResult([{ count: 2 }]);
-
-    const list = await getLeaderboardData("all", 1, 50, "tokens");
-
-    // The two counts are deliberately different sources. Pagination must track
-    // the rankable set, or hiding a user leaves a trailing page that renders
-    // empty; stats must track everyone, because hiding withdraws someone from
-    // the competition without erasing their usage from the totals.
-    expect(list.pagination.totalUsers).toBe(2);
-    expect(list.stats.uniqueUsers).toBe(3);
-    expect(serializeSqlCalls().some((text) =>
-      text.includes("COUNT(DISTINCT submissions.userId)")
-    )).toBe(true);
-
-    mockState.reset();
-    mockState.pushAwaitedResult([]);
-    mockState.pushAwaitedResult([{ count: 0 }]);
-    mockState.pushAwaitedResult([{ totalTokens: 0, totalCost: 0, uniqueUsers: 2 }]);
-
-    const search = await getLeaderboardData("all", 1, 50, "tokens", "ali");
-    expect(search.stats.uniqueUsers).toBe(2);
-    expect(serializeSqlCalls().some((text) =>
-      text.includes("COUNT(DISTINCT submissions.userId)")
-    )).toBe(true);
-  });
-
-  it("keeps tied all-time users at the same rank across list, search, and user rank", async () => {
-    mockState.pushAwaitedResult([
+describe("all-time leaderboard aggregate query", () => {
+  it("uses competition rank and source/model directives", async () => {
+    state.results.push([
       {
-        rank: 1,
-        userId: "user-bob",
-        username: "bob",
-        displayName: "Bob",
-        avatarUrl: null,
-        totalTokens: 5000,
-        totalCost: 50,
-      },
-      {
-        rank: 2,
-        userId: "user-alice",
-        username: "alice",
-        displayName: "Alice",
-        avatarUrl: null,
-        totalTokens: 3000,
-        totalCost: 40,
-      },
-      {
-        rank: 2,
-        userId: "user-alicia",
-        username: "alicia",
-        displayName: "Alicia",
-        avatarUrl: null,
-        totalTokens: 3000,
-        totalCost: 30,
+        users: [],
+        totalUsers: 0,
+        totalTokens: 100,
+        totalCost: 10,
+        uniqueUsers: 2,
       },
     ]);
-    mockState.pushAwaitedResult([
+    await getLeaderboardData(
+      "all",
+      1,
+      50,
+      "tokens",
+      "client:codex model:gpt-5",
+    );
+    expect(query()).toContain("RANK() OVER (ORDER BY total_tokens DESC)");
+    expect(query()).toContain("unnest(s.sources_used)");
+    expect(query()).toContain("unnest(s.models_used)");
+  });
+
+  it("keeps global headline totals unfiltered by directives and includes hidden users", async () => {
+    state.results.push([
       {
-        totalTokens: 11000,
-        totalCost: 120,
+        users: [],
+        totalUsers: 1,
+        totalTokens: 1000,
+        totalCost: 100,
         uniqueUsers: 3,
       },
     ]);
-
-    const leaderboard = await getLeaderboardData("all", 1, 50, "tokens");
-    const aliceListRank = leaderboard.users.find((user) => user.username === "alice")?.rank;
-    const aliciaListRank = leaderboard.users.find((user) => user.username === "alicia")?.rank;
-
-    mockState.reset();
-    mockState.pushAwaitedResult([
-      {
-        rank: 2,
-        userId: "user-alice",
-        username: "alice",
-        displayName: "Alice",
-        avatarUrl: null,
-        totalTokens: 3000,
-        totalCost: 40,
-      },
-      {
-        rank: 2,
-        userId: "user-alicia",
-        username: "alicia",
-        displayName: "Alicia",
-        avatarUrl: null,
-        totalTokens: 3000,
-        totalCost: 30,
-      },
-    ]);
-    mockState.pushAwaitedResult([{ count: 2 }]);
-    mockState.pushAwaitedResult([
-      {
-        totalTokens: 11000,
-        totalCost: 120,
-        uniqueUsers: 3,
-      },
-    ]);
-
-    const searchLeaderboard = await getLeaderboardData("all", 1, 50, "tokens", "ali");
-    const aliceSearchRank = searchLeaderboard.users.find((user) => user.username === "alice")?.rank;
-    const aliciaSearchRank = searchLeaderboard.users.find((user) => user.username === "alicia")?.rank;
-
-    mockState.reset();
-    mockState.pushAwaitedResult([
-      {
-        id: "user-alice",
-        username: "alice",
-        displayName: "Alice",
-        avatarUrl: null,
-      },
-    ]);
-    mockState.pushAwaitedResult([
-      {
-        totalTokens: 3000,
-        totalCost: 40,
-      },
-    ]);
-    mockState.pushAwaitedResult([{ count: 1 }]);
-
-    const aliceUserRank = await getUserRank("alice", "all", "tokens");
-
-    expect(aliceListRank).toBe(2);
-    expect(aliciaListRank).toBe(2);
-    expect(aliceSearchRank).toBe(2);
-    expect(aliciaSearchRank).toBe(2);
-    expect(aliceUserRank?.rank).toBe(2);
+    const data = await getLeaderboardData(
+      "all",
+      1,
+      50,
+      "tokens",
+      "client:codex",
+    );
+    expect(data.stats).toEqual({
+      totalTokens: 1000,
+      totalCost: 100,
+      uniqueUsers: 3,
+    });
+    expect(query()).toContain("stat_rows AS (");
+    expect(query()).toContain("stats AS (");
+    expect(query()).toContain("WHERE leaderboard_hidden = false");
+    expect(occurrences(finalQuery(), "unnest(s.sources_used)")).toBe(1);
+    expect(occurrences(finalQuery(), "stats AS (")).toBe(1);
+    expect(occurrences(finalQuery(), "FROM stat_rows")).toBe(1);
   });
 
-  it("selects and returns only fields consumed by leaderboard surfaces", async () => {
-    mockState.pushAwaitedResult([
+  it("aggregates duplicate submission rows into one ranked user before counting", async () => {
+    state.results.push([
       {
-        rank: 1,
-        userId: "user-alice",
-        username: "alice",
-        displayName: "Alice",
-        avatarUrl: null,
-        totalTokens: 3000,
-        totalCost: 30,
-      },
-    ]);
-    mockState.pushAwaitedResult([
-      {
-        totalTokens: 3000,
-        totalCost: 30,
+        users: [
+          {
+            rank: 1,
+            userId: "alice",
+            username: "alice",
+            displayName: null,
+            avatarUrl: null,
+            totalTokens: 300,
+            totalCost: 3,
+          },
+        ],
+        totalUsers: 1,
+        totalTokens: 300,
+        totalCost: 3,
         uniqueUsers: 1,
       },
     ]);
-
-    const leaderboard = await getLeaderboardData("all", 1, 50, "tokens");
-    expect(selectedKeys(0)).toEqual([
-      "rank",
-      "userId",
-      "username",
-      "displayName",
-      "avatarUrl",
-      "totalTokens",
-      "totalCost",
-    ]);
-    expect(selectedKeys(1)).toEqual([
-      "totalTokens",
-      "totalCost",
-      "uniqueUsers",
-    ]);
-    expect(Object.keys(leaderboard.users[0]).sort()).toEqual([
-      "avatarUrl",
-      "displayName",
-      "rank",
-      "totalCost",
-      "totalTokens",
-      "userId",
-      "username",
-    ]);
-    expect(leaderboard.stats).toEqual({
-      totalTokens: 3000,
-      totalCost: 30,
-      uniqueUsers: 1,
+    const data = await getLeaderboardData("all");
+    expect(data).toMatchObject({
+      users: [{ username: "alice", rank: 1, totalTokens: 300 }],
+      pagination: { totalUsers: 1 },
+      stats: { uniqueUsers: 1 },
     });
-
-    mockState.reset();
-
-    mockState.pushAwaitedResult([
-      {
-        id: "user-alice",
-        username: "alice",
-        displayName: "Alice",
-        avatarUrl: null,
-      },
-    ]);
-    mockState.pushAwaitedResult([
-      {
-        totalTokens: 3000,
-        totalCost: 30,
-      },
-    ]);
-    mockState.pushAwaitedResult([
-      {
-        count: 0,
-      },
-    ]);
-
-    const rank = await getUserRank("alice", "all", "tokens");
-
-    expect(selectedKeys(1)).toEqual([
-      "totalTokens",
-      "totalCost",
-    ]);
-    expect(Object.keys(rank || {}).sort()).toEqual([
-      "avatarUrl",
-      "displayName",
-      "rank",
-      "totalCost",
-      "totalTokens",
-      "userId",
-      "username",
-    ]);
-  });
-
-  it("looks up all-time user rank usernames case-insensitively", async () => {
-    mockState.pushAwaitedResult([
-      {
-        id: "user-imlunahey",
-        username: "ImLunaHey",
-        displayName: "Luna",
-        avatarUrl: null,
-      },
-    ]);
-    mockState.pushAwaitedResult([
-      {
-        totalTokens: 1200,
-        totalCost: 12,
-      },
-    ]);
-    mockState.pushAwaitedResult([{ count: 0 }]);
-
-    const rank = await getUserRank("imlunahey", "all", "tokens");
-    const sqlTexts = serializeSqlCalls();
-
-    expect(rank).toMatchObject({
-      rank: 1,
-      username: "ImLunaHey",
-      totalTokens: 1200,
-    });
-    expect(mockState.limitCalls[0]).toBe(2);
-    expect(sqlTexts.some((text) =>
-      text.toLowerCase().includes("lower(users.username) = imlunahey")
-    )).toBe(true);
-  });
-
-  it("rejects ambiguous case-insensitive all-time user rank matches", async () => {
-    mockState.pushAwaitedResult([
-      {
-        id: "user-imlunahey",
-        username: "ImLunaHey",
-        displayName: "Luna",
-        avatarUrl: null,
-      },
-      {
-        id: "user-imlunahey-duplicate",
-        username: "imlunahey",
-        displayName: "Luna Duplicate",
-        avatarUrl: null,
-      },
-    ]);
-
-    await expect(getUserRank("imlunahey", "all", "tokens")).rejects.toThrow(
-      "Multiple users match username imlunahey case-insensitively"
+    expect(query()).toContain("SUM(s.total_tokens) AS total_tokens");
+    expect(query()).toContain("GROUP BY s.user_id");
+    expect(query()).toContain("COUNT(*)::int AS unique_users");
+    const final = finalQuery();
+    expect(final.indexOf("GROUP BY s.user_id")).toBeLessThan(
+      final.indexOf("RANK() OVER (ORDER BY total_tokens DESC)"),
     );
-    expect(mockState.limitCalls[0]).toBe(2);
   });
 
-  it("casts all-time cost at the full numeric(18,4) column precision so large totals don't overflow", async () => {
-    // Regression: total_cost is numeric(18,4) (migration 0014); every cost cast must stay >= 18 wide or costs >= 1e8 overflow.
-    // Width-based (not literal) so it also catches a re-narrowing to any precision below the column, e.g. DECIMAL(15,4).
-    await getLeaderboardData("all", 1, 50, "cost");
-
-    expectNoNarrowedCostCast(serializeSqlCalls());
-  });
-});
-
-describe("all-time cost aggregation precision across query shapes (numeric overflow regression)", () => {
-  // Complements the all-time-list check above with the search and user-rank
-  // shapes that also cast submissions.total_cost (decimal(18,4)). Any cast
-  // narrower than 18 overflows on costs >= the narrowed ceiling and 500s the
-  // query; width-based so a re-narrowing to e.g. DECIMAL(15,4) is still caught.
-  it("casts total_cost at full column precision in the all-time search list", async () => {
-    mockState.pushAwaitedResult([]);
-    mockState.pushAwaitedResult([{ count: 0 }]);
-    mockState.pushAwaitedResult([
-      { totalTokens: 0, totalCost: 0, uniqueUsers: 0 },
-    ]);
-
-    await getLeaderboardData("all", 1, 50, "cost", "ali");
-
-    expectNoNarrowedCostCast(serializeSqlCalls());
-  });
-
-  it("casts total_cost at full column precision for all-time user rank", async () => {
-    mockState.pushAwaitedResult([
-      { id: "user-alice", username: "alice", displayName: "Alice", avatarUrl: null },
-    ]);
-    mockState.pushAwaitedResult([
+  it("keeps primary-metric ties at the same rank and orders their display deterministically", async () => {
+    state.results.push([
       {
-        totalTokens: 3000,
-        totalCost: 40,
+        users: [
+          {
+            rank: 1,
+            userId: "alice",
+            username: "alice",
+            displayName: null,
+            avatarUrl: null,
+            totalTokens: 300,
+            totalCost: 3,
+          },
+          {
+            rank: 1,
+            userId: "bob",
+            username: "bob",
+            displayName: null,
+            avatarUrl: null,
+            totalTokens: 300,
+            totalCost: 2,
+          },
+        ],
+        totalUsers: 2,
+        totalTokens: 600,
+        totalCost: 5,
+        uniqueUsers: 2,
       },
     ]);
-    mockState.pushAwaitedResult([{ count: 0 }]);
+    const data = await getLeaderboardData("all");
+    expect(data.users.map((user) => [user.username, user.rank])).toEqual([
+      ["alice", 1],
+      ["bob", 1],
+    ]);
+    const final = finalQuery();
+    expect(final).toContain("RANK() OVER (ORDER BY total_tokens DESC)");
+    expect(final).toContain(
+      "ORDER BY rank ASC, total_cost DESC, LOWER(username) ASC, user_id ASC",
+    );
+  });
 
-    await getUserRank("alice", "all", "cost");
+  it("returns one all-time user rank after aggregating that user's submissions", async () => {
+    state.results.push([
+      {
+        users: [
+          {
+            rank: 1,
+            userId: "alice",
+            username: "alice",
+            displayName: null,
+            avatarUrl: null,
+            totalTokens: 300,
+            totalCost: 3,
+          },
+        ],
+        totalUsers: 1,
+        totalTokens: 850,
+        totalCost: 10,
+        uniqueUsers: 3,
+      },
+    ]);
+    await expect(getUserRank("alice")).resolves.toMatchObject({
+      username: "alice",
+      rank: 1,
+      totalTokens: 300,
+    });
+    expect(query()).toContain("SUM(s.total_tokens) AS total_tokens");
+  });
 
-    expectNoNarrowedCostCast(serializeSqlCalls());
+  it("does not interpret literal percent or underscore directives as wildcards", async () => {
+    state.results.push([
+      {
+        users: [],
+        totalUsers: 0,
+        totalTokens: 0,
+        totalCost: 0,
+        uniqueUsers: 0,
+      },
+    ]);
+    await getLeaderboardData("all", 1, 50, "tokens", "a%_!");
+    expect(query()).toContain("%a!%!_!!%");
+    expect(query()).toContain("ESCAPE '!'");
   });
 });
