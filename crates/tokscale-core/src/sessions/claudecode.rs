@@ -1267,6 +1267,10 @@ struct ClaudeHeadlessState {
     cache_read: i64,
     cache_write: i64,
     timestamp_ms: Option<i64>,
+    /// A local Claude Code notice uses `<synthetic>` as its model. Ignore all
+    /// stream deltas until its matching stop event so they cannot leak into the
+    /// next real response.
+    skipping_synthetic_stream: bool,
 }
 
 fn parse_claude_headless_json(
@@ -1320,6 +1324,11 @@ fn process_claude_headless_line(
 
     match event_type {
         "message_start" => {
+            if state.skipping_synthetic_stream {
+                // A new start without a stop means the synthetic stream was
+                // truncated. Its deltas must not survive into the new stream.
+                *state = ClaudeHeadlessState::default();
+            }
             completed_message = finalize_headless_state(
                 state,
                 session_id,
@@ -1334,6 +1343,7 @@ fn process_claude_headless_line(
                 .is_some_and(is_claude_synthetic_placeholder_model)
             {
                 *state = ClaudeHeadlessState::default();
+                state.skipping_synthetic_stream = true;
                 return completed_message;
             }
             state.model = model;
@@ -1348,6 +1358,9 @@ fn process_claude_headless_line(
             }
         }
         "message_delta" => {
+            if state.skipping_synthetic_stream {
+                return None;
+            }
             if let Some(usage) = value
                 .get("usage")
                 .or_else(|| value.get("delta").and_then(|delta| delta.get("usage")))
@@ -1356,6 +1369,10 @@ fn process_claude_headless_line(
             }
         }
         "message_stop" => {
+            if state.skipping_synthetic_stream {
+                *state = ClaudeHeadlessState::default();
+                return None;
+            }
             completed_message = finalize_headless_state(
                 state,
                 session_id,
@@ -2481,6 +2498,41 @@ mod tests {
         assert_eq!(messages[0].provider_id, "google");
         assert_eq!(messages[0].tokens.input, 200);
         assert_eq!(messages[0].tokens.output, 80);
+    }
+
+    #[test]
+    fn test_headless_synthetic_stream_deltas_do_not_leak_into_next_response() {
+        let content = r#"{"type":"message_start","timestamp":"2026-06-24T01:00:00Z","message":{"model":"<synthetic>","usage":{"input_tokens":0}}}
+{"type":"message_delta","usage":{"output_tokens":999,"cache_read_input_tokens":888}}
+{"type":"message_stop"}
+{"type":"message_start","timestamp":"2026-06-24T01:00:02Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"cache_read_input_tokens":2}}}
+{"type":"message_delta","usage":{"output_tokens":3}}
+{"type":"message_stop"}"#;
+        let file = create_test_file(content);
+        let messages = parse_claude_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "claude-sonnet-4-6");
+        assert_eq!(messages[0].tokens.input, 10);
+        assert_eq!(messages[0].tokens.output, 3);
+        assert_eq!(messages[0].tokens.cache_read, 2);
+    }
+
+    #[test]
+    fn test_truncated_headless_synthetic_stream_does_not_leak_into_next_response() {
+        let content = r#"{"type":"message_start","timestamp":"2026-06-24T01:00:00Z","message":{"model":"<synthetic>","usage":{"input_tokens":0}}}
+{"type":"message_delta","usage":{"output_tokens":999,"cache_read_input_tokens":888}}
+{"type":"message_start","timestamp":"2026-06-24T01:00:02Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"cache_read_input_tokens":2}}}
+{"type":"message_delta","usage":{"output_tokens":3}}
+{"type":"message_stop"}"#;
+        let file = create_test_file(content);
+        let messages = parse_claude_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "claude-sonnet-4-6");
+        assert_eq!(messages[0].tokens.input, 10);
+        assert_eq!(messages[0].tokens.output, 3);
+        assert_eq!(messages[0].tokens.cache_read, 2);
     }
 
     #[test]
