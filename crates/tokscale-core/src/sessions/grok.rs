@@ -1499,8 +1499,11 @@ fn hex_value(byte: u8) -> Option<u8> {
 mod tests {
     use super::*;
 
+    /// `updates_jsonl` is taken as bytes so fixtures can contain sequences a
+    /// `&str` cannot hold (undecodable bytes, a UTF-8 BOM); `&str` and `&String`
+    /// still pass through unchanged.
     fn write_fixture(
-        updates_jsonl: &str,
+        updates_jsonl: impl AsRef<[u8]>,
         summary_json: Option<&str>,
         signals_json: Option<&str>,
     ) -> (tempfile::TempDir, PathBuf) {
@@ -1513,29 +1516,13 @@ mod tests {
             .join("session-1");
         std::fs::create_dir_all(&session_dir).unwrap();
         let updates_path = session_dir.join("updates.jsonl");
-        std::fs::write(&updates_path, updates_jsonl).unwrap();
+        std::fs::write(&updates_path, updates_jsonl.as_ref()).unwrap();
         if let Some(summary_json) = summary_json {
             std::fs::write(session_dir.join("summary.json"), summary_json).unwrap();
         }
         if let Some(signals_json) = signals_json {
             std::fs::write(session_dir.join("signals.json"), signals_json).unwrap();
         }
-        (temp, updates_path)
-    }
-
-    /// Byte-level variant of `write_fixture` for fixtures that must contain
-    /// bytes a `&str` cannot hold (undecodable sequences, a UTF-8 BOM).
-    fn write_fixture_bytes(updates_jsonl: &[u8]) -> (tempfile::TempDir, PathBuf) {
-        let temp = tempfile::TempDir::new().unwrap();
-        let session_dir = temp
-            .path()
-            .join(".grok")
-            .join("sessions")
-            .join("%2Ftmp%2Fproject")
-            .join("session-1");
-        std::fs::create_dir_all(&session_dir).unwrap();
-        let updates_path = session_dir.join("updates.jsonl");
-        std::fs::write(&updates_path, updates_jsonl).unwrap();
         (temp, updates_path)
     }
 
@@ -1881,7 +1868,7 @@ mod tests {
             fixture.push(b'\n');
         }
 
-        let (_temp, path) = write_fixture_bytes(&fixture);
+        let (_temp, path) = write_fixture(&fixture, None, None);
         let messages = parse_grok_updates_file(&path);
 
         assert_eq!(messages.len(), 100);
@@ -1897,7 +1884,7 @@ mod tests {
         fixture.extend_from_slice(usage_line("turn-2", 1_700_000_002_000, 20, 2).as_bytes());
         fixture.push(b'\n');
 
-        let (_temp, path) = write_fixture_bytes(&fixture);
+        let (_temp, path) = write_fixture(&fixture, None, None);
         let messages = parse_grok_updates_file(&path);
 
         assert_eq!(messages.len(), 2);
