@@ -12,6 +12,13 @@ const CACHE_FILENAME: &str = "pricing-openrouter.json";
 /// per-model URL used to be hardcoded, which left the author-pricing leg
 /// unreachable offline: any test that got far enough to exercise it made a
 /// real request to openrouter.ai.
+///
+/// Do not reintroduce a literal URL for either request.
+/// `a_fetch_with_caching_disabled_writes_no_cache_file` reaches the
+/// author-pricing leg on purpose — that is the only path that populates
+/// `result`, and therefore the only one that can reach the cache write the
+/// test guards. Hardcoding that URL again would not fail the test; it would
+/// make `cargo test` call openrouter.ai for real on every run.
 const API_BASE: &str = "https://openrouter.ai/api/v1";
 const MAX_CONCURRENT_REQUESTS: usize = 10;
 
