@@ -2977,9 +2977,23 @@ pub enum SubmissionPricingMode {
     /// default: the tokens are real, and the alternative is deleting usage or
     /// blocking a whole batch over an id nobody publishes a price for.
     ReportUnpriced,
+    /// `ReportUnpriced` with the pricing-outage guard waived, for the user
+    /// whose usage genuinely is mostly unpriceable — a self-hosted model, a
+    /// provider nobody publishes rates for. Nothing tells that user apart from
+    /// a machine whose pricing broke, so the guard has to be waivable or they
+    /// can never submit at all.
+    ReportUnpricedWithoutOutageCheck,
     /// Fail the submission instead, for a user who wants a cost-complete
     /// submission or none at all (`--strict-pricing`).
     Strict,
+}
+
+impl SubmissionPricingMode {
+    /// Whether this mode still asks whether the zeros it is about to submit
+    /// are an artifact of broken pricing.
+    fn checks_for_a_pricing_outage(self) -> bool {
+        !matches!(self, Self::ReportUnpricedWithoutOutageCheck)
+    }
 }
 
 async fn generate_graph_with_loaded_pricing(
@@ -3032,14 +3046,22 @@ fn build_graph_from_messages(
     let (filtered, unpriced_submission_usage) = match pricing_requirement {
         GraphPricingRequirement::Lenient => (filtered, Vec::new()),
         GraphPricingRequirement::Submission(mode) => {
-            let pricing = pricing.ok_or(SubmissionError::PricingDataUnavailable)?;
-            reject_submission_priced_by_an_outage(&filtered, pricing)?;
+            let pricing = pricing.ok_or(SubmissionError::PricingDataUnavailable(
+                UncoverablePricingShare {
+                    priceable_tokens: 0,
+                    uncoverable_tokens: 0,
+                },
+            ))?;
+            if mode.checks_for_a_pricing_outage() {
+                reject_submission_priced_by_an_outage(&filtered, pricing)?;
+            }
             let (submitted, unpriced) = match mode {
                 SubmissionPricingMode::Strict => {
                     validate_priced_messages(&filtered, Some(pricing))?;
                     (filtered, Vec::new())
                 }
-                SubmissionPricingMode::ReportUnpriced => {
+                SubmissionPricingMode::ReportUnpriced
+                | SubmissionPricingMode::ReportUnpricedWithoutOutageCheck => {
                     zero_cost_unpriced_submission_messages(filtered, pricing)
                 }
             };
@@ -3083,11 +3105,11 @@ fn build_graph_from_messages(
 /// empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmissionError {
-    /// No published pricing dataset loaded at all, and the submission holds
-    /// usage that needs one. Every such row would be reported at $0.00 and the
-    /// server stores what it is sent, so a transient network failure would
-    /// overwrite the user's recorded spend with zeros.
-    PricingDataUnavailable,
+    /// Published pricing covers too little of the submission for its costs to
+    /// mean anything. Every uncovered row would be reported at $0.00 and the
+    /// server stores what it is sent, so a pricing failure would overwrite the
+    /// user's recorded spend with zeros.
+    PricingDataUnavailable(UncoverablePricingShare),
     /// A cost-complete submission was asked for and some usage has no
     /// published price. The payload names the offending ids; naming the flag
     /// that asked for this is the CLI's job, because the flag is the CLI's.
@@ -3096,12 +3118,43 @@ pub enum SubmissionError {
     Report(String),
 }
 
+/// How much of a submission's price-needing token volume nothing could price.
+///
+/// Rows that never needed a published price are outside both numbers: a
+/// generic routing label has no price whether or not the fetch succeeded, and
+/// a client-reported cost answers the question the pricing tables cannot.
+/// Counting either would let a Cursor user's `auto` rows dilute the share and
+/// hide a real outage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UncoverablePricingShare {
+    /// Tokens in rows whose cost has to come from a published price.
+    pub priceable_tokens: i64,
+    /// How many of those no loaded dataset could cover.
+    pub uncoverable_tokens: i64,
+}
+
+impl UncoverablePricingShare {
+    /// The share as a percentage, for messages. Zero when there was nothing to
+    /// price, which is never an outage.
+    pub fn percent(&self) -> f64 {
+        if self.priceable_tokens <= 0 {
+            return 0.0;
+        }
+        (self.uncoverable_tokens as f64 / self.priceable_tokens as f64) * 100.0
+    }
+}
+
 impl std::fmt::Display for SubmissionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::PricingDataUnavailable => f.write_str(
-                "no pricing data could be loaded, so this submission would report $0.00 \
-                 for usage that has a real cost",
+            Self::PricingDataUnavailable(share) => write!(
+                f,
+                "no published price covers {:.0}% of this submission's token usage \
+                 ({} of {} tokens that need one), so it would report $0.00 for usage \
+                 that has a real cost",
+                share.percent(),
+                share.uncoverable_tokens,
+                share.priceable_tokens,
             ),
             Self::UnpricedUsage(summary) => write!(
                 f,
@@ -3120,41 +3173,93 @@ impl From<String> for SubmissionError {
     }
 }
 
+/// Share of price-needing token volume that has to come up uncoverable before
+/// a submission reads as a pricing outage rather than a fact about the usage.
+///
+/// Set where it is because the denominator is already narrow: routing labels
+/// and client-costed rows are out of it, so what remains names concrete models
+/// that a working pricing service is expected to cover. Token volume for a
+/// real user concentrates in a handful of mainstream models that every
+/// published dataset lists, so exotic ids are a minority of tokens by
+/// construction — a few percent uncoverable is the normal long tail, and more
+/// than half of it is coverage that broke rather than usage that changed.
+const PRICING_OUTAGE_UNCOVERABLE_TOKEN_SHARE: f64 = 0.5;
+
 /// Refuses a submission whose zeros would be an artifact of a pricing outage
 /// rather than a fact about the usage.
 ///
 /// The three published pricing sources each degrade to a stale cache and then
 /// to nothing, which is what keeps one source's outage from blocking every
-/// command (#1002). When *all* of them come up empty — a fresh machine, or a
-/// cleared cache, with no route to the network — every row that needs a price
-/// looks unpriced, gets zeroed, and uploads at $0.00 over the top of whatever
-/// the leaderboard already recorded.
+/// command (#1002). That degradation is usually partial: LiteLLM fails while
+/// models.dev loads, or one source's cache expires. The surviving dataset then
+/// covers a fraction of the usage, everything it misses is zeroed, and the
+/// server overwrites the cost it already recorded with $0.00 — so measuring
+/// only the total blackout misses most of the harm it exists to stop.
+///
+/// Judged on token volume rather than row count because that is what the money
+/// follows: one zeroed million-token session outweighs a thousand tiny rows.
+/// There is deliberately no minimum-volume floor — a small submission is
+/// exactly the shape a fresh machine with no pricing at all produces, and a
+/// floor would let that case straight back through.
 ///
 /// Only usage that a working pricing service could have priced counts here. A
 /// generic routing label has no price whether or not the fetch succeeded, and
 /// a client-reported cost never needed one, so neither is evidence of an
 /// outage and neither loses anything by being submitted.
+///
+/// A user whose usage really is mostly unpriceable looks identical to an
+/// outage from here, and cannot be told apart by looking harder. That user
+/// waives the check with `SubmissionPricingMode::ReportUnpricedWithoutOutageCheck`.
 fn reject_submission_priced_by_an_outage(
     messages: &[UnifiedMessage],
     pricing: &pricing::PricingService,
 ) -> Result<(), SubmissionError> {
-    if pricing.has_published_pricing_data() {
+    let share = uncoverable_pricing_share(messages, pricing);
+
+    if share.priceable_tokens == 0 {
         return Ok(());
     }
 
-    let priceable_usage_was_zeroed = messages.iter().any(|message| {
-        is_unpriced_submission_usage(message, pricing)
-            && matches!(
-                unpriced_usage_cause(message),
-                UnpricedUsageCause::NoPublishedPrice
-            )
-    });
-
-    if priceable_usage_was_zeroed {
-        return Err(SubmissionError::PricingDataUnavailable);
+    let uncoverable_enough = share.uncoverable_tokens as f64
+        > share.priceable_tokens as f64 * PRICING_OUTAGE_UNCOVERABLE_TOKEN_SHARE;
+    if uncoverable_enough {
+        return Err(SubmissionError::PricingDataUnavailable(share));
     }
 
     Ok(())
+}
+
+/// Measures how much of `messages` needs a published price and how much of
+/// that nothing could price.
+fn uncoverable_pricing_share(
+    messages: &[UnifiedMessage],
+    pricing: &pricing::PricingService,
+) -> UncoverablePricingShare {
+    let mut share = UncoverablePricingShare {
+        priceable_tokens: 0,
+        uncoverable_tokens: 0,
+    };
+
+    for message in messages {
+        if !needs_published_price(message) {
+            continue;
+        }
+        let tokens = message.tokens.total();
+        share.priceable_tokens = share.priceable_tokens.saturating_add(tokens);
+        if is_unpriced_submission_usage(message, pricing) {
+            share.uncoverable_tokens = share.uncoverable_tokens.saturating_add(tokens);
+        }
+    }
+
+    share
+}
+
+/// True when this row carries token usage whose cost can only come from a
+/// published price — the usage a pricing outage takes away.
+fn needs_published_price(message: &UnifiedMessage) -> bool {
+    message.tokens.total() > 0
+        && !carries_client_reported_cost(message)
+        && !is_generic_routing_label(&message.provider_id, &message.model_id)
 }
 
 /// Provider column value for labels that are generic no matter who reports
@@ -3376,7 +3481,12 @@ fn validate_priced_messages(
     pricing: Option<&pricing::PricingService>,
 ) -> Result<(), SubmissionError> {
     let Some(pricing) = pricing else {
-        return Err(SubmissionError::PricingDataUnavailable);
+        return Err(SubmissionError::PricingDataUnavailable(
+            UncoverablePricingShare {
+                priceable_tokens: 0,
+                uncoverable_tokens: 0,
+            },
+        ));
     };
 
     // Counted rather than listed per message: a real submission repeats the
@@ -8521,6 +8631,31 @@ mod tests {
         pricing::PricingService::new(litellm, HashMap::new())
     }
 
+    /// A row tokscale priced itself, stamped the way `apply_pricing_if_available`
+    /// stamps one.
+    ///
+    /// Submissions built entirely out of usage nothing can price are refused as
+    /// a pricing outage, so a test about how one unpriced row is treated needs
+    /// priced usage around it — which is also the only shape a real submission
+    /// takes.
+    fn priced_gpt_4o_row(input: i64, cost: f64) -> UnifiedMessage {
+        let mut message = UnifiedMessage::new(
+            "synthetic",
+            "gpt-4o",
+            "openai",
+            "priced",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input,
+                ..Default::default()
+            },
+            0.0,
+        );
+        message.cost = cost;
+        message.mark_estimated_cost();
+        message
+    }
+
     #[test]
     fn only_submission_graphs_report_unpriced_usage() {
         let message = UnifiedMessage::new(
@@ -8535,10 +8670,11 @@ mod tests {
             },
             0.0,
         );
+        let messages = vec![message, priced_gpt_4o_row(1_000, 0.5)];
         let pricing = pricing_service_missing_the_model_under_test();
 
         let report = build_graph_from_messages(
-            vec![message.clone()],
+            messages.clone(),
             Some(&pricing),
             GraphPricingRequirement::Lenient,
             std::time::Instant::now(),
@@ -8546,7 +8682,7 @@ mod tests {
         )
         .expect("reporting graphs should retain unpriced usage");
         let submission = build_graph_from_messages(
-            vec![message],
+            messages,
             Some(&pricing),
             GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
@@ -8554,10 +8690,10 @@ mod tests {
         )
         .expect("submission graphs should keep unpriced usage at zero cost");
 
-        assert_eq!(report.summary.total_tokens, 1);
+        assert_eq!(report.summary.total_tokens, 1_001);
         assert!(report.unpriced_submission_usage.is_empty());
-        assert_eq!(submission.summary.total_tokens, 1);
-        assert_eq!(submission.summary.total_cost, 0.0);
+        assert_eq!(submission.summary.total_tokens, 1_001);
+        assert_eq!(submission.summary.total_cost, 0.5);
         assert_eq!(
             submission.unpriced_submission_usage[0].model_id,
             "genuinely-unpriced-model"
@@ -8566,7 +8702,8 @@ mod tests {
 
     // A concrete model with no published price names something that really ran.
     // Its tokens reach the leaderboard at zero cost, reported with the reason
-    // that tells the user they can do something about it (#1013, #1021).
+    // that tells the user they can do something about it (#1013, #1021) —
+    // rather than blocking the priced usage submitted alongside it.
     #[test]
     fn submission_submits_unpriced_concrete_model_at_zero_cost() {
         let pricing = pricing_service_missing_the_model_under_test();
@@ -8585,7 +8722,7 @@ mod tests {
         );
 
         let graph = build_graph_from_messages(
-            vec![message],
+            vec![message, priced_gpt_4o_row(1_000, 0.01)],
             Some(&pricing),
             GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
@@ -8593,8 +8730,8 @@ mod tests {
         )
         .expect("an unpriced concrete model must not fail the submission");
 
-        assert_eq!(graph.summary.total_tokens, 6);
-        assert_eq!(graph.summary.total_cost, 0.0);
+        assert_eq!(graph.summary.total_tokens, 1_006);
+        assert_eq!(graph.summary.total_cost, 0.01);
         assert_eq!(
             graph.unpriced_submission_usage,
             vec![UnpricedSubmissionUsage {
@@ -8639,11 +8776,13 @@ mod tests {
         )
         .expect_err("a pricing outage must not submit a whole history at $0.00");
 
-        assert_eq!(error, SubmissionError::PricingDataUnavailable);
+        let SubmissionError::PricingDataUnavailable(share) = error.clone() else {
+            panic!("a total outage is a pricing outage, got {error:?}");
+        };
+        assert_eq!(share.uncoverable_tokens, 2_500_000);
+        assert_eq!(share.priceable_tokens, 2_500_000);
         assert!(
-            error
-                .to_string()
-                .contains("no pricing data could be loaded"),
+            error.to_string().contains("no published price covers"),
             "the message has to name the cause: {error}"
         );
     }
@@ -8654,18 +8793,7 @@ mod tests {
     #[test]
     fn submission_with_loaded_pricing_still_submits_models_it_cannot_cover() {
         let pricing = pricing_service_missing_the_model_under_test();
-        let priced = UnifiedMessage::new(
-            "synthetic",
-            "gpt-4o",
-            "openai",
-            "priced",
-            1_736_510_400_000,
-            TokenBreakdown {
-                input: 1_000_000,
-                ..Default::default()
-            },
-            1.0,
-        );
+        let priced = priced_gpt_4o_row(1_000_000, 1.0);
         let uncoverable = UnifiedMessage::new(
             "synthetic",
             "K-EXAONE-236B-A23B",
@@ -8790,7 +8918,7 @@ mod tests {
         partly_priced.mark_estimated_cost();
 
         let graph = build_graph_from_messages(
-            vec![partly_priced],
+            vec![partly_priced, priced_gpt_4o_row(1_000, 0.01)],
             Some(&pricing),
             GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
@@ -8798,7 +8926,7 @@ mod tests {
         )
         .expect("a partly priced row is submittable at zero cost");
 
-        assert_eq!(graph.summary.total_cost, 0.0);
+        assert_eq!(graph.summary.total_cost, 0.01);
         assert_eq!(graph.unpriced_submission_usage.len(), 1);
         assert!(
             (graph.unpriced_submission_usage[0].discarded_cost - 0.25).abs() < 1e-9,
@@ -8838,6 +8966,142 @@ mod tests {
 
         assert_eq!(graph.summary.total_tokens, 165);
         assert_eq!(graph.summary.total_cost, 0.0);
+        assert_eq!(
+            graph.unpriced_submission_usage[0].cause,
+            UnpricedUsageCause::GenericRoutingLabel
+        );
+    }
+
+    // The common outage is partial, not total: one source fails or one cache
+    // expires while another still loads, so `has_published_pricing_data` stays
+    // true and the surviving dataset covers a sliver of the usage. Everything
+    // it misses is zeroed and uploaded over the top of the recorded spend.
+    #[test]
+    fn submission_aborts_when_a_partial_outage_zeroes_most_of_the_usage() {
+        let pricing = pricing_service_missing_the_model_under_test();
+        let covered = UnifiedMessage::new(
+            "synthetic",
+            "gpt-4o",
+            "openai",
+            "covered",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 1_000,
+                ..Default::default()
+            },
+            0.0,
+        );
+        let uncoverable = UnifiedMessage::new(
+            "claude",
+            "claude-sonnet-4-20250514",
+            "anthropic",
+            "history",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 2_000_000,
+                output: 500_000,
+                ..Default::default()
+            },
+            0.0,
+        );
+
+        let error = build_graph_from_messages(
+            vec![covered, uncoverable],
+            Some(&pricing),
+            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect_err("degraded pricing coverage must not submit a history at $0.00");
+
+        let SubmissionError::PricingDataUnavailable(share) = error else {
+            panic!("degraded coverage is a pricing outage, got {error:?}");
+        };
+        assert_eq!(share.uncoverable_tokens, 2_500_000);
+        assert_eq!(share.priceable_tokens, 2_501_000);
+    }
+
+    // The escape hatch, for the user whose usage really is mostly unpriceable —
+    // a self-hosted model, a provider nobody publishes rates for. The guard
+    // cannot tell them apart from an outage, so they need a way through that is
+    // not `--strict-pricing` (which is stricter, not looser).
+    #[test]
+    fn submission_without_the_outage_check_submits_usage_nothing_can_price() {
+        let pricing = pricing_service_missing_the_model_under_test();
+        let uncoverable = UnifiedMessage::new(
+            "synthetic",
+            "K-EXAONE-236B-A23B",
+            "friendli",
+            "self-hosted",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 2_000_000,
+                ..Default::default()
+            },
+            0.0,
+        );
+
+        let graph = build_graph_from_messages(
+            vec![uncoverable],
+            Some(&pricing),
+            GraphPricingRequirement::Submission(
+                SubmissionPricingMode::ReportUnpricedWithoutOutageCheck,
+            ),
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("the outage check has to be waivable or such a user can never submit");
+
+        assert_eq!(graph.summary.total_tokens, 2_000_000);
+        assert_eq!(graph.summary.total_cost, 0.0);
+        assert_eq!(
+            graph.unpriced_submission_usage[0].cause,
+            UnpricedUsageCause::NoPublishedPrice
+        );
+    }
+
+    // A Cursor or Copilot user reports `auto` for nearly everything. No price
+    // can exist for that label whether or not pricing loaded, so it is not
+    // evidence of an outage and must not count toward one — the share is
+    // measured over the usage that actually needs a published price.
+    #[test]
+    fn submission_submits_usage_that_is_mostly_generic_routing_labels() {
+        let pricing = pricing_service_missing_the_model_under_test();
+        let routed = UnifiedMessage::new(
+            "cursor",
+            "auto",
+            "cursor",
+            "routed",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 2_000_000,
+                ..Default::default()
+            },
+            0.0,
+        );
+        let covered = UnifiedMessage::new(
+            "synthetic",
+            "gpt-4o",
+            "openai",
+            "covered",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 1_000,
+                ..Default::default()
+            },
+            0.0,
+        );
+
+        let graph = build_graph_from_messages(
+            vec![routed, covered],
+            Some(&pricing),
+            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("routing labels are not evidence that pricing broke");
+
+        assert_eq!(graph.summary.total_tokens, 2_001_000);
         assert_eq!(
             graph.unpriced_submission_usage[0].cause,
             UnpricedUsageCause::GenericRoutingLabel

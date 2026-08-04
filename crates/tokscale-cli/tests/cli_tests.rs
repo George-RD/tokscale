@@ -3597,12 +3597,34 @@ fn test_submit_without_any_pricing_data_aborts_instead_of_submitting_zeros() {
         "a total pricing outage must not submit; stderr: {stderr}"
     );
     assert!(
-        stderr.contains("no pricing data could be loaded"),
+        stderr.contains("no published price covers"),
         "the failure has to name the cause: {stderr}"
     );
     assert!(
         stderr.contains("your recorded spend is untouched"),
         "and say the leaderboard was left alone: {stderr}"
+    );
+
+    // The same usage, from a user who knows it has no published price.
+    let waived = offline_cmd_with_home(tmp.path())
+        .args([
+            "submit",
+            "--client",
+            "opencode",
+            "--dry-run",
+            "--no-pricing-outage-check",
+        ])
+        .output()
+        .unwrap();
+    let waived_stdout = String::from_utf8_lossy(&waived.stdout);
+    assert!(
+        waived.status.success(),
+        "the guard has to be waivable; stderr: {}",
+        String::from_utf8_lossy(&waived.stderr)
+    );
+    assert!(
+        waived_stdout.contains("Total tokens: 3,951"),
+        "the waived run still submits the usage: {waived_stdout}"
     );
 }
 

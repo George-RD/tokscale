@@ -272,6 +272,12 @@ enum Commands {
             help = "Fail the submission when no published price covers some of the usage, instead of submitting that usage at $0.00 (a model priced for some token buckets but not the ones it used counts as uncovered)"
         )]
         strict_pricing: bool,
+        #[arg(
+            long,
+            conflicts_with = "strict_pricing",
+            help = "Submit even when no published price covers most of the usage. Off by default because that is what a pricing outage looks like, and submitting it would overwrite your recorded spend with $0.00; pass this when your usage genuinely has no published price"
+        )]
+        no_pricing_outage_check: bool,
     },
     #[command(about = "Manage periodic usage submission")]
     Autosubmit {
@@ -813,6 +819,7 @@ fn main() -> Result<()> {
             date,
             dry_run,
             strict_pricing,
+            no_pricing_outage_check,
         }) => {
             reject_unsupported_home_override(&cli.home, "submit")?;
             let (since, until) = build_date_filter(&date, &cli.home);
@@ -830,6 +837,7 @@ fn main() -> Result<()> {
                 year,
                 dry_run,
                 strict_pricing,
+                no_pricing_outage_check,
                 mode: SubmitMode::Interactive,
             })
         }
@@ -5556,9 +5564,11 @@ fn format_unpriced_submission_warning(
 /// the fix is phrased in terms of what the user just ran.
 fn describe_submission_error(error: tokscale_core::SubmissionError) -> anyhow::Error {
     match error {
-        tokscale_core::SubmissionError::PricingDataUnavailable => anyhow::anyhow!(
+        tokscale_core::SubmissionError::PricingDataUnavailable(_) => anyhow::anyhow!(
             "{error}. Nothing was submitted, so your recorded spend is untouched. \
-             Check your network connection and run this again."
+             Check your network connection and run this again. \
+             If your usage really has no published price, re-run with \
+             --no-pricing-outage-check to submit it at $0.00."
         ),
         tokscale_core::SubmissionError::UnpricedUsage(_) => anyhow::anyhow!(
             "--strict-pricing: {error}. \
@@ -5623,6 +5633,9 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
             // interactive one does. Failing the run instead would leave a
             // scheduled submission silently broken for weeks over one id
             // nobody publishes a price for.
+            // The outage guard stays on for an unattended run. Nobody is
+            // watching to notice a $0.00 submission going out over the
+            // recorded spend, so this is the run that most needs stopping.
             match run_submit_command(SubmitCommandOptions {
                 clients,
                 since,
@@ -5630,6 +5643,7 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
                 year,
                 dry_run: false,
                 strict_pricing: false,
+                no_pricing_outage_check: false,
                 mode: SubmitMode::Autosubmit,
             }) {
                 Ok(()) => {
@@ -5648,9 +5662,10 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
     }
 }
 
-/// Named fields rather than a positional argument list: `dry_run` and
-/// `strict_pricing` are adjacent bools, and transposing them compiles clean
-/// while turning a dry run into a real submission.
+/// Named fields rather than a positional argument list: `dry_run`,
+/// `strict_pricing` and `no_pricing_outage_check` are adjacent bools, and
+/// transposing them compiles clean while turning a dry run into a real
+/// submission.
 struct SubmitCommandOptions {
     clients: Option<Vec<String>>,
     since: Option<String>,
@@ -5658,6 +5673,7 @@ struct SubmitCommandOptions {
     year: Option<String>,
     dry_run: bool,
     strict_pricing: bool,
+    no_pricing_outage_check: bool,
     mode: SubmitMode,
 }
 
@@ -5674,6 +5690,7 @@ fn run_submit_command(options: SubmitCommandOptions) -> Result<()> {
         year,
         dry_run,
         strict_pricing,
+        no_pricing_outage_check,
         mode,
     } = options;
 
@@ -5756,6 +5773,8 @@ fn run_submit_command(options: SubmitCommandOptions) -> Result<()> {
                 },
                 if strict_pricing {
                     SubmissionPricingMode::Strict
+                } else if no_pricing_outage_check {
+                    SubmissionPricingMode::ReportUnpricedWithoutOutageCheck
                 } else {
                     SubmissionPricingMode::ReportUnpriced
                 },
@@ -6630,16 +6649,42 @@ mod tests {
     #[test]
     fn pricing_outage_failure_says_nothing_was_submitted() {
         let message =
-            describe_submission_error(tokscale_core::SubmissionError::PricingDataUnavailable)
-                .to_string();
+            describe_submission_error(tokscale_core::SubmissionError::PricingDataUnavailable(
+                tokscale_core::UncoverablePricingShare {
+                    priceable_tokens: 2_501_000,
+                    uncoverable_tokens: 2_500_000,
+                },
+            ))
+            .to_string();
 
-        assert!(
-            message.contains("no pricing data could be loaded"),
-            "{message}"
-        );
+        assert!(message.contains("no published price covers"), "{message}");
         assert!(
             message.contains("your recorded spend is untouched"),
             "{message}"
+        );
+    }
+
+    // The guard cannot tell a user whose usage is genuinely unpriceable from a
+    // machine whose pricing broke, so the message it fails with is the only
+    // place that user learns there is a way through at all.
+    #[test]
+    fn pricing_outage_failure_names_the_flag_that_waives_it() {
+        let message =
+            describe_submission_error(tokscale_core::SubmissionError::PricingDataUnavailable(
+                tokscale_core::UncoverablePricingShare {
+                    priceable_tokens: 10,
+                    uncoverable_tokens: 10,
+                },
+            ))
+            .to_string();
+
+        assert!(
+            message.contains("--no-pricing-outage-check"),
+            "the way out has to be named: {message}"
+        );
+        assert!(
+            !message.contains("--strict-pricing"),
+            "--strict-pricing is stricter, not looser: {message}"
         );
     }
 
