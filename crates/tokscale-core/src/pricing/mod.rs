@@ -302,6 +302,15 @@ impl PricingService {
         )
     }
 
+    /// The user's `custom-pricing.json`, as loaded when this service was built.
+    ///
+    /// Callers that need to report on the override file should read it from
+    /// here rather than loading it again: a second load re-emits every skip
+    /// warning the first one already printed.
+    pub fn custom(&self) -> &CustomPricing {
+        &self.custom
+    }
+
     pub async fn get_or_init() -> Result<Arc<PricingService>, String> {
         PRICING_SERVICE
             .get_or_try_init(|| async { Self::fetch_inner().await.map(Arc::new) })

@@ -4631,6 +4631,70 @@ fn test_submit_dry_run_names_zero_rate_override_on_submitted_model() {
     );
 }
 
+/// A skipped override already produces one warning when the pricing service
+/// loads the file. Submit must not read the same file a second time just to
+/// name its zero rates, or every skip warning is printed twice in one run.
+#[test]
+fn test_submit_dry_run_reports_each_override_skip_once() {
+    let tmp = create_empty_fixture_dir();
+    let config_dir = tmp.path().join(".config/tokscale");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("custom-pricing.json"),
+        r#"{
+            "models": {
+                "no-rates-at-all": {},
+                "fully-free-model": {
+                    "input_cost_per_million_tokens": 0,
+                    "output_cost_per_million_tokens": 0
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let session = tmp
+        .path()
+        .join(".local/share/opencode/storage/message/session1");
+    fs::create_dir_all(&session).unwrap();
+    fs::write(
+        session.join("msg_free.json"),
+        r#"{
+            "id": "msg_free",
+            "sessionID": "session1",
+            "role": "assistant",
+            "modelID": "fully-free-model",
+            "providerID": "anthropic",
+            "tokens": {
+                "input": 1000,
+                "output": 500,
+                "reasoning": 0,
+                "cache": { "read": 0, "write": 0 }
+            },
+            "time": { "created": 1736510400000.0 }
+        }"#,
+    )
+    .unwrap();
+
+    let output = cmd_with_home(tmp.path())
+        .env("TOKSCALE_API_TOKEN", "test-token")
+        .args(["submit", "--client", "opencode", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("skipping no-rates-at-all").count(),
+        1,
+        "custom-pricing.json must be read once per run: {stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("fully-free-model (declared free: $0.00)"),
+        "and the zero-rate warning still has to appear"
+    );
+}
+
 #[test]
 fn test_submit_dry_run_is_quiet_without_zero_rate_overrides() {
     let tmp = create_empty_fixture_dir();

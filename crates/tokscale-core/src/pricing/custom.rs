@@ -249,15 +249,6 @@ impl CustomPricing {
         self.lookup_with_key(model_id).map(|result| result.pricing)
     }
 
-    /// Which rates the override matching `model_id` sets to $0.00, or `None`
-    /// when it sets none.
-    ///
-    /// Resolves through the same raw/normalized matching as [`Self::lookup`],
-    /// so callers can pass a model id straight off a usage row.
-    pub fn zero_rate_summary(&self, model_id: &str) -> Option<ZeroRateSummary> {
-        self.lookup(model_id).and_then(ZeroRateSummary::for_pricing)
-    }
-
     pub fn lookup_with_key(&self, model_id: &str) -> Option<CustomLookupResult<'_>> {
         let raw_key = model_id.to_lowercase();
         if let Some(pricing) = self.models.get_key_value(&raw_key) {
@@ -936,13 +927,15 @@ mod tests {
         let loaded = CustomPricing::load_from_path(&path);
 
         let free_both = loaded
-            .zero_rate_summary("FREE-BOTH")
+            .lookup("FREE-BOTH")
+            .and_then(ZeroRateSummary::for_pricing)
             .expect("a model with every declared rate at $0.00 must be reported");
         assert_eq!(free_both.fields(), ["input", "output"]);
         assert!(free_both.is_free_model());
 
         let free_input_only = loaded
-            .zero_rate_summary("free-input-only")
+            .lookup("free-input-only")
+            .and_then(ZeroRateSummary::for_pricing)
             .expect("a $0.00 input rate must be reported even when output is priced");
         assert_eq!(free_input_only.fields(), ["input"]);
         assert!(
@@ -950,7 +943,10 @@ mod tests {
             "output costs $8.00/1M, so this model is not free"
         );
 
-        assert!(loaded.zero_rate_summary("paid-model").is_none());
+        assert!(loaded
+            .lookup("paid-model")
+            .and_then(ZeroRateSummary::for_pricing)
+            .is_none());
     }
 
     /// Cache reads dominate agent sessions, so a $0.00 cache-read rate on an
@@ -984,13 +980,15 @@ mod tests {
         let loaded = CustomPricing::load_from_path(&path);
 
         let cache_read = loaded
-            .zero_rate_summary("free-cache-read")
+            .lookup("free-cache-read")
+            .and_then(ZeroRateSummary::for_pricing)
             .expect("a $0.00 cache-read rate must be reported");
         assert_eq!(cache_read.fields(), ["cache read"]);
         assert!(!cache_read.is_free_model());
 
         let long_context = loaded
-            .zero_rate_summary("free-long-context-output")
+            .lookup("free-long-context-output")
+            .and_then(ZeroRateSummary::for_pricing)
             .expect("a $0.00 long-context rate must be reported");
         assert_eq!(long_context.fields(), ["output above 200k"]);
     }

@@ -5569,9 +5569,11 @@ fn zero_rate_marker(summary: &ZeroRateSummary) -> String {
 /// Submitted models whose custom override sets any rate to $0.00, sorted and
 /// deduplicated.
 ///
-/// Matching goes through `zero_rate_summary` rather than a lookup keyed on the
-/// verbatim id, so a usage row whose id only matches after synthetic
-/// `/models/` normalization is still caught.
+/// Each model is named by the key it matched in `custom-pricing.json`, not by
+/// the verbatim id off the usage row. Override keys are matched
+/// case-insensitively and after synthetic `/models/` normalization, so several
+/// distinct submitted ids can resolve to one entry — naming the matched key
+/// collapses those to the single line the user would go and edit.
 fn zero_rate_overrides_in_submission(
     overrides: &tokscale_core::pricing::custom::CustomPricing,
     submitted_models: &[String],
@@ -5583,9 +5585,9 @@ fn zero_rate_overrides_in_submission(
     let mut named: Vec<(String, ZeroRateSummary)> = submitted_models
         .iter()
         .filter_map(|model_id| {
-            overrides
-                .zero_rate_summary(model_id)
-                .map(|summary| (model_id.clone(), summary))
+            let matched = overrides.lookup_with_key(model_id)?;
+            let summary = ZeroRateSummary::for_pricing(matched.pricing)?;
+            Some((matched.matched_key.to_string(), summary))
         })
         .collect();
     named.sort_by(|a, b| a.0.cmp(&b.0));
@@ -5618,12 +5620,13 @@ fn zero_rate_override_submit_warning(
     Some(message)
 }
 
-fn report_zero_rate_custom_overrides(submitted_models: &[String]) {
+fn report_zero_rate_custom_overrides(
+    overrides: &tokscale_core::pricing::custom::CustomPricing,
+    submitted_models: &[String],
+) {
     use colored::Colorize;
-    use tokscale_core::pricing::custom::CustomPricing;
 
-    let overrides = CustomPricing::load_from_default_path();
-    let zero_rate = zero_rate_overrides_in_submission(&overrides, submitted_models);
+    let zero_rate = zero_rate_overrides_in_submission(overrides, submitted_models);
     if let Some(message) = zero_rate_override_submit_warning(&zero_rate) {
         println!("{}", message.yellow());
     }
@@ -5788,7 +5791,13 @@ fn run_submit_command(
         &graph_result.unpriced_submission_exclusions,
         graph_result.summary.total_tokens > 0,
     );
-    report_zero_rate_custom_overrides(&graph_result.summary.models);
+    // Reuses the process-wide pricing service the graph run above already
+    // initialized, so `custom-pricing.json` is read once per run and its skip
+    // warnings are printed once.
+    let pricing = rt
+        .block_on(tokscale_core::pricing::PricingService::get_or_init())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    report_zero_rate_custom_overrides(pricing.custom(), &graph_result.summary.models);
 
     println!("{}", "  Data to submit:".white());
     println!(
@@ -6584,6 +6593,22 @@ mod tests {
 
         assert!(zero_rate_overrides_in_submission(&overrides, &submitted).is_empty());
         assert!(zero_rate_override_submit_warning(&[]).is_none());
+    }
+
+    /// Override keys are matched case-insensitively, so two usage rows that
+    /// differ only in casing resolve to one entry in `custom-pricing.json` and
+    /// must be reported as the one entry the user would edit.
+    #[test]
+    fn one_override_reached_under_two_casings_is_named_once() {
+        let overrides = custom_overrides(&[("free-local-model", Some(0.0), Some(0.0))]);
+        let submitted = vec![
+            "Free-Local-Model".to_string(),
+            "free-local-model".to_string(),
+        ];
+
+        let named = zero_rate_overrides_in_submission(&overrides, &submitted);
+        let named_ids: Vec<&str> = named.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(named_ids, ["free-local-model"]);
     }
 
     /// An override that zeroes one side of a model still charges real money on
