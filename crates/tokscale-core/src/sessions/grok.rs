@@ -408,12 +408,17 @@ pub fn parse_grok_updates_file(path: &Path) -> Vec<UnifiedMessage> {
             let event_id = get_path(&value, &["params", "_meta", "eventId"])
                 .and_then(|value| extract_string(Some(value)))
                 .unwrap_or_else(|| format!("turn-{usage_index}"));
-            // `eventId` is not unique: Grok reuses it across usage records, and
-            // identical dedup keys are collapsed downstream, so keying on it
-            // alone merged distinct turns into one. The position of the record
-            // within the file disambiguates them and stays stable across
-            // re-parses of an unchanged file, which the on-disk message cache
-            // this key feeds requires.
+            // `eventId` is not unique: Grok reuses it across usage records, so
+            // keying on it alone gave distinct turns byte-identical keys. The
+            // Grok lane in `lib.rs` does not collapse duplicate keys today —
+            // it only runs `prefer_unified_log_messages` — so this is not
+            // currently load-bearing, but a per-record-unique key is correct on
+            // its own merits and cheap insurance against any consumer that does
+            // key on it. The position of the record within the file
+            // disambiguates them and stays stable across re-parses of an
+            // unchanged file, which the on-disk message cache this key feeds
+            // requires. Note the key is only unique within one file; it is not
+            // a global identity.
             usage_messages.push(message_from_tokens(
                 &metadata,
                 model_id,
