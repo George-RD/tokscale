@@ -498,6 +498,37 @@ mod tests {
         assert!((cost - 1.925).abs() < 1e-9, "unexpected cost: {cost}");
     }
 
+    // Regression: #1021, #1035. The unit tests around `covers_usage` pin the
+    // row-level rule; this pins the behaviour the issues actually reported,
+    // which is a submission aborting. It has to run through `PricingService`
+    // because the shortcut is only reached via `resolve_for_usage`, whose
+    // `normalize_provider_hint(..).is_none() || covers_usage(..)` condition
+    // decides whether a hinted row is consulted at all — reordering that
+    // condition would reintroduce the aborted submission while every
+    // row-level test kept passing.
+    #[test]
+    fn a_hinted_all_zero_row_covers_cache_usage_through_the_service() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "kenari/nemotron-free-fixture".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0),
+                output_cost_per_token: Some(0.0),
+                ..Default::default()
+            },
+        );
+        let service = PricingService::new(litellm, HashMap::new());
+        let usage = cache_read_usage();
+
+        assert!(
+            service.covers_usage_with_provider("nemotron-free-fixture", Some("kenari"), &usage),
+            "cache-bearing usage on an all-zero row must not abort the submission"
+        );
+        let cost =
+            service.calculate_cost_with_provider("nemotron-free-fixture", Some("kenari"), &usage);
+        assert_eq!(cost, 0.0, "an all-zero row must price at exactly zero");
+    }
+
     #[test]
     fn reasonix_uses_the_inferred_upstream_provider_for_pricing() {
         let mut litellm = HashMap::new();
