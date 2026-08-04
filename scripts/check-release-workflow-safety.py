@@ -78,6 +78,92 @@ def strip_yaml_scalar(value: str) -> str:
     return value
 
 
+def decode_yaml_double_quoted(value: str) -> str:
+    escapes = {
+        "0": "\0",
+        "a": "\a",
+        "b": "\b",
+        "t": "\t",
+        "n": "\n",
+        "v": "\v",
+        "f": "\f",
+        "r": "\r",
+        "e": "\x1b",
+        " ": " ",
+        '"': '"',
+        "/": "/",
+        "\\": "\\",
+        "N": "\x85",
+        "_": "\xa0",
+        "L": "\u2028",
+        "P": "\u2029",
+    }
+    hex_widths = {"x": 2, "u": 4, "U": 8}
+    decoded: list[str] = []
+    index = 0
+    while index < len(value):
+        if value[index] != "\\":
+            decoded.append(value[index])
+            index += 1
+            continue
+
+        index += 1
+        if index >= len(value):
+            raise ValueError("unterminated YAML escape")
+        escape = value[index]
+        if escape in escapes:
+            decoded.append(escapes[escape])
+            index += 1
+            continue
+        if escape not in hex_widths:
+            raise ValueError(f"unsupported YAML escape: \\{escape}")
+
+        width = hex_widths[escape]
+        start = index + 1
+        end = start + width
+        digits = value[start:end]
+        if len(digits) != width or not re.fullmatch(r"[0-9A-Fa-f]+", digits):
+            raise ValueError(f"invalid YAML escape: \\{escape}{digits}")
+        codepoint = int(digits, 16)
+        if codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
+            raise ValueError(f"invalid YAML codepoint: {codepoint:#x}")
+        decoded.append(chr(codepoint))
+        index = end
+
+    return "".join(decoded)
+
+
+def yaml_mapping_entry(line: str, indent: int) -> tuple[str, str] | None:
+    content = strip_yaml_comment(line)
+    match = re.match(
+        rf"\s{{{indent}}}(?:([A-Za-z_][A-Za-z0-9_-]*)|\"([^\"]+)\"|'([^']+)'):\s*(.*)$",
+        content,
+    )
+    if not match:
+        return None
+    bare_key, double_quoted_key, single_quoted_key = match.groups()[:3]
+    if double_quoted_key is not None:
+        try:
+            key = decode_yaml_double_quoted(double_quoted_key)
+        except ValueError:
+            return None
+    else:
+        key = bare_key if bare_key is not None else single_quoted_key
+    if key is None:
+        return None
+    return key, strip_yaml_scalar(match.group(4))
+
+
+def mapping_scalars(lines: list[str], indent: int) -> dict[str, str]:
+    mappings: dict[str, str] = {}
+    for line in lines:
+        entry = yaml_mapping_entry(line, indent)
+        if entry:
+            key, value = entry
+            mappings[key] = value
+    return mappings
+
+
 def top_level_env(lines: list[str]) -> dict[str, str]:
     env: dict[str, str] = {}
     for index, line in enumerate(lines):
@@ -217,6 +303,65 @@ def uncommented_lines(lines: list[str]) -> list[str]:
     return [line for line in lines if not line.lstrip().startswith("#")]
 
 
+def named_step_block(job_lines: list[str], step_name: str) -> list[str]:
+    lines = uncommented_lines(job_lines)
+    for index, line in enumerate(lines):
+        match = re.match(r"(\s*)-\s+name:\s*(.+?)\s*$", line)
+        if not match or strip_yaml_scalar(match.group(2)) != step_name:
+            continue
+
+        step_indent = len(match.group(1))
+        end = len(lines)
+        for child_index in range(index + 1, len(lines)):
+            child = strip_yaml_comment(lines[child_index])
+            if not child.strip():
+                continue
+            child_indent = len(child) - len(child.lstrip(" "))
+            if child_indent < step_indent or (
+                child_indent == step_indent and re.match(r"\s*-\s+", child)
+            ):
+                end = child_index
+                break
+        return lines[index:end]
+
+    return []
+
+
+def step_run_block(step_lines: list[str]) -> list[str]:
+    for index, line in enumerate(step_lines):
+        match = re.match(r"(\s*)run:\s*[|>][-+]?\s*$", strip_yaml_comment(line))
+        if not match:
+            continue
+
+        run_indent = len(match.group(1))
+        run_lines: list[str] = []
+        for child in step_lines[index + 1 :]:
+            content = strip_yaml_comment(child)
+            if not content.strip():
+                continue
+            child_indent = len(content) - len(content.lstrip(" "))
+            if child_indent <= run_indent:
+                break
+            run_lines.append(content.strip())
+        return run_lines
+
+    return []
+
+
+def step_has_property(step_lines: list[str], property_name: str) -> bool:
+    if not step_lines:
+        return False
+    match = re.match(r"(\s*)-\s+", step_lines[0])
+    if not match:
+        return False
+    property_indent = len(match.group(1)) + 2
+    return any(
+        (entry := yaml_mapping_entry(line, property_indent)) is not None
+        and entry[0] == property_name
+        for line in uncommented_lines(step_lines[1:])
+    )
+
+
 def yaml_list_scalars(lines: list[str]) -> set[str]:
     values: set[str] = set()
     for line in lines:
@@ -264,6 +409,35 @@ def main() -> None:
     publish_lines = read_lines(PUBLISH_WORKFLOW)
     native_lines = read_lines(BUILD_NATIVE_WORKFLOW)
     errors: list[str] = []
+
+    publish_bump = uncommented_lines(job_block(publish_lines, "bump-versions"))
+    default_branch_step = named_step_block(publish_bump, "Require the default branch")
+    default_branch_env = {
+        "DEFAULT_BRANCH": "${{ github.event.repository.default_branch }}",
+        "RELEASE_REF_NAME": "${{ github.ref_name }}",
+        "RELEASE_REF_TYPE": "${{ github.ref_type }}",
+    }
+    default_branch_env_block = mapping_block(default_branch_step, "env", 8)
+    default_branch_env_values = mapping_scalars(default_branch_env_block, 10)
+    default_branch_run = step_run_block(default_branch_step)
+    guard = 'if [[ "$RELEASE_REF_TYPE" != "branch" || "$RELEASE_REF_NAME" != "$DEFAULT_BRANCH" ]]; then'
+    try:
+        guard_index = default_branch_run.index(guard)
+        fi_index = default_branch_run.index("fi", guard_index + 1)
+        exit_index = default_branch_run.index("exit 1", guard_index + 1, fi_index)
+        gate_aborts = guard_index == 0 and guard_index < exit_index < fi_index
+    except ValueError:
+        gate_aborts = False
+    if (
+        not all(
+            default_branch_env_values.get(key) == value
+            for key, value in default_branch_env.items()
+        )
+        or step_has_property(default_branch_step, "if")
+        or step_has_property(default_branch_step, "continue-on-error")
+        or not gate_aborts
+    ):
+        errors.append("publish workflow must reject non-default branch dispatches")
 
     native_env = top_level_env(native_lines)
     for key in REQUIRED_ENV_KEYS:
