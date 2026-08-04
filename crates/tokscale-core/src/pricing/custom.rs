@@ -381,10 +381,66 @@ impl ZeroRateSummary {
 
 /// Every rate a user can set on an override, paired with the label the CLI
 /// shows for it.
-fn declared_rates(pricing: &ModelPricing) -> [(&'static str, Option<f64>); 2] {
+///
+/// The list is exhaustive over `ModelPricing` on purpose. Base rates are not
+/// the highest-leverage zero: agent sessions are dominated by cache reads, so a
+/// $0.00 `cache_read_input_token_cost_per_million_tokens` on an otherwise fully
+/// priced model removes far more reported spend than a zeroed input rate while
+/// looking untouched in the listing. Every field here is one a user can type,
+/// so every field has to be watched.
+///
+/// Adding a rate to `ModelPricing` without adding it here silently reopens that
+/// gap; the array length is spelled out so the omission is a compile error.
+fn declared_rates(pricing: &ModelPricing) -> [(&'static str, Option<f64>); 15] {
     [
         ("input", pricing.input_cost_per_token),
+        (
+            "input above 128k",
+            pricing.input_cost_per_token_above_128k_tokens,
+        ),
+        (
+            "input above 200k",
+            pricing.input_cost_per_token_above_200k_tokens,
+        ),
+        (
+            "input above 256k",
+            pricing.input_cost_per_token_above_256k_tokens,
+        ),
+        (
+            "input above 272k",
+            pricing.input_cost_per_token_above_272k_tokens,
+        ),
         ("output", pricing.output_cost_per_token),
+        (
+            "output above 128k",
+            pricing.output_cost_per_token_above_128k_tokens,
+        ),
+        (
+            "output above 200k",
+            pricing.output_cost_per_token_above_200k_tokens,
+        ),
+        (
+            "output above 256k",
+            pricing.output_cost_per_token_above_256k_tokens,
+        ),
+        (
+            "output above 272k",
+            pricing.output_cost_per_token_above_272k_tokens,
+        ),
+        ("cache write", pricing.cache_creation_input_token_cost),
+        (
+            "cache write above 200k",
+            pricing.cache_creation_input_token_cost_above_200k_tokens,
+        ),
+        ("cache read", pricing.cache_read_input_token_cost),
+        (
+            "cache read above 200k",
+            pricing.cache_read_input_token_cost_above_200k_tokens,
+        ),
+        (
+            "cache read above 272k",
+            pricing.cache_read_input_token_cost_above_272k_tokens,
+        ),
     ]
 }
 
@@ -895,6 +951,48 @@ mod tests {
         );
 
         assert!(loaded.zero_rate_summary("paid-model").is_none());
+    }
+
+    /// Cache reads dominate agent sessions, so a $0.00 cache-read rate on an
+    /// otherwise fully priced model is the most effective way to zero out
+    /// reported spend — roughly $750 per 500M cache-read tokens at Opus rates.
+    /// The READMEs promise that $0.00 overrides are called out, so the net has
+    /// to cover every rate a user can zero, not just the two base rates.
+    #[test]
+    fn zero_cache_rates_are_named_even_when_base_rates_are_priced() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("custom-pricing.json");
+        fs::write(
+            &path,
+            r#"{
+                "models": {
+                    "free-cache-read": {
+                        "input_cost_per_million_tokens": 15.00,
+                        "output_cost_per_million_tokens": 75.00,
+                        "cache_read_input_token_cost_per_million_tokens": 0
+                    },
+                    "free-long-context-output": {
+                        "input_cost_per_million_tokens": 15.00,
+                        "output_cost_per_million_tokens": 75.00,
+                        "output_cost_per_million_tokens_above_200k_tokens": 0
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let loaded = CustomPricing::load_from_path(&path);
+
+        let cache_read = loaded
+            .zero_rate_summary("free-cache-read")
+            .expect("a $0.00 cache-read rate must be reported");
+        assert_eq!(cache_read.fields(), ["cache read"]);
+        assert!(!cache_read.is_free_model());
+
+        let long_context = loaded
+            .zero_rate_summary("free-long-context-output")
+            .expect("a $0.00 long-context rate must be reported");
+        assert_eq!(long_context.fields(), ["output above 200k"]);
     }
 
     #[test]
