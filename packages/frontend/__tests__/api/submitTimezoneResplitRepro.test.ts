@@ -20,8 +20,11 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 // WITHIN a day, and the emptied day is not part of the payload at all.
 //
 // These tests characterize CURRENT submit behavior (the inflation is real and
-// silent). The offline recovery described in docs/ratchet-inflation-recovery.md
-// is intentionally out of this route's scope. The CLI-side fix in #1016
+// silent). Phase 4a (`daily_breakdown_reported`) now records each explicitly
+// reported unguarded cell alongside the guarded store — the served
+// `totalTokens` is unchanged. It is not a whole-scan snapshot: omitted cells
+// remain unknowable without client-declared coverage plus generations or
+// tombstones. The CLI-side fix in #1016
 // (pinned `scanner.bucketTimezone`) stops new re-splits from pinned devices;
 // the last test asserts the server-side consequence -- a same-day rescan
 // merges flat instead of inflating.
@@ -173,6 +176,33 @@ function collectStrings(
   for (const value of Object.values(node as Record<string, unknown>)) {
     collectStrings(value, out, seen);
   }
+}
+
+/** Like collectStrings, but also keeps finite numbers (bind params). */
+function collectPrimitives(
+  node: unknown,
+  out: Array<string | number>,
+  seen = new Set<object>(),
+): void {
+  if (typeof node === "string" || (typeof node === "number" && Number.isFinite(node))) {
+    out.push(node);
+    return;
+  }
+  if (!node || typeof node !== "object") return;
+  if (seen.has(node as object)) return;
+  seen.add(node as object);
+  if (Array.isArray(node)) {
+    for (const item of node) collectPrimitives(item, out, seen);
+    return;
+  }
+  for (const value of Object.values(node as Record<string, unknown>)) {
+    collectPrimitives(value, out, seen);
+  }
+}
+
+function isDailyBreakdownInsert(sqlFragment: string): boolean {
+  // Must not match `INSERT INTO daily_breakdown_reported`.
+  return /INSERT INTO daily_breakdown\b(?!_)/.test(sqlFragment);
 }
 
 function storedClientEntry(tokens: number) {
@@ -475,6 +505,34 @@ describe("POST /api/submit timezone re-split vs monotonic merge (#960)", () => {
     expect(strings.some((s) => s.includes("UPDATE daily_breakdown"))).toBe(
       false,
     );
+
+    // Phase 4a records the unguarded observation for the moved day only. The
+    // Seoul day is not written by this payload, but that does not establish it
+    // as absent: an earlier observation for the cell could remain in the table.
+    // Assert the exact calendar-date bind set separately from other string
+    // parameters such as the `reported_at` ISO timestamp.
+    const shadowSqls = executedSqlArgs.filter((arg) => {
+      const parts: string[] = [];
+      collectStrings(arg, parts);
+      return parts.some((s) =>
+        s.includes("INSERT INTO daily_breakdown_reported"),
+      );
+    });
+    expect(shadowSqls).toHaveLength(1);
+    const shadowParts: Array<string | number> = [];
+    collectPrimitives(shadowSqls[0], shadowParts);
+    expect(
+      shadowParts.some(
+        (s) => typeof s === "string" && s.includes("GREATEST"),
+      ),
+    ).toBe(false);
+    expect(shadowParts).toContain("claude");
+    expect(shadowParts).toContain(1000);
+    const calendarDates = shadowParts.filter(
+      (value): value is string =>
+        typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value),
+    );
+    expect(calendarDates).toEqual(["2026-03-02"]);
   });
 
   it("lets the regression guard preserve the client that moved off a day", async () => {
@@ -576,8 +634,6 @@ describe("POST /api/submit timezone re-split vs monotonic merge (#960)", () => {
     expect(updateJsons).toHaveLength(1);
     const merged = JSON.parse(updateJsons[0]) as { claude: { tokens: number } };
     expect(merged.claude.tokens).toBe(1000);
-    expect(strings.some((s) => s.includes("INSERT INTO daily_breakdown"))).toBe(
-      false,
-    );
+    expect(strings.some((s) => isDailyBreakdownInsert(s))).toBe(false);
   });
 });

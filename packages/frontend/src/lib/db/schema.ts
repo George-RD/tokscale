@@ -389,6 +389,76 @@ export const dailyBreakdownRelations = relations(dailyBreakdown, ({ one }) => ({
 }));
 
 // ============================================================================
+// DAILY BREAKDOWN REPORTED (ratchet-inflation shadow, Phase 4a)
+// ============================================================================
+/**
+ * Unguarded latest observations for reported (device, date, client) cells.
+ *
+ * Phase 4a of docs/ratchet-inflation-recovery.md. **Nothing reads this table.**
+ * It records explicit cell reports that the monotonic merge on
+ * `daily_breakdown` throws away. It is not a whole-scan snapshot and has no
+ * reader or recovery behavior today.
+ *
+ * Merge semantics: last-write-wins on conflict. No `GREATEST`, no regression
+ * guard, no alias-fold normalisation. A `--since` scan that omits a cell does
+ * not touch that cell's row — absence is not zero. A future recovery workflow
+ * needs client-declared authoritative coverage and snapshot generations or
+ * tombstones before an omitted cell can be treated as absent.
+ *
+ * **Never backfill this from `daily_breakdown`.** The stored rows are the
+ * inflated values this table exists to contradict; seeding from them would
+ * leave Phase 4b with nothing to heal.
+ *
+ * `origin` is a plain column, not part of the primary key. Unlike
+ * `submitted_device_client_totals`, a later scan of either origin replaces the
+ * previous explicit observation for that (device, date, client) outright — it
+ * is a per-cell LWW table, not a complete payload snapshot or high-water.
+ */
+export const dailyBreakdownReported = pgTable(
+  "daily_breakdown_reported",
+  {
+    submittedDeviceId: uuid("submitted_device_id")
+      .notNull()
+      .references(() => submittedDevices.id, { onDelete: "cascade" }),
+    date: date("date").notNull(),
+    /** Canonical client id (post alias normalization, e.g. "kilo" not "kilocode"). */
+    client: varchar("client", { length: 128 }).notNull(),
+
+    tokens: bigint("tokens", { mode: "number" }).notNull(),
+    cost: decimal("cost", { precision: 14, scale: 4 }).notNull(),
+    input: bigint("input", { mode: "number" }).notNull(),
+    output: bigint("output", { mode: "number" }).notNull(),
+    /** Day-level active time, repeated on each client row for that date. */
+    activeTimeMs: bigint("active_time_ms", { mode: "number" }),
+    /** "cli" for locally-scanned usage, "backfill" for `tokscale import`. */
+    origin: varchar("origin", { length: 16 }).notNull(),
+
+    reportedAt: timestamp("reported_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.submittedDeviceId, table.date, table.client],
+    }),
+    index("idx_daily_breakdown_reported_device_date").on(
+      table.submittedDeviceId,
+      table.date
+    ),
+  ]
+);
+
+export const dailyBreakdownReportedRelations = relations(
+  dailyBreakdownReported,
+  ({ one }) => ({
+    submittedDevice: one(submittedDevices, {
+      fields: [dailyBreakdownReported.submittedDeviceId],
+      references: [submittedDevices.id],
+    }),
+  })
+);
+
+// ============================================================================
 // SUBMITTED DEVICE CLIENT TOTALS (ratchet-inflation census, Phase 1)
 // ============================================================================
 /**
