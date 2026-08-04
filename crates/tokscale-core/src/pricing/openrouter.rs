@@ -524,11 +524,18 @@ mod tests {
     /// on the path so the author-pricing leg is answered locally instead of
     /// reaching openrouter.ai. `response_server` above cannot do this: it
     /// replays one fixed body for every connection.
+    ///
+    /// Bounded to the two requests a single fetch makes so the thread and its
+    /// listening socket are released when the test ends, rather than parking
+    /// on `accept` for the life of the test process.
     fn openrouter_api_server(models_body: &'static str, endpoints_body: &'static str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         thread::spawn(move || {
-            while let Ok((mut stream, _)) = listener.accept() {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
                 let mut buffer = [0; 1024];
                 let read = stream.read(&mut buffer).unwrap_or(0);
                 let request = String::from_utf8_lossy(&buffer[..read]).to_string();
@@ -572,16 +579,26 @@ mod tests {
 
         // `anthropic/` maps to a known author, so this model survives the
         // author filter and drives the endpoints request the fixture answers.
+        //
+        // The endpoint quotes a different prompt price than the model list on
+        // purpose. `fetch_author_pricing` falls back to the listed price on any
+        // endpoints failure, so a fixture that quoted the same number on both
+        // legs would pass even if the endpoints request had gone to
+        // openrouter.ai and failed — which is precisely the regression
+        // `API_BASE` exists to prevent. Asserting the endpoint's distinct rate
+        // won makes that leg observable.
         let url = openrouter_api_server(
             r#"{"data":[{"id":"anthropic/claude","pricing":{"prompt":"0.000003","completion":"0.000015"}}]}"#,
-            r#"{"data":{"id":"anthropic/claude","endpoints":[{"provider_name":"Anthropic","pricing":{"prompt":"0.000003","completion":"0.000015"}}]}}"#,
+            r#"{"data":{"id":"anthropic/claude","endpoints":[{"provider_name":"Anthropic","pricing":{"prompt":"0.000009","completion":"0.000015"}}]}}"#,
         );
         let data = fetch_all_models_from_api_base(&url, false)
             .await
             .expect("the fixture serves one priced model");
-        assert!(
-            data.contains_key("anthropic/claude"),
-            "the fetch itself must succeed, otherwise the write is skipped for the wrong reason"
+        assert_eq!(
+            data.get("anthropic/claude")
+                .and_then(|pricing| pricing.input_cost_per_token),
+            Some(9e-6),
+            "the local endpoints fixture must have served the author-pricing leg; the listed 3e-6 means it fell back, so this test would no longer catch a hardcoded URL"
         );
         assert_eq!(
             cache::get_cache_path(CACHE_FILENAME),
