@@ -396,6 +396,7 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                 "unified.jsonl" => file_name == "unified.jsonl",
                 "events.jsonl" => file_name == "events.jsonl",
                 "ui_messages.json" => file_name == "ui_messages.json",
+                "cline-cli-messages" => file_name.ends_with(".messages.json"),
                 "session-usage.json" => file_name == "session-usage.json",
                 "chat-messages.json" => file_name == "chat-messages.json",
                 "workbuddy.db" => file_name == "workbuddy.db",
@@ -873,6 +874,32 @@ fn cline_additional_vscode_task_roots(home_dir: &str, use_env_roots: bool) -> Ve
     );
 
     roots
+}
+
+fn cline_cli_session_roots(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
+    let home_fallback = || PathBuf::from(home_dir).join(".cline/data/sessions");
+
+    if !use_env_roots {
+        return vec![home_fallback()];
+    }
+
+    let non_blank_env_path = |name: &str| {
+        std::env::var_os(name)
+            .filter(|value| !value.to_string_lossy().trim().is_empty())
+            .map(PathBuf::from)
+    };
+
+    if let Some(path) = non_blank_env_path("CLINE_SESSION_DATA_DIR") {
+        return vec![path];
+    }
+    if let Some(path) = non_blank_env_path("CLINE_DATA_DIR") {
+        return vec![path.join("sessions")];
+    }
+    if let Some(path) = non_blank_env_path("CLINE_DIR") {
+        return vec![path.join("data/sessions")];
+    }
+
+    vec![home_fallback()]
 }
 
 pub fn devin_desktop_additional_roots(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
@@ -1615,6 +1642,16 @@ fn scan_all_clients_with_env_strategy_inner(
         for root in cline_additional_vscode_task_roots(home_dir, use_env_roots) {
             push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Cline, root);
         }
+
+        for root in cline_cli_session_roots(home_dir, use_env_roots) {
+            push_unique_scan_task_with_pattern(
+                &mut tasks,
+                &mut seen_scan_roots,
+                ClientId::Cline,
+                root,
+                "cline-cli-messages",
+            );
+        }
     }
 
     if enabled.contains(&ClientId::DevinDesktop) {
@@ -2209,6 +2246,19 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_directory_cline_cli_messages_pattern() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+
+        File::create(path.join("session.messages.json")).unwrap();
+        File::create(path.join("session.json")).unwrap();
+        File::create(path.join("session.messages.jsonl")).unwrap();
+
+        let files = scan_directory(path.to_str().unwrap(), "cline-cli-messages");
+        assert_eq!(files, vec![path.join("session.messages.json")]);
+    }
+
+    #[test]
     fn test_scan_directory_nested() {
         let dir = TempDir::new().unwrap();
         let path = dir.path();
@@ -2482,6 +2532,14 @@ mod tests {
         let pi_path = base.join(".pi/agent/sessions/--test--");
         fs::create_dir_all(&pi_path).unwrap();
         let mut file = File::create(pi_path.join("1733011200000_pi_ses_001.jsonl")).unwrap();
+        file.write_all(b"{}").unwrap();
+    }
+
+    fn setup_mock_kimchi_dir(base: &std::path::Path) {
+        let kimchi_path = base.join(".config/kimchi/harness/sessions/--test--");
+        fs::create_dir_all(&kimchi_path).unwrap();
+        let mut file =
+            File::create(kimchi_path.join("2026-08-01T00-00-00Z_kimchi_ses_001.jsonl")).unwrap();
         file.write_all(b"{}").unwrap();
     }
 
@@ -2783,6 +2841,16 @@ mod tests {
         File::create(macos.join("ui_messages.json")).unwrap();
         File::create(windows.join("ui_messages.json")).unwrap();
         File::create(server.join("ui_messages.json")).unwrap();
+    }
+
+    fn setup_mock_cline_cli_dir(data_dir: &std::path::Path) {
+        setup_mock_cline_cli_session_root(&data_dir.join("sessions"));
+    }
+
+    fn setup_mock_cline_cli_session_root(sessions_root: &std::path::Path) {
+        let sessions = sessions_root.join("cli-session");
+        fs::create_dir_all(&sessions).unwrap();
+        File::create(sessions.join("cli-session.messages.json")).unwrap();
     }
 
     fn setup_mock_crush_registry(registry_path: &Path, projects_json: &str) {
@@ -3743,6 +3811,24 @@ mod tests {
         assert_eq!(result.get(ClientId::Pi).len(), 1);
         assert!(result.get(ClientId::OpenCode).is_empty());
         assert!(result.get(ClientId::Claude).is_empty());
+    }
+
+    #[test]
+    fn test_scan_all_clients_kimchi() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_kimchi_dir(home);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["kimchi".to_string()],
+            false,
+        );
+        assert_eq!(result.get(ClientId::Kimchi).len(), 1);
+        assert!(result.get(ClientId::Kimchi)[0]
+            .to_string_lossy()
+            .ends_with(".jsonl"));
+        assert!(result.get(ClientId::Pi).is_empty());
     }
 
     #[test]
@@ -4757,6 +4843,152 @@ mod tests {
             .get(ClientId::Cline)
             .iter()
             .all(|p| p.ends_with("ui_messages.json")));
+    }
+
+    #[test]
+    fn test_scan_all_clients_cline_cli() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_cline_cli_dir(&home.join(".cline/data"));
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["cline".to_string()],
+            false,
+        );
+        assert_eq!(result.get(ClientId::Cline).len(), 1);
+        assert!(result.get(ClientId::Cline)[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".messages.json")));
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_cline_cli_session_data_dir_takes_precedence() {
+        let mut env = EnvGuard::capture(&["CLINE_SESSION_DATA_DIR", "CLINE_DATA_DIR", "CLINE_DIR"]);
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let session_data_dir = dir.path().join("custom-cline-sessions");
+        let data_dir = dir.path().join("custom-cline-data");
+        let cline_dir = dir.path().join("custom-cline");
+
+        setup_mock_cline_cli_session_root(&session_data_dir);
+        setup_mock_cline_cli_dir(&data_dir);
+        setup_mock_cline_cli_dir(&cline_dir.join("data"));
+        setup_mock_cline_cli_dir(&home.join(".cline/data"));
+        env.set("CLINE_SESSION_DATA_DIR", &session_data_dir);
+        env.set("CLINE_DATA_DIR", &data_dir);
+        env.set("CLINE_DIR", &cline_dir);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["cline".to_string()],
+            true,
+        );
+        let expected = session_data_dir.join("cli-session/cli-session.messages.json");
+
+        assert_eq!(result.get(ClientId::Cline), &vec![expected]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_cline_cli_uses_data_dir_override() {
+        let mut env = EnvGuard::capture(&["CLINE_SESSION_DATA_DIR", "CLINE_DATA_DIR", "CLINE_DIR"]);
+        env.remove("CLINE_SESSION_DATA_DIR");
+        env.remove("CLINE_DIR");
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let data_dir = dir.path().join("custom-cline-data");
+        let cline_dir = dir.path().join("custom-cline");
+
+        setup_mock_cline_cli_dir(&data_dir);
+        setup_mock_cline_cli_dir(&cline_dir.join("data"));
+        setup_mock_cline_cli_dir(&home.join(".cline/data"));
+        env.set("CLINE_DATA_DIR", &data_dir);
+        env.set("CLINE_DIR", &cline_dir);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["cline".to_string()],
+            true,
+        );
+        let expected = data_dir.join("sessions/cli-session/cli-session.messages.json");
+
+        assert_eq!(result.get(ClientId::Cline), &vec![expected]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_cline_cli_uses_cline_dir_override() {
+        let mut env = EnvGuard::capture(&["CLINE_SESSION_DATA_DIR", "CLINE_DATA_DIR", "CLINE_DIR"]);
+        env.remove("CLINE_SESSION_DATA_DIR");
+        env.remove("CLINE_DATA_DIR");
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let cline_dir = dir.path().join("custom-cline");
+
+        setup_mock_cline_cli_dir(&cline_dir.join("data"));
+        setup_mock_cline_cli_dir(&home.join(".cline/data"));
+        env.set("CLINE_DIR", &cline_dir);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["cline".to_string()],
+            true,
+        );
+        let expected = cline_dir.join("data/sessions/cli-session/cli-session.messages.json");
+
+        assert_eq!(result.get(ClientId::Cline), &vec![expected]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_cline_cli_ignores_env_roots_when_disabled() {
+        let mut env = EnvGuard::capture(&["CLINE_SESSION_DATA_DIR", "CLINE_DATA_DIR", "CLINE_DIR"]);
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let session_data_dir = dir.path().join("custom-cline-sessions");
+        let data_dir = dir.path().join("custom-cline-data");
+        let cline_dir = dir.path().join("custom-cline");
+
+        setup_mock_cline_cli_session_root(&session_data_dir);
+        setup_mock_cline_cli_dir(&data_dir);
+        setup_mock_cline_cli_dir(&cline_dir.join("data"));
+        setup_mock_cline_cli_dir(&home.join(".cline/data"));
+        env.set("CLINE_SESSION_DATA_DIR", &session_data_dir);
+        env.set("CLINE_DATA_DIR", &data_dir);
+        env.set("CLINE_DIR", &cline_dir);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["cline".to_string()],
+            false,
+        );
+        let expected = home.join(".cline/data/sessions/cli-session/cli-session.messages.json");
+
+        assert_eq!(result.get(ClientId::Cline), &vec![expected]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_cline_cli_whitespace_data_dir_uses_default() {
+        let mut env = EnvGuard::capture(&["CLINE_SESSION_DATA_DIR", "CLINE_DATA_DIR", "CLINE_DIR"]);
+        env.remove("CLINE_SESSION_DATA_DIR");
+        env.remove("CLINE_DIR");
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_cline_cli_dir(&home.join(".cline/data"));
+        env.set("CLINE_DATA_DIR", " \t ");
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["cline".to_string()],
+            true,
+        );
+        let expected = home.join(".cline/data/sessions/cli-session/cli-session.messages.json");
+
+        assert_eq!(result.get(ClientId::Cline), &vec![expected]);
     }
 
     #[test]

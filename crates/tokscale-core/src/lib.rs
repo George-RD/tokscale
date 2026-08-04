@@ -1669,6 +1669,32 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
+    let kimchi_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Kimchi)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                message_cache::CacheIdentity::for_client(ClientId::Kimchi),
+                path,
+                &source_cache,
+                pricing,
+                sessions::kimchi::parse_kimchi_file,
+            )
+        })
+        .collect();
+    let mut kimchi_seen: HashSet<String> = HashSet::new();
+    for outcome in kimchi_outcomes {
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut kimchi_seen, message)),
+        );
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     let senpi_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Senpi)
         .par_iter()
@@ -1953,13 +1979,19 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                 path,
                 &source_cache,
                 pricing,
-                message_cache::SourceFingerprint::check_roo_path_samples_only,
+                message_cache::SourceFingerprint::check_cline_path_samples_only,
                 sessions::cline::parse_cline_file,
             )
         })
         .collect();
+    let mut cline_seen: HashSet<String> = HashSet::new();
     for outcome in cline_outcomes {
-        all_messages.extend(outcome.messages);
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut cline_seen, message)),
+        );
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         }
@@ -3570,6 +3602,21 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Pi, pi_count);
     messages.extend(pi_msgs);
 
+    let kimchi_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Kimchi)
+        .par_iter()
+        .flat_map(|path| sessions::kimchi::parse_kimchi_file(path))
+        .collect();
+    let mut kimchi_seen: HashSet<String> = HashSet::new();
+    let kimchi_msgs: Vec<ParsedMessage> = kimchi_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut kimchi_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let kimchi_count = kimchi_msgs.len() as i32;
+    counts.set(ClientId::Kimchi, kimchi_count);
+    messages.extend(kimchi_msgs);
+
     let senpi_msgs: Vec<ParsedMessage> = scan_result
         .get(ClientId::Senpi)
         .par_iter()
@@ -3751,15 +3798,16 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::KiloCode, kilocode_count);
     messages.extend(kilocode_msgs);
 
-    let cline_msgs: Vec<ParsedMessage> = scan_result
+    let cline_msgs_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Cline)
         .par_iter()
-        .flat_map(|path| {
-            sessions::cline::parse_cline_file(path)
-                .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|path| sessions::cline::parse_cline_file(path))
+        .collect();
+    let mut cline_seen: HashSet<String> = HashSet::new();
+    let cline_msgs: Vec<ParsedMessage> = cline_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut cline_seen, message))
+        .map(|message| unified_to_parsed(&message))
         .collect();
     let cline_count = summed_parsed_message_count(&cline_msgs);
     counts.set(ClientId::Cline, cline_count);
@@ -5881,6 +5929,104 @@ mod tests {
         .unwrap();
     }
 
+    fn write_kimchi_fixture(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            r#"{"type":"session","id":"kimchi-session","timestamp":"2026-08-01T00:00:00.000Z","cwd":"/tmp/kimchi-project"}
+{"type":"message","id":"kimchi-message","timestamp":"2026-08-01T00:00:01.000Z","message":{"role":"assistant","model":"kimi-k2.6","provider":"kimchi-dev","usage":{"input":100,"output":10,"cacheRead":5,"cacheWrite":2,"totalTokens":117}}}"#,
+        )
+        .unwrap();
+    }
+    fn write_cline_cli_fixture(path: &std::path::Path, messages: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!(r#"{{"sessionId":"cline-dedup-session","messages":[{messages}]}}"#),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_cline_cli_deduplicates_duplicate_records_in_cached_and_local_paths() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+
+        {
+            let duplicate = r#"{"id":"duplicate","role":"assistant","ts":1785320475705,"modelInfo":{"id":"cline-free/glm-5.2","provider":"cline-pass"},"metrics":{"inputTokens":100,"outputTokens":10}}"#;
+            let distinct_a = r#"{"id":"distinct-a","role":"assistant","ts":1785320476705,"metrics":{"inputTokens":200,"outputTokens":20}}"#;
+            let distinct_b = r#"{"id":"distinct-b","role":"assistant","ts":1785320477705,"metrics":{"inputTokens":300,"outputTokens":30}}"#;
+            write_cline_cli_fixture(
+                &source_home
+                    .path()
+                    .join(".cline/data/sessions/first/first.messages.json"),
+                &format!("{duplicate},{distinct_a}"),
+            );
+            write_cline_cli_fixture(
+                &source_home
+                    .path()
+                    .join(".cline/data/sessions/second/second.messages.json"),
+                &format!("{duplicate},{distinct_b}"),
+            );
+
+            let clients = ["cline".to_string()];
+            let scanner_settings = scanner::ScannerSettings::default();
+            let cached = parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                None,
+                false,
+                &scanner_settings,
+            );
+            let mut cached_inputs = cached
+                .iter()
+                .map(|message| message.tokens.input)
+                .collect::<Vec<_>>();
+            cached_inputs.sort_unstable();
+            assert_eq!(cached_inputs, vec![100, 200, 300]);
+            let cached_again = parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                None,
+                false,
+                &scanner_settings,
+            );
+            let mut cached_again_inputs = cached_again
+                .iter()
+                .map(|message| message.tokens.input)
+                .collect::<Vec<_>>();
+            cached_again_inputs.sort_unstable();
+            assert_eq!(cached_again_inputs, vec![100, 200, 300]);
+
+            let parsed = parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(clients.to_vec()),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings,
+            })
+            .unwrap();
+            let mut local_inputs = parsed
+                .messages
+                .iter()
+                .map(|message| message.input)
+                .collect::<Vec<_>>();
+            local_inputs.sort_unstable();
+            assert_eq!(local_inputs, vec![100, 200, 300]);
+            assert_eq!(parsed.counts.get(ClientId::Cline), 3);
+        }
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_parse_all_messages_with_pricing_prefers_grok_unified_log() {
@@ -6098,6 +6244,65 @@ mod tests {
             assert_eq!(parsed.messages.iter().map(|m| m.input).sum::<i64>(), 40);
             assert_eq!(parsed.messages.iter().map(|m| m.output).sum::<i64>(), 5);
         }
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_kimchi_deduplicates_same_message_across_scan_roots() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+
+        let default_path = source_home
+            .path()
+            .join(".config/kimchi/harness/sessions/workspace/session.jsonl");
+        let extra_path = source_home
+            .path()
+            .join("kimchi-extra/workspace/session.jsonl");
+        write_kimchi_fixture(&default_path);
+        write_kimchi_fixture(&extra_path);
+
+        let mut extra_scan_paths = std::collections::BTreeMap::new();
+        extra_scan_paths.insert(
+            "kimchi".to_string(),
+            vec![source_home.path().join("kimchi-extra")],
+        );
+        let scanner_settings = scanner::ScannerSettings {
+            extra_scan_paths,
+            ..Default::default()
+        };
+
+        let parsed = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["kimchi".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner_settings.clone(),
+        })
+        .unwrap();
+        assert_eq!(parsed.counts.get(ClientId::Kimchi), 1);
+        assert_eq!(parsed.messages.len(), 1);
+
+        let messages = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &["kimchi".to_string()],
+            None,
+            false,
+            &scanner_settings,
+        );
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some("kimchi:kimchi-session:kimchi-message")
+        );
 
         match original_home {
             Some(home) => std::env::set_var("HOME", home),
