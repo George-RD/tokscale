@@ -249,29 +249,13 @@ impl CustomPricing {
         self.lookup_with_key(model_id).map(|result| result.pricing)
     }
 
-    /// Sorted model ids whose override declares a $0.00 input or output base
-    /// rate.
+    /// Which rates the override matching `model_id` sets to $0.00, or `None`
+    /// when it sets none.
     ///
-    /// Declaring a model free is legitimate (self-hosted endpoints, promotional
-    /// tiers) but it is also the one override that can zero out spend on a
-    /// public leaderboard, so callers use this to name those entries instead of
-    /// letting a `$0.00` line blend into the rest of the listing (#1021).
-    pub fn zero_rate_model_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self
-            .models
-            .iter()
-            .filter(|(_, pricing)| declares_zero_base_rate(pricing))
-            .map(|(model_id, _)| model_id.clone())
-            .collect();
-        ids.sort();
-        ids
-    }
-
-    /// Whether the override matching `model_id` declares a $0.00 base rate.
     /// Resolves through the same raw/normalized matching as [`Self::lookup`],
     /// so callers can pass a model id straight off a usage row.
-    pub fn declares_zero_rate(&self, model_id: &str) -> bool {
-        self.lookup(model_id).is_some_and(declares_zero_base_rate)
+    pub fn zero_rate_summary(&self, model_id: &str) -> Option<ZeroRateSummary> {
+        self.lookup(model_id).and_then(ZeroRateSummary::for_pricing)
     }
 
     pub fn lookup_with_key(&self, model_id: &str) -> Option<CustomLookupResult<'_>> {
@@ -341,11 +325,67 @@ impl CustomPricing {
     }
 }
 
-/// A rate of exactly 0.0 that the user typed, as opposed to a rate they left
-/// out: `CustomModelPricing` keeps every field `Option<f64>`, so `Some(0.0)` is
-/// an explicit "this is free" and `None` is "not declared".
-fn declares_zero_base_rate(pricing: &ModelPricing) -> bool {
-    pricing.input_cost_per_token == Some(0.0) || pricing.output_cost_per_token == Some(0.0)
+/// The rates one override sets to exactly $0.00.
+///
+/// Declaring a rate free is legitimate (self-hosted endpoints, promotional
+/// tiers) but it is also the override that can zero out spend on a public
+/// leaderboard, so callers use this to name what was zeroed instead of letting
+/// a `$0.00` line blend into the rest of the listing (#1021).
+///
+/// Only rates the user actually typed count: `CustomModelPricing` keeps every
+/// field `Option<f64>`, so `Some(0.0)` is an explicit "this is free" and `None`
+/// is "not declared". A rate left out is not a zero rate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ZeroRateSummary {
+    fields: Vec<&'static str>,
+    all_declared_rates_zero: bool,
+}
+
+impl ZeroRateSummary {
+    /// `None` when the override sets no rate to $0.00.
+    pub fn for_pricing(pricing: &ModelPricing) -> Option<Self> {
+        let mut fields = Vec::new();
+        let mut charges_for_something = false;
+        for (label, rate) in declared_rates(pricing) {
+            let Some(rate) = rate else { continue };
+            if rate == 0.0 {
+                fields.push(label);
+            } else {
+                charges_for_something = true;
+            }
+        }
+
+        if fields.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            fields,
+            all_declared_rates_zero: !charges_for_something,
+        })
+    }
+
+    /// Human-readable labels for the zeroed rates, in declaration order.
+    pub fn fields(&self) -> &[&'static str] {
+        &self.fields
+    }
+
+    /// Whether every rate this override declares is $0.00 — the only case in
+    /// which the model itself is free. An override that zeroes one side and
+    /// charges on the other is not free, and describing it as free would be a
+    /// false statement about money.
+    pub fn is_free_model(&self) -> bool {
+        self.all_declared_rates_zero
+    }
+}
+
+/// Every rate a user can set on an override, paired with the label the CLI
+/// shows for it.
+fn declared_rates(pricing: &ModelPricing) -> [(&'static str, Option<f64>); 2] {
+    [
+        ("input", pricing.input_cost_per_token),
+        ("output", pricing.output_cost_per_token),
+    ]
 }
 
 fn base_price(
@@ -809,8 +849,9 @@ mod tests {
     }
 
     /// Declaring a model free is now possible, so it must not be possible to do
-    /// it quietly: every zero base rate is reported for the override listing and
-    /// the submit-time warning to name.
+    /// it quietly: every zero rate is reported for the override listing and the
+    /// submit-time warning to name. A model free on one side only is reported
+    /// too, but is not a free model — it charges on the side it did not zero.
     #[test]
     fn zero_rate_overrides_are_named_for_visibility() {
         let temp = TempDir::new().unwrap();
@@ -838,12 +879,22 @@ mod tests {
 
         let loaded = CustomPricing::load_from_path(&path);
 
-        assert_eq!(
-            loaded.zero_rate_model_ids(),
-            vec!["free-both".to_string(), "free-input-only".to_string()]
+        let free_both = loaded
+            .zero_rate_summary("FREE-BOTH")
+            .expect("a model with every declared rate at $0.00 must be reported");
+        assert_eq!(free_both.fields(), ["input", "output"]);
+        assert!(free_both.is_free_model());
+
+        let free_input_only = loaded
+            .zero_rate_summary("free-input-only")
+            .expect("a $0.00 input rate must be reported even when output is priced");
+        assert_eq!(free_input_only.fields(), ["input"]);
+        assert!(
+            !free_input_only.is_free_model(),
+            "output costs $8.00/1M, so this model is not free"
         );
-        assert!(!loaded.declares_zero_rate("paid-model"));
-        assert!(loaded.declares_zero_rate("FREE-BOTH"));
+
+        assert!(loaded.zero_rate_summary("paid-model").is_none());
     }
 
     #[test]

@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use tokscale_core::pricing::custom::ZeroRateSummary;
 use tui::Tab;
 
 #[derive(Parser)]
@@ -3647,9 +3648,17 @@ fn run_pricing_list_overrides(json: bool) -> Result<()> {
     #[serde(rename_all = "camelCase")]
     struct OverrideEntry {
         model_id: String,
-        /// Always emitted, including when false, so a consumer diffing this
-        /// output can tell "not free" from "field absent in an older build".
-        declares_zero_rate: bool,
+        /// Which rates this override sets to $0.00, empty when none. Always
+        /// emitted, including when empty, so a consumer diffing this output can
+        /// tell "nothing zeroed" from "field absent in an older build".
+        zero_rate_fields: Vec<String>,
+        /// True only when *every* rate the override declares is $0.00. A model
+        /// with a $0.00 input rate and a priced output rate is not free.
+        declares_free_model: bool,
+        /// Text form of the two fields above, built once so the human listing
+        /// and the JSON form cannot drift apart.
+        #[serde(skip)]
+        zero_rate_marker: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         input_cost_per_million_tokens: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -3660,10 +3669,18 @@ fn run_pricing_list_overrides(json: bool) -> Result<()> {
         cache_creation_input_token_cost_per_million_tokens: Option<f64>,
     }
 
-    fn entry(model_id: &str, pricing: &ModelPricing, declares_zero_rate: bool) -> OverrideEntry {
+    fn entry(model_id: &str, pricing: &ModelPricing) -> OverrideEntry {
+        let zero_rates = ZeroRateSummary::for_pricing(pricing);
         OverrideEntry {
             model_id: model_id.to_string(),
-            declares_zero_rate,
+            zero_rate_fields: zero_rates
+                .iter()
+                .flat_map(|summary| summary.fields().iter().map(|field| field.to_string()))
+                .collect(),
+            declares_free_model: zero_rates
+                .as_ref()
+                .is_some_and(ZeroRateSummary::is_free_model),
+            zero_rate_marker: zero_rates.as_ref().map(zero_rate_marker),
             input_cost_per_million_tokens: per_million(pricing.input_cost_per_token),
             output_cost_per_million_tokens: per_million(pricing.output_cost_per_token),
             cache_read_input_token_cost_per_million_tokens: per_million(
@@ -3681,11 +3698,9 @@ fn run_pricing_list_overrides(json: bool) -> Result<()> {
     // can silently zero out a model's contribution to public spend, so the
     // listing names it rather than letting "$0.00 / 1M tokens" read as an
     // ordinary rate.
-    let zero_rate_ids: std::collections::HashSet<String> =
-        overrides.zero_rate_model_ids().into_iter().collect();
     let mut entries: Vec<OverrideEntry> = overrides
         .entries()
-        .map(|(model_id, pricing)| entry(model_id, pricing, zero_rate_ids.contains(model_id)))
+        .map(|(model_id, pricing)| entry(model_id, pricing))
         .collect();
     entries.sort_by(|a, b| a.model_id.cmp(&b.model_id));
 
@@ -3724,14 +3739,9 @@ fn run_pricing_list_overrides(json: bool) -> Result<()> {
     println!();
 
     for entry in entries {
-        if entry.declares_zero_rate {
-            println!(
-                "  {} {}",
-                entry.model_id.bold(),
-                ZERO_RATE_OVERRIDE_MARKER.yellow()
-            );
-        } else {
-            println!("  {}", entry.model_id.bold());
+        match &entry.zero_rate_marker {
+            Some(marker) => println!("  {} {}", entry.model_id.bold(), marker.yellow()),
+            None => println!("  {}", entry.model_id.bold()),
         }
         if let Some(input) = entry.input_cost_per_million_tokens {
             println!("    Input:  ${:.2} / 1M tokens", input);
@@ -5536,52 +5546,76 @@ fn report_unpriced_submission_exclusions(
     }
 }
 
-/// Shown beside any custom-pricing override that declares a $0.00 base rate.
+/// Shown beside any custom-pricing override that sets a rate to $0.00.
 ///
 /// `custom-pricing.json` accepts a genuinely free model (#1021), which also
 /// means a user can declare a paid model free and contribute zero spend for
 /// real usage. That is allowed — the file is the user's own escape hatch — but
 /// it must never be invisible, so both the override listing and the submit
 /// output name the affected models.
-const ZERO_RATE_OVERRIDE_MARKER: &str = "(declared free: $0.00)";
+///
+/// "Free" is claimed only when every declared rate is $0.00. An override that
+/// zeroes input and charges $15.00/1M on output is a legitimate configuration,
+/// and it gets the rates it actually zeroed listed rather than a label that
+/// would be false about what the model costs.
+fn zero_rate_marker(summary: &ZeroRateSummary) -> String {
+    if summary.is_free_model() {
+        "(declared free: $0.00)".to_string()
+    } else {
+        format!("(declared $0.00: {})", summary.fields().join(", "))
+    }
+}
 
-/// Submitted model ids that a custom override prices at $0.00, sorted and
+/// Submitted models whose custom override sets any rate to $0.00, sorted and
 /// deduplicated.
 ///
-/// Matching goes through `declares_zero_rate` rather than a plain lookup in
-/// `zero_rate_model_ids`, so a usage row whose id only matches after synthetic
+/// Matching goes through `zero_rate_summary` rather than a lookup keyed on the
+/// verbatim id, so a usage row whose id only matches after synthetic
 /// `/models/` normalization is still caught.
 fn zero_rate_overrides_in_submission(
     overrides: &tokscale_core::pricing::custom::CustomPricing,
     submitted_models: &[String],
-) -> Vec<String> {
+) -> Vec<(String, ZeroRateSummary)> {
     if overrides.is_empty() {
         return Vec::new();
     }
 
-    let mut named: Vec<String> = submitted_models
+    let mut named: Vec<(String, ZeroRateSummary)> = submitted_models
         .iter()
-        .filter(|model_id| overrides.declares_zero_rate(model_id))
-        .cloned()
+        .filter_map(|model_id| {
+            overrides
+                .zero_rate_summary(model_id)
+                .map(|summary| (model_id.clone(), summary))
+        })
         .collect();
-    named.sort();
-    named.dedup();
+    named.sort_by(|a, b| a.0.cmp(&b.0));
+    named.dedup_by(|a, b| a.0 == b.0);
     named
 }
 
-/// Warn that part of this submission is priced at $0.00 by the user's own
-/// override file, naming every affected model. Returns `None` when nothing in
-/// the submission is affected so the caller prints nothing.
-fn zero_rate_override_submit_warning(zero_rate_models: &[String]) -> Option<String> {
+/// Warn that part of this submission carries $0.00 rates from the user's own
+/// override file, naming every affected model and which of its rates are
+/// zeroed. Returns `None` when nothing in the submission is affected so the
+/// caller prints nothing.
+///
+/// The claim is deliberately scoped to "for those rates": a model that is free
+/// on input and $15.00/1M on output still contributes real cost, and telling
+/// the user its usage is submitted at zero cost would be false.
+fn zero_rate_override_submit_warning(
+    zero_rate_models: &[(String, ZeroRateSummary)],
+) -> Option<String> {
     if zero_rate_models.is_empty() {
         return None;
     }
 
-    Some(format!(
-        "  Warning: {} model(s) in this submission are priced at $0.00 by custom-pricing.json: {}. Their usage is submitted with zero cost.",
-        zero_rate_models.len(),
-        zero_rate_models.join(", ")
-    ))
+    let mut message = format!(
+        "  Warning: custom-pricing.json sets $0.00 rates for {} model(s) in this submission, so that usage is submitted at $0.00 for those rates:",
+        zero_rate_models.len()
+    );
+    for (model_id, summary) in zero_rate_models {
+        message.push_str(&format!("\n    {model_id} {}", zero_rate_marker(summary)));
+    }
+    Some(message)
 }
 
 fn report_zero_rate_custom_overrides(submitted_models: &[String]) {
@@ -6532,13 +6566,8 @@ mod tests {
         ];
 
         let named = zero_rate_overrides_in_submission(&overrides, &submitted);
-        assert_eq!(
-            named,
-            vec![
-                "free-input-only".to_string(),
-                "free-local-model".to_string()
-            ]
-        );
+        let named_ids: Vec<&str> = named.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(named_ids, ["free-input-only", "free-local-model"]);
 
         let warning = zero_rate_override_submit_warning(&named)
             .expect("zero-rate overrides in a submission must be reported");
@@ -6555,6 +6584,29 @@ mod tests {
 
         assert!(zero_rate_overrides_in_submission(&overrides, &submitted).is_empty());
         assert!(zero_rate_override_submit_warning(&[]).is_none());
+    }
+
+    /// An override that zeroes one side of a model still charges real money on
+    /// the other, so neither surface may call it free or say its usage is
+    /// submitted at zero cost.
+    #[test]
+    fn half_free_override_is_not_described_as_free() {
+        let overrides = custom_overrides(&[("free-input-only", Some(0.0), Some(0.000015))]);
+        let submitted = vec!["free-input-only".to_string()];
+
+        let named = zero_rate_overrides_in_submission(&overrides, &submitted);
+        let warning =
+            zero_rate_override_submit_warning(&named).expect("a $0.00 rate must still be reported");
+
+        assert!(warning.contains("free-input-only"), "{warning}");
+        assert!(
+            !warning.contains("zero cost"),
+            "output charges $15.00/1M, so its usage is not submitted at zero cost: {warning}"
+        );
+        assert!(
+            warning.contains("input"),
+            "the warning must say which rate is $0.00: {warning}"
+        );
     }
 
     #[test]
