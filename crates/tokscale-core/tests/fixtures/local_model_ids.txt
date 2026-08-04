@@ -70,10 +70,15 @@ gpt-5.1-codex-low | openai | gpt | 5.1 | 1.25 | 10.0
 gpt-5.1-codex-max | openai | gpt | 5.1 | 1.25 | 10.0
 gpt-5.1-codex-max-high | openai | gpt | 5.1 | 1.25 | 10.0
 gpt-5.1-codex-max-xhigh | openai | gpt | 5.1 | 1.25 | 10.0
-gpt-5.2 | github-copilot | gpt | 5.2 | 1.75 | 14.0
+# GitHub publishes no Copilot rate for gpt-5.2 or gpt-5.2-codex, and the only
+# rate models.dev carries for them is a byte-identical copy of openai/gpt-5.2 —
+# a vendor passthrough quote, not what a Copilot subscriber is billed. tokscale
+# refuses to price these two under Copilot, so they are acceptable-None here.
+# The same ids under `openai` keep OpenAI's real rate below.
+gpt-5.2 | github-copilot | gpt | 5.2 | NONE | NONE
 gpt-5.2 | openai | gpt | 5.2 | 1.75 | 14.0
 gpt-5.2 | openai-codex | gpt | 5.2 | 1.75 | 14.0
-gpt-5.2-codex | github-copilot | gpt | 5.2 | 1.75 | 14.0
+gpt-5.2-codex | github-copilot | gpt | 5.2 | NONE | NONE
 gpt-5.2-codex | openai | gpt | 5.2 | 1.75 | 14.0
 gpt-5.2-high | openai | gpt | 5.2 | 1.75 | 14.0
 gpt-5.2-xhigh | openai | gpt | 5.2 | 1.75 | 14.0

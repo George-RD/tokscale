@@ -166,9 +166,74 @@ fn key_has_version(matched_lower: &str, version: &str) -> bool {
     matched_lower.contains(&dashed) || matched_lower.contains(&dotted)
 }
 
-/// Build the lookup exactly as `PricingService` does for cached datasets
-/// (filter github_copilot, no cursor overrides needed for these ids, models.dev
-/// as the long-tail source), or `None` when the cache is absent.
+/// Mirror of `PricingService::filter_models_dev_data`: the Copilot
+/// vendor-passthrough rows are dropped before the dataset is indexed, so a bare
+/// `gpt-5.2` lookup cannot land on `github-copilot/gpt-5.2` by way of the
+/// model-part index.
+fn filter_models_dev(mut data: HashMap<String, ModelPricing>) -> HashMap<String, ModelPricing> {
+    data.retain(|key, _| !is_copilot_vendor_passthrough(key, None));
+    data
+}
+
+/// Mirror of `pricing::is_copilot_vendor_passthrough`, which is crate-private.
+///
+/// Production refuses these before consulting the lookup at all; without the
+/// same refusal here the mirror resolves them through the surviving
+/// `openai/gpt-5.2` row and keeps asserting the passthrough rate this branch
+/// exists to stop charging.
+fn is_copilot_vendor_passthrough(model_id: &str, provider_id: Option<&str>) -> bool {
+    const MODELS: &[&str] = &["gpt-5.2", "gpt-5.2-codex"];
+    const TIERS: &[&str] = &[
+        "-minimal", "-low", "-medium", "-high", "-xhigh", "-auto", "-none",
+    ];
+
+    let lower = model_id.trim().to_lowercase();
+    let scoped_by_key =
+        lower.starts_with("github-copilot/") || lower.starts_with("github_copilot/");
+    let terminal = if scoped_by_key {
+        lower.split('/').next_back().unwrap_or(&lower)
+    } else {
+        lower.as_str()
+    };
+
+    let copilot_scoped = scoped_by_key
+        || provider_id.is_some_and(|provider| {
+            provider.trim().to_lowercase().replace('-', "_") == "github_copilot"
+        });
+    if !copilot_scoped {
+        return false;
+    }
+
+    let base = terminal
+        .strip_suffix(')')
+        .and_then(|rest| rest.rsplit_once('('))
+        .filter(|(base, tier)| {
+            !base.is_empty()
+                && base.trim() == *base
+                && matches!(
+                    *tier,
+                    "minimal" | "low" | "medium" | "high" | "xhigh" | "auto" | "none"
+                )
+        })
+        .map(|(base, _)| base)
+        .unwrap_or(terminal);
+    let base = TIERS
+        .iter()
+        .find_map(|suffix| base.strip_suffix(suffix))
+        .unwrap_or(base);
+
+    MODELS.contains(&base)
+}
+
+/// Build the lookup exactly as `PricingService` does for cached datasets: the
+/// unpriced LiteLLM rows filtered out, the Copilot vendor-passthrough rows
+/// filtered out of models.dev, no cursor overrides needed for these ids, and
+/// models.dev as the long-tail source. `None` when the cache is absent.
+///
+/// The two Copilot guards are mirrored rather than skipped because a mirror
+/// that bypasses them asserts invariants against a dataset the binary never
+/// sees — which is exactly how this file kept asserting the passthrough rate
+/// after production stopped serving it.
 fn load_lookup() -> Option<PricingLookup> {
     let (Some(litellm_data), Some(openrouter_data), Some(models_dev_data)) = (
         litellm::load_cached_any_age(),
@@ -183,7 +248,7 @@ fn load_lookup() -> Option<PricingLookup> {
         openrouter_data,
         HashMap::new(),
         HashMap::new(),
-        models_dev_data,
+        filter_models_dev(models_dev_data),
     ))
 }
 
@@ -192,6 +257,9 @@ fn lookup_id(
     id: &str,
     provider: Option<&str>,
 ) -> Option<(String, ModelPricing)> {
+    if is_copilot_vendor_passthrough(id, provider) {
+        return None;
+    }
     lookup
         .lookup_with_provider(id, provider)
         .map(|r| (r.matched_key, r.pricing))

@@ -382,18 +382,28 @@ impl PricingService {
     }
 
     /// Exact-match the built-in GitHub overrides, accepting the Copilot-scoped
-    /// spelling (`github-copilot/oswe-vscode-prime`) as well as the bare id.
-    /// Mirrors how `PricingLookup` matches its Cursor and Sakana overrides.
+    /// spelling (`github-copilot/oswe-vscode-prime`, or LiteLLM's
+    /// `github_copilot/`) as well as the bare id. Mirrors how `PricingLookup`
+    /// matches its Cursor and Sakana overrides.
+    ///
+    /// The namespaced retry is restricted to the Copilot namespaces on
+    /// purpose. Stripping any namespace would hand GitHub's Raptor mini rate —
+    /// and the `GitHub` source label, which claims GitHub published this
+    /// number for this key — to `openai/oswe-vscode-prime` or
+    /// `anthropic/oswe-vscode-prime`, ids GitHub says nothing about. These
+    /// rates are only GitHub's within GitHub's own namespace.
     fn lookup_github_override(&self, model_id: &str) -> Option<LookupResult> {
         let lower = model_id.trim().to_lowercase();
         let key = if self.github.contains_key(&lower) {
             lower
         } else {
-            let terminal = lower.split('/').next_back()?.to_string();
-            if terminal == lower || !self.github.contains_key(&terminal) {
+            let terminal = ["github-copilot/", "github_copilot/"]
+                .iter()
+                .find_map(|prefix| lower.strip_prefix(prefix))?;
+            if !self.github.contains_key(terminal) {
                 return None;
             }
-            terminal
+            terminal.to_string()
         };
 
         Some(LookupResult {
@@ -1192,13 +1202,15 @@ mod tests {
             openai_passthrough.clone(),
         );
         data.insert("openai/gpt-5.2".into(), openai_passthrough);
-        // GitHub's own cache-read rate ($0.50/1M) rather than xAI's native
-        // $0.30 — the evidence that models.dev tracks GitHub for this row.
+        // Verbatim from live models.dev (accessed 2026-08-05): $2.00 / $6.00 /
+        // $0.50 per 1M. The cache-read rate is GitHub's own rather than xAI's
+        // native $0.30 — the evidence that models.dev tracks GitHub for this
+        // row, and the reason the numbers here have to be the real ones.
         data.insert(
             "github-copilot/grok-4.5".into(),
             ModelPricing {
-                input_cost_per_token: Some(2e-7),
-                output_cost_per_token: Some(1.5e-6),
+                input_cost_per_token: Some(2e-6),
+                output_cost_per_token: Some(6e-6),
                 cache_read_input_token_cost: Some(5e-7),
                 ..Default::default()
             },
@@ -1315,7 +1327,7 @@ mod tests {
         let service = copilot_service();
 
         for (model, expected_input) in [
-            ("github-copilot/grok-4.5", 2e-7),
+            ("github-copilot/grok-4.5", 2e-6),
             ("github-copilot/claude-sonnet-4.5", 3e-6),
         ] {
             let result = service
@@ -1909,6 +1921,32 @@ mod tests {
 
         assert_eq!(result.source, "GitHub");
         assert_eq!(result.matched_key, "oswe-vscode-prime");
+    }
+
+    // The rates are GitHub's only inside GitHub's namespace. Stripping any
+    // namespace would hand Raptor mini's rate — and a `GitHub` source label
+    // asserting GitHub published it for that key — to ids GitHub says nothing
+    // about.
+    #[test]
+    fn test_github_override_rejects_foreign_namespaces() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+
+        for model in [
+            "openai/oswe-vscode-prime",
+            "anthropic/oswe-vscode-prime",
+            "some-router/openai/oswe-vscode-prime",
+        ] {
+            assert!(
+                service.lookup_with_source(model, None).is_none(),
+                "{model} is not GitHub's key and must not receive GitHub's rate"
+            );
+        }
+
+        // LiteLLM's underscore spelling of the same namespace stays accepted.
+        let litellm_spelling = service
+            .lookup_with_source("github_copilot/oswe-vscode-prime", None)
+            .expect("LiteLLM's namespace spelling must still resolve");
+        assert_eq!(litellm_spelling.matched_key, "oswe-vscode-prime");
     }
 
     #[test]
