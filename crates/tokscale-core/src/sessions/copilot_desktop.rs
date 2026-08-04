@@ -404,6 +404,38 @@ mod tests {
     }
 
     #[test]
+    fn keeps_reading_events_after_an_undecodable_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("data.db");
+        let conn = create_copilot_desktop_db(&db_path);
+        insert_session(&conn, "session-1", "auto", 100, 50, 0, 0);
+        drop(conn);
+
+        let events_dir = dir.path().join("session-state").join("session-1");
+        fs::create_dir_all(&events_dir).unwrap();
+        let mut fixture = Vec::new();
+        fixture.extend_from_slice(
+            br#"{"type":"session.start","data":{"context":{"cwd":"/Users/alice/project"}}}"#,
+        );
+        fixture.push(b'\n');
+        // A lone 0xff can never appear in valid UTF-8, so `BufRead::lines()`
+        // reports this line as `InvalidData` and `map_while(Result::ok)` would
+        // treat it as end of file, losing the model change below it.
+        fixture.extend_from_slice(b"{\"type\":\"session.note\",\"data\":\"\xff\xfe\"}\n");
+        fixture.extend_from_slice(
+            br#"{"type":"session.model_change","data":{"newModel":"claude-sonnet-4-5"}}"#,
+        );
+        fixture.push(b'\n');
+        fs::write(events_dir.join("events.jsonl"), &fixture).unwrap();
+
+        let messages = parse_copilot_desktop_db(&db_path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "claude-sonnet-4-5");
+        assert_eq!(messages[0].provider_id, "anthropic");
+    }
+
+    #[test]
     fn parse_copilot_desktop_db_uses_github_copilot_provider_for_auto() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("data.db");
