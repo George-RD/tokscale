@@ -1725,6 +1725,35 @@ mod tests {
     }
 
     #[test]
+    fn test_friendli_override_yields_to_a_contradicting_provider_hint() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+
+        // K-EXAONE is open weights, so a session that reports a different host
+        // was billed by that host at its own rate — FriendliAI's card says
+        // nothing about it. This is the same reasoning that keeps the bare
+        // terminal segment unmatched without a FriendliAI hint, applied to the
+        // spellings that name the model in full. The `friendli/` prefix does
+        // not overrule the hint: the hint is what the session says billed, the
+        // prefix is a label the client baked into the id.
+        let contradicted: &[(&str, &str)] = &[
+            (K_EXAONE_MODEL_ID, "together_ai"),
+            (K_EXAONE_MODEL_ID, "openrouter"),
+            (K_EXAONE_MODEL_ID, "freerouter"),
+            ("friendli/LGAI-EXAONE/K-EXAONE-236B-A23B", "together_ai"),
+            ("friendliai/LGAI-EXAONE/K-EXAONE-236B-A23B", "openrouter"),
+        ];
+
+        for (model_id, provider_id) in contradicted {
+            let result =
+                service.lookup_with_source_and_provider(model_id, None, Some(*provider_id));
+            assert!(
+                !matches!(result.as_ref(), Some(r) if r.source == "FriendliAI"),
+                "{model_id:?} under provider {provider_id:?} must not take FriendliAI's rate"
+            );
+        }
+    }
+
+    #[test]
     fn test_friendli_override_does_not_price_other_models() {
         let service = PricingService::new(HashMap::new(), HashMap::new());
 

@@ -1088,11 +1088,24 @@ impl PricingLookup {
     ///
     /// An id naming any other model stays unmatched even under the hint — the
     /// map is an exact rate card for one model, not a FriendliAI-wide default.
+    ///
+    /// A hint naming a DIFFERENT vendor suppresses the override in every
+    /// spelling, including the `friendli/`-prefixed ones. That is the same
+    /// reasoning as the missing terminal fallback, applied in the other
+    /// direction: these are open weights other hosts resell at their own rates,
+    /// so if the session says someone else billed, FriendliAI's card is not the
+    /// rate. The hint is what the session reports as the billing entity; the
+    /// path prefix is only a label the client baked into the id, so the hint
+    /// wins when the two disagree.
     fn exact_match_friendli(
         &self,
         model_id: &str,
         provider_id: Option<&str>,
     ) -> Option<LookupResult> {
+        if provider_id.is_some() && !is_friendli_provider(provider_id) {
+            return None;
+        }
+
         if let Some(result) = self.friendli_override(model_id) {
             return Some(result);
         }
