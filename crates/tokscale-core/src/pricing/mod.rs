@@ -94,6 +94,7 @@ pub(crate) fn describe_error(error: &(dyn std::error::Error + 'static)) -> Strin
 pub struct PricingService {
     custom: CustomPricing,
     lookup: PricingLookup,
+    github: HashMap<String, ModelPricing>,
 }
 
 impl PricingService {
@@ -127,6 +128,7 @@ impl PricingService {
                 Self::build_sakana_overrides(),
                 Self::filter_models_dev_data(models_dev_data),
             ),
+            github: Self::build_github_overrides(),
         }
     }
 
@@ -268,6 +270,86 @@ impl PricingService {
             },
         );
         overrides
+    }
+
+    // @keep: GitHub-published pricing for a model no upstream dataset carries,
+    // plus the provenance caveat on the id -> display-name binding. Both halves
+    // are load-bearing; see the ID BINDING note below before trusting the key.
+    //
+    // `oswe-vscode-prime` is GitHub Copilot's "Raptor mini" (GA, fine-tuned by
+    // GitHub). Neither models.dev nor LiteLLM carries it — a search of both live
+    // datasets on 2026-08-05 returned zero hits for `oswe` and zero for
+    // `raptor` — so without this override every Raptor mini session is unpriced.
+    //
+    // Rates source: GitHub's own table, verbatim
+    // (https://raw.githubusercontent.com/github/docs/main/data/tables/copilot/models-and-pricing.yml,
+    // rendered at
+    // https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing,
+    // accessed 2026-08-05):
+    //   - model: 'Raptor mini', provider: github, release_status: GA,
+    //     input: $0.25, cached_input: $0.025, output: $2.00,
+    //     notes: "Uses GPT-5 mini pricing"
+    // Per token: input 2.5e-7, output 2e-6, cache read 2.5e-8. GitHub publishes
+    // NO cache-write rate, so `cache_creation_input_token_cost` stays None
+    // rather than being guessed, and publishes no long-context tiers, so no
+    // `*_above_*` field is populated.
+    //
+    // ID BINDING (confidence: HIGH on the rate, MEDIUM-HIGH on the id).
+    // GitHub publishes no model ids anywhere — its table keys on display names
+    // only — so the `oswe-vscode-prime` -> "Raptor mini" binding does not come
+    // from GitHub. It comes from third-party clients relaying Copilot's own
+    // /models API: zed-industries/zed#49514 lists `"model": "oswe-vscode-prime"`
+    // under the display name "Raptor mini", and the pi extension
+    // WSeubring/pi-extension-raptor-mini hardcodes
+    // `const RAPTOR_ID = "oswe-vscode-prime"`. Two independent signals
+    // corroborate it: those clients report the model's capability family as
+    // `gpt-5-mini`, and GitHub's own note says "Uses GPT-5 mini pricing" at a
+    // rate byte-identical to GPT-5 mini's. That is strong but not first-party,
+    // and it is recorded here rather than left implicit so the next reader can
+    // re-check the binding instead of assuming GitHub documented it. If GitHub
+    // ever reassigns the id, this entry misprices silently — revisit it, do not
+    // extend it to sibling ids on the strength of this comment.
+    //
+    // Reports source label "GitHub" (the publisher of the rate) and is
+    // consulted only AFTER the entire upstream lookup chain returns nothing, so
+    // any real LiteLLM/OpenRouter/models.dev row always wins — strictly more
+    // deferential than the Cursor/Sakana overrides, which outrank fuzzy
+    // matching.
+    fn build_github_overrides() -> HashMap<String, ModelPricing> {
+        let mut overrides = HashMap::with_capacity(1);
+        overrides.insert(
+            "oswe-vscode-prime".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(2.5e-7),
+                output_cost_per_token: Some(2e-6),
+                cache_read_input_token_cost: Some(2.5e-8),
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+        overrides
+    }
+
+    /// Exact-match the built-in GitHub overrides, accepting the Copilot-scoped
+    /// spelling (`github-copilot/oswe-vscode-prime`) as well as the bare id.
+    /// Mirrors how `PricingLookup` matches its Cursor and Sakana overrides.
+    fn lookup_github_override(&self, model_id: &str) -> Option<LookupResult> {
+        let lower = model_id.trim().to_lowercase();
+        let key = if self.github.contains_key(&lower) {
+            lower
+        } else {
+            let terminal = lower.split('/').next_back()?.to_string();
+            if terminal == lower || !self.github.contains_key(&terminal) {
+                return None;
+            }
+            terminal
+        };
+
+        Some(LookupResult {
+            pricing: self.github.get(&key)?.clone(),
+            source: "GitHub".into(),
+            matched_key: key,
+        })
     }
 
     async fn fetch_inner() -> Result<Self, String> {
@@ -423,8 +505,21 @@ impl PricingService {
             return None;
         }
 
-        self.lookup
-            .lookup_with_source_and_provider(model_id, force_source, provider_id)
+        if let Some(result) =
+            self.lookup
+                .lookup_with_source_and_provider(model_id, force_source, provider_id)
+        {
+            return Some(result);
+        }
+
+        // Built-in GitHub-published rates are the last resort, so a real
+        // upstream row always wins. `force_source` names an upstream dataset,
+        // and answering it from a built-in override would misreport where the
+        // number came from.
+        if force_source.is_none() {
+            return self.lookup_github_override(model_id);
+        }
+        None
     }
 
     pub fn calculate_cost(
@@ -467,6 +562,17 @@ impl PricingService {
             return 0.0;
         }
 
+        if let Some(result) = self.github_override_for_unresolved(model_id, provider_id) {
+            return compute_cost(
+                &result.pricing,
+                usage.input,
+                usage.output,
+                usage.cache_read,
+                usage.cache_write,
+                usage.reasoning,
+            );
+        }
+
         self.lookup
             .calculate_cost_with_provider(model_id, provider_id, usage)
     }
@@ -485,8 +591,34 @@ impl PricingService {
             return false;
         }
 
+        if let Some(result) = self.github_override_for_unresolved(model_id, provider_id) {
+            return result.pricing.covers_usage(usage);
+        }
+
         self.lookup
             .covers_usage_with_provider(model_id, provider_id, usage)
+    }
+
+    /// The built-in GitHub override for `model_id`, but only when the upstream
+    /// chain cannot resolve it at all.
+    ///
+    /// `calculate_cost_with_provider` and `covers_usage_with_provider` delegate
+    /// to `PricingLookup`, which applies cross-row rate borrowing and OpenAI's
+    /// full-request tiering on top of a resolution — so the override cannot be
+    /// substituted for that path, only consulted when it yields nothing.
+    fn github_override_for_unresolved(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        if self
+            .lookup
+            .lookup_with_provider(model_id, provider_id)
+            .is_some()
+        {
+            return None;
+        }
+        self.lookup_github_override(model_id)
     }
 
     fn lookup_custom(&self, model_id: &str) -> Option<LookupResult> {
@@ -1614,6 +1746,100 @@ mod tests {
         assert_eq!(result.source, "Sakana");
         assert_eq!(result.matched_key, "fugu-ultra");
         assert_eq!(result.pricing.input_cost_per_token, Some(5e-6));
+    }
+
+    // GitHub publishes a rate for "Raptor mini" ($0.25 / $2.00 / $0.025 per
+    // 1M); neither models.dev nor LiteLLM carries the model at all.
+    #[test]
+    fn test_github_returns_pricing_for_oswe_vscode_prime() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let result = service
+            .lookup_with_source("oswe-vscode-prime", None)
+            .expect("Raptor mini must price from the built-in GitHub override");
+
+        assert_eq!(result.source, "GitHub");
+        assert_eq!(result.matched_key, "oswe-vscode-prime");
+        assert_eq!(result.pricing.input_cost_per_token, Some(2.5e-7));
+        assert_eq!(result.pricing.output_cost_per_token, Some(2e-6));
+        assert_eq!(result.pricing.cache_read_input_token_cost, Some(2.5e-8));
+        // GitHub publishes no cache-write rate and no long-context tier, so
+        // neither is invented here.
+        assert_eq!(result.pricing.cache_creation_input_token_cost, None);
+        assert_eq!(result.pricing.input_cost_per_token_above_272k_tokens, None);
+        assert_eq!(result.pricing.output_cost_per_token_above_272k_tokens, None);
+    }
+
+    #[test]
+    fn test_github_override_resolves_copilot_scoped_oswe_vscode_prime() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let result = service
+            .lookup_with_source("github-copilot/oswe-vscode-prime", None)
+            .expect("the copilot-scoped spelling must resolve too");
+
+        assert_eq!(result.source, "GitHub");
+        assert_eq!(result.matched_key, "oswe-vscode-prime");
+    }
+
+    #[test]
+    fn test_github_override_calculate_cost_and_coverage() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let usage = TokenBreakdown {
+            input: 1_000_000,
+            output: 100_000,
+            cache_read: 50_000,
+            cache_write: 0,
+            reasoning: 0,
+        };
+
+        assert!(service.covers_usage_with_provider(
+            "oswe-vscode-prime",
+            Some("github-copilot"),
+            &usage
+        ));
+        let cost = service.calculate_cost_with_provider(
+            "oswe-vscode-prime",
+            Some("github-copilot"),
+            &usage,
+        );
+        let expected = 1_000_000.0 * 2.5e-7 + 100_000.0 * 2e-6 + 50_000.0 * 2.5e-8;
+        assert!((cost - expected).abs() < 1e-10, "unexpected cost: {cost}");
+    }
+
+    // Mirrors `test_sakana_yields_to_litellm_exact`: the override is a
+    // stopgap for a model upstream does not carry, so the day upstream does
+    // carry it, upstream wins.
+    #[test]
+    fn test_github_override_yields_to_litellm_exact() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "oswe-vscode-prime".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.002),
+                ..Default::default()
+            },
+        );
+        let service = PricingService::new(litellm, HashMap::new());
+        let result = service
+            .lookup_with_source("oswe-vscode-prime", None)
+            .unwrap();
+
+        assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.pricing.input_cost_per_token, Some(0.001));
+    }
+
+    #[test]
+    fn test_github_override_skipped_when_force_source_set() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+
+        for source in ["litellm", "openrouter", "models.dev", "custom"] {
+            assert!(
+                service
+                    .lookup_with_source("oswe-vscode-prime", Some(source))
+                    .is_none(),
+                "forcing {source} must not surface the built-in override"
+            );
+        }
     }
 
     #[test]
