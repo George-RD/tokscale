@@ -26,6 +26,33 @@ fn prime_pricing_cache(base: &Path) {
     }
 }
 
+/// Seed every pricing dataset from disk, LiteLLM with `litellm_data`.
+///
+/// `prime_pricing_cache` leaves models.dev uncached, so a run under it still
+/// fetches models.dev live and prices from whatever rate that service
+/// publishes at test time. Any assertion on a cost then moves when a vendor
+/// changes a price. Writing all three caches keeps the run off the network and
+/// makes the expected cost a property of the fixture.
+fn prime_pricing_cache_with_litellm(base: &Path, litellm_data: &str) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs();
+    let empty = format!(r#"{{"timestamp":{},"data":{{}}}}"#, now);
+    let litellm = format!(r#"{{"timestamp":{},"data":{}}}"#, now, litellm_data);
+
+    for dir in [
+        base.join("Library/Caches/tokscale"),
+        base.join(".cache/tokscale"),
+        base.join(".config/tokscale/cache"),
+    ] {
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("pricing-litellm.json"), &litellm).unwrap();
+        fs::write(dir.join("pricing-openrouter.json"), &empty).unwrap();
+        fs::write(dir.join("pricing-models-dev.json"), &empty).unwrap();
+    }
+}
+
 fn prime_override_pricing_cache(config_dir: &Path) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3605,6 +3632,12 @@ fn test_submit_reports_generic_routing_label_usage_at_zero_cost() {
 #[test]
 fn test_submit_fails_fast_on_unpriced_usage_only_with_strict_pricing() {
     let tmp = create_empty_fixture_dir();
+    // gpt-4o at $10/M in and $20/M out, so the priced row below costs exactly
+    // $0.02 no matter what OpenAI charges the day this runs.
+    prime_pricing_cache_with_litellm(
+        tmp.path(),
+        r#"{"gpt-4o":{"input_cost_per_token":0.00001,"output_cost_per_token":0.00002}}"#,
+    );
     let message_dir = tmp
         .path()
         .join(".local/share/opencode/storage/message/unpriced");
@@ -3649,9 +3682,9 @@ fn test_submit_fails_fast_on_unpriced_usage_only_with_strict_pricing() {
         ))
         .stdout(predicate::str::contains("custom-pricing.json"))
         // 1,500 priced tokens plus the single zero-cost one, and a cost that
-        // comes only from the priced row.
+        // comes only from the priced row: 1000 * $10/M + 500 * $20/M.
         .stdout(predicate::str::contains("Total tokens: 1,501"))
-        .stdout(predicate::str::contains("Total cost: $0.01"));
+        .stdout(predicate::str::contains("Total cost: $0.02"));
 
     cmd_with_home(tmp.path())
         .env("TOKSCALE_API_TOKEN", "test-token")
