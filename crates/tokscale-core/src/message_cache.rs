@@ -941,7 +941,11 @@ fn parser_version(client: ClientId) -> u32 {
         // buckets repeat, and fingerprints the complete sessions metadata tree.
         // v6 persists whether an unknown unified model was deliberately
         // fail-closed due to conflicting child attribution evidence.
-        ClientId::Grok => 6,
+        // v6->v7: session files are now parsed past undecodable lines instead
+        // of stopping at the first one, and usage dedup keys carry the record's
+        // file position. Both change the parse of byte-identical input, so
+        // cached entries hold truncated and under-deduplicated output (#1031).
+        ClientId::Grok => 7,
         // v1 retained MiMo's embedded `cost` value but did not preserve its
         // provider-reported provenance. Reparse cached rows so strict submit
         // validation does not reject valid unknown-model MiMo usage offline.
@@ -2321,8 +2325,11 @@ mod tests {
     }
 
     #[test]
-    fn test_grok_conflicted_model_attribution_bumps_parser_version() {
-        assert_eq!(parser_version(ClientId::Grok), 6);
+    fn test_grok_resilient_line_reader_parser_version_invalidates_v6_entries() {
+        // A Grok session file that is never appended to again keeps its
+        // fingerprint forever, so only the version bump discards the truncated
+        // v6 parse and forces a cold reparse.
+        assert_eq!(parser_version(ClientId::Grok), 7);
     }
 
     #[test]
