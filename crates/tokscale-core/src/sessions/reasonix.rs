@@ -26,8 +26,6 @@ struct ReasonixStat {
     #[serde(default)]
     cache_hit: i64,
     #[serde(default)]
-    cache_miss: i64,
-    #[serde(default)]
     total: i64,
     #[serde(default)]
     requests: i64,
@@ -76,15 +74,11 @@ pub fn parse_reasonix_file(path: &Path) -> Vec<UnifiedMessage> {
             let timestamp = parse_timestamp_value(&record.ts)?;
             let (provider_id, model_id) = split_model_ref(&record.model);
             let cache_read = non_negative(record.cache_hit);
-            let cache_miss = non_negative(record.cache_miss);
             let raw_input = non_negative(record.prompt);
-            // Reasonix defines cache_miss as prompt tokens not served from a
-            // cache. It is ordinary input, not a cache-creation/write charge.
-            let input = if cache_miss > 0 {
-                cache_miss
-            } else {
-                raw_input.saturating_sub(cache_read)
-            };
+            // Cache misses may be reported independently of the prompt
+            // total, so they must not replace ordinary input. Preserve the
+            // complete request total by subtracting only cache hits.
+            let input = raw_input.saturating_sub(cache_read);
             let reasoning = non_negative(record.reasoning).min(non_negative(record.completion));
             let tokens = TokenBreakdown {
                 input,
@@ -97,7 +91,7 @@ pub fn parse_reasonix_file(path: &Path) -> Vec<UnifiedMessage> {
                 return None;
             }
 
-            Some(UnifiedMessage::new_with_dedup(
+            let mut message = UnifiedMessage::new_with_dedup(
                 "reasonix",
                 model_id,
                 provider_id,
@@ -112,7 +106,9 @@ pub fn parse_reasonix_file(path: &Path) -> Vec<UnifiedMessage> {
                     record.requests,
                     record.total
                 )),
-            ))
+            );
+            message.message_count = record.requests.clamp(1, i64::from(i32::MAX)) as i32;
+            Some(message)
         })
         .collect()
 }
@@ -140,11 +136,13 @@ mod tests {
         assert_eq!(message.client, "reasonix");
         assert_eq!(message.provider_id, "deepseek");
         assert_eq!(message.model_id, "deepseek-v4");
-        assert_eq!(message.tokens.input, 10);
+        assert_eq!(message.tokens.input, 70);
         assert_eq!(message.tokens.output, 15);
         assert_eq!(message.tokens.reasoning, 5);
         assert_eq!(message.tokens.cache_read, 30);
         assert_eq!(message.tokens.cache_write, 0);
+        assert_eq!(message.tokens.total(), 120);
+        assert_eq!(message.message_count, 1);
         assert_eq!(
             message.timestamp,
             parse_timestamp_value(&serde_json::json!("2026-08-04T09:10:11Z")).unwrap()
@@ -175,6 +173,45 @@ mod tests {
         assert_eq!(
             split_model_ref("claude-sonnet-4"),
             ("anthropic".into(), "claude-sonnet-4".into())
+        );
+    }
+
+    #[test]
+    fn preserves_totals_when_cache_miss_disagrees_with_prompt_input() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            "{\"ts\":\"2026-08-04T09:10:11Z\",\"model\":\"deepseek/chat\",\"prompt\":100,\"completion\":20,\"cache_hit\":30,\"cache_miss\":10,\"total\":120}\n",
+        )
+        .unwrap();
+
+        let messages = parse_reasonix_file(file.path());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 70);
+        assert_eq!(messages[0].tokens.cache_read, 30);
+        assert_eq!(messages[0].tokens.total(), 120);
+    }
+
+    #[test]
+    fn maps_authoritative_request_count_to_bounded_message_count() {
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            concat!(
+                "{\"ts\":\"2026-08-04T09:10:11Z\",\"model\":\"deepseek/chat\",\"prompt\":1,\"completion\":1,\"total\":2,\"requests\":3}\n",
+                "{\"ts\":\"2026-08-04T09:11:11Z\",\"model\":\"deepseek/chat\",\"prompt\":1,\"completion\":1,\"total\":2,\"requests\":0}\n",
+                "{\"ts\":\"2026-08-04T09:12:11Z\",\"model\":\"deepseek/chat\",\"prompt\":1,\"completion\":1,\"total\":2,\"requests\":9999999999}\n",
+            ),
+        )
+        .unwrap();
+
+        let messages = parse_reasonix_file(file.path());
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.message_count)
+                .collect::<Vec<_>>(),
+            vec![3, 1, i32::MAX]
         );
     }
 }
