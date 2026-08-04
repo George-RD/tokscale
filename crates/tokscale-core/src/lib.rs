@@ -8943,9 +8943,9 @@ mod tests {
     }
 
     // The common outage is partial, not total: one source fails or one cache
-    // expires while another still loads, so `has_published_pricing_data` stays
-    // true and the surviving dataset covers a sliver of the usage. Everything
-    // it misses is zeroed and uploaded over the top of the recorded spend.
+    // expires while another still loads, and the surviving dataset covers a
+    // sliver of the usage. Everything it misses is zeroed and uploaded over the
+    // top of the recorded spend.
     #[test]
     fn submission_aborts_when_a_partial_outage_zeroes_most_of_the_usage() {
         let pricing = pricing_service_missing_the_model_under_test();

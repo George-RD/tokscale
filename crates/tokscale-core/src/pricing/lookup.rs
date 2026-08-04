@@ -1207,22 +1207,6 @@ impl PricingLookup {
             .is_some_and(|result| result.pricing.covers_usage(usage))
     }
 
-    /// Whether any published pricing dataset made it into this lookup.
-    ///
-    /// The three dynamic sources each degrade to their own stale cache and
-    /// then to nothing, so a machine that has never fetched them and cannot
-    /// reach the network builds a lookup holding none of them. That is not the
-    /// same as a dataset that loaded and happens to omit a model, and callers
-    /// that would otherwise read "no price" as a fact about the usage need to
-    /// tell the two apart.
-    ///
-    /// The Cursor and Sakana overrides are deliberately excluded: they are a
-    /// dozen hardcoded rows compiled into the binary and are always present,
-    /// so counting them would make this permanently true.
-    pub(crate) fn has_published_pricing_data(&self) -> bool {
-        !self.litellm.is_empty() || !self.openrouter.is_empty() || !self.models_dev.is_empty()
-    }
-
     /// Resolve `model_id` for pricing `usage`, borrowing the rates the
     /// provider-hinted row omits from the canonical unhinted row.
     ///
@@ -1272,21 +1256,6 @@ impl PricingLookup {
             pricing: filled,
             ..hinted
         })
-    }
-}
-
-// Lives here rather than beside the rest of `PricingService` because the
-// answer is a property of the lookup's datasets, and `pricing::lookup` is the
-// module that can read them.
-impl super::PricingService {
-    /// Whether any published pricing dataset loaded at all.
-    ///
-    /// False means the pricing service came up empty — every source failed to
-    /// fetch and none had a cache of any age — not that some model is missing.
-    /// A submission uses this to refuse to report $0.00 for usage it simply
-    /// could not price.
-    pub fn has_published_pricing_data(&self) -> bool {
-        self.lookup.has_published_pricing_data()
     }
 }
 
