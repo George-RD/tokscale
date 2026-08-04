@@ -204,6 +204,17 @@ impl PricingService {
     // upstream matches, before the fuzzy stage — so a real upstream entry
     // always wins if one ever appears.
     //
+    // KEYED ON THE MODEL ID ALONE, not on a provider-joined string. The lookup
+    // receives `model_id` and `provider_id` as separate arguments and never
+    // concatenates them, and the parsers keep them separate all the way down
+    // (`sessions/pi.rs` sets `model_id = message.model` and
+    // `provider_id = message.provider` independently). The composite
+    // `friendli/LGAI-EXAONE/K-EXAONE-236B-A23B` in #1035 is the unpriced-model
+    // error message's display form — `format!("{}/{}", provider_id, model_id)`
+    // in lib.rs — so an override keyed that way would be dead code on real
+    // input. `PricingLookup::exact_match_friendli` accepts the FriendliAI
+    // provider-qualified spellings of this key on top of the bare path.
+    //
     // Rates source: https://friendli.ai/api/public/model-apis, the JSON
     // endpoint that generates https://friendli.ai/pricing (the pricing page
     // itself is a client-side React shell whose static HTML carries no
@@ -244,7 +255,7 @@ impl PricingService {
     fn build_friendli_overrides() -> HashMap<String, ModelPricing> {
         let mut overrides = HashMap::with_capacity(1);
         overrides.insert(
-            "friendli/LGAI-EXAONE/K-EXAONE-236B-A23B".to_string(),
+            "LGAI-EXAONE/K-EXAONE-236B-A23B".to_string(),
             ModelPricing {
                 input_cost_per_token: Some(2e-7),
                 output_cost_per_token: Some(8e-7),
@@ -1651,15 +1662,28 @@ mod tests {
         assert!((cost - expected).abs() < 1e-10);
     }
 
-    const K_EXAONE_ID: &str = "friendli/LGAI-EXAONE/K-EXAONE-236B-A23B";
+    // The arguments a real session actually produces. Parsers carry `model_id`
+    // and `provider_id` as separate fields and never join them (see
+    // `sessions/pi.rs`), so the id that reaches the lookup is the bare
+    // vendor-qualified model path. The composite `friendli/LGAI-EXAONE/...`
+    // string in #1035 is the unpriced-model ERROR MESSAGE's display form, built
+    // in lib.rs as `format!("{}/{}", provider_id, model_id)` — not a lookup key.
+    const K_EXAONE_MODEL_ID: &str = "LGAI-EXAONE/K-EXAONE-236B-A23B";
+    const FRIENDLI_PROVIDER_ID: &str = "friendli";
+
+    fn lookup_k_exaone(service: &PricingService) -> LookupResult {
+        service
+            .lookup_with_source_and_provider(K_EXAONE_MODEL_ID, None, Some(FRIENDLI_PROVIDER_ID))
+            .expect("K-EXAONE must price from the split (model_id, provider_id) form")
+    }
 
     #[test]
     fn test_friendli_prices_k_exaone() {
         let service = PricingService::new(HashMap::new(), HashMap::new());
-        let result = service.lookup_with_source(K_EXAONE_ID, None).unwrap();
+        let result = lookup_k_exaone(&service);
 
         assert_eq!(result.source, "FriendliAI");
-        assert_eq!(result.matched_key, K_EXAONE_ID);
+        assert_eq!(result.matched_key, K_EXAONE_MODEL_ID);
         assert_eq!(result.pricing.input_cost_per_token, Some(2e-7));
         assert_eq!(result.pricing.output_cost_per_token, Some(8e-7));
         assert_eq!(result.pricing.cache_read_input_token_cost, Some(1e-7));
@@ -1669,12 +1693,57 @@ mod tests {
     }
 
     #[test]
+    fn test_friendli_prices_k_exaone_across_client_spellings() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+
+        // Every shape a client can emit for the same served model: the bare
+        // vendor path with and without a provider hint, both provider-qualified
+        // spellings (`friendliai/` is the ecosystem-canonical one), and the
+        // terminal segment alone — the last only under a FriendliAI hint, since
+        // by itself it says nothing about who served the open weights.
+        let cases: &[(&str, Option<&str>)] = &[
+            (K_EXAONE_MODEL_ID, Some(FRIENDLI_PROVIDER_ID)),
+            (K_EXAONE_MODEL_ID, Some("friendliai")),
+            (K_EXAONE_MODEL_ID, None),
+            ("friendli/LGAI-EXAONE/K-EXAONE-236B-A23B", None),
+            ("friendliai/LGAI-EXAONE/K-EXAONE-236B-A23B", None),
+            ("K-EXAONE-236B-A23B", Some(FRIENDLI_PROVIDER_ID)),
+            ("K-EXAONE-236B-A23B", Some("friendliai")),
+        ];
+
+        for (model_id, provider_id) in cases {
+            let result = service
+                .lookup_with_source_and_provider(model_id, None, *provider_id)
+                .unwrap_or_else(|| panic!("{model_id:?} (provider {provider_id:?}) must resolve"));
+            assert_eq!(result.source, "FriendliAI", "for {model_id:?}");
+            assert_eq!(
+                result.pricing.input_cost_per_token,
+                Some(2e-7),
+                "for {model_id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_friendli_override_does_not_price_other_models() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+
+        // A FriendliAI provider hint does not turn the override into a blanket
+        // rate card: only the model it was sourced for may take these numbers.
+        for model_id in ["LGAI-EXAONE/EXAONE-4.0-32B", "openai/gpt-5", "some-model"] {
+            let result =
+                service.lookup_with_source_and_provider(model_id, None, Some(FRIENDLI_PROVIDER_ID));
+            assert!(
+                !matches!(result.as_ref(), Some(r) if r.source == "FriendliAI"),
+                "{model_id:?} must not take FriendliAI's K-EXAONE rate"
+            );
+        }
+    }
+
+    #[test]
     fn test_friendli_k_exaone_has_no_long_context_tier() {
         let service = PricingService::new(HashMap::new(), HashMap::new());
-        let pricing = service
-            .lookup_with_source(K_EXAONE_ID, None)
-            .unwrap()
-            .pricing;
+        let pricing = lookup_k_exaone(&service).pricing;
 
         // One flat tier spans the whole 262,144-token window, so every tiered
         // field must stay None; a populated one would invent a second rate.
@@ -1694,19 +1763,35 @@ mod tests {
     fn test_friendli_k_exaone_cost_is_flat_across_the_context_window() {
         let service = PricingService::new(HashMap::new(), HashMap::new());
         // Well past 272K input tokens: without a tier the base rate still applies.
-        let cost = service.calculate_cost(K_EXAONE_ID, 300_000, 10_000, 50_000, 0, 0);
+        let usage = TokenBreakdown {
+            input: 300_000,
+            output: 10_000,
+            cache_read: 50_000,
+            cache_write: 0,
+            reasoning: 0,
+        };
+        let cost = service.calculate_cost_with_provider(
+            K_EXAONE_MODEL_ID,
+            Some(FRIENDLI_PROVIDER_ID),
+            &usage,
+        );
         let expected = 300_000.0 * 2e-7 + 10_000.0 * 8e-7 + 50_000.0 * 1e-7;
         assert!(
             (cost - expected).abs() < 1e-10,
             "got {cost}, want {expected}"
         );
+        assert!(service.covers_usage_with_provider(
+            K_EXAONE_MODEL_ID,
+            Some(FRIENDLI_PROVIDER_ID),
+            &usage
+        ));
     }
 
     #[test]
     fn test_friendli_yields_to_litellm_exact() {
         let mut litellm = HashMap::new();
         litellm.insert(
-            K_EXAONE_ID.to_lowercase(),
+            K_EXAONE_MODEL_ID.to_lowercase(),
             ModelPricing {
                 input_cost_per_token: Some(0.001),
                 output_cost_per_token: Some(0.002),
@@ -1714,7 +1799,7 @@ mod tests {
             },
         );
         let service = PricingService::new(litellm, HashMap::new());
-        let result = service.lookup_with_source(K_EXAONE_ID, None).unwrap();
+        let result = lookup_k_exaone(&service);
 
         assert_eq!(result.source, "LiteLLM");
         assert_eq!(result.pricing.input_cost_per_token, Some(0.001));

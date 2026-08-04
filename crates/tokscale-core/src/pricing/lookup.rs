@@ -91,6 +91,16 @@ const FUZZY_BLOCKLIST: &[&str] = &[
 // full id runs before this guard.
 const SIMILARITY_BLOCKED_ROUTER_PREFIXES: &[&str] = &["freerouter/"];
 
+// Spellings of the FriendliAI vendor name that a client can put in either the
+// provider field or the leading path segment of a model id. `friendliai` is the
+// ecosystem-canonical form (LiteLLM's rows for this vendor are
+// `friendliai/meta-llama-3.1-*`); `friendli` is what the senpi/oh-my-openagent
+// session in #1035 reports. `provider_identity` does not fold the two together,
+// and unifying them there would change resolution for every other lookup, so
+// the pair is kept local to the FriendliAI override matcher.
+const FRIENDLI_PROVIDER_NAMES: &[&str] = &["friendli", "friendliai"];
+const FRIENDLI_PROVIDER_PREFIXES: &[&str] = &["friendli/", "friendliai/"];
+
 const MAX_LOOKUP_CACHE_ENTRIES: usize = 512;
 const TIERED_PRICING_THRESHOLD_128K_TOKENS: f64 = 128_000.0;
 const TIERED_PRICING_THRESHOLD_200K_TOKENS: f64 = 200_000.0;
@@ -690,7 +700,7 @@ impl PricingLookup {
         }
 
         // FriendliAI built-in overrides, same precedence as Cursor and Sakana.
-        if let Some(result) = self.exact_match_friendli(model_id) {
+        if let Some(result) = self.exact_match_friendli(model_id, provider_id) {
             return Some(result);
         }
 
@@ -1061,12 +1071,55 @@ impl PricingLookup {
         None
     }
 
-    /// The FriendliAI overrides are keyed by their full provider-qualified path
-    /// (`friendli/LGAI-EXAONE/K-EXAONE-236B-A23B`), so unlike the Cursor and
-    /// Sakana matchers there is no terminal-segment fallback: a bare
-    /// `k-exaone-236b-a23b` says nothing about who served it, and the same open
-    /// weights are resold elsewhere at other rates.
-    fn exact_match_friendli(&self, model_id: &str) -> Option<LookupResult> {
+    /// The FriendliAI overrides are keyed by the vendor-qualified model path
+    /// FriendliAI itself publishes (`LGAI-EXAONE/K-EXAONE-236B-A23B`), because
+    /// that is the `model_id` a real session carries — the provider arrives as
+    /// a separate argument and is never joined onto it (see
+    /// `build_friendli_overrides` in `pricing/mod.rs`).
+    ///
+    /// Three further spellings resolve, covering what clients actually emit:
+    ///   * `friendli/<path>` and `friendliai/<path>`, the provider-qualified
+    ///     forms. `friendliai/` is the ecosystem-canonical prefix — LiteLLM's
+    ///     own rows for this vendor are `friendliai/meta-llama-3.1-*`.
+    ///   * the terminal segment alone (`k-exaone-236b-a23b`), but ONLY under a
+    ///     FriendliAI provider hint. Unlike the Cursor and Sakana matchers
+    ///     there is no unconditional terminal fallback: these are open weights
+    ///     other hosts resell at their own rates, so without the hint the bare
+    ///     name says nothing about who billed for the request.
+    ///
+    /// An id naming any other model stays unmatched even under the hint — the
+    /// map is an exact rate card for one model, not a FriendliAI-wide default.
+    fn exact_match_friendli(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        if let Some(result) = self.friendli_override(model_id) {
+            return Some(result);
+        }
+
+        for prefix in FRIENDLI_PROVIDER_PREFIXES {
+            if let Some(path) = model_id.strip_prefix(prefix) {
+                if let Some(result) = self.friendli_override(path) {
+                    return Some(result);
+                }
+            }
+        }
+
+        if !is_friendli_provider(provider_id) {
+            return None;
+        }
+
+        // The map holds a handful of entries, so scanning for a terminal-segment
+        // match is cheaper than carrying a third index for it.
+        let key = self.friendli_lower.iter().find_map(|(lower_key, key)| {
+            let terminal = lower_key.rsplit('/').next()?;
+            (terminal != lower_key && terminal == model_id).then_some(key)
+        })?;
+        lookup_result_if_usable(self.friendli.get(key)?, "FriendliAI", key)
+    }
+
+    fn friendli_override(&self, model_id: &str) -> Option<LookupResult> {
         let key = self.friendli_lower.get(model_id)?;
         lookup_result_if_usable(self.friendli.get(key)?, "FriendliAI", key)
     }
@@ -2133,6 +2186,14 @@ fn has_similarity_blocked_router_prefix(model_id: &str) -> bool {
     SIMILARITY_BLOCKED_ROUTER_PREFIXES
         .iter()
         .any(|prefix| model_id.starts_with(prefix))
+}
+
+fn is_friendli_provider(provider_id: Option<&str>) -> bool {
+    provider_id.is_some_and(|provider| {
+        FRIENDLI_PROVIDER_NAMES
+            .iter()
+            .any(|name| provider.eq_ignore_ascii_case(name))
+    })
 }
 
 fn is_fuzzy_eligible(model_id: &str) -> bool {
