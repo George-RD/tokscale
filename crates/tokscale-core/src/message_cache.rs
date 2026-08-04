@@ -511,6 +511,25 @@ impl SourceFingerprint {
         Self::check_kimi_path_with_mode(path, cached, ContentHashMode::SamplesOnly)
     }
 
+    /// Fingerprint a Reasonix transcript together with its metadata and every
+    /// checkpoint sidecar. Checkpoint edits supply the authoritative turn
+    /// timestamps, so reusing a transcript-only cache would retain usage in
+    /// the wrong date bucket. Dynamic enumeration also detects sidecar
+    /// additions and removals because related fingerprints compare the full
+    /// path set.
+    pub(crate) fn check_reasonix_path_samples_only(
+        path: &Path,
+        cached: Option<&Self>,
+    ) -> Option<FingerprintStatus> {
+        let related_paths = crate::sessions::reasonix::reasonix_related_paths(path);
+        Self::check_path_with_related_mode(
+            path,
+            related_paths,
+            cached,
+            ContentHashMode::SamplesOnly,
+        )
+    }
+
     fn check_kimi_path_with_mode(
         path: &Path,
         cached: Option<&Self>,
@@ -912,6 +931,10 @@ fn parser_version(client: ClientId) -> u32 {
         // v1->v2: Kimchi's Pi-compatible messages now carry stable namespaced
         // deduplication keys.
         ClientId::Kimchi => 2,
+        // Initial Reasonix implementation. The fingerprint includes its meta
+        // and checkpoint sidecars because they define model, workspace, and
+        // turn timestamps.
+        ClientId::Reasonix => 1,
         // v1->v2: per-model token attribution now comes from
         // session_model_usage instead of crediting the whole session to
         // sessions.model, and dedup keys are namespaced per (session, model).
@@ -2373,6 +2396,63 @@ mod tests {
         std::fs::write(&events_path, b"event-2\n").unwrap();
         let updated_events = SourceFingerprint::from_grok_path(&updates_path).unwrap();
         assert_ne!(with_events, updated_events);
+    }
+
+    #[test]
+    fn test_reasonix_fingerprint_tracks_meta_and_checkpoint_add_change_remove() {
+        let dir = TempDir::new().unwrap();
+        let session_path = dir.path().join("session.jsonl");
+        std::fs::write(&session_path, b"{\"role\":\"assistant\"}\n").unwrap();
+
+        let initial = match SourceFingerprint::check_reasonix_path_samples_only(&session_path, None)
+        {
+            Some(FingerprintStatus::Changed(fingerprint)) => fingerprint,
+            _ => panic!("uncached Reasonix session must produce a fingerprint"),
+        };
+        assert!(matches!(
+            SourceFingerprint::check_reasonix_path_samples_only(&session_path, Some(&initial)),
+            Some(FingerprintStatus::Unchanged)
+        ));
+
+        let meta_path = session_path.with_extension("jsonl.meta");
+        std::fs::write(&meta_path, br#"{"model":"deepseek-v4"}"#).unwrap();
+        let with_meta = match SourceFingerprint::check_reasonix_path_samples_only(
+            &session_path,
+            Some(&initial),
+        ) {
+            Some(FingerprintStatus::Changed(fingerprint)) => fingerprint,
+            _ => panic!("Reasonix metadata creation must invalidate"),
+        };
+
+        let checkpoint_dir = dir.path().join("session.ckpt");
+        std::fs::create_dir_all(&checkpoint_dir).unwrap();
+        let checkpoint = checkpoint_dir.join("turn-0.json");
+        std::fs::write(&checkpoint, br#"{"time":"2026-06-20T10:00:00Z"}"#).unwrap();
+        let with_checkpoint = match SourceFingerprint::check_reasonix_path_samples_only(
+            &session_path,
+            Some(&with_meta),
+        ) {
+            Some(FingerprintStatus::Changed(fingerprint)) => fingerprint,
+            _ => panic!("Reasonix checkpoint creation must invalidate"),
+        };
+
+        std::fs::write(&checkpoint, br#"{"time":"2026-06-21T10:00:00Z"}"#).unwrap();
+        let changed_checkpoint = match SourceFingerprint::check_reasonix_path_samples_only(
+            &session_path,
+            Some(&with_checkpoint),
+        ) {
+            Some(FingerprintStatus::Changed(fingerprint)) => fingerprint,
+            _ => panic!("Reasonix checkpoint changes must invalidate"),
+        };
+
+        std::fs::remove_file(&checkpoint).unwrap();
+        assert!(matches!(
+            SourceFingerprint::check_reasonix_path_samples_only(
+                &session_path,
+                Some(&changed_checkpoint),
+            ),
+            Some(FingerprintStatus::Changed(_))
+        ));
     }
 
     #[test]

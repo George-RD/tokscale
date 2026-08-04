@@ -1695,6 +1695,27 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
+    let reasonix_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Reasonix)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source_with_fingerprint(
+                message_cache::CacheIdentity::for_client(ClientId::Reasonix),
+                path,
+                &source_cache,
+                pricing,
+                message_cache::SourceFingerprint::check_reasonix_path_samples_only,
+                sessions::reasonix::parse_reasonix_file,
+            )
+        })
+        .collect();
+    for outcome in reasonix_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     let senpi_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Senpi)
         .par_iter()
@@ -3616,6 +3637,20 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let kimchi_count = kimchi_msgs.len() as i32;
     counts.set(ClientId::Kimchi, kimchi_count);
     messages.extend(kimchi_msgs);
+
+    let reasonix_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::Reasonix)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::reasonix::parse_reasonix_file(path)
+                .into_iter()
+                .map(|message| unified_to_parsed(&message))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let reasonix_count = reasonix_msgs.len() as i32;
+    counts.set(ClientId::Reasonix, reasonix_count);
+    messages.extend(reasonix_msgs);
 
     let senpi_msgs: Vec<ParsedMessage> = scan_result
         .get(ClientId::Senpi)
