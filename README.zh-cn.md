@@ -439,6 +439,7 @@ tokscale pricing list-overrides
 6. **提供商前缀匹配** - 尝试常见前缀（`anthropic/`、`openai/` 等）
 7. **Cursor 模型定价** - LiteLLM/OpenRouter 中尚未收录的模型的硬编码定价（例如：`gpt-5.3-codex`）
 8. **模糊匹配** - 部分模型名称的词边界匹配
+9. **GitHub Copilot 定价** - 针对任何上游数据集都未收录的 Copilot 模型的 GitHub 公开费率（例如：`oswe-vscode-prime` /「Raptor mini」），最后才检查，因此上游条目始终优先
 
 ### 自定义价格覆盖
 
@@ -1818,6 +1819,8 @@ Tokscale 从 [LiteLLM 的价格数据库](https://github.com/BerriAI/litellm/blo
 **Cursor 模型定价**：对于 LiteLLM 和 OpenRouter 中都尚未收录的最新模型（例如 `gpt-5.3-codex`），Tokscale 使用从 [Cursor 模型文档](https://cursor.com/en-US/docs/models)获取的硬编码定价。这些覆盖在所有上游来源之后、模糊匹配之前检查，因此当真正的上游定价可用时会自动让步。
 
 **Sakana Fugu 定价**：Fugu Ultra 的成本根据 Sakana 公布的按量付费（pay-as-you-go）费率估算；`fugu` 路由模型有意不定价，因为它的成本就是其所编排的底层模型的浮动费率。
+
+**GitHub Copilot 定价**：GitHub 以 AI Credits 按[其自己公布的按 token 费率](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing)对 Copilot 用量计费。对于任何上游数据集都完全未收录的 Copilot 模型（目前是 `oswe-vscode-prime`，即「Raptor mini」），Tokscale 内置了 GitHub 的费率作为覆盖，并以来源标签 `GitHub` 报告。该覆盖在所有上游来源以及模糊匹配之后才检查，因此一旦上游数据集收录该模型便会自动让步。还有两个相反的例子：GitHub Copilot 下的 `gpt-5.2` 和 `gpt-5.2-codex` 有意不定价，因为 GitHub 根本没有为这两者公布 Copilot 费率，而唯一公布的费率与 OpenAI 的直销标价逐字节相同——那是供应商透传报价，而非 Copilot 订阅者实际被收取的金额。这两个模型的用量会从提交中排除并向用户报告，而不是按一个已知错误的费率计费。
 
 **缓存**：价格数据以 1 小时 TTL 缓存到磁盘，确保快速启动：
 - LiteLLM 缓存：`~/.config/tokscale/cache/pricing-litellm.json`

@@ -440,6 +440,7 @@ The pricing lookup uses a multi-step resolution strategy:
 6. **Provider Prefix Matching** - Tries common prefixes (`anthropic/`, `openai/`, etc.)
 7. **Cursor Model Pricing** - Hardcoded pricing for models not yet in LiteLLM/OpenRouter (e.g., `gpt-5.3-codex`)
 8. **Fuzzy Matching** - Word-boundary matching for partial model names
+9. **GitHub Copilot Pricing** - GitHub-published rates for Copilot models that no upstream dataset carries (e.g., `oswe-vscode-prime` / "Raptor mini"), consulted last so any upstream row wins
 
 ### Custom Pricing Overrides
 
@@ -1956,6 +1957,8 @@ Tokscale fetches real-time pricing from [LiteLLM's pricing database](https://git
 **Cursor Model Pricing**: For very recently released models not yet in either LiteLLM or OpenRouter (e.g., `gpt-5.3-codex`), Tokscale includes hardcoded pricing sourced from [Cursor's model docs](https://cursor.com/en-US/docs/models). These overrides are checked after all upstream sources but before fuzzy matching, so they automatically yield once real upstream pricing becomes available.
 
 **Sakana Fugu Pricing**: Fugu Ultra cost is estimated from Sakana's published pay-as-you-go rates; the `fugu` router model is intentionally left unpriced because its cost is the variable rate of whichever underlying model it orchestrated.
+
+**GitHub Copilot Pricing**: GitHub bills Copilot usage under AI Credits at [its own published per-token rates](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing). For Copilot models that no upstream dataset carries at all — currently `oswe-vscode-prime` ("Raptor mini") — Tokscale includes GitHub's rate as a built-in override, reported under the source label `GitHub`. It is consulted after every upstream source and after fuzzy matching, so it yields the moment an upstream dataset picks the model up. Two ids go the other way: `gpt-5.2` and `gpt-5.2-codex` under GitHub Copilot are deliberately left unpriced, because GitHub publishes no Copilot rate for either and the only rates anyone publishes are byte-identical copies of OpenAI's direct list price — a passthrough quote rather than what a Copilot subscriber is billed. Usage of those two is excluded from submissions and reported rather than charged at a rate known to be wrong.
 
 **Caching**: Pricing data is cached to disk with 1-hour TTL for fast startup:
 - LiteLLM cache: `~/.config/tokscale/cache/pricing-litellm.json`
