@@ -2185,7 +2185,8 @@ fn contains_delimited_major_minor(haystack: &str, major: char) -> bool {
 struct BlockedRoute<'a> {
     /// The segment naming the vendor the route forwards to — `nvidia` in
     /// `freerouter/nvidia/nemotron-3-ultra-550b-a55b`. `None` when the id
-    /// carries no vendor segment at all, which makes the route unidentifiable.
+    /// carries no vendor segment at all, in which case the model's author is
+    /// the only vendor the route identifies (see `blocked_route_keeps_vendor`).
     vendor: Option<&'a str>,
 }
 
@@ -2245,8 +2246,15 @@ fn similarity_blocked_route<'a>(
 /// stages), not at erosion as such: exact and prefix-stripped resolutions that
 /// keep the route's own vendor stay intact, and
 /// `freerouter/anthropic/claude-opus-4.6` still resolves to Anthropic's real
-/// list rate. Only a route that identifies no vendor, or whose resolution names
-/// a different one, goes unpriced.
+/// list rate.
+///
+/// A route with NO vendor segment (`freerouter/gpt-5.6`, or a bare model id
+/// under a freerouter provider) is a routine BYOK gateway shape, not a
+/// malformed one, so it is not refused wholesale — that would turn correct
+/// prices into no price. It keeps the model's OWN canonical entry: a dataset
+/// key carrying no provider segment at all, or one whose provider is the
+/// model's author. What it refuses is an arbitrary reseller — `kenari/...` for
+/// an NVIDIA model — which is the actual defect.
 fn blocked_route_keeps_vendor(
     route: &BlockedRoute<'_>,
     queried_id: &str,
@@ -2260,29 +2268,45 @@ fn blocked_route_keeps_vendor(
         return true;
     }
 
-    let Some(vendor) = route.vendor else {
-        return false;
-    };
-
     // A key with no provider segment is the model's own canonical entry rather
-    // than some other vendor's resale of it.
+    // than some other vendor's resale of it — there is no vendor in it to have
+    // been swapped. True whether or not the route named one.
     let Some(matched_provider) = matched.split('/').next().filter(|_| matched.contains('/')) else {
         return true;
     };
 
     let matched_tags = provider_identity::key_provider_tags(&matched);
-    let vendor_tags = provider_identity::provider_tags(vendor);
-    if matched_tags
-        .iter()
-        .any(|matched_tag| vendor_tags.iter().any(|tag| tag == matched_tag))
-    {
-        return true;
-    }
+    let names_same_vendor = |vendor: &str| {
+        let vendor_tags = provider_identity::provider_tags(vendor);
+        if matched_tags
+            .iter()
+            .any(|matched_tag| vendor_tags.iter().any(|tag| tag == matched_tag))
+        {
+            return true;
+        }
 
-    // `provider_identity` returns no tags for vendors it does not know, and two
-    // empty tag lists must not read as agreement — so fall back to comparing the
-    // names literally.
-    matched_provider.eq_ignore_ascii_case(vendor)
+        // `provider_identity` returns no tags for vendors it does not know, and
+        // two empty tag lists must not read as agreement — so fall back to
+        // comparing the names literally.
+        matched_provider.eq_ignore_ascii_case(vendor)
+    };
+
+    let Some(vendor) = route.vendor else {
+        // The route named a model and nothing else, so the model's author is
+        // the only vendor it identifies. A key under that author is the entry
+        // the same lookup returns with no provider hint at all; a key under
+        // anyone else is a guess at which reseller served the request.
+        return provider_identity::inferred_provider_from_model(route_model_segment(queried_id))
+            .is_some_and(names_same_vendor);
+    };
+
+    names_same_vendor(vendor)
+}
+
+/// The segment of a routed id that names a model rather than a hop — the last
+/// one, since every segment before it is a router, proxy, or vendor.
+fn route_model_segment(queried_id: &str) -> &str {
+    queried_id.rsplit('/').next().unwrap_or(queried_id)
 }
 
 fn is_friendli_provider(provider_id: Option<&str>) -> bool {
@@ -6476,6 +6500,16 @@ mod tests {
                 ..Default::default()
             },
         );
+        // A second model whose author is written into the key, so the
+        // vendor-less shapes below are not all one family.
+        openrouter.insert(
+            "openai/gpt-5.6".into(),
+            ModelPricing {
+                input_cost_per_token: Some(2e-6),
+                output_cost_per_token: Some(1e-5),
+                ..Default::default()
+            },
+        );
         openrouter
     }
 
@@ -6528,11 +6562,24 @@ mod tests {
         );
     }
 
-    // A route with no vendor segment at all identifies nothing, so no eroded
-    // candidate may stand in for it — least of all `kenari/...`.
+    // A route with no vendor segment names only a model, so the guard has to
+    // decide from the model name alone. Both halves are asserted together
+    // because either one alone is satisfied by a blanket answer: a rule that
+    // refuses every vendor-less route passes the first half, and a rule that
+    // accepts every one passes the second.
+    //
+    // Refused: `kenari.id` has no relation to the NVIDIA model whose name it
+    // carries, and nothing in `nemotron-3-ultra-550b-a55b` identifies an
+    // author, so `kenari/...` at $0 is a guess about who served the request.
+    //
+    // Kept: `anthropic/claude-opus-4.6` and `openai/gpt-5.6` are the models'
+    // own authors' entries — the same keys the lookup returns with no provider
+    // hint at all — so they are prices FOR those models, not guesses about the
+    // gateway.
     #[test]
-    fn unidentifiable_freerouter_route_is_unpriced() {
+    fn vendor_less_freerouter_route_refuses_a_reseller_but_keeps_the_authors_entry() {
         let lookup = freerouter_lookup();
+
         for (model_id, provider_id) in [
             ("nemotron-3-ultra-550b-a55b", Some("freerouter")),
             ("freerouter/nemotron-3-ultra-550b-a55b", None),
@@ -6541,6 +6588,67 @@ mod tests {
             assert!(
                 result.is_none(),
                 "{model_id:?} must be unpriced, got matched_key={:?}",
+                result.map(|r| r.matched_key)
+            );
+        }
+
+        for (model_id, provider_id, expected_key, expected_input) in [
+            (
+                "claude-opus-4.6",
+                Some("freerouter"),
+                "anthropic/claude-opus-4.6",
+                5e-6,
+            ),
+            ("gpt-5.6", Some("freerouter"), "openai/gpt-5.6", 2e-6),
+            (
+                "freerouter/claude-opus-4.6",
+                None,
+                "anthropic/claude-opus-4.6",
+                5e-6,
+            ),
+            ("freerouter/gpt-5.6", None, "openai/gpt-5.6", 2e-6),
+        ] {
+            let result = lookup
+                .lookup_with_provider(model_id, provider_id)
+                .unwrap_or_else(|| {
+                    panic!("{model_id:?} must keep the model's own canonical price")
+                });
+            assert_eq!(result.matched_key, expected_key, "for {model_id:?}");
+            assert_eq!(
+                result.pricing.input_cost_per_token,
+                Some(expected_input),
+                "for {model_id:?}"
+            );
+        }
+    }
+
+    // The canonical-entry allowance is not "any single candidate wins": a
+    // vendor-less route whose only candidate is a RESELLER of an
+    // author-identifiable model is still refused. Same `kenari` reseller as the
+    // fixture above, over a model whose author the name does identify — so the
+    // refusal here can only come from the reseller check, not from an
+    // unidentifiable model name.
+    #[test]
+    fn vendor_less_freerouter_route_refuses_a_reseller_of_an_identifiable_model() {
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "kenari/claude-opus-4.6".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0),
+                output_cost_per_token: Some(0.0),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(HashMap::new(), openrouter, HashMap::new());
+
+        for (model_id, provider_id) in [
+            ("claude-opus-4.6", Some("freerouter")),
+            ("freerouter/claude-opus-4.6", None),
+        ] {
+            let result = lookup.lookup_with_provider(model_id, provider_id);
+            assert!(
+                result.is_none(),
+                "{model_id:?} must not take a reseller's rate, got matched_key={:?}",
                 result.map(|r| r.matched_key)
             );
         }
@@ -6562,6 +6670,28 @@ mod tests {
             assert_eq!(result.matched_key, "anthropic/claude-opus-4.6");
             assert_eq!(result.pricing.input_cost_per_token, Some(5e-6));
         }
+    }
+
+    // A dataset key carrying no provider segment at all is the model's own
+    // entry by construction — there is no vendor in it to have been swapped —
+    // so a vendor-less freerouter route keeps it even after suffix erosion.
+    #[test]
+    fn vendor_less_freerouter_route_keeps_a_provider_less_dataset_key() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-5.6".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(2e-6),
+                output_cost_per_token: Some(1e-5),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("gpt-5.6-thinking", Some("freerouter"))
+            .expect("a provider-less dataset key must survive the guard");
+        assert_eq!(result.matched_key, "gpt-5.6");
     }
 
     // The suppression is scoped to `freerouter`: an id routed through any other
