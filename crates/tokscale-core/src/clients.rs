@@ -739,13 +739,19 @@ impl Default for ClientCounts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use serial_test::serial;
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
+    // These tests mutate process-global environment variables, so they take
+    // `#[serial]` rather than the private `Mutex` they used to share. The
+    // mutex made them exclusive with each other but not with the rest of the
+    // crate, which serializes on `serial_test` — two disjoint domains over one
+    // set of variables. `test_path_root_config_*` restores its snapshot of
+    // `TOKSCALE_CONFIG_DIR` on the way out, which is a *clear* when the
+    // developer has none set, and that clear landed in the middle of the
+    // pricing cache tests that redirect the same variable: they went on
+    // asserting against a temp path the code was no longer writing to while
+    // the real `~/.config/tokscale/cache` took the write. One domain is the
+    // only arrangement that holds, so nothing here may reintroduce a second.
     fn restore_env(var: &str, previous: Option<String>) {
         match previous {
             Some(value) => unsafe { std::env::set_var(var, value) },
@@ -808,8 +814,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_reasonix_stats_prefers_state_home_then_reasonix_home() {
-        let _guard = env_lock().lock().unwrap();
         let state_previous = std::env::var("REASONIX_STATE_HOME").ok();
         let home_previous = std::env::var("REASONIX_HOME").ok();
         unsafe {
@@ -831,8 +837,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_reasonix_stats_normalizes_env_roots_and_ignores_blank_values() {
-        let _guard = env_lock().lock().unwrap();
         let state_previous = std::env::var("REASONIX_STATE_HOME").ok();
         let home_previous = std::env::var("REASONIX_HOME").ok();
         let client = ClientId::Reasonix;
@@ -863,8 +869,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_reasonix_stats_expands_environment_references_before_normalizing_paths() {
-        let _guard = env_lock().lock().unwrap();
         let state_previous = std::env::var("REASONIX_STATE_HOME").ok();
         let root_previous = std::env::var("TOKSCALE_REASONIX_TEST_ROOT").ok();
         let unset_previous = std::env::var("TOKSCALE_REASONIX_TEST_UNSET").ok();
@@ -903,8 +909,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_reasonix_stats_ignores_env_roots_when_requested() {
-        let _guard = env_lock().lock().unwrap();
         let state_previous = std::env::var("REASONIX_STATE_HOME").ok();
         let home_previous = std::env::var("REASONIX_HOME").ok();
         unsafe {
@@ -924,8 +930,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_kimchi_defaults_to_home_agent_dir_without_env_override() {
-        let _guard = env_lock().lock().unwrap();
         let previous = std::env::var("KIMCHI_CODING_AGENT_DIR").ok();
         unsafe { std::env::remove_var("KIMCHI_CODING_AGENT_DIR") };
 
@@ -939,8 +945,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_kimchi_honors_agent_dir_env_override() {
-        let _guard = env_lock().lock().unwrap();
         let previous = std::env::var("KIMCHI_CODING_AGENT_DIR").ok();
         unsafe { std::env::set_var("KIMCHI_CODING_AGENT_DIR", "/custom/kimchi-agent") };
 
@@ -954,8 +960,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_senpi_defaults_to_home_agent_dir_without_env_override() {
-        let _guard = env_lock().lock().unwrap();
         let previous = std::env::var("SENPI_CODING_AGENT_DIR").ok();
         unsafe { std::env::remove_var("SENPI_CODING_AGENT_DIR") };
 
@@ -969,8 +975,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_senpi_honors_agent_dir_env_override() {
-        let _guard = env_lock().lock().unwrap();
         let previous = std::env::var("SENPI_CODING_AGENT_DIR").ok();
         unsafe { std::env::set_var("SENPI_CODING_AGENT_DIR", "/custom/senpi-agent") };
 
@@ -1110,8 +1116,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_path_root_xdg_data_uses_env_var_when_set() {
-        let _guard = env_lock().lock().unwrap();
         let previous = std::env::var("XDG_DATA_HOME").ok();
         unsafe { std::env::set_var("XDG_DATA_HOME", "/tmp/xdg-data-home") };
 
@@ -1122,8 +1128,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_path_root_xdg_data_falls_back_when_unset() {
-        let _guard = env_lock().lock().unwrap();
         let previous = std::env::var("XDG_DATA_HOME").ok();
         unsafe { std::env::remove_var("XDG_DATA_HOME") };
 
@@ -1134,8 +1140,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_path_root_xdg_data_ignores_env_when_disabled() {
-        let _guard = env_lock().lock().unwrap();
         let previous = std::env::var("XDG_DATA_HOME").ok();
         unsafe { std::env::set_var("XDG_DATA_HOME", "/tmp/xdg-data-home") };
 
@@ -1146,8 +1152,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_path_root_config_uses_override_when_set() {
-        let _guard = env_lock().lock().unwrap();
         let previous_override = std::env::var("TOKSCALE_CONFIG_DIR").ok();
         let previous_xdg = std::env::var("XDG_CONFIG_HOME").ok();
         unsafe {
@@ -1164,8 +1170,8 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    #[serial]
     fn test_path_root_config_uses_xdg_config_home_when_override_unset() {
-        let _guard = env_lock().lock().unwrap();
         let previous_override = std::env::var("TOKSCALE_CONFIG_DIR").ok();
         let previous_xdg = std::env::var("XDG_CONFIG_HOME").ok();
         unsafe {
@@ -1182,13 +1188,13 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "windows")]
+    #[serial]
     fn test_path_root_config_uses_dirs_config_dir_on_windows() {
         // Windows must resolve PathRoot::Config to the same root that
         // paths::get_config_dir() and get_antigravity_cache_dir() use,
         // i.e. dirs::config_dir() (= %APPDATA%\tokscale). Hardcoding
         // {home}/.config/tokscale would diverge from the writer side
         // and silently hide synced Antigravity data from reports.
-        let _guard = env_lock().lock().unwrap();
         let previous_override = std::env::var("TOKSCALE_CONFIG_DIR").ok();
         unsafe {
             std::env::remove_var("TOKSCALE_CONFIG_DIR");
@@ -1209,8 +1215,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_path_root_config_ignores_env_when_disabled() {
-        let _guard = env_lock().lock().unwrap();
         let previous_override = std::env::var("TOKSCALE_CONFIG_DIR").ok();
         let previous_xdg = std::env::var("XDG_CONFIG_HOME").ok();
         unsafe {
@@ -1234,8 +1240,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_path_root_env_var_uses_env_when_set() {
-        let _guard = env_lock().lock().unwrap();
         let var = "TOKSCALE_TEST_PATH_ROOT";
         let previous = std::env::var(var).ok();
         unsafe { std::env::set_var(var, "/tmp/custom-root") };
@@ -1251,8 +1257,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_path_root_env_var_falls_back_when_unset() {
-        let _guard = env_lock().lock().unwrap();
         let var = "TOKSCALE_TEST_PATH_ROOT";
         let previous = std::env::var(var).ok();
         unsafe { std::env::remove_var(var) };
@@ -1268,8 +1274,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_path_root_env_var_ignores_env_when_disabled() {
-        let _guard = env_lock().lock().unwrap();
         let var = "TOKSCALE_TEST_PATH_ROOT";
         let previous = std::env::var(var).ok();
         unsafe { std::env::set_var(var, "/tmp/custom-root") };
@@ -1328,8 +1334,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_gjc_data_dir_path() {
-        let _guard = env_lock().lock().unwrap();
         let var = "GJC_CODING_AGENT_DIR";
         let previous = std::env::var(var).ok();
         // Env unset (cleared): resolves under home/.gjc/agent/sessions.
@@ -1400,8 +1406,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_zed_data_dir_path() {
-        let _guard = env_lock().lock().unwrap();
         let previous = std::env::var("XDG_DATA_HOME").ok();
         unsafe { std::env::remove_var("XDG_DATA_HOME") };
 

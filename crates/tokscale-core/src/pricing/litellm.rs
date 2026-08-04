@@ -597,6 +597,14 @@ mod tests {
     /// The `starts_with` assertion is what makes that substitution honest; if
     /// the redirect ever stopped taking effect the test would otherwise pass
     /// vacuously while the real cache was still being overwritten.
+    ///
+    /// `#[serial]` is load-bearing for the same reason. `TOKSCALE_CONFIG_DIR`
+    /// is process-global, so a concurrent test that restores its own snapshot
+    /// of it clears this redirect mid-run; the path captured at the top then
+    /// stops being the path the code would write to, and the final assertion
+    /// checks an empty temp dir while the real cache is clobbered. The
+    /// `assert_eq!` after the fetch catches that breach directly instead of
+    /// letting it read as a pass.
     #[tokio::test]
     #[serial]
     async fn a_fetch_with_caching_disabled_writes_no_cache_file() {
@@ -616,6 +624,12 @@ mod tests {
             .await
             .expect("the fixture serves one usable base-priced row");
         assert!(data.contains_key("usable"), "the fetch itself must succeed");
+
+        assert_eq!(
+            cache::get_cache_path(CACHE_FILENAME),
+            cache_path,
+            "the redirect moved while the fetch ran, so the assertion below would check a path the fetch never targeted"
+        );
 
         assert!(
             !cache_path.exists(),

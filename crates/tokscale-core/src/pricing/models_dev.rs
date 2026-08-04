@@ -214,6 +214,11 @@ mod tests {
             data.contains_key("anthropic/claude"),
             "the fetch itself must succeed"
         );
+        assert_eq!(
+            cache::get_cache_path(CACHE_FILENAME),
+            cache_path,
+            "the redirect moved while the fetch ran, so the assertion below would check a path the fetch never targeted"
+        );
 
         assert!(
             !cache_path.exists(),
