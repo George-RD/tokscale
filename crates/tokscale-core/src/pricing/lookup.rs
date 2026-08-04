@@ -1541,9 +1541,12 @@ pub fn compute_cost(
     // because upstream LiteLLM does not currently declare 128k or 256k
     // cache-read pricing for any model. If upstream begins emitting
     // those keys, also add matching fields to `ModelPricing`,
-    // `has_any_usable_pricing`, `has_any_valid_above_tier_value`, and
-    // `has_meaningful_tier_support`; otherwise tier walks will silently
-    // undercost long-context cache reads on those models.
+    // `has_any_valid_above_tier_value`, and `has_meaningful_tier_support`;
+    // otherwise tier walks will silently undercost long-context cache reads
+    // on those models. `has_any_usable_pricing` and
+    // `quotes_zero_for_every_published_rate` need no entry here: they read
+    // `ModelPricing::all_rates`, whose exhaustive destructure fails to
+    // compile until the new field is added there.
     let cache_read_cost = tiered_cost(
         cache_read_clamped,
         pricing.cache_read_input_token_cost,
@@ -1929,25 +1932,10 @@ fn is_valid_price_value(value: f64) -> bool {
 /// subscription-based providers like Perplexity) are useless for
 /// pay-per-token cost estimation and should be deprioritized.
 fn has_any_usable_pricing(pricing: &ModelPricing) -> bool {
-    [
-        pricing.input_cost_per_token,
-        pricing.output_cost_per_token,
-        pricing.cache_read_input_token_cost,
-        pricing.cache_creation_input_token_cost,
-        pricing.input_cost_per_token_above_128k_tokens,
-        pricing.input_cost_per_token_above_200k_tokens,
-        pricing.input_cost_per_token_above_256k_tokens,
-        pricing.input_cost_per_token_above_272k_tokens,
-        pricing.output_cost_per_token_above_128k_tokens,
-        pricing.output_cost_per_token_above_200k_tokens,
-        pricing.output_cost_per_token_above_256k_tokens,
-        pricing.output_cost_per_token_above_272k_tokens,
-        pricing.cache_read_input_token_cost_above_200k_tokens,
-        pricing.cache_read_input_token_cost_above_272k_tokens,
-        pricing.cache_creation_input_token_cost_above_200k_tokens,
-    ]
-    .into_iter()
-    .any(|opt| opt.is_some_and(is_valid_price_value))
+    pricing
+        .all_rates()
+        .into_iter()
+        .any(|opt| opt.is_some_and(is_valid_price_value))
 }
 
 fn lookup_result_if_usable(

@@ -26,6 +26,53 @@ pub struct ModelPricing {
 }
 
 impl ModelPricing {
+    /// Every rate this row can carry, base rates and long-context tiers alike,
+    /// as one list.
+    ///
+    /// The destructure below deliberately carries no `..` rest pattern: adding
+    /// a field to `ModelPricing` breaks this function at compile time and
+    /// forces the new rate into every predicate that reasons over *all* rates.
+    /// Leaving that to a comment is not safe enough for
+    /// `quotes_zero_for_every_published_rate`, where an overlooked rate is
+    /// treated as zero and a new paid tier would read as free.
+    pub(crate) fn all_rates(&self) -> [Option<f64>; 15] {
+        let Self {
+            input_cost_per_token,
+            input_cost_per_token_above_128k_tokens,
+            input_cost_per_token_above_200k_tokens,
+            input_cost_per_token_above_256k_tokens,
+            input_cost_per_token_above_272k_tokens,
+            output_cost_per_token,
+            output_cost_per_token_above_128k_tokens,
+            output_cost_per_token_above_200k_tokens,
+            output_cost_per_token_above_256k_tokens,
+            output_cost_per_token_above_272k_tokens,
+            cache_creation_input_token_cost,
+            cache_creation_input_token_cost_above_200k_tokens,
+            cache_read_input_token_cost,
+            cache_read_input_token_cost_above_200k_tokens,
+            cache_read_input_token_cost_above_272k_tokens,
+        } = *self;
+
+        [
+            input_cost_per_token,
+            input_cost_per_token_above_128k_tokens,
+            input_cost_per_token_above_200k_tokens,
+            input_cost_per_token_above_256k_tokens,
+            input_cost_per_token_above_272k_tokens,
+            output_cost_per_token,
+            output_cost_per_token_above_128k_tokens,
+            output_cost_per_token_above_200k_tokens,
+            output_cost_per_token_above_256k_tokens,
+            output_cost_per_token_above_272k_tokens,
+            cache_creation_input_token_cost,
+            cache_creation_input_token_cost_above_200k_tokens,
+            cache_read_input_token_cost,
+            cache_read_input_token_cost_above_200k_tokens,
+            cache_read_input_token_cost_above_272k_tokens,
+        ]
+    }
+
     /// Whether every rate this row publishes is exactly `0.0`, so the buckets
     /// it never quotes can be read as zero as well.
     ///
@@ -65,28 +112,13 @@ impl ModelPricing {
             |rate: Option<f64>| rate.is_some_and(|rate| rate.is_finite() && rate >= 0.0);
         quoted_rate(self.input_cost_per_token)
             && quoted_rate(self.output_cost_per_token)
-            && [
-                self.input_cost_per_token,
-                self.input_cost_per_token_above_128k_tokens,
-                self.input_cost_per_token_above_200k_tokens,
-                self.input_cost_per_token_above_256k_tokens,
-                self.input_cost_per_token_above_272k_tokens,
-                self.output_cost_per_token,
-                self.output_cost_per_token_above_128k_tokens,
-                self.output_cost_per_token_above_200k_tokens,
-                self.output_cost_per_token_above_256k_tokens,
-                self.output_cost_per_token_above_272k_tokens,
-                self.cache_creation_input_token_cost,
-                self.cache_creation_input_token_cost_above_200k_tokens,
-                self.cache_read_input_token_cost,
-                self.cache_read_input_token_cost_above_200k_tokens,
-                self.cache_read_input_token_cost_above_272k_tokens,
-            ]
-            .into_iter()
-            .flatten()
-            // Rejects NaN as well as any real price, so a row carrying an
-            // unusable rate is never mistaken for a published zero.
-            .all(|rate| rate == 0.0)
+            && self
+                .all_rates()
+                .into_iter()
+                .flatten()
+                // Rejects NaN as well as any real price, so a row carrying an
+                // unusable rate is never mistaken for a published zero.
+                .all(|rate| rate == 0.0)
     }
 
     /// Whether this row can price every populated token bucket under
