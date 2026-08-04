@@ -13,11 +13,63 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 
-use crate::TokenBreakdown;
+use crate::{provider_identity, TokenBreakdown};
 
 pub use litellm::ModelPricing;
 
 static PRICING_SERVICE: OnceCell<Arc<PricingService>> = OnceCell::const_new();
+
+/// Copilot-served models whose only available rates are an upstream vendor's,
+/// not GitHub's, and which therefore must resolve to no price at all.
+///
+/// models.dev's Copilot catalog generally tracks GitHub's own published table —
+/// 24 of its 29 `github-copilot/*` entries match it exactly, and
+/// `github-copilot/grok-4.5` proves the sourcing by carrying GitHub's $0.50/1M
+/// cache-read rate rather than xAI's native $0.30. These two are the exception:
+/// they are absent from GitHub's table entirely, and their models.dev rates
+/// ($1.75 / $14.00 / $0.175 per 1M) are byte-identical to models.dev's own
+/// `openai/gpt-5.2` row. That is an OpenAI passthrough quote, not what a
+/// Copilot subscriber is billed under AI Credits.
+///
+/// Withholding a price is the conservative failure mode: an unpriced row is
+/// excluded from submission and reported to the user, whereas a wrongly priced
+/// row silently corrupts a public spend leaderboard. This mirrors the reasoning
+/// that leaves Sakana's `fugu` router unpriced in `build_sakana_overrides`.
+///
+/// GitHub's rate table:
+/// <https://raw.githubusercontent.com/github/docs/main/data/tables/copilot/models-and-pricing.yml>
+/// (accessed 2026-08-05).
+const COPILOT_VENDOR_PASSTHROUGH_MODELS: &[&str] = &["gpt-5.2", "gpt-5.2-codex"];
+
+/// Whether this lookup is for one of the Copilot passthrough models above.
+///
+/// Both spellings of the namespace are recognized, because the two datasets
+/// disagree: models.dev keys on `github-copilot/`, LiteLLM on `github_copilot/`
+/// (`provider_identity` canonicalizes the former to the latter). The bare id
+/// plus a `github-copilot` provider hint is checked too — that is the shape
+/// Copilot session logs actually carry, and it resolves to the very same
+/// models.dev row, so matching only the slash-qualified spelling would leave
+/// the wrong-price path wide open.
+///
+/// Deliberately narrow: the terminal segment must equal one of the two ids
+/// exactly, so the other 27 `github-copilot/*` entries keep pricing normally.
+fn is_copilot_vendor_passthrough(model_id: &str, provider_id: Option<&str>) -> bool {
+    let lower = model_id.trim().to_lowercase();
+    let scoped_by_key =
+        lower.starts_with("github-copilot/") || lower.starts_with("github_copilot/");
+    let terminal = if scoped_by_key {
+        lower.split('/').next_back().unwrap_or(&lower)
+    } else {
+        lower.as_str()
+    };
+
+    let copilot_scoped = scoped_by_key
+        || provider_id.is_some_and(|provider| {
+            provider_identity::canonical_provider(provider).as_deref() == Some("github_copilot")
+        });
+
+    copilot_scoped && COPILOT_VENDOR_PASSTHROUGH_MODELS.contains(&terminal)
+}
 
 // @keep: explains why we do not just print the error.
 /// Flatten an error and its `source()` chain into one line.
@@ -73,9 +125,24 @@ impl PricingService {
                 openrouter_data,
                 Self::build_cursor_overrides(),
                 Self::build_sakana_overrides(),
-                models_dev_data,
+                Self::filter_models_dev_data(models_dev_data),
             ),
         }
+    }
+
+    /// Drop the Copilot vendor-passthrough rows before they can be indexed.
+    ///
+    /// The resolution guard in `lookup_with_source_and_provider` is what makes
+    /// these ids unpriced; this removes them from the dataset as well so they
+    /// cannot leak in sideways. `PricingLookup` builds a model-part index over
+    /// models.dev keys, and `gpt-5.2` in that index could otherwise resolve to
+    /// `github-copilot/gpt-5.2` for a lookup that never mentions Copilot at
+    /// all.
+    fn filter_models_dev_data(
+        mut data: HashMap<String, ModelPricing>,
+    ) -> HashMap<String, ModelPricing> {
+        data.retain(|key, _| !is_copilot_vendor_passthrough(key, None));
+        data
     }
 
     // @keep: records why the `github_copilot/` prefix filter that used to live
@@ -323,19 +390,7 @@ impl PricingService {
         model_id: &str,
         force_source: Option<&str>,
     ) -> Option<LookupResult> {
-        match force_source {
-            Some(source) if source.eq_ignore_ascii_case("custom") => {
-                return self.lookup_custom(model_id);
-            }
-            None => {
-                if let Some(result) = self.lookup_custom(model_id) {
-                    return Some(result);
-                }
-            }
-            Some(_) => {}
-        }
-
-        self.lookup.lookup_with_source(model_id, force_source)
+        self.lookup_with_source_and_provider(model_id, force_source, None)
     }
 
     pub fn lookup_with_source_and_provider(
@@ -354,6 +409,18 @@ impl PricingService {
                 }
             }
             Some(_) => {}
+        }
+
+        // Refusing here, rather than only dropping the dataset rows, is what
+        // makes the refusal stick: the lookup chain strips an unrecognized
+        // `github-copilot/` prefix and retries the terminal segment, so a
+        // suppressed row would otherwise fall straight through to the
+        // `openai/gpt-5.2` quote it was copied from — the same wrong number by
+        // another route. It sits below the custom pass on purpose: a user who
+        // writes their own rate for these ids has stated an intent we should
+        // not override.
+        if is_copilot_vendor_passthrough(model_id, provider_id) {
+            return None;
         }
 
         self.lookup
@@ -396,6 +463,10 @@ impl PricingService {
             );
         }
 
+        if is_copilot_vendor_passthrough(model_id, provider_id) {
+            return 0.0;
+        }
+
         self.lookup
             .calculate_cost_with_provider(model_id, provider_id, usage)
     }
@@ -408,6 +479,10 @@ impl PricingService {
     ) -> bool {
         if let Some(result) = self.custom.lookup_with_key(model_id) {
             return result.pricing.covers_usage(usage);
+        }
+
+        if is_copilot_vendor_passthrough(model_id, provider_id) {
+            return false;
         }
 
         self.lookup
@@ -915,6 +990,126 @@ mod tests {
 
         assert_eq!(result.source, "Custom");
         assert_eq!(result.pricing.input_cost_per_token, Some(0.000009));
+    }
+
+    /// models.dev rows shaped like the live Copilot catalog: the two vendor
+    /// passthrough entries, the `openai/` row they were copied from, and two
+    /// entries that do track GitHub's own published numbers.
+    fn copilot_models_dev() -> HashMap<String, ModelPricing> {
+        let openai_passthrough = ModelPricing {
+            input_cost_per_token: Some(1.75e-6),
+            output_cost_per_token: Some(1.4e-5),
+            cache_read_input_token_cost: Some(1.75e-7),
+            ..Default::default()
+        };
+        let mut data = HashMap::new();
+        data.insert("github-copilot/gpt-5.2".into(), openai_passthrough.clone());
+        data.insert(
+            "github-copilot/gpt-5.2-codex".into(),
+            openai_passthrough.clone(),
+        );
+        data.insert("openai/gpt-5.2".into(), openai_passthrough);
+        // GitHub's own cache-read rate ($0.50/1M) rather than xAI's native
+        // $0.30 — the evidence that models.dev tracks GitHub for this row.
+        data.insert(
+            "github-copilot/grok-4.5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(2e-7),
+                output_cost_per_token: Some(1.5e-6),
+                cache_read_input_token_cost: Some(5e-7),
+                ..Default::default()
+            },
+        );
+        data.insert(
+            "github-copilot/claude-sonnet-4.5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(3e-6),
+                output_cost_per_token: Some(1.5e-5),
+                cache_read_input_token_cost: Some(3e-7),
+                ..Default::default()
+            },
+        );
+        data
+    }
+
+    fn copilot_service() -> PricingService {
+        custom_service_with_models_dev(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            copilot_models_dev(),
+        )
+    }
+
+    // `github-copilot/gpt-5.2` and `-codex` are absent from GitHub's published
+    // rate table, and models.dev prices them byte-identically to its own
+    // `openai/gpt-5.2` row — vendor passthrough, not what a Copilot subscriber
+    // is billed. Pricing them silently corrupts a public spend leaderboard;
+    // leaving them unpriced merely excludes and reports the row.
+    #[test]
+    fn copilot_gpt_5_2_passthrough_rows_resolve_to_no_price() {
+        let service = copilot_service();
+        let usage = TokenBreakdown {
+            input: 1_000_000,
+            output: 100_000,
+            ..Default::default()
+        };
+
+        for model in ["github-copilot/gpt-5.2", "github-copilot/gpt-5.2-codex"] {
+            assert!(
+                service.lookup_with_source(model, None).is_none(),
+                "{model} must not resolve to a price"
+            );
+            assert!(
+                !service.covers_usage_with_provider(model, None, &usage),
+                "{model} must report as unpriced so submission excludes it"
+            );
+            let cost = service.calculate_cost_with_provider(model, None, &usage);
+            assert_eq!(cost, 0.0, "{model} priced at {cost}");
+        }
+    }
+
+    // Copilot session logs carry the bare model id plus a `github-copilot`
+    // provider, which resolves to the same models.dev row. Suppressing only
+    // the slash-qualified spelling would leave the live wrong-price path open.
+    #[test]
+    fn copilot_gpt_5_2_stays_unpriced_under_a_provider_hint() {
+        let service = copilot_service();
+
+        for model in ["gpt-5.2", "gpt-5.2-codex"] {
+            assert!(
+                service
+                    .lookup_with_source_and_provider(model, None, Some("github-copilot"))
+                    .is_none(),
+                "{model} under a github-copilot hint must not resolve to a price"
+            );
+        }
+    }
+
+    // Guard against over-suppression: the other 27 `github-copilot/*` entries
+    // track GitHub's table and must keep pricing, as must `openai/gpt-5.2`
+    // itself for actual OpenAI usage.
+    #[test]
+    fn other_copilot_models_and_openai_gpt_5_2_still_price() {
+        let service = copilot_service();
+
+        for (model, expected_input) in [
+            ("github-copilot/grok-4.5", 2e-7),
+            ("github-copilot/claude-sonnet-4.5", 3e-6),
+        ] {
+            let result = service
+                .lookup_with_source(model, None)
+                .unwrap_or_else(|| panic!("{model} must still price from models.dev"));
+            assert_eq!(result.source, "Models.dev");
+            assert_eq!(result.matched_key, model);
+            assert_eq!(result.pricing.input_cost_per_token, Some(expected_input));
+        }
+
+        let openai = service
+            .lookup_with_source_and_provider("gpt-5.2", None, Some("openai"))
+            .expect("OpenAI's own gpt-5.2 must keep pricing");
+        assert_eq!(openai.matched_key, "openai/gpt-5.2");
+        assert_eq!(openai.pricing.input_cost_per_token, Some(1.75e-6));
     }
 
     // Regression: GitHub moved Copilot off premium-request billing onto
