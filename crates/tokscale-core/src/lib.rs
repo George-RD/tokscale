@@ -3043,9 +3043,11 @@ fn build_graph_from_messages(
                     zero_cost_unpriced_submission_messages(filtered, pricing)
                 }
             };
-            if !submitted.iter().any(|message| message.tokens.total() > 0) {
-                return Err(SubmissionError::Report(EMPTY_SUBMISSION_ERROR.to_string()));
-            }
+            // A range with no token-bearing usage in it is an idle range, not
+            // a failure: `ReportUnpriced` drops nothing, so this is only ever
+            // true when the input was already empty. Whether the submission
+            // would have been all zeros because pricing broke is a different
+            // question, asked above.
             (submitted, unpriced)
         }
     };
@@ -3073,11 +3075,6 @@ fn build_graph_from_messages(
 
     Ok(result)
 }
-
-/// A submission that carries no tokens is not a submission. Reporting success
-/// for one would tell the user their usage is on the leaderboard when nothing
-/// was sent.
-const EMPTY_SUBMISSION_ERROR: &str = "no token-bearing usage found to submit";
 
 /// Why a submission could not be built.
 ///
@@ -4544,7 +4541,7 @@ mod tests {
         scanner, select_local_parse_pricing, unified_to_parsed, validate_priced_messages, ClientId,
         GraphPricingRequirement, GroupBy, LocalParseOptions, ReportOptions, SubmissionError,
         SubmissionPricingMode, TokenBreakdown, UnifiedMessage, UnpricedSubmissionUsage,
-        UnpricedUsageCause, EMPTY_SUBMISSION_ERROR, UNKNOWN_WORKSPACE_LABEL,
+        UnpricedUsageCause, UNKNOWN_WORKSPACE_LABEL,
     };
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
@@ -8903,11 +8900,13 @@ mod tests {
         assert_eq!(graph.summary.total_tokens, 2_001_000);
     }
 
-    // Nothing token-bearing survived, so there is nothing to put on the
-    // leaderboard. Succeeding would tell the user otherwise.
+    // A date range with no usage in it is what every idle day looks like, and
+    // `tokscale autosubmit run --today` asks for exactly that range every time
+    // the scheduler fires before the user has done any work. Failing here left
+    // the scheduled run stuck in an error state it could never clear.
     #[test]
-    fn submission_without_token_bearing_usage_is_an_error() {
-        let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
+    fn submission_over_an_idle_range_is_an_empty_success() {
+        let pricing = pricing_service_missing_the_model_under_test();
         let cost_only = UnifiedMessage::new(
             "cursor",
             "composer-1",
@@ -8918,16 +8917,27 @@ mod tests {
             1.25,
         );
 
-        let error = build_graph_from_messages(
+        let graph = build_graph_from_messages(
             vec![cost_only],
             Some(&pricing),
             GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
-        .expect_err("a submission with no tokens must not report success");
+        .expect("an idle range is not an error");
 
-        assert_eq!(error.to_string(), EMPTY_SUBMISSION_ERROR);
+        assert_eq!(graph.summary.total_tokens, 0);
+
+        let empty = build_graph_from_messages(
+            Vec::new(),
+            Some(&pricing),
+            GraphPricingRequirement::Submission(SubmissionPricingMode::ReportUnpriced),
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("neither is a range with nothing in it at all");
+
+        assert_eq!(empty.summary.total_tokens, 0);
     }
 
     #[test]

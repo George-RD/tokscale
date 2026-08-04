@@ -5792,10 +5792,12 @@ fn run_submit_command(options: SubmitCommandOptions) -> Result<()> {
     println!();
 
     if graph_result.summary.total_tokens == 0 {
-        // Reporting success here would tell the user their usage is on the
-        // leaderboard when nothing was sent.
+        // An idle date range. `autosubmit run` defaults to `--today` and only
+        // advances its schedule on success, so failing here would leave a
+        // scheduled submission stuck every time it fired before the user
+        // started working.
         println!("{}", "  No usage data found to submit.\n".yellow());
-        return Err(anyhow::anyhow!("no token-bearing usage found to submit"));
+        return Ok(());
     }
 
     if dry_run {

@@ -1790,15 +1790,30 @@ fn test_graph_fresh_cursor_cache_skips_auto_sync_warning() {
 #[test]
 fn test_submit_cursor_explicit_missing_cache_reports_setup_warning_text() {
     let tmp = create_empty_fixture_dir();
-    // No cache means no usage, and a submission with nothing in it is an error
-    // — but the setup warning still has to say how to fix that.
+    // No cache means no usage, which is a no-op rather than a failure — but the
+    // setup warning still has to say how to fix that.
     cmd_with_home(tmp.path())
         .env("TOKSCALE_API_TOKEN", "test-token")
         .args(["submit", "--client", "cursor", "--dry-run"])
         .assert()
-        .failure()
+        .success()
         .stderr(predicate::str::contains("Cursor usage requires"))
         .stderr(predicate::str::contains("tokscale cursor login"));
+}
+
+/// An idle day is the normal state of a scheduled submission that fires before
+/// the user has done any work, and `autosubmit run` only advances its
+/// `last_run_at_ms` on success. Failing here wedged the schedule permanently.
+#[test]
+fn test_submit_over_an_idle_range_succeeds_with_guidance() {
+    let tmp = create_empty_fixture_dir();
+
+    cmd_with_home(tmp.path())
+        .env("TOKSCALE_API_TOKEN", "test-token")
+        .args(["submit", "--client", "opencode", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No usage data found to submit."));
 }
 
 #[test]
