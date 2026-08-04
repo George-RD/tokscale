@@ -28,6 +28,23 @@ struct CopilotDesktopSessionRow {
 struct SessionStateMetadata {
     model: Option<String>,
     cwd: Option<String>,
+    shutdowns: Vec<ShutdownUsage>,
+}
+
+/// One model's usage from a single `session.shutdown` record.
+///
+/// These carry their own timestamp, which is the only per-run timing the
+/// desktop app exposes: the `sessions` row has a lifetime total and an
+/// immutable `created_at`.
+#[derive(Debug)]
+struct ShutdownUsage {
+    timestamp_ms: i64,
+    model: String,
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    reasoning: i64,
 }
 
 pub fn parse_copilot_desktop_db(db_path: &Path) -> Vec<UnifiedMessage> {
@@ -98,23 +115,36 @@ pub fn parse_copilot_desktop_db(db_path: &Path) -> Vec<UnifiedMessage> {
         }
     };
 
-    rows.filter_map(|row| match row {
-        Ok(row) => Some(session_row_to_message(db_path, row)),
+    rows.flat_map(|row| match row {
+        Ok(row) => session_row_to_messages(db_path, row),
         Err(err) => {
             warn!(
                 db_path = %db_path.display(),
                 error = %err,
                 "Failed to decode Copilot Desktop session row"
             );
-            None
+            Vec::new()
         }
     })
     .collect()
 }
 
-fn session_row_to_message(db_path: &Path, row: CopilotDesktopSessionRow) -> UnifiedMessage {
+/// Turn one `sessions` row into the messages its usage actually belongs to.
+///
+/// The row holds a lifetime total against an immutable `created_at`, so
+/// emitting it as-is re-dated every later turn to the day the session was
+/// opened: that day grew on every rescan and the days the tokens were really
+/// spent on received none of them (#962).
+///
+/// `session.shutdown` records carry their own timestamp and a per-model
+/// breakdown, so each one is emitted at its own time and under its own model.
+/// Whatever they do not account for — a run that died before writing its
+/// shutdown, or a session recorded by the CLI rather than the desktop app —
+/// stays on `created_at` under the row's original dedup key, so the row
+/// remains the authority on the all-time total and nothing is dropped.
+fn session_row_to_messages(db_path: &Path, row: CopilotDesktopSessionRow) -> Vec<UnifiedMessage> {
     let metadata = read_session_state_metadata(db_path, &row.id);
-    let model_id = metadata
+    let fallback_model = metadata
         .model
         .as_deref()
         .or(row.model.as_deref())
@@ -122,11 +152,8 @@ fn session_row_to_message(db_path: &Path, row: CopilotDesktopSessionRow) -> Unif
         .filter(|model| !model.is_empty())
         .unwrap_or("auto")
         .to_string();
-    let provider_id = inferred_provider_from_model(&model_id)
-        .unwrap_or("github-copilot")
-        .to_string();
 
-    let timestamp_ms = row
+    let created_at_ms = row
         .created_at
         .as_deref()
         .and_then(parse_iso8601_timestamp_ms)
@@ -139,33 +166,83 @@ fn session_row_to_message(db_path: &Path, row: CopilotDesktopSessionRow) -> Unif
             0
         });
 
-    let mut message = UnifiedMessage::new_with_dedup(
-        "copilot",
-        model_id,
-        provider_id,
-        row.id.clone(),
-        timestamp_ms,
-        // Copilot reports input tokens inclusive of cache reads (same convention
-        // as the OTEL exporter that feeds this same session data). Reuse the
-        // shared normalizer so the desktop-DB and OTEL paths never diverge and
-        // additive pricing does not double-charge the cached portion.
-        super::copilot::normalize_input_tokens(
-            row.total_input_tokens,
-            row.total_output_tokens,
-            row.total_cached_tokens,
-            0,
-            row.total_reasoning_tokens,
-        ),
-        0.0,
-        Some(format!("copilot-desktop:{}", row.id)),
-    );
+    let workspace_key = metadata.cwd.as_deref().and_then(normalize_workspace_key);
+    let build = |model_id: String, timestamp_ms: i64, tokens, dedup_key: String| {
+        let provider_id = inferred_provider_from_model(&model_id)
+            .unwrap_or("github-copilot")
+            .to_string();
+        let mut message = UnifiedMessage::new_with_dedup(
+            "copilot",
+            model_id,
+            provider_id,
+            row.id.clone(),
+            timestamp_ms,
+            tokens,
+            0.0,
+            Some(dedup_key),
+        );
+        if let Some(workspace_key) = workspace_key.clone() {
+            let workspace_label = workspace_label_from_key(&workspace_key);
+            message.set_workspace(Some(workspace_key), workspace_label);
+        }
+        message
+    };
 
-    if let Some(workspace_key) = metadata.cwd.as_deref().and_then(normalize_workspace_key) {
-        let workspace_label = workspace_label_from_key(&workspace_key);
-        message.set_workspace(Some(workspace_key), workspace_label);
+    let mut messages = Vec::with_capacity(metadata.shutdowns.len() + 1);
+    for (index, shutdown) in metadata.shutdowns.iter().enumerate() {
+        let model_id = match shutdown.model.trim() {
+            "" | "auto" => fallback_model.clone(),
+            model => model.to_string(),
+        };
+        messages.push(build(
+            model_id,
+            shutdown.timestamp_ms,
+            // Copilot reports input tokens inclusive of cache reads (same
+            // convention as the OTEL exporter that feeds this same session
+            // data). Reuse the shared normalizer so the desktop-DB and OTEL
+            // paths never diverge and additive pricing does not double-charge
+            // the cached portion.
+            super::copilot::normalize_input_tokens(
+                shutdown.input,
+                shutdown.output,
+                shutdown.cache_read,
+                shutdown.cache_write,
+                shutdown.reasoning,
+            ),
+            format!(
+                "copilot-desktop:{}:shutdown:{index}:{}",
+                row.id, shutdown.model
+            ),
+        ));
     }
 
-    message
+    let consumed = |pick: fn(&ShutdownUsage) -> i64| -> i64 {
+        metadata
+            .shutdowns
+            .iter()
+            .map(pick)
+            .fold(0i64, i64::saturating_add)
+    };
+    // The row's own cache-write column does not exist, so the shutdown records
+    // are the only source for that bucket and there is nothing to reconcile.
+    let residual = super::copilot::normalize_input_tokens(
+        (row.total_input_tokens - consumed(|usage| usage.input)).max(0),
+        (row.total_output_tokens - consumed(|usage| usage.output)).max(0),
+        (row.total_cached_tokens - consumed(|usage| usage.cache_read)).max(0),
+        0,
+        (row.total_reasoning_tokens - consumed(|usage| usage.reasoning)).max(0),
+    );
+
+    if messages.is_empty() || residual.total() > 0 {
+        messages.push(build(
+            fallback_model,
+            created_at_ms,
+            residual,
+            format!("copilot-desktop:{}", row.id),
+        ));
+    }
+
+    messages
 }
 
 fn read_session_state_metadata(db_path: &Path, session_id: &str) -> SessionStateMetadata {
@@ -219,11 +296,59 @@ fn read_events_metadata(events_path: &Path) -> SessionStateMetadata {
                     metadata.model = Some(model.to_string());
                 }
             }
+            "session.shutdown" => collect_shutdown_usage(&event, &mut metadata.shutdowns),
             _ => {}
         }
     }
 
     metadata
+}
+
+fn collect_shutdown_usage(event: &Value, out: &mut Vec<ShutdownUsage>) {
+    // The desktop app nests event payloads under `data`; a flat record is
+    // accepted too so a shutdown that omits the envelope still reports usage
+    // rather than silently contributing nothing.
+    let payload = event.get("data").unwrap_or(event);
+    let Some(timestamp_ms) = payload
+        .get("ts")
+        .or_else(|| event.get("ts"))
+        .and_then(Value::as_str)
+        .and_then(parse_iso8601_timestamp_ms)
+    else {
+        return;
+    };
+    let Some(metrics) = payload
+        .get("modelMetrics")
+        .or_else(|| event.get("modelMetrics"))
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+
+    for (model, entry) in metrics {
+        let Some(usage) = entry.get("usage") else {
+            continue;
+        };
+        let read = |key: &str| usage.get(key).and_then(Value::as_i64).unwrap_or(0).max(0);
+        let shutdown = ShutdownUsage {
+            timestamp_ms,
+            model: model.clone(),
+            input: read("inputTokens"),
+            output: read("outputTokens"),
+            cache_read: read("cacheReadTokens"),
+            cache_write: read("cacheWriteTokens"),
+            reasoning: read("reasoningTokens"),
+        };
+        if shutdown.input == 0
+            && shutdown.output == 0
+            && shutdown.cache_read == 0
+            && shutdown.cache_write == 0
+            && shutdown.reasoning == 0
+        {
+            continue;
+        }
+        out.push(shutdown);
+    }
 }
 
 fn parse_iso8601_timestamp_ms(value: &str) -> Option<i64> {
@@ -447,6 +572,139 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].provider_id, "github-copilot");
+    }
+
+    /// Regression (#962): the row carries a lifetime total and an immutable
+    /// `created_at`, so every rescan grew the creation day and gave the days
+    /// the tokens were actually spent on nothing. `session.shutdown` records
+    /// carry their own timestamp, so usage lands on the day it happened.
+    #[test]
+    fn shutdown_events_attribute_usage_to_their_own_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("data.db");
+        let conn = create_copilot_desktop_db(&db_path);
+        insert_session(&conn, "session-1", "gpt-5.1-codex", 100, 50, 25, 10);
+        drop(conn);
+        write_events(
+            dir.path(),
+            "session-1",
+            &[
+                r#"{"type":"session.shutdown","data":{"ts":"2026-07-02T00:00:00Z","shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"outputTokens":50,"cacheReadTokens":25,"cacheWriteTokens":0,"reasoningTokens":10}}}}}"#,
+            ],
+        );
+
+        let messages = parse_copilot_desktop_db(&db_path);
+
+        assert_eq!(messages.len(), 1, "the row total is fully accounted for");
+        let message = &messages[0];
+        assert_eq!(
+            message.timestamp, 1_782_950_400_000,
+            "usage belongs to the shutdown day, not the creation day"
+        );
+        assert_eq!(message.model_id, "gpt-5.1-codex");
+        assert_eq!(message.tokens.input, 75);
+        assert_eq!(message.tokens.output, 50);
+        assert_eq!(message.tokens.cache_read, 25);
+        assert_eq!(message.tokens.reasoning, 10);
+    }
+
+    /// Whatever the shutdown records do not account for still has to be kept,
+    /// so the row stays the authority on the all-time total when a run dies
+    /// before it can write its shutdown.
+    #[test]
+    fn usage_beyond_the_shutdown_events_stays_at_session_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("data.db");
+        let conn = create_copilot_desktop_db(&db_path);
+        insert_session(&conn, "session-1", "gpt-5.1-codex", 200, 100, 50, 20);
+        drop(conn);
+        write_events(
+            dir.path(),
+            "session-1",
+            &[
+                r#"{"type":"session.shutdown","data":{"ts":"2026-07-02T00:00:00Z","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"outputTokens":50,"cacheReadTokens":25,"cacheWriteTokens":0,"reasoningTokens":10}}}}}"#,
+            ],
+        );
+
+        let messages = parse_copilot_desktop_db(&db_path);
+
+        assert_eq!(messages.len(), 2);
+        let residual = messages
+            .iter()
+            .find(|message| message.timestamp == 1_782_909_296_000)
+            .expect("the unaccounted remainder stays on the creation day");
+        assert_eq!(residual.tokens.input, 75);
+        assert_eq!(residual.tokens.output, 50);
+        assert_eq!(residual.tokens.cache_read, 25);
+        assert_eq!(residual.tokens.reasoning, 10);
+        assert_eq!(
+            residual.dedup_key.as_deref(),
+            Some("copilot-desktop:session-1"),
+            "the remainder keeps the row's own dedup key"
+        );
+
+        let total_input: i64 = messages.iter().map(|message| message.tokens.input).sum();
+        assert_eq!(total_input, 150, "the row total is preserved exactly");
+    }
+
+    /// The `sessions` table has no cache-write column, so that bucket was
+    /// hardcoded to zero. The shutdown records do carry it.
+    #[test]
+    fn shutdown_events_recover_cache_write_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("data.db");
+        let conn = create_copilot_desktop_db(&db_path);
+        insert_session(&conn, "session-1", "gpt-5.1-codex", 100, 50, 25, 10);
+        drop(conn);
+        write_events(
+            dir.path(),
+            "session-1",
+            &[
+                r#"{"type":"session.shutdown","data":{"ts":"2026-07-02T00:00:00Z","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"outputTokens":50,"cacheReadTokens":25,"cacheWriteTokens":7,"reasoningTokens":10}}}}}"#,
+            ],
+        );
+
+        let messages = parse_copilot_desktop_db(&db_path);
+
+        let shutdown = messages
+            .iter()
+            .find(|message| message.timestamp == 1_782_950_400_000)
+            .expect("shutdown message");
+        assert_eq!(shutdown.tokens.cache_write, 7);
+    }
+
+    /// `modelMetrics` is keyed by model, which attributes each model's usage
+    /// exactly instead of letting the last `session.model_change` claim the
+    /// whole session.
+    #[test]
+    fn shutdown_events_split_usage_per_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("data.db");
+        let conn = create_copilot_desktop_db(&db_path);
+        insert_session(&conn, "session-1", "auto", 300, 60, 0, 0);
+        drop(conn);
+        write_events(
+            dir.path(),
+            "session-1",
+            &[
+                r#"{"type":"session.shutdown","data":{"ts":"2026-07-02T00:00:00Z","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"outputTokens":20}},"claude-sonnet-4-5":{"usage":{"inputTokens":200,"outputTokens":40}}}}}"#,
+            ],
+        );
+
+        let messages = parse_copilot_desktop_db(&db_path);
+
+        let codex = messages
+            .iter()
+            .find(|message| message.model_id == "gpt-5.1-codex")
+            .expect("codex row");
+        let claude = messages
+            .iter()
+            .find(|message| message.model_id == "claude-sonnet-4-5")
+            .expect("claude row");
+        assert_eq!(codex.tokens.input, 100);
+        assert_eq!(codex.provider_id, "openai");
+        assert_eq!(claude.tokens.input, 200);
+        assert_eq!(claude.provider_id, "anthropic");
     }
 
     #[test]
