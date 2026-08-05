@@ -1998,6 +1998,7 @@ pub fn scan_all_clients(home_dir: &str, clients: &[String]) -> ScanResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::json_path_literal;
     use crate::paths::test_env::EnvGuard;
     use serial_test::serial;
     use std::fs::{self, File};
@@ -4019,8 +4020,8 @@ mod tests {
         fs::write(
             &variant_file,
             format!(
-                r#"{{"name":"kimi-code","provider":"kimi","configDir":"{}"}}"#,
-                config_dir.display()
+                r#"{{"name":"kimi-code","provider":"kimi","configDir":{}}}"#,
+                json_path_literal(&config_dir)
             ),
         )
         .unwrap();
@@ -4057,8 +4058,8 @@ mod tests {
         fs::write(
             variant_dir.join("variant.json"),
             format!(
-                r#"{{"name":"plain-mirror","provider":"mirror","configDir":"{}"}}"#,
-                normal_claude_dir.display()
+                r#"{{"name":"plain-mirror","provider":"mirror","configDir":{}}}"#,
+                json_path_literal(&normal_claude_dir)
             ),
         )
         .unwrap();
@@ -4266,6 +4267,32 @@ mod tests {
             .any(|p| p.ends_with("messages.jsonl")));
     }
 
+    /// The `workspace_key` a Crush fixture path should produce, spelled out
+    /// here rather than obtained from the production normalizer.
+    ///
+    /// `scan_crush_registry` keys a workspace with `normalize_workspace_key`,
+    /// which folds `\` to `/` on purpose so one workspace reached under two
+    /// separator spellings is one key. That fold is the claim these tests
+    /// carry on Windows, and a raw `display()` expectation could not state it —
+    /// it only agreed with the normalizer on Unix, where there is nothing to
+    /// fold.
+    ///
+    /// Calling `normalize_workspace_key` in the expectation states it, but
+    /// states it self-referentially: production applies the same function to
+    /// the same input, so the assertion would hold no matter what that function
+    /// did, including nothing. The fold is one line to write out, so write it
+    /// out — this expectation is wrong whenever the normalizer stops folding,
+    /// which is the entire point of having it.
+    ///
+    /// The single `replace` is the whole rule for these inputs. The normalizer
+    /// also collapses repeated separators and trims a trailing one; a
+    /// `TempDir`-rooted `join` produces neither, so nothing else applies. (It
+    /// agrees on a UNC root too: `\\srv\share\p` folds to `//srv/share/p` with
+    /// no doubled separator left inside to collapse.)
+    fn expected_workspace_key(path: &Path) -> Option<String> {
+        Some(path.to_string_lossy().replace('\\', "/"))
+    }
+
     #[test]
     fn test_scan_crush_registry_resolves_relative_and_absolute_data_dirs() {
         let dir = TempDir::new().unwrap();
@@ -4280,15 +4307,15 @@ mod tests {
         let projects_json = format!(
             r#"{{
   "projects": [
-    {{ "path": "{}", "data_dir": ".crush" }},
-    {{ "path": "{}", "data_dir": "{}" }},
-    {{ "path": "{}", "data_dir": ".crush" }}
+    {{ "path": {}, "data_dir": ".crush" }},
+    {{ "path": {}, "data_dir": {} }},
+    {{ "path": {}, "data_dir": ".crush" }}
   ]
 }}"#,
-            project_a.display(),
-            dir.path().join("project-b").display(),
-            project_b_data.display(),
-            dir.path().join("missing-project").display(),
+            json_path_literal(&project_a),
+            json_path_literal(&dir.path().join("project-b")),
+            json_path_literal(&project_b_data),
+            json_path_literal(&dir.path().join("missing-project")),
         );
         setup_mock_crush_registry(&registry_path, &projects_json);
 
@@ -4298,12 +4325,12 @@ mod tests {
             vec![
                 CrushDbSource {
                     db_path: project_a.join(".crush").join("crush.db"),
-                    workspace_key: Some(project_a.display().to_string()),
+                    workspace_key: expected_workspace_key(&project_a),
                     workspace_label: Some("project-a".to_string()),
                 },
                 CrushDbSource {
                     db_path: project_b_data.join("crush.db"),
-                    workspace_key: Some(dir.path().join("project-b").display().to_string()),
+                    workspace_key: expected_workspace_key(&dir.path().join("project-b")),
                     workspace_label: Some("project-b".to_string()),
                 },
             ]
@@ -4321,13 +4348,13 @@ mod tests {
         let projects_json = format!(
             r#"{{
   "projects": [
-    {{ "path": "{}", "data_dir": ".crush" }},
+    {{ "path": {}, "data_dir": ".crush" }},
     {{ "path": 123, "data_dir": ".crush" }},
     {{ "data_dir": ".crush" }},
     "not-an-object"
   ]
 }}"#,
-            valid_project.display()
+            json_path_literal(&valid_project)
         );
         setup_mock_crush_registry(&registry_path, &projects_json);
 
@@ -4336,7 +4363,7 @@ mod tests {
             result,
             vec![CrushDbSource {
                 db_path: valid_project.join(".crush").join("crush.db"),
-                workspace_key: Some(valid_project.display().to_string()),
+                workspace_key: expected_workspace_key(&valid_project),
                 workspace_label: Some("valid-project".to_string()),
             }]
         );
@@ -4390,8 +4417,8 @@ mod tests {
         File::create(project.join(".crush").join("crush.db")).unwrap();
 
         let projects_json = format!(
-            r#"{{ "projects": [ {{ "path": "{}", "data_dir": ".crush" }} ] }}"#,
-            project.display()
+            r#"{{ "projects": [ {{ "path": {}, "data_dir": ".crush" }} ] }}"#,
+            json_path_literal(&project)
         );
         setup_mock_crush_registry(&global_data.join("projects.json"), &projects_json);
 
@@ -4428,8 +4455,8 @@ mod tests {
         File::create(project.join(".crush").join("crush.db")).unwrap();
 
         let projects_json = format!(
-            r#"{{ "projects": [ {{ "path": "{}", "data_dir": ".crush" }} ] }}"#,
-            project.display()
+            r#"{{ "projects": [ {{ "path": {}, "data_dir": ".crush" }} ] }}"#,
+            json_path_literal(&project)
         );
         setup_mock_crush_registry(
             &home.join("AppData/Local/crush/projects.json"),
@@ -4460,8 +4487,8 @@ mod tests {
         File::create(project.join(".crush").join("crush.db")).unwrap();
 
         let projects_json = format!(
-            r#"{{ "projects": [ {{ "path": "{}", "data_dir": ".crush" }} ] }}"#,
-            project.display()
+            r#"{{ "projects": [ {{ "path": {}, "data_dir": ".crush" }} ] }}"#,
+            json_path_literal(&project)
         );
         setup_mock_crush_registry(&xdg.join("crush/projects.json"), &projects_json);
         setup_mock_crush_registry(
@@ -4505,10 +4532,10 @@ mod tests {
         let projects_json = format!(
             r#"{{
   "projects": [
-    {{ "path": "{}", "data_dir": ".crush" }}
+    {{ "path": {}, "data_dir": ".crush" }}
   ]
 }}"#,
-            project.display()
+            json_path_literal(&project)
         );
         setup_mock_crush_registry(&registry_path, &projects_json);
 
@@ -4519,7 +4546,7 @@ mod tests {
             result.crush_dbs,
             vec![CrushDbSource {
                 db_path: data_dir.join("crush.db"),
-                workspace_key: Some(project.display().to_string()),
+                workspace_key: expected_workspace_key(&project),
                 workspace_label: Some("project".to_string()),
             }]
         );
@@ -4683,6 +4710,16 @@ mod tests {
     /// resolves — trimming the value here would silently miss it.
     #[test]
     #[serial]
+    // Unix-only because the fixture cannot exist on Windows: a directory name
+    // ending in a space is not addressable there. `CreateDirectoryW` strips the
+    // trailing space, so `<tmp>\ padded-kimi-code ` becomes
+    // `<tmp>\ padded-kimi-code`, and the very next call — which carries that
+    // component in the middle of a longer path, where no stripping happens —
+    // fails with ERROR_PATH_NOT_FOUND. The claim being made here (a padded
+    // KIMI_CODE_HOME is honored verbatim rather than trimmed) is also one
+    // Windows cannot violate: the OS trims the name before tokscale sees a
+    // directory at all.
+    #[cfg(unix)]
     fn test_scan_all_clients_kimi_code_home_override_is_not_trimmed() {
         let mut env = EnvGuard::capture(&["KIMI_CODE_HOME"]);
         let dir = TempDir::new().unwrap();

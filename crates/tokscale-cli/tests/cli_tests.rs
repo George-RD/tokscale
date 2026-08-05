@@ -121,40 +121,33 @@ fn create_temp_fixture_dir() -> TempDir {
     create_temp_fixture_dir_with_pricing_cache(true)
 }
 
+/// Put a stand-in `codex` on PATH for the three `headless_capture_*` tests.
+///
+/// The stand-in is `src/bin/fake_codex.rs`, built by cargo as a real binary for
+/// whatever platform the tests are running on, and copied here under the name
+/// `run_capture_command` looks for. `CARGO_BIN_EXE_<name>` is set by cargo for
+/// every binary in this package when it compiles this package's integration
+/// tests, so the helper is guaranteed to exist and there is no target directory
+/// to guess at.
+///
+/// It used to be a `#!/bin/sh` script written at test time, which is why these
+/// tests could not run on Windows: there is no shebang there, and
+/// `Command::new("codex")` resolves a bare program name by appending `.exe`
+/// only — an extensionless `codex` is never even probed, so the child reported
+/// `Failed to spawn 'codex': program not found`. That was the fixture failing,
+/// not the feature.
+///
+/// The extension matters, so it is chosen per platform rather than assumed.
+/// `std::fs::copy` carries the source's mode on Unix, which is why there is no
+/// longer an explicit chmod.
 fn create_fake_codex_bin() -> TempDir {
     let tmp = TempDir::new().expect("failed to create fake codex dir");
-    let codex_path = tmp.path().join("codex");
-    fs::write(
-        &codex_path,
-        r#"#!/bin/sh
-case "$TOKSCALE_FAKE_CODEX_MODE" in
-  success)
-    printf 'captured ok'
-    exit 0
-    ;;
-  fail)
-    printf 'captured fail'
-    exit 17
-    ;;
-  slow)
-    exec sleep 20
-    ;;
-  *)
-    echo "unknown TOKSCALE_FAKE_CODEX_MODE" >&2
-    exit 2
-    ;;
-esac
-"#,
-    )
-    .unwrap();
+    let codex_path = tmp
+        .path()
+        .join(if cfg!(windows) { "codex.exe" } else { "codex" });
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&codex_path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&codex_path, permissions).unwrap();
-    }
+    fs::copy(Path::new(env!("CARGO_BIN_EXE_fake_codex")), &codex_path)
+        .expect("failed to install the fake codex onto PATH");
 
     tmp
 }
@@ -231,8 +224,28 @@ fn headless_capture_slow_command_times_out() {
         .code(124);
     let elapsed = started.elapsed();
 
+    // The discriminating fact is that the *parent's* 10s timeout ended this run,
+    // not the child's own 20s sleep. The lower bound proves the parent waited for
+    // its deadline instead of failing early; the upper bound proves it did not
+    // simply outlive the child.
+    //
+    // The upper bound is set against the child's 20s sleep, not against a
+    // teardown budget. The previous 14s left only 4s for everything outside the
+    // deadline — `tokscale`'s own process startup, `child.kill()`, `child.wait()`
+    // and joining the stdout pump — and on a Windows runner startup alone can
+    // consume most of that. It failed at 14.83s in CI (job 92167428621) while
+    // still killing the child correctly, so the bound was measuring runner speed
+    // rather than the behaviour this test is named for.
+    //
+    // 18s keeps a 2s margin below the child's sleep, so a parent that hung until
+    // the child exited on its own is still caught.
+    //
+    // Note this test cannot catch #1049: the stand-in spawns nothing, so its pipe
+    // closes the moment it is killed, and the unbounded `output_handle.join()`
+    // after the kill is never exercised. Widening the bound does not hide that —
+    // it was never covered.
     assert!(
-        elapsed >= Duration::from_secs(10) && elapsed < Duration::from_secs(14),
+        elapsed >= Duration::from_secs(10) && elapsed < Duration::from_secs(18),
         "slow command timeout duration was unexpected: {elapsed:?}"
     );
 }
@@ -251,6 +264,7 @@ fn create_empty_fixture_dir() -> TempDir {
     tmp
 }
 
+#[cfg(unix)]
 fn create_timezone_boundary_fixture_dir() -> TempDir {
     let tmp = TempDir::new().expect("failed to create temp dir");
     let base = tmp.path();
@@ -298,6 +312,7 @@ fn create_timezone_boundary_fixture_dir() -> TempDir {
     tmp
 }
 
+#[cfg(unix)]
 fn create_positive_utc_offset_submit_fixture_dir() -> (TempDir, String) {
     let tmp = TempDir::new().expect("failed to create temp dir");
     let base = tmp.path();
@@ -467,12 +482,36 @@ fn create_conflicting_codex_fixture_dir() -> TempDir {
 
 /// Build a Command pointing HOME and the XDG dirs at the given temp dir for
 /// hermetic test runs (no flags are added; callers append their own).
+/// The config root every `cmd_with_home` fixture writes into, and the value
+/// the child is told to use.
+///
+/// `HOME` plus the `XDG_*` vars locate the config dir on Unix and reach nothing
+/// on Windows: `paths::get_config_dir` resolves the Windows root through
+/// `dirs::config_dir()`, a `SHGetKnownFolderPath` call no environment variable
+/// redirects. The child therefore read the *runner's* real
+/// `%APPDATA%\tokscale\` — so a fixture's settings.json was never seen (model
+/// aliases went unfolded, `scanner.extraScanPaths` came back null, auto-pinning
+/// had nothing to pin into) and the pricing cache the fixture primed with an
+/// empty catalog was replaced by whatever real prices happened to be on the
+/// machine.
+///
+/// `TOKSCALE_CONFIG_DIR` is the one override consulted first on every platform,
+/// and on Unix it names the directory the `XDG_CONFIG_HOME` pin already
+/// produced, so nothing moves there. Setting it also means these runs no longer
+/// depend on the legacy macOS settings fallback, which is correct for a
+/// hermetic fixture: `paths.rs` documents the override as meaning exactly "do
+/// not ingest anything from outside this root".
+fn sandbox_config_dir(tmp: &Path) -> std::path::PathBuf {
+    tmp.join(".config").join("tokscale")
+}
+
 fn cmd_with_home(tmp: &Path) -> Command {
     let mut cmd = cargo_bin_cmd!("tokscale");
     cmd.env("HOME", tmp)
         .env("XDG_CONFIG_HOME", tmp.join(".config"))
         .env("XDG_DATA_HOME", tmp.join(".local/share"))
         .env("XDG_CACHE_HOME", tmp.join(".cache"))
+        .env("TOKSCALE_CONFIG_DIR", sandbox_config_dir(tmp))
         .env("TOKSCALE_PRICING_CACHE_ONLY", "1")
         // Clear scan-path overrides inherited from the dev's shell, otherwise a
         // developer who exports e.g. TOKSCALE_EXTRA_DIRS=~/.codex/sessions (for
@@ -485,8 +524,7 @@ fn cmd_with_home(tmp: &Path) -> Command {
         .env_remove("GOOSE_PATH_ROOT")
         .env_remove("CODEBUFF_DATA_DIR")
         .env_remove("GEMINI_CLI_HOME")
-        .env_remove("HERMES_HOME")
-        .env_remove("TOKSCALE_CONFIG_DIR");
+        .env_remove("HERMES_HOME");
     cmd
 }
 
@@ -510,6 +548,7 @@ fn offline_cmd_with_home(tmp: &Path) -> Command {
         .env("XDG_CONFIG_HOME", tmp.join(".config"))
         .env("XDG_DATA_HOME", tmp.join(".local/share"))
         .env("XDG_CACHE_HOME", tmp.join(".cache"))
+        .env("TOKSCALE_CONFIG_DIR", sandbox_config_dir(tmp))
         .env("HTTP_PROXY", "http://127.0.0.1:9")
         .env("HTTPS_PROXY", "http://127.0.0.1:9")
         .env("ALL_PROXY", "http://127.0.0.1:9")
@@ -521,8 +560,7 @@ fn offline_cmd_with_home(tmp: &Path) -> Command {
         .env_remove("GOOSE_PATH_ROOT")
         .env_remove("CODEBUFF_DATA_DIR")
         .env_remove("GEMINI_CLI_HOME")
-        .env_remove("HERMES_HOME")
-        .env_remove("TOKSCALE_CONFIG_DIR");
+        .env_remove("HERMES_HOME");
     cmd
 }
 
@@ -533,14 +571,30 @@ fn write_pricing_cache(base: &Path, timestamp: u64) {
     );
     let openrouter = format!(r#"{{"timestamp":{},"data":{{}}}}"#, timestamp);
 
-    // Seed all three locations so the test exercises the same fallback
-    // chain the binary uses post-#470: canonical
-    // <config_dir>/cache/, then legacy dirs::cache_dir()/tokscale, then
-    // ~/.cache/tokscale. Without the canonical path seeded, CI runners
-    // where dirs::cache_dir() resolves outside the sandboxed HOME (e.g.
-    // some Linux runners with XDG_CACHE_HOME set globally) miss the
-    // pricing cache entirely and the report falls back to embedded
-    // source costs.
+    // Only the first of these is read back. Every caller of this helper runs
+    // the child through `offline_cmd_with_home`, which sets
+    // `TOKSCALE_CONFIG_DIR`, and `paths::legacy_dirs_cache_dir` and
+    // `paths::legacy_dot_cache_tokscale_dir` both return `None` whenever that
+    // override is set — deliberately, since the override means "this root and
+    // nothing outside it". `pricing::cache::legacy_cache_paths` therefore comes
+    // back empty and the canonical `<config_dir>/cache/` seed is the only one
+    // the binary can find. Deleting it makes all four
+    // `*_offline_uses_stale_pricing_cache_when_available` tests fail; deleting
+    // the other two changes nothing.
+    //
+    // So what these fixtures no longer exercise is the post-#470 legacy
+    // fallback chain itself: no CLI test in this file reaches it, because none
+    // of them run without the override. That path is covered at the unit level
+    // by `pricing::cache::tests::load_falls_back_to_legacy_dirs_cache_path`.
+    // The macOS *settings* half of the same consequence is disclosed on
+    // `sandbox_config_dir` and worked around in
+    // `test_auto_pinning_does_not_shadow_a_legacy_settings_file_it_cannot_open`,
+    // which clears `TOKSCALE_CONFIG_DIR` precisely because the override would
+    // leave it nothing to assert.
+    //
+    // The two legacy directories are still written: they cost nothing, and a
+    // fixture that clears the override the way that test does needs them
+    // present rather than absent.
     for dir in [
         base.join(".config/tokscale/cache"),
         base.join("Library/Caches/tokscale"),
@@ -661,20 +715,68 @@ fn write_fake_credentials(base: &Path) {
 }
 
 fn write_settings_json(base: &Path, body: &str) {
-    let path = settings_json_path(base);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, body).unwrap();
+    write_settings_json_at(settings_json_path(base), body);
 }
 
-fn settings_json_path(base: &Path) -> std::path::PathBuf {
-    if cfg!(target_os = "windows") {
+/// Settings for a run that passes `--home <base>` rather than inheriting the
+/// sandbox config dir.
+///
+/// An explicit `--home` bypasses `TOKSCALE_CONFIG_DIR` entirely:
+/// `Settings::load_for_home_override` reads
+/// `ExplicitHomeConfigLayout::current()` under the given home, which is
+/// `.config/tokscale` on Unix and `AppData\Roaming\tokscale` on Windows. That
+/// branch is real product behavior, unlike the one [`settings_json_path`] used
+/// to carry, so this mirrors it.
+fn write_explicit_home_settings_json(base: &Path, body: &str) {
+    let path = if cfg!(target_os = "windows") {
         base.join("AppData")
             .join("Roaming")
             .join("tokscale")
             .join("settings.json")
     } else {
         base.join(".config").join("tokscale").join("settings.json")
-    }
+    };
+    write_settings_json_at(path, body);
+}
+
+fn write_settings_json_at(path: std::path::PathBuf, body: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, body).unwrap();
+}
+
+/// One path on every platform: the child is given `TOKSCALE_CONFIG_DIR`, so
+/// where it looks no longer depends on the OS. The Windows arm this replaces
+/// mirrored the real `%APPDATA%` layout under the fixture home, which the child
+/// never consulted — `dirs::config_dir()` reads the known folder, not `HOME` —
+/// so the fixture and the reader disagreed and every settings-driven assertion
+/// on Windows saw an absent file.
+fn settings_json_path(base: &Path) -> std::path::PathBuf {
+    sandbox_config_dir(base).join("settings.json")
+}
+
+/// A scan path spelled the way the binary spells it.
+///
+/// `ClientDef::resolve_path` builds every client's root as
+/// `format!("{root}/{relative}")` — one separator, `/`, on every platform,
+/// with the relative half a `/`-joined literal in the client table. Windows
+/// accepts `/` in a path, so the value works; it just is not what
+/// `Path::join` produces. An expectation built with `join` disagreed on the
+/// first separator only (`...\.tmpXXXX\.codex/sessions` against the emitted
+/// `...\.tmpXXXX/.codex/sessions`) — and note that `join` did not give a
+/// natively-spelled path either, because the rest of the literal keeps its
+/// forward slashes. There was no native-separator contract to preserve, only
+/// two spellings of the same path, so match the one the binary actually
+/// emits.
+///
+/// That does make this helper a pin on the mixed spelling: `clients --json`
+/// prints `C:\Users\me/.codex/sessions` in `sessionsPath` and
+/// `additionalPaths[].path`, and the two assertions below now hold it there.
+/// The pin is deliberate but not an endorsement — whether user-facing path
+/// output should be normalized, and to native or to forward separators, is a
+/// product decision tracked in junhoyeo/tokscale#1048. Changing the emitter
+/// means changing this helper in the same commit.
+fn client_scan_path(home: &Path, relative: &str) -> String {
+    format!("{}/{}", home.display(), relative)
 }
 
 /// Writes a minimal clawdboard account export to `<dir>/export.json` and
@@ -1312,7 +1414,7 @@ fn test_clients_home_override_uses_explicit_home_for_json() {
         .unwrap();
     assert_eq!(
         codex["sessionsPath"],
-        serde_json::json!(real_home.path().join(".codex/sessions"))
+        serde_json::json!(client_scan_path(real_home.path(), ".codex/sessions"))
     );
     assert_eq!(codex["messageCount"].as_i64().unwrap(), 2);
 }
@@ -1395,7 +1497,10 @@ fn test_models_with_no_matching_date() {
     );
 }
 
+/// Unix-only: the premise is a host in `America/Los_Angeles`, and `TZ` does not
+/// move `chrono::Local` on Windows. See `graph_day_buckets` for the full note.
 #[test]
+#[cfg(unix)]
 fn test_graph_single_day_filter_uses_local_timezone_boundaries() {
     let tmp = create_timezone_boundary_fixture_dir();
     let output = cmd_with_home(tmp.path())
@@ -1772,7 +1877,11 @@ fn test_submit_cursor_explicit_missing_cache_reports_setup_warning_text() {
         .stderr(predicate::str::contains("tokscale cursor login"));
 }
 
+/// Unix-only: the fixture's expected date is UTC+1 day, which only holds if the
+/// child really runs in `Pacific/Kiritimati`. `TZ` does not move
+/// `chrono::Local` on Windows — see the note on `graph_day_buckets`.
 #[test]
+#[cfg(unix)]
 fn test_submit_dry_run_preserves_local_date_ahead_of_utc() {
     let (tmp, expected_local_date) = create_positive_utc_offset_submit_fixture_dir();
 
@@ -2281,7 +2390,7 @@ fn test_hourly_home_override_uses_explicit_home_scanner_settings() {
         210,
         40,
     );
-    write_settings_json(
+    write_explicit_home_settings_json(
         real_home.path(),
         &format!(
             r#"{{
@@ -2526,17 +2635,9 @@ fn add_alias_variant_message(tmp: &Path) {
 }
 
 /// Writes a tokscale `settings.json` with the given `modelAliases` object into
-/// the sandbox config dir that `cmd_with_home` points at
-/// (`XDG_CONFIG_HOME/tokscale`). `cmd_with_home` clears `TOKSCALE_CONFIG_DIR`, so
-/// the config must live under the pinned XDG path to be read.
+/// the sandbox config dir `cmd_with_home` points the child at.
 fn write_model_aliases(tmp: &Path, aliases_json: &str) {
-    let config_dir = tmp.join(".config/tokscale");
-    fs::create_dir_all(&config_dir).unwrap();
-    fs::write(
-        config_dir.join("settings.json"),
-        format!(r#"{{"modelAliases": {aliases_json}}}"#),
-    )
-    .unwrap();
+    write_settings_json(tmp, &format!(r#"{{"modelAliases": {aliases_json}}}"#));
 }
 
 fn models_by_name(tmp: &Path) -> serde_json::Value {
@@ -3081,7 +3182,7 @@ fn test_clients_json_includes_claude_transcripts_path() {
 
     assert_eq!(
         claude["additionalPaths"][0]["path"],
-        serde_json::json!(tmp.path().join(".claude/transcripts"))
+        serde_json::json!(client_scan_path(tmp.path(), ".claude/transcripts"))
     );
     assert_eq!(claude["additionalPaths"][0]["exists"], true);
 }
@@ -3816,17 +3917,45 @@ fn pin_bucket_timezone(base: &Path, zone: &str) {
 /// [`pin_bucket_timezone`] with the raw JSON value, so a test can write `null`
 /// as well as a string.
 fn pin_bucket_timezone_field(base: &Path, json_value: &str) {
-    let config_dir = base.join(".config/tokscale");
-    fs::create_dir_all(&config_dir).unwrap();
-    fs::write(
-        config_dir.join("settings.json"),
-        format!(r#"{{ "scanner": {{ "bucketTimezone": {json_value} }} }}"#),
-    )
-    .unwrap();
+    write_settings_json(
+        base,
+        &format!(r#"{{ "scanner": {{ "bucketTimezone": {json_value} }} }}"#),
+    );
 }
 
 /// Day buckets that actually carry messages, as `(date, message_count)`.
 /// The graph zero-fills a calendar, so the empty days carry no signal.
+///
+/// # Why the `TZ`-driven tests below are unix-only
+///
+/// `TZ` is the instrument these tests pose their question with, and it is a
+/// POSIX instrument. `chrono::Local` honors it on Unix; on Windows `Local`
+/// reads `GetTimeZoneInformation` — the machine's own zone, which no
+/// environment variable overrides. A test whose premise is "run this from Los
+/// Angeles, then from Seoul" therefore runs twice from the runner's own zone
+/// on Windows and asserts against buckets the host never produced. Concretely:
+/// this fixture's two messages sit at 2026-03-02T11:30Z and 2026-03-02T18:00Z,
+/// so a UTC runner buckets both into `2026-03-02` while the expectation is
+/// Seoul's `03-02`/`03-03` split.
+///
+/// That is a statement about the instrument, and only about the instrument. It
+/// is *not* a claim that the product was fine on Windows. It was not:
+/// `detect_local_iana_name` declining to pin while a foreign `TZ` was set was
+/// a real bug — the device never pinned, on any run, for as long as the
+/// variable stayed set, and so kept the rescan-splits-history behaviour that
+/// pinning exists to remove. It is fixed in `bucket_tz::tz_env_zone`, which no
+/// longer offers `TZ` as the pin candidate on the platform where
+/// `chrono::Local` does not read it.
+///
+/// That fix does not hand these tests their instrument back. `TZ` still cannot
+/// move the zone the child buckets in on Windows, so these tests still cannot
+/// place the child anywhere, and they stay gated. What the fix restored is
+/// covered directly by the unit test
+/// `bucket_tz::tests::a_foreign_tz_does_not_make_a_windows_host_unpinnable`,
+/// which asserts the pinning behaviour itself rather than through `TZ`.
+///
+/// Tests that pin a zone through settings.json rather than through `TZ` stay
+/// on every platform: the pin outranks the host, which is the whole claim.
 fn graph_day_buckets(base: &Path, timezone: &str) -> Vec<(String, i64)> {
     let output = cmd_with_home(base)
         .env("TZ", timezone)
@@ -3891,6 +4020,7 @@ fn test_pinned_bucket_timezone_survives_a_host_timezone_change() {
 /// Separate homes because the first run on a home pins it; this asserts the
 /// unpinned/first-scan semantics, which are the ones that must not move.
 #[test]
+#[cfg(unix)]
 fn test_unpinned_first_scan_still_buckets_by_the_host_timezone() {
     let los_angeles = create_bucket_timezone_fixture_dir();
     let seoul = create_bucket_timezone_fixture_dir();
@@ -3910,10 +4040,20 @@ fn test_unpinned_first_scan_still_buckets_by_the_host_timezone() {
 /// The first run records the zone, and recording it changes nothing about what
 /// that run reports. If pinning moved the numbers on the machine doing the
 /// pinning, every user would see a one-off jump on upgrade.
+///
+/// This is the integration witness to the Windows bug fixed in
+/// `bucket_tz::tz_env_zone`, and it stays unix-only anyway. Both of its
+/// assertions are addressed to a zone this test cannot put a Windows child in:
+/// the buckets it expects are Seoul's, and the zone it expects on disk is
+/// `Asia/Seoul`, whereas a fixed Windows host pins the Win32 zone it is
+/// actually in (`Etc/UTC` on the runner) and buckets accordingly. Passing there
+/// would require `TZ` to move `chrono::Local`, which is the one thing Windows
+/// does not do. See [`graph_day_buckets`].
 #[test]
+#[cfg(unix)]
 fn test_first_run_pins_the_host_timezone_without_changing_its_own_output() {
     let tmp = create_bucket_timezone_fixture_dir();
-    let settings_path = tmp.path().join(".config/tokscale/settings.json");
+    let settings_path = settings_json_path(tmp.path());
     assert!(!settings_path.exists(), "fixture must start unpinned");
 
     let buckets = graph_day_buckets(tmp.path(), "Asia/Seoul");
@@ -4214,7 +4354,7 @@ fn test_hourly_keys_follow_the_pinned_bucket_timezone() {
 fn test_auto_pinning_never_overwrites_a_settings_file_it_could_not_read() {
     // Positive control — a readable file on this host really does get pinned.
     let control = create_bucket_timezone_fixture_dir();
-    let control_settings = control.path().join(".config/tokscale/settings.json");
+    let control_settings = settings_json_path(control.path());
     fs::create_dir_all(control_settings.parent().unwrap()).unwrap();
     fs::write(&control_settings, r#"{"colorPalette":"green"}"#).unwrap();
     graph_day_buckets(control.path(), "Asia/Seoul");
@@ -4238,7 +4378,7 @@ fn test_auto_pinning_never_overwrites_a_settings_file_it_could_not_read() {
         r#"{"colorPalette": 42, "scanner": {"extraScanPaths": {"claude": ["/data"]}}}"#,
     ] {
         let tmp = create_bucket_timezone_fixture_dir();
-        let settings_path = tmp.path().join(".config/tokscale/settings.json");
+        let settings_path = settings_json_path(tmp.path());
         fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
         fs::write(&settings_path, unreadable).unwrap();
 
@@ -4263,7 +4403,7 @@ fn test_auto_pinning_never_overwrites_a_settings_file_it_could_not_read() {
 #[test]
 fn test_config_set_refuses_to_overwrite_unreadable_settings() {
     let tmp = create_bucket_timezone_fixture_dir();
-    let settings_path = tmp.path().join(".config/tokscale/settings.json");
+    let settings_path = settings_json_path(tmp.path());
     fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
     let unreadable = r#"{"scanner": {"extraScanPaths": "not-a-map"}}"#;
     fs::write(&settings_path, unreadable).unwrap();
@@ -4290,10 +4430,8 @@ fn test_config_set_refuses_to_overwrite_unreadable_settings() {
 #[test]
 fn test_auto_pinning_recovers_from_a_bucket_timezone_that_names_no_zone() {
     let pinned_zone = |base: &Path| -> String {
-        let settings: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(base.join(".config/tokscale/settings.json")).unwrap(),
-        )
-        .unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(settings_json_path(base)).unwrap()).unwrap();
         settings["scanner"]["bucketTimezone"]
             .as_str()
             .unwrap_or_default()
@@ -4375,7 +4513,7 @@ fn test_auto_pinning_declines_when_settings_json_cannot_be_opened() {
         return;
     }
 
-    let settings_path = tmp.path().join(".config/tokscale/settings.json");
+    let settings_path = settings_json_path(tmp.path());
     fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
     fs::write(&settings_path, r#"{"colorPalette":"green"}"#).unwrap();
     fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o000)).unwrap();
@@ -4420,10 +4558,18 @@ fn test_auto_pinning_does_not_shadow_a_legacy_settings_file_it_cannot_open() {
     fs::write(&legacy, r#"{"colorPalette":"green"}"#).unwrap();
     fs::set_permissions(&legacy, fs::Permissions::from_mode(0o000)).unwrap();
 
-    let primary = tmp.path().join(".config/tokscale/settings.json");
+    let primary = settings_json_path(tmp.path());
     assert!(!primary.exists(), "fixture must start with no primary file");
 
     cmd_with_home(tmp.path())
+        // The one test here that must run *without* the config-dir override:
+        // `Settings::load_with_origin` skips the legacy macOS read whenever
+        // `TOKSCALE_CONFIG_DIR` is set, because the override means "this root
+        // and nothing outside it". With it set there is no fallback left to
+        // shadow and the assertion below could never fail. Clearing it leaves
+        // the resolver on `$HOME/.config/tokscale`, which is the same sandbox
+        // directory — this is macOS-only, so no known-folder lookup is in play.
+        .env_remove("TOKSCALE_CONFIG_DIR")
         .env("TZ", "Asia/Seoul")
         .args(["graph", "--client", "opencode", "--no-spinner"])
         .assert()

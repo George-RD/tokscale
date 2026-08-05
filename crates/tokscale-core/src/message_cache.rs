@@ -751,8 +751,25 @@ impl CachedPath {
     }
 }
 
+/// `/` and `\` as UTF-16 code units, and the `\\?\` verbatim prefix.
 #[cfg(windows)]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+const FORWARD_SLASH_UTF16: u16 = b'/' as u16;
+#[cfg(windows)]
+const BACKSLASH_UTF16: u16 = b'\\' as u16;
+#[cfg(windows)]
+const VERBATIM_PREFIX_UTF16: [u16; 4] = [
+    BACKSLASH_UTF16,
+    BACKSLASH_UTF16,
+    b'?' as u16,
+    BACKSLASH_UTF16,
+];
+
+/// The stored spelling is kept verbatim so [`CachedPath::to_path_buf`] hands
+/// back exactly the path that was cached, but *identity* — equality, hashing
+/// and the shard digest — folds `/` into `\` first. See [`CachedPath::
+/// identity_units`] for why.
+#[cfg(windows)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CachedPath(Vec<u16>);
 
 #[cfg(windows)]
@@ -770,9 +787,70 @@ impl CachedPath {
         PathBuf::from(OsString::from_wide(&self.0))
     }
 
+    /// The code units this path is *identified* by: the stored ones, with `/`
+    /// folded to `\`.
+    ///
+    /// On Windows both characters are directory separators, so `C:\a/b\f.jsonl`
+    /// and `C:\a\b\f.jsonl` name one file — and a scan produces both spellings
+    /// for that one file. `ClientDef::resolve_path` assembles every scan root by
+    /// string concatenation (`format!("{root}/{relative}")`), so the root half
+    /// carries forward slashes, while `WalkDir` appends each child below it with
+    /// the platform separator. Hashing the units as written therefore gave one
+    /// file two cache keys.
+    ///
+    /// That is not only a test artifact. `tokscale --home C:/Users/me` and a
+    /// default run (where `dirs` yields `C:\Users\me`) disagree on every key, so
+    /// neither run can ever read the other's entries: the cache stays cold and
+    /// the shards accumulate a duplicate copy of every file. Git Bash and MSYS2
+    /// export `HOME` with forward slashes, so this is reachable without anyone
+    /// typing an unusual path.
+    ///
+    /// Paths in the verbatim namespace are exempt. After `\\?\` the object
+    /// manager performs no translation at all, so `/` there is an ordinary
+    /// character in a name rather than a separator, and folding it would merge
+    /// two genuinely different paths.
+    ///
+    /// Case is deliberately *not* folded. Windows filesystems are usually but
+    /// not always case-insensitive — NTFS supports per-directory sensitivity —
+    /// so folding case could merge two real files. Separator folding has no such
+    /// exception outside the verbatim namespace, which is why only it is safe.
+    fn identity_units(&self) -> impl Iterator<Item = u16> + '_ {
+        let verbatim = self.0.starts_with(&VERBATIM_PREFIX_UTF16);
+        self.0.iter().map(move |unit| {
+            if !verbatim && *unit == FORWARD_SLASH_UTF16 {
+                BACKSLASH_UTF16
+            } else {
+                *unit
+            }
+        })
+    }
+
     fn update_digest(&self, hasher: &mut Sha256) {
-        for code_unit in &self.0 {
+        for code_unit in self.identity_units() {
             hasher.update(code_unit.to_le_bytes());
+        }
+    }
+}
+
+#[cfg(windows)]
+impl PartialEq for CachedPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity_units().eq(other.identity_units())
+    }
+}
+
+#[cfg(windows)]
+impl Eq for CachedPath {}
+
+#[cfg(windows)]
+impl std::hash::Hash for CachedPath {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Length first, mirroring the `Vec<u16>` derive this replaces. Folding
+        // `/` to `\` never changes the length, so this stays consistent with
+        // the `PartialEq` above.
+        state.write_usize(self.0.len());
+        for code_unit in self.identity_units() {
+            state.write_u16(code_unit);
         }
     }
 }
@@ -1796,6 +1874,7 @@ pub(crate) fn codex_cache_entry_matches_fingerprint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::json_path_literal;
     use crate::TokenBreakdown;
     use std::io::Write;
     use tempfile::{NamedTempFile, TempDir};
@@ -1880,42 +1959,44 @@ mod tests {
     }
 
     /// Pin every env var the cache resolvers consult so the test stays
-    /// inside `temp_home`. CI runners can leak `XDG_CONFIG_HOME` /
-    /// `XDG_CACHE_HOME` from the host, which would resolve cache shards outside
-    /// the sandbox. Returns the previous values so the caller can restore.
-    fn sandbox_cache_env(
-        temp_home: &std::path::Path,
-    ) -> (
-        Option<std::ffi::OsString>,
-        Option<std::ffi::OsString>,
-        Option<std::ffi::OsString>,
-        Option<std::ffi::OsString>,
-    ) {
-        let prev_home = std::env::var_os("HOME");
-        let prev_xdg_config = std::env::var_os("XDG_CONFIG_HOME");
-        let prev_xdg_cache = std::env::var_os("XDG_CACHE_HOME");
-        let prev_override = std::env::var_os("TOKSCALE_CONFIG_DIR");
-        unsafe {
-            std::env::set_var("HOME", temp_home);
-            std::env::set_var("XDG_CONFIG_HOME", temp_home.join(".config"));
-            std::env::set_var("XDG_CACHE_HOME", temp_home.join(".cache"));
-            std::env::remove_var("TOKSCALE_CONFIG_DIR");
-        }
-        (prev_home, prev_xdg_config, prev_xdg_cache, prev_override)
-    }
-
-    fn restore_cache_env(
-        prev: (
-            Option<std::ffi::OsString>,
-            Option<std::ffi::OsString>,
-            Option<std::ffi::OsString>,
-            Option<std::ffi::OsString>,
-        ),
-    ) {
-        restore_env_var("HOME", prev.0);
-        restore_env_var("XDG_CONFIG_HOME", prev.1);
-        restore_env_var("XDG_CACHE_HOME", prev.2);
-        restore_env_var("TOKSCALE_CONFIG_DIR", prev.3);
+    /// inside `temp_home`, until the returned guard drops. CI runners can leak
+    /// `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` from the host, which would resolve
+    /// cache shards outside the sandbox.
+    ///
+    /// The restore has to be a `Drop` guard rather than a trailing call. A
+    /// failing assertion panics before any trailing restore runs, and of the
+    /// four keys here `TOKSCALE_CONFIG_DIR` is consulted first on every
+    /// platform — so a leaked one aims every later test in this binary at a
+    /// `TempDir` that has already been dropped, which is the contamination this
+    /// sandbox exists to prevent. `serial_test` prevents overlap, not
+    /// inheritance.
+    #[must_use = "the sandbox is torn down as soon as the guard drops; bind it to a \
+                  named variable that outlives the test body"]
+    fn sandbox_cache_env(temp_home: &std::path::Path) -> crate::paths::test_env::EnvGuard {
+        let mut env = crate::paths::test_env::EnvGuard::capture(&[
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "TOKSCALE_CONFIG_DIR",
+        ]);
+        env.set("HOME", temp_home);
+        env.set("XDG_CONFIG_HOME", temp_home.join(".config"));
+        env.set("XDG_CACHE_HOME", temp_home.join(".cache"));
+        // The three above isolate the cache on Unix and none of them reach
+        // it on Windows: `paths::get_config_dir` resolves the Windows root
+        // with `dirs::config_dir()`, a known-folder lookup that reads no
+        // environment variable. Without this line every test here shared
+        // one real `%APPDATA%\tokscale\cache`, so `SourceMessageCache::load`
+        // returned its neighbours' shards along with its own and the entry
+        // counts came out too high. `TOKSCALE_CONFIG_DIR` is the override
+        // paths.rs documents for this case and is consulted first
+        // everywhere; on Unix it names the directory the redirects above
+        // already produced.
+        env.set(
+            "TOKSCALE_CONFIG_DIR",
+            temp_home.join(".config").join("tokscale"),
+        );
+        env
     }
 
     fn write_temp_file(content: &[u8]) -> NamedTempFile {
@@ -2591,11 +2672,23 @@ mod tests {
     #[serial_test::serial]
     fn test_kimi_stale_parser_cache_is_rejected_and_rebuilt_with_same_fingerprint() {
         let temp_home = TempDir::new().unwrap();
-        let prev_env = sandbox_cache_env(temp_home.path());
+        let _cache_env = sandbox_cache_env(temp_home.path());
         let source_home = TempDir::new().unwrap();
-        let wire_path = source_home
-            .path()
-            .join(".kimi/sessions/group/session/wire.jsonl");
+        // Spelled the way the scan will spell it. `ClientDef::resolve_path`
+        // joins the root with `/` and `WalkDir` appends the components below it
+        // with the platform separator, so on Windows the parse stores this
+        // entry under `<home>/.kimi/sessions\group\session\wire.jsonl` while a
+        // `Path::join` fixture asks for it back under all backslashes.
+        // `CachedPath` keys on the OS string as written, so those are two keys
+        // for one file and the lookup below found nothing.
+        let wire_path = PathBuf::from(
+            ClientId::Kimi
+                .data()
+                .resolve_path_with_env_strategy(&source_home.path().to_string_lossy(), false),
+        )
+        .join("group")
+        .join("session")
+        .join("wire.jsonl");
         std::fs::create_dir_all(wire_path.parent().unwrap()).unwrap();
         std::fs::write(
             &wire_path,
@@ -2699,8 +2792,6 @@ mod tests {
             &crate::scanner::ScannerSettings::default(),
         );
         assert_eq!(second, first);
-
-        restore_cache_env(prev_env);
     }
 
     #[test]
@@ -2872,8 +2963,8 @@ mod tests {
         std::fs::write(
             &variant_path,
             format!(
-                r#"{{"name":"kimi-code","provider":"kimi","configDir":"{}"}}"#,
-                config_dir.display()
+                r#"{{"name":"kimi-code","provider":"kimi","configDir":{}}}"#,
+                json_path_literal(&config_dir)
             ),
         )
         .unwrap();
@@ -2883,8 +2974,8 @@ mod tests {
         std::fs::write(
             &variant_path,
             format!(
-                r#"{{"name":"kimi-code","provider":"minimax","configDir":"{}"}}"#,
-                config_dir.display()
+                r#"{{"name":"kimi-code","provider":"minimax","configDir":{}}}"#,
+                json_path_literal(&config_dir)
             ),
         )
         .unwrap();
@@ -2912,8 +3003,8 @@ mod tests {
         std::fs::write(
             &variant_path,
             format!(
-                r#"{{"name":"kimi-code","provider":"kimi","configDir":"{}"}}"#,
-                config_dir.display()
+                r#"{{"name":"kimi-code","provider":"kimi","configDir":{}}}"#,
+                json_path_literal(&config_dir)
             ),
         )
         .unwrap();
@@ -2924,8 +3015,8 @@ mod tests {
         std::fs::write(
             &variant_path,
             format!(
-                r#"{{"name":"kimi-code","provider":"minimax","configDir":"{}"}}"#,
-                config_dir.display()
+                r#"{{"name":"kimi-code","provider":"minimax","configDir":{}}}"#,
+                json_path_literal(&config_dir)
             ),
         )
         .unwrap();
@@ -3015,7 +3106,7 @@ mod tests {
     #[serial_test::serial]
     fn test_source_message_cache_round_trips_across_distinct_shards() {
         let temp_home = TempDir::new().unwrap();
-        let prev_env = sandbox_cache_env(temp_home.path());
+        let _cache_env = sandbox_cache_env(temp_home.path());
         let source_dir = TempDir::new().unwrap();
         let identity = CacheIdentity::for_client(ClientId::Claude);
         let (path_one, path_two) = write_sources_in_distinct_shards(&source_dir, identity);
@@ -3034,8 +3125,6 @@ mod tests {
         assert_eq!(loaded.entries.len(), 2);
         assert!(loaded.get(identity, &path_one).is_some());
         assert!(loaded.get(identity, &path_two).is_some());
-
-        restore_cache_env(prev_env);
     }
 
     #[test]
@@ -3044,7 +3133,7 @@ mod tests {
         const TEST_SHARD_LIMIT: u64 = 32 * 1024;
 
         let temp_home = TempDir::new().unwrap();
-        let prev_env = sandbox_cache_env(temp_home.path());
+        let _cache_env = sandbox_cache_env(temp_home.path());
         let source_dir = TempDir::new().unwrap();
         let identity = CacheIdentity::for_client(ClientId::Claude);
         let (path_one, path_two) = write_sources_in_distinct_shards(&source_dir, identity);
@@ -3074,15 +3163,13 @@ mod tests {
         let loaded = SourceMessageCache::load();
         assert!(loaded.get(identity, &path_one).is_some());
         assert!(loaded.get(identity, &path_two).is_some());
-
-        restore_cache_env(prev_env);
     }
 
     #[test]
     #[serial_test::serial]
     fn test_corrupt_shard_does_not_hide_entries_from_other_shards() {
         let temp_home = TempDir::new().unwrap();
-        let prev_env = sandbox_cache_env(temp_home.path());
+        let _cache_env = sandbox_cache_env(temp_home.path());
         let source_dir = TempDir::new().unwrap();
         let identity = CacheIdentity::for_client(ClientId::Claude);
         let (corrupt_path, valid_path) = write_sources_in_distinct_shards(&source_dir, identity);
@@ -3109,15 +3196,13 @@ mod tests {
             loaded.dirty,
             "the corrupt shard should be scheduled for rewrite"
         );
-
-        restore_cache_env(prev_env);
     }
 
     #[test]
     #[serial_test::serial]
     fn test_stale_parser_shard_is_skipped_before_decoding_garbage_payload() {
         let temp_home = TempDir::new().unwrap();
-        let prev_env = sandbox_cache_env(temp_home.path());
+        let _cache_env = sandbox_cache_env(temp_home.path());
         let source = write_temp_file(b"claude\n");
         let claude = CacheIdentity::for_client(ClientId::Claude);
         let codex = CacheIdentity::for_client(ClientId::Codex);
@@ -3138,11 +3223,18 @@ mod tests {
             parser_version: codex.parser_version.saturating_sub(1),
             payload: b"deliberately invalid entry payload".to_vec(),
         };
-        let mut writer = BufWriter::new(File::create(&stale_path).unwrap());
-        bincode::options()
-            .serialize_into(&mut writer, &stale_envelope)
-            .unwrap();
-        writer.flush().unwrap();
+        // Scoped, so the handle is closed before anything rewrites this shard:
+        // the rewrite goes through an atomic replace, and Windows refuses to
+        // replace a file another handle still has open (`Access is denied`, os
+        // error 5). On Unix the rename succeeds with the handle open, which is
+        // why the leak was invisible.
+        {
+            let mut writer = BufWriter::new(File::create(&stale_path).unwrap());
+            bincode::options()
+                .serialize_into(&mut writer, &stale_envelope)
+                .unwrap();
+            writer.flush().unwrap();
+        }
 
         assert!(matches!(
             read_shard(&stale_path, codex),
@@ -3161,15 +3253,13 @@ mod tests {
         assert!(SourceMessageCache::load()
             .get(claude, source.path())
             .is_some());
-
-        restore_cache_env(prev_env);
     }
 
     #[test]
     #[serial_test::serial]
     fn test_prior_cache_format_shard_is_skipped_before_decoding_payload() {
         let temp_home = TempDir::new().unwrap();
-        let prev_env = sandbox_cache_env(temp_home.path());
+        let _cache_env = sandbox_cache_env(temp_home.path());
         let codex = CacheIdentity::for_client(ClientId::Codex);
         let stale_key = CacheShardKey {
             namespace: codex.namespace.to_string(),
@@ -3193,15 +3283,13 @@ mod tests {
             read_shard(&stale_path, codex),
             ShardReadStatus::Stale
         ));
-
-        restore_cache_env(prev_env);
     }
 
     #[test]
     #[serial_test::serial]
     fn test_copilot_stale_cache_is_rejected_and_rebuilt_with_root_agent() {
         let temp_home = TempDir::new().unwrap();
-        let prev_env = sandbox_cache_env(temp_home.path());
+        let _cache_env = sandbox_cache_env(temp_home.path());
         let source_dir = TempDir::new().unwrap();
         let source_path = source_dir.path().join("copilot-otel.jsonl");
         std::fs::write(
@@ -3328,15 +3416,13 @@ mod tests {
                     && entries[0].messages[0].agent.as_deref()
                         == Some("github.copilot.default")
         ));
-
-        restore_cache_env(prev_env);
     }
 
     #[test]
     #[serial_test::serial]
     fn test_explicit_invalidation_of_existing_path_persists() {
         let temp_home = TempDir::new().unwrap();
-        let prev_env = sandbox_cache_env(temp_home.path());
+        let _cache_env = sandbox_cache_env(temp_home.path());
         let source = write_temp_file(b"still exists\n");
         let identity = CacheIdentity::for_client(ClientId::Claude);
 
@@ -3358,15 +3444,13 @@ mod tests {
         assert!(SourceMessageCache::load()
             .get(identity, source.path())
             .is_none());
-
-        restore_cache_env(prev_env);
     }
 
     #[test]
     #[serial_test::serial]
     fn test_stale_invalidation_preserves_concurrently_refreshed_entry() {
         let temp_home = TempDir::new().unwrap();
-        let prev_env = sandbox_cache_env(temp_home.path());
+        let _cache_env = sandbox_cache_env(temp_home.path());
         let source_dir = TempDir::new().unwrap();
         let path = source_dir.path().join("session.jsonl");
         let identity = CacheIdentity::for_client(ClientId::Claude);
@@ -3391,8 +3475,6 @@ mod tests {
             loaded.get(identity, &path).unwrap().messages[0].session_id,
             "fresh-session"
         );
-
-        restore_cache_env(prev_env);
     }
 
     #[test]
@@ -3431,7 +3513,7 @@ mod tests {
     #[serial_test::serial]
     fn test_save_if_dirty_marks_cache_clean() {
         let temp_home = TempDir::new().unwrap();
-        let prev_env = sandbox_cache_env(temp_home.path());
+        let _cache_env = sandbox_cache_env(temp_home.path());
 
         let mut cache = SourceMessageCache::default();
         assert!(!cache.dirty);
@@ -3445,15 +3527,13 @@ mod tests {
             cache.save_if_dirty();
             assert!(!cache.dirty);
         }
-
-        restore_cache_env(prev_env);
     }
 
     #[test]
     #[serial_test::serial]
     fn test_save_if_dirty_merges_concurrent_writers() {
         let temp_home = TempDir::new().unwrap();
-        let prev_env = sandbox_cache_env(temp_home.path());
+        let _cache_env = sandbox_cache_env(temp_home.path());
 
         {
             let source_dir = TempDir::new().unwrap();
@@ -3477,15 +3557,13 @@ mod tests {
             assert!(loaded.get(identity, &path_one).is_some());
             assert!(loaded.get(identity, &path_two).is_some());
         }
-
-        restore_cache_env(prev_env);
     }
 
     #[test]
     #[serial_test::serial]
     fn test_save_if_dirty_preserves_recreated_path_from_concurrent_writer() {
         let temp_home = TempDir::new().unwrap();
-        let prev_env = sandbox_cache_env(temp_home.path());
+        let _cache_env = sandbox_cache_env(temp_home.path());
 
         {
             let source_dir = TempDir::new().unwrap();
@@ -3514,8 +3592,6 @@ mod tests {
                 .expect("recreated source cache entry should survive stale delete");
             assert_eq!(entry.messages[0].session_id, "fresh-session");
         }
-
-        restore_cache_env(prev_env);
     }
 
     fn keyed_message(namespace: &str, session_id: &str, dedup_key: &str) -> UnifiedMessage {
@@ -3563,7 +3639,7 @@ mod tests {
     #[serial_test::serial]
     fn test_loading_claude_cache_removes_synthetic_placeholder_rows_without_retiring_history() {
         let temp_home = TempDir::new().unwrap();
-        let prev_env = sandbox_cache_env(temp_home.path());
+        let _cache_env = sandbox_cache_env(temp_home.path());
 
         {
             let source_dir = TempDir::new().unwrap();
@@ -3621,15 +3697,13 @@ mod tests {
                             .all(|message| message.model_id != " <SYNTHETIC> ")
             ));
         }
-
-        restore_cache_env(prev_env);
     }
 
     #[test]
     #[serial_test::serial]
     fn test_claude_cache_save_does_not_restore_synthetic_history_from_another_writer() {
         let temp_home = TempDir::new().unwrap();
-        let prev_env = sandbox_cache_env(temp_home.path());
+        let _cache_env = sandbox_cache_env(temp_home.path());
 
         {
             let source_dir = TempDir::new().unwrap();
@@ -3664,8 +3738,6 @@ mod tests {
                         && entries[0].messages[0].dedup_key.as_deref() == Some("live:req_live")
             ));
         }
-
-        restore_cache_env(prev_env);
     }
 
     /// A Claude entry can hold assistant turns the live transcript no longer
@@ -3677,7 +3749,7 @@ mod tests {
     #[serial_test::serial]
     fn test_save_if_dirty_unions_retained_history_for_the_same_path() {
         let temp_home = TempDir::new().unwrap();
-        let prev_env = sandbox_cache_env(temp_home.path());
+        let _cache_env = sandbox_cache_env(temp_home.path());
 
         {
             let source_dir = TempDir::new().unwrap();
@@ -3721,8 +3793,6 @@ mod tests {
                 "and must not duplicate the shared turn"
             );
         }
-
-        restore_cache_env(prev_env);
     }
 
     /// The union is scoped to keys that stay valid wherever the message is
@@ -3733,7 +3803,7 @@ mod tests {
     #[serial_test::serial]
     fn test_save_if_dirty_does_not_union_path_scoped_keys() {
         let temp_home = TempDir::new().unwrap();
-        let prev_env = sandbox_cache_env(temp_home.path());
+        let _cache_env = sandbox_cache_env(temp_home.path());
 
         {
             let source_dir = TempDir::new().unwrap();
@@ -3769,8 +3839,6 @@ mod tests {
                 "path-scoped keys must not outlive the bytes that produced them"
             );
         }
-
-        restore_cache_env(prev_env);
     }
 
     /// The union exists only for namespaces that retain history. Everywhere
@@ -3780,7 +3848,7 @@ mod tests {
     #[serial_test::serial]
     fn test_save_if_dirty_still_replaces_entries_for_non_retaining_clients() {
         let temp_home = TempDir::new().unwrap();
-        let prev_env = sandbox_cache_env(temp_home.path());
+        let _cache_env = sandbox_cache_env(temp_home.path());
 
         {
             let source_dir = TempDir::new().unwrap();
@@ -3812,8 +3880,6 @@ mod tests {
             let entry = loaded.get(identity, &path).expect("entry should survive");
             assert_eq!(entry.messages.len(), 1);
         }
-
-        restore_cache_env(prev_env);
     }
 
     #[cfg(unix)]
@@ -3826,5 +3892,67 @@ mod tests {
         let cached_path = CachedPath::from_path(&path);
 
         assert_eq!(cached_path.to_path_buf(), path);
+    }
+
+    /// One file reached under both separators is one cache entry.
+    ///
+    /// A scan spells a discovered transcript with both: the root half comes
+    /// from `format!("{root}/{relative}")` and the children below it from
+    /// `Path::join`. Keying on the raw code units made those two spellings two
+    /// entries for one file, so the cache could never hit.
+    #[cfg(windows)]
+    #[test]
+    fn cached_path_identity_folds_the_two_windows_separators() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn hash_of(path: &CachedPath) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            path.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        let mixed = CachedPath::from_path(Path::new(r"C:\home/.claude/projects\demo\s.jsonl"));
+        let native = CachedPath::from_path(Path::new(r"C:\home\.claude\projects\demo\s.jsonl"));
+
+        assert_eq!(mixed, native, "both spellings name one file");
+        assert_eq!(hash_of(&mixed), hash_of(&native), "Hash must match Eq");
+
+        let mut digests = Vec::new();
+        for path in [&mixed, &native] {
+            let mut hasher = Sha256::new();
+            path.update_digest(&mut hasher);
+            digests.push(hasher.finalize());
+        }
+        assert_eq!(
+            digests[0], digests[1],
+            "the shard digest must agree too, or one file lands in two shards"
+        );
+
+        // The stored spelling is untouched: `to_path_buf` still round-trips,
+        // which `SourceMessageCache` relies on to stat the file it cached.
+        assert_eq!(
+            mixed.to_path_buf(),
+            PathBuf::from(r"C:\home/.claude/projects\demo\s.jsonl")
+        );
+
+        // Different files stay different.
+        let other = CachedPath::from_path(Path::new(r"C:\home\.claude\projects\demo\t.jsonl"));
+        assert_ne!(mixed, other);
+    }
+
+    /// After `\\?\` the object manager stops translating, so `/` is an ordinary
+    /// character in a name rather than a separator. Folding it there would merge
+    /// two genuinely different paths.
+    #[cfg(windows)]
+    #[test]
+    fn cached_path_identity_leaves_verbatim_paths_alone() {
+        let with_slash = CachedPath::from_path(Path::new(r"\\?\C:\dir/name\f.jsonl"));
+        let with_backslash = CachedPath::from_path(Path::new(r"\\?\C:\dir\name\f.jsonl"));
+
+        assert_ne!(
+            with_slash, with_backslash,
+            "inside the verbatim namespace `/` is part of the name, not a separator"
+        );
     }
 }
