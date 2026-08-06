@@ -1015,14 +1015,20 @@ fn extract_claude_tool_result_message(
         // still be Claude Code's local `<synthetic>` notice when the placeholder
         // arrived in a different transcript (a subagent sidechain resets the
         // per-file suppression flag), so re-check the inherited value instead of
-        // trusting `suppress_unattributed` alone. Without this, the placeholder
-        // becomes a `model_id` carrying a char-based estimate.
+        // trusting `suppress_unattributed` alone.
         //
-        // That used to abort the whole submission with "pricing is unavailable
-        // for submitted token usage". Since #1053 it no longer does: the row is
-        // excluded with a warning and the rest is submitted, so the fabricated
-        // usage fails quietly rather than loudly. The guard matters more for it,
-        // not less — a regression here is now invisible in normal use.
+        // Without this the row is emitted as `unknown/<synthetic>`. Production
+        // passes `allow_char_estimate: false`, so it carries tokens only when
+        // the tool result declared them explicitly; a text-only result yields
+        // no usage and is dropped before reaching submission.
+        //
+        // What that costs depends on pricing coverage, and neither outcome is
+        // the "aborts the whole submission" this comment once claimed:
+        //   - dataset loaded but not covering the model — #1053 excludes the
+        //     row with a named warning and submits the priced remainder, if any
+        //   - no pricing dataset loaded at all — #1055 fails the submission
+        // The first is a warning in a long run rather than a hard stop, so a
+        // regression here is easy to miss. Keep the guard.
         None => match context.last_model {
             Some(model) if is_claude_synthetic_placeholder_model(model) => return None,
             Some(model) => model.to_string(),
@@ -2353,9 +2359,10 @@ mod tests {
     fn test_inherited_synthetic_model_does_not_price_a_tool_result() {
         // A `<synthetic>` notice that is not immediately followed by the tool
         // result in the same transcript still leaves the placeholder as the
-        // inherited carrier model. The estimate must be dropped rather than
-        // emitted as `unknown/<synthetic>`, which submission rejects as
-        // unpriceable usage.
+        // inherited carrier model. The usage must be dropped rather than
+        // emitted as `unknown/<synthetic>`: submission cannot price that model,
+        // so it either excludes the row or fails outright depending on pricing
+        // coverage. See the guard in `extract_claude_tool_result_message`.
         let context = ClaudeToolResultContext {
             entry: &ClaudeEntry {
                 entry_type: "user".to_string(),
