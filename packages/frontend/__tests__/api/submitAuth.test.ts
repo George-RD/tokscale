@@ -112,7 +112,10 @@ vi.mock("@/lib/validation/submission", () => ({
   generateSubmissionHash: mockState.generateSubmissionHash,
 }));
 
-vi.mock("@/lib/db/helpers", () => ({
+vi.mock("@/lib/db/helpers", async (importOriginal) => ({
+  // Spread the real module so a newly added export does not break every
+  // test that mocks this file; only the named functions are stubbed.
+  ...(await importOriginal<typeof import("@/lib/db/helpers")>()),
   mergeClientBreakdowns: mockState.mergeClientBreakdowns,
   mergeClientBreakdownsWithRegressionGuard: mockState.mergeClientBreakdownsWithRegressionGuard,
   recalculateDayTotals: mockState.recalculateDayTotals,
@@ -757,7 +760,9 @@ describe("POST /api/submit auth path", () => {
         },
       },
       expect.any(Set),
-      expect.any(Map)
+      expect.any(Map),
+      // #1044: submissions that omit the flag are complete.
+      true
     );
     expect(await response.json()).toEqual(expect.objectContaining({
       success: true,
@@ -1139,7 +1144,9 @@ describe("POST /api/submit auth path", () => {
         },
       },
       expect.any(Set),
-      expect.any(Map)
+      expect.any(Map),
+      // #1044: submissions that omit the flag are complete.
+      true
     );
     expect(await response.json()).toEqual(expect.objectContaining({
       success: true,
@@ -2005,7 +2012,9 @@ describe("POST /api/submit auth path", () => {
       legacyBreakdown,
       incomingBreakdownWithProvenance,
       expect.any(Set),
-      expect.any(Map)
+      expect.any(Map),
+      // #1044: submissions that omit the flag are complete.
+      true
     );
     expect(await response.json()).toEqual(expect.objectContaining({
       success: true,

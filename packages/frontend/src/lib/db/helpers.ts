@@ -24,6 +24,17 @@ export interface ClientBreakdownProvenanceData {
    * so merges do not silently drop the tag.
    */
   origin?: "cli" | "backfill";
+  /**
+   * `false` when this client's stored `cost` is a floor rather than a total —
+   * the submission that wrote it could not price every token it counted
+   * (#1044). Absent means complete, so rows written before this existed, and
+   * every already-released CLI, keep exact semantics.
+   *
+   * Carried PER CLIENT, not per day, because a day's clients are written
+   * independently: a healthy resubmit naming only client B must not clear the
+   * incompleteness of client A, which the merge preserves untouched.
+   */
+  costIsComplete?: boolean;
 }
 
 export interface ClientBreakdownData {
@@ -123,6 +134,11 @@ export function deriveClientBreakdownProvenance(
     // Carry the origin tag through re-derivation (merges, alias folding) so
     // a backfill-tagged client row keeps its tag.
     ...(origin ? { origin } : {}),
+    // Same: re-derivation must not silently promote a floored cost back to
+    // complete. Only an explicitly complete write clears this, in the merge.
+    ...(breakdown.provenance?.costIsComplete === false
+      ? { costIsComplete: false }
+      : {}),
   };
 }
 
@@ -169,7 +185,19 @@ export function mergeClientBreakdownsWithRegressionGuard(
   // normal guard still applies. A pure rename-only fold (only the legacy key
   // was ever present) is NOT included here and keeps the normal guard
   // behavior.
-  foldedClientFloors?: Map<string, number>
+  foldedClientFloors?: Map<string, number>,
+  // `false` when the submission declared its own pricing incomplete (#1044).
+  // Its per-client costs are then floors, not totals, so a client's stored
+  // cost may only rise, and the client is tagged incomplete.
+  //
+  // This is deliberately applied HERE rather than in SQL. The day's scalar
+  // `cost` is recomputed from this merged breakdown by recalculateDayTotals,
+  // so flooring the scalar in the write statement while replacing the JSON
+  // wholesale would leave the row's two representations disagreeing — and
+  // different readers use different ones (profile totals read the scalar,
+  // filtered leaderboards sum the JSON). Flooring the breakdown keeps them
+  // reconcilable by construction.
+  incomingCostIsComplete: boolean = true
 ): MergeClientBreakdownsResult {
   const merged: Record<string, ClientBreakdownData> = { ...(existing || {}) };
   const warnings: string[] = [];
@@ -230,11 +258,87 @@ export function mergeClientBreakdownsWithRegressionGuard(
       continue;
     }
 
-    merged[clientName] = nextClient;
+    merged[clientName] = applyCostCompleteness(
+      nextClient,
+      existingClient,
+      incomingCostIsComplete
+    );
     foldPreservedClients.delete(clientName);
   }
 
   return { merged, warnings, foldPreservedClients };
+}
+
+/**
+ * Resolve one client's cost and completeness tag against what is stored.
+ *
+ * A complete submission overwrites exactly, clearing any earlier floor — that
+ * is how a day recovers once pricing is healthy again, and it keeps legitimate
+ * downward corrections working.
+ *
+ * An incomplete one may only raise the cost. Note the tag does not depend on
+ * which value won: a floored client stays incomplete even when its own number
+ * was kept, because the stored cost still may not cover the tokens now
+ * recorded alongside it. Deriving the tag from the comparison instead would
+ * mark a client complete whenever an incomplete rescan happened to report less
+ * than the old total for a *larger* token set.
+ */
+function applyCostCompleteness(
+  next: ClientBreakdownData,
+  existing: ClientBreakdownData | undefined,
+  incomingCostIsComplete: boolean
+): ClientBreakdownData {
+  if (incomingCostIsComplete) {
+    const { costIsComplete: _dropped, ...provenance } =
+      next.provenance ?? deriveClientBreakdownProvenance(next);
+    return { ...next, provenance };
+  }
+
+  const flooredCost = Math.max(existing?.cost ?? 0, next.cost);
+  return {
+    ...next,
+    cost: flooredCost,
+    provenance: {
+      ...(next.provenance ?? deriveClientBreakdownProvenance(next)),
+      costIsComplete: false,
+    },
+  };
+}
+
+/**
+ * Tag every client in a breakdown with the submission's completeness.
+ *
+ * For a day with no stored row there is nothing to floor against, but the tags
+ * still have to be written: a later filtered resubmit naming only healthy
+ * clients must be able to see that this one was incomplete.
+ */
+export function tagBreakdownCostCompleteness(
+  breakdown: Record<string, ClientBreakdownData>,
+  costIsComplete: boolean
+): Record<string, ClientBreakdownData> {
+  if (costIsComplete) return breakdown;
+
+  const tagged: Record<string, ClientBreakdownData> = {};
+  for (const [clientName, client] of Object.entries(breakdown)) {
+    tagged[clientName] = applyCostCompleteness(client, undefined, false);
+  }
+  return tagged;
+}
+
+/**
+ * True when every client in a day carries a complete cost.
+ *
+ * Absent tags mean complete, so legacy rows and released CLIs read as
+ * complete. Clients the submission never mentioned are included, which is the
+ * point: a filtered resubmit of one healthy client must not clear a preserved
+ * sibling's incompleteness.
+ */
+export function breakdownCostIsComplete(
+  breakdown: Record<string, ClientBreakdownData> | null | undefined
+): boolean {
+  return Object.values(breakdown ?? {}).every(
+    (client) => client.provenance?.costIsComplete !== false
+  );
 }
 
 export function clientContributionToBreakdownData(

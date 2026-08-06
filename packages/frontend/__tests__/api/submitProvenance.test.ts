@@ -137,7 +137,10 @@ vi.mock("@/lib/validation/submission", () => ({
   generateSubmissionHash: mockState.generateSubmissionHash,
 }));
 
-vi.mock("@/lib/db/helpers", () => ({
+vi.mock("@/lib/db/helpers", async (importOriginal) => ({
+  // Spread the real module so a newly added export does not break every
+  // test that mocks this file; only the named functions are stubbed.
+  ...(await importOriginal<typeof import("@/lib/db/helpers")>()),
   mergeClientBreakdownsWithRegressionGuard: mockState.mergeClientBreakdownsWithRegressionGuard,
   recalculateDayTotals: mockState.recalculateDayTotals,
   deriveClientBreakdownProvenance: mockState.deriveClientBreakdownProvenance,

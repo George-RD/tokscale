@@ -5,8 +5,10 @@ import {
   validateSubmission,
 } from "../../src/lib/validation/submission";
 import {
+  breakdownCostIsComplete,
   deriveClientBreakdownProvenance,
   mergeClientBreakdownsWithRegressionGuard,
+  recalculateDayTotals,
   type ClientBreakdownData,
 } from "../../src/lib/db/helpers";
 
@@ -457,6 +459,118 @@ describe('POST /api/submit - Client-Level Merge', () => {
 
       expect(result.valid).toBe(true);
       expect(result.errors).toHaveLength(0);
+    });
+  });
+
+  describe("costIsComplete merge floor (#1044)", () => {
+    function client(
+      tokens: number,
+      cost: number,
+      costIsComplete?: boolean
+    ): ClientBreakdownData {
+      return {
+        tokens,
+        cost,
+        input: tokens,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        reasoning: 0,
+        messages: 1,
+        models: {},
+        ...(costIsComplete === false
+          ? {
+              provenance: {
+                schemaVersion: 1,
+                messageCount: 1,
+                modelCount: 0,
+                costIsComplete: false,
+              },
+            }
+          : {}),
+      };
+    }
+
+    it("floors a client's cost when the submission declares itself incomplete", () => {
+      // More tokens at a LOWER cost: the token guard accepts the client, so
+      // without a floor the day's recorded spend drops permanently.
+      const { merged } = mergeClientBreakdownsWithRegressionGuard(
+        { claude: client(100, 10) },
+        { claude: client(110, 5) },
+        new Set(["claude"]),
+        undefined,
+        false
+      );
+
+      expect(merged.claude.cost).toBe(10);
+      expect(merged.claude.tokens).toBe(110);
+      expect(breakdownCostIsComplete(merged)).toBe(false);
+    });
+
+    it("marks the client incomplete even when its own cost was kept", () => {
+      // The stored $10 was complete for the OLD token set. Deriving the tag
+      // from "did the new value win?" would call this complete, which is the
+      // defect adversarial review found in the earlier SQL-side design.
+      const { merged } = mergeClientBreakdownsWithRegressionGuard(
+        { claude: client(100, 10) },
+        { claude: client(110, 5) },
+        new Set(["claude"]),
+        undefined,
+        false
+      );
+
+      expect(merged.claude.provenance?.costIsComplete).toBe(false);
+    });
+
+    it("keeps the day scalar reconcilable with the stored breakdown", () => {
+      // The scalar is recomputed from this breakdown, so flooring here (rather
+      // than in SQL) is what stops the row's two representations diverging.
+      const { merged } = mergeClientBreakdownsWithRegressionGuard(
+        { claude: client(100, 10) },
+        { claude: client(110, 5) },
+        new Set(["claude"]),
+        undefined,
+        false
+      );
+
+      expect(recalculateDayTotals(merged).cost).toBe(10);
+    });
+
+    it("does not let a filtered healthy resubmit clear a sibling's incompleteness", () => {
+      // Day holds incomplete A and complete B; a healthy submit naming only B
+      // must leave A's state alone. Day-level state cannot express this.
+      const { merged } = mergeClientBreakdownsWithRegressionGuard(
+        { claude: client(100, 10, false), codex: client(50, 5) },
+        { codex: client(60, 6) },
+        new Set(["codex"]),
+        undefined,
+        true
+      );
+
+      expect(merged.claude.provenance?.costIsComplete).toBe(false);
+      expect(merged.codex.provenance?.costIsComplete).toBeUndefined();
+      expect(breakdownCostIsComplete(merged)).toBe(false);
+    });
+
+    it("clears the floor once a complete submission covers the client", () => {
+      // Recovery, and the reason downward corrections still work.
+      const { merged } = mergeClientBreakdownsWithRegressionGuard(
+        { claude: client(100, 10, false) },
+        { claude: client(100, 4) },
+        new Set(["claude"]),
+        undefined,
+        true
+      );
+
+      expect(merged.claude.cost).toBe(4);
+      expect(merged.claude.provenance?.costIsComplete).toBeUndefined();
+      expect(breakdownCostIsComplete(merged)).toBe(true);
+    });
+
+    it("treats an untagged breakdown as complete", () => {
+      expect(breakdownCostIsComplete({ claude: client(10, 1) })).toBe(true);
+      expect(breakdownCostIsComplete({})).toBe(true);
+      expect(breakdownCostIsComplete(null)).toBe(true);
     });
   });
 

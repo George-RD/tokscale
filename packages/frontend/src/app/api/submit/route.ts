@@ -15,6 +15,8 @@ import {
   clientContributionToBreakdownData,
   deriveClientBreakdownProvenance,
   mergeTimestampMs,
+  breakdownCostIsComplete,
+  tagBreakdownCostCompleteness,
   type ClientBreakdownData,
 } from "@/lib/db/helpers";
 import {
@@ -732,7 +734,8 @@ export async function POST(request: Request) {
             existingClientBreakdown,
             incomingClientBreakdown,
             submittedClients,
-            foldedClientFloors
+            foldedClientFloors,
+            incomingDay.totals?.costIsComplete ?? true
           );
           warnings.push(
             ...mergeResult.warnings.map((warning) => `Day ${incomingDay.date}: ${warning}`)
@@ -772,12 +775,21 @@ export async function POST(request: Request) {
             timestampMs: mergeTimestampMs(existingDay.timestampMs, incomingDay.timestampMs ?? null),
             activeTimeMs: mergeActiveTimeMs(existingDay.activeTimeMs, incomingDay.activeTimeMs),
             sourceBreakdown: mergedClientBreakdown,
-            // Absent means complete: released CLIs cannot send this, and must
-            // keep exact overwrite semantics including downward corrections.
-            costIsComplete: incomingDay.totals?.costIsComplete ?? true,
+            // Derived from the MERGED breakdown, not the incoming day: a
+            // filtered resubmit naming only healthy clients must not clear a
+            // preserved sibling's incompleteness. The merge has already
+            // floored each incoming client's cost, so this agrees with the
+            // scalar recomputed above by construction.
+            costIsComplete: breakdownCostIsComplete(mergedClientBreakdown),
           });
         } else {
-          const dayTotals = recalculateDayTotals(incomingClientBreakdown);
+          // A day with no stored row has nothing to floor against, but its
+          // clients still carry the tag forward for later merges.
+          const insertedClientBreakdown = tagBreakdownCostCompleteness(
+            incomingClientBreakdown,
+            incomingDay.totals?.costIsComplete ?? true
+          );
+          const dayTotals = recalculateDayTotals(insertedClientBreakdown);
 
           toInsert.push({
             submissionId,
@@ -789,8 +801,8 @@ export async function POST(request: Request) {
             outputTokens: dayTotals.outputTokens,
             timestampMs: incomingDay.timestampMs ?? null,
             activeTimeMs: incomingDay.activeTimeMs ?? null,
-            sourceBreakdown: incomingClientBreakdown,
-            costIsComplete: incomingDay.totals?.costIsComplete ?? true,
+            sourceBreakdown: insertedClientBreakdown,
+            costIsComplete: breakdownCostIsComplete(insertedClientBreakdown),
           });
         }
       }
@@ -820,22 +832,14 @@ export async function POST(request: Request) {
           VALUES ${insertValuesList}
           ON CONFLICT (submission_id, submitted_device_id, date) DO UPDATE SET
             tokens = EXCLUDED.tokens,
-            -- A submission that declares its own pricing incomplete may raise a
-            -- day's cost but never lower it: its cost is a floor, not a total,
-            -- and this write overwrites per day (#1044). Complete submissions
-            -- keep exact overwrite semantics, downward corrections included.
-            cost = CASE
-                     WHEN EXCLUDED.cost_is_complete THEN EXCLUDED.cost
-                     ELSE GREATEST(daily_breakdown.cost, EXCLUDED.cost)
-                   END,
-            -- Describes the cost actually stored above, so the flag cannot
-            -- claim a number is unreliable when the guard just kept a complete
-            -- one, nor claim completeness after an incomplete floor won.
-            cost_is_complete = CASE
-                                 WHEN EXCLUDED.cost_is_complete THEN true
-                                 WHEN EXCLUDED.cost > daily_breakdown.cost THEN false
-                                 ELSE daily_breakdown.cost_is_complete
-                               END,
+            -- Both of these are plain overwrites on purpose. The #1044 floor is
+            -- applied per client during the in-memory merge, so cost here is
+            -- already recomputed from the floored breakdown and cannot be lower
+            -- than what an incomplete submission is allowed to store. Guarding
+            -- the scalar in SQL while replacing source_breakdown wholesale
+            -- would instead leave the row's two representations disagreeing.
+            cost = EXCLUDED.cost,
+            cost_is_complete = EXCLUDED.cost_is_complete,
             input_tokens = EXCLUDED.input_tokens,
             output_tokens = EXCLUDED.output_tokens,
             timestamp_ms = EXCLUDED.timestamp_ms,
@@ -862,18 +866,10 @@ export async function POST(request: Request) {
         await tx.execute(sql`
           UPDATE daily_breakdown AS d SET
             tokens = batch.tokens,
-            -- Same guard as the ON CONFLICT arm above; this is the path #1044
-            -- named explicitly, and leaving it unguarded would reopen the hole
-            -- for every day that already had a row for this device.
-            cost = CASE
-                     WHEN batch.cost_is_complete THEN batch.cost
-                     ELSE GREATEST(d.cost, batch.cost)
-                   END,
-            cost_is_complete = CASE
-                                 WHEN batch.cost_is_complete THEN true
-                                 WHEN batch.cost > d.cost THEN false
-                                 ELSE d.cost_is_complete
-                               END,
+            -- Plain overwrites for the same reason as the ON CONFLICT arm: the
+            -- floor lives in the merge, so this value already respects it.
+            cost = batch.cost,
+            cost_is_complete = batch.cost_is_complete,
             input_tokens = batch.input_tokens,
             output_tokens = batch.output_tokens,
             timestamp_ms = batch.timestamp_ms,
