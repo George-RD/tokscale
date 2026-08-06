@@ -294,6 +294,20 @@ impl PricingService {
         ))
     }
 
+    /// True when this service holds pricing from at least one source that can
+    /// fail to load — the three fetchable upstreams, or the user's
+    /// `custom-pricing.json`.
+    ///
+    /// Mirrors the signal `from_cached_datasets` uses to decide a cached
+    /// service is worth building at all. Callers that must distinguish "this
+    /// model has no published price" from "no pricing dataset loaded" need
+    /// this, because an empty service answers `false` to every coverage
+    /// question and is otherwise indistinguishable from healthy pricing that
+    /// happens not to cover the model in hand.
+    pub fn has_pricing_data(&self) -> bool {
+        !self.custom.is_empty() || self.lookup.has_upstream_dataset()
+    }
+
     pub fn load_cached_any_age() -> Option<Self> {
         Self::from_cached_datasets(
             litellm::load_cached_any_age(),

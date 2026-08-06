@@ -26,6 +26,35 @@ fn prime_pricing_cache(base: &Path) {
     }
 }
 
+// @keep: the empty `data` in prime_pricing_cache is easy to mistake for real pricing.
+/// Prime the LiteLLM cache with an actual priced model.
+///
+/// `prime_pricing_cache` writes `"data":{}`, so the pricing service loads
+/// successfully holding nothing. That is indistinguishable from a total upstream
+/// outage, and the submission path now rejects exclusions made against it. Tests
+/// that need "pricing loaded fine, it just does not cover *this* model" must
+/// prime a non-empty dataset with this.
+fn prime_pricing_cache_with_a_priced_model(base: &Path) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs();
+    let payload = format!(
+        r#"{{"timestamp":{},"data":{{"gpt-4o":{{"input_cost_per_token":0.0000025,"output_cost_per_token":0.00001,"cache_read_input_token_cost":0.00000125,"cache_creation_input_token_cost":0.000003125}}}}}}"#,
+        now
+    );
+
+    for dir in [
+        base.join("Library/Caches/tokscale"),
+        base.join(".cache/tokscale"),
+        base.join(".config/tokscale/cache"),
+    ] {
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("pricing-litellm.json"), &payload).unwrap();
+        fs::write(dir.join("pricing-openrouter.json"), &payload).unwrap();
+    }
+}
+
 fn prime_override_pricing_cache(config_dir: &Path) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3621,6 +3650,10 @@ fn test_root_with_group_by() {
 #[test]
 fn test_submit_excludes_unpriced_usage_and_keeps_the_rest() {
     let tmp = create_temp_fixture_dir();
+    // Healthy pricing that does not happen to cover the unpriced model below.
+    // Without this the fixture holds no pricing at all, which is a different
+    // (fatal) condition — see test_submit_offline_without_pricing_cache_fails.
+    prime_pricing_cache_with_a_priced_model(tmp.path());
     write_fake_credentials(tmp.path());
     let unpriced_dir = tmp
         .path()
@@ -3670,6 +3703,65 @@ fn test_submit_excludes_unpriced_usage_and_keeps_the_rest() {
     assert!(
         stdout.contains("Dry run - not submitting data."),
         "dry-run must complete without submitting: {stdout}"
+    );
+}
+
+/// Regression: a cold cache with no network must not look like "no usage".
+///
+/// Every fetchable upstream is unreachable here and nothing is cached, so the
+/// pricing service loads empty and covers nothing. Excluding on that basis would
+/// consume the whole batch and exit 0 reporting no usage to submit, which is
+/// indistinguishable from an empty history and reads as success to autosubmit.
+#[test]
+fn test_submit_offline_without_pricing_cache_fails() {
+    let tmp = create_temp_fixture_dir_without_pricing_cache();
+    write_fake_credentials(tmp.path());
+    // Cost 0 keeps these messages non-authoritative, so they depend on pricing.
+    // The stock fixture's messages carry a positive OpenCode cost, which is
+    // provider-reported and would bypass pricing entirely.
+    let unpriced_dir = tmp
+        .path()
+        .join(".local/share/opencode/storage/message/needs-pricing");
+    fs::create_dir_all(&unpriced_dir).unwrap();
+    fs::write(
+        unpriced_dir.join("needs-pricing.json"),
+        r#"{
+            "id": "needs-pricing",
+            "sessionID": "needs-pricing",
+            "role": "assistant",
+            "modelID": "claude-sonnet-4-20250514",
+            "providerID": "anthropic",
+            "cost": 0,
+            "tokens": { "input": 1000, "output": 500, "reasoning": 0, "cache": { "read": 0, "write": 0 } },
+            "time": { "created": 1736510400000.0 }
+        }"#,
+    )
+    .unwrap();
+
+    let output = offline_cmd_with_home(tmp.path())
+        .args([
+            "--no-spinner",
+            "submit",
+            "--client",
+            "opencode",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a total pricing outage must fail loudly, not report an empty submission;\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("pricing data is unavailable for submission"),
+        "the failure must name the pricing outage: {stderr}"
+    );
+    assert!(
+        !stdout.contains("No usage data found to submit."),
+        "usage exists; it must not be reported as absent: {stdout}"
     );
 }
 
