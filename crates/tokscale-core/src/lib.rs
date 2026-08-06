@@ -2997,6 +2997,7 @@ fn build_graph_from_messages(
         GraphPricingRequirement::Lenient => (filtered, Vec::new()),
         GraphPricingRequirement::Submission => {
             let (submitted, exclusions) = exclude_unpriced_submission_messages(filtered, pricing);
+            require_trustworthy_exclusions(pricing, &exclusions)?;
             validate_priced_messages(&submitted, pricing)?;
             (submitted, exclusions)
         }
@@ -3167,12 +3168,51 @@ pub async fn generate_local_graph_report(options: ReportOptions) -> Result<Graph
     .await
 }
 
+const UNAVAILABLE_SUBMISSION_PRICING: &str = "pricing data is unavailable for submission";
+
+// @keep: the two conditions are load-bearing together; either alone is wrong.
+/// Refuse to act on exclusions that no pricing dataset backs.
+///
+/// `exclude_unpriced_submission_messages` drops what the pricing service cannot
+/// cover, but a service with no dataset covers *nothing*, so "unpriced" and "we
+/// have no prices" produce identical exclusions. Left alone, a cold cache with
+/// no network excludes the entire batch, leaves `total_tokens == 0`, and lets
+/// the CLI print "No usage data found to submit" and exit 0 — indistinguishable
+/// from genuinely having no usage, and reported as success to autosubmit.
+///
+/// Both conditions matter:
+///
+/// - Only when something was excluded. A batch whose messages all carry
+///   provider-reported costs never consults pricing, so a missing dataset is
+///   irrelevant and must not block it.
+/// - Only when no dataset loaded. A populated dataset that simply lacks a price
+///   for some model is the case #1053 exists to handle; failing there would
+///   break autosubmit for anyone whose usage is legitimately unpriceable, which
+///   is the trap #1044 documents.
+///
+/// This runs after exclusion because the exclusion list is the signal. It
+/// cannot move into `validate_priced_messages`, which sees only the survivors —
+/// and when everything is excluded that slice is empty and validates trivially.
+fn require_trustworthy_exclusions(
+    pricing: Option<&pricing::PricingService>,
+    exclusions: &[UnpricedSubmissionExclusion],
+) -> Result<(), String> {
+    if exclusions.is_empty() {
+        return Ok(());
+    }
+
+    match pricing {
+        Some(pricing) if pricing.has_pricing_data() => Ok(()),
+        _ => Err(UNAVAILABLE_SUBMISSION_PRICING.to_string()),
+    }
+}
+
 fn validate_priced_messages(
     messages: &[UnifiedMessage],
     pricing: Option<&pricing::PricingService>,
 ) -> Result<(), String> {
     let Some(pricing) = pricing else {
-        return Err("pricing data is unavailable for submission".to_string());
+        return Err(UNAVAILABLE_SUBMISSION_PRICING.to_string());
     };
 
     // Counted rather than listed per message: a real submission repeats the
@@ -8164,7 +8204,9 @@ mod tests {
             },
             0.0,
         );
-        let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
+        // Populated but not covering this model: an empty service would instead
+        // trip the "no pricing dataset loaded" guard, which is a different case.
+        let pricing = pricing::PricingService::new(unrelated_litellm_dataset(), HashMap::new());
 
         let report = build_graph_from_messages(
             vec![message.clone()],
@@ -8192,6 +8234,24 @@ mod tests {
         );
     }
 
+    /// A dataset that loaded successfully but prices an unrelated model.
+    ///
+    /// Tests asserting "this model is unpriced" must use this rather than an
+    /// empty service: an empty service means *no dataset loaded*, which is a
+    /// separate, fatal condition on the submission path.
+    fn unrelated_litellm_dataset() -> HashMap<String, pricing::ModelPricing> {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-4o".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(1e-6),
+                output_cost_per_token: Some(2e-6),
+                ..Default::default()
+            },
+        );
+        litellm
+    }
+
     #[test]
     fn submission_without_any_pricing_data_still_fails() {
         let message = UnifiedMessage::new(
@@ -8207,16 +8267,62 @@ mod tests {
             0.0,
         );
 
-        let error = build_graph_from_messages(
+        // `None` is unreachable from `generate_submission_graph`, which always
+        // passes `Some(..)` because `PricingService::get_or_init` degrades every
+        // failed source to an empty map rather than erroring. The reachable
+        // shape of "no pricing dataset loaded" is a populated-with-nothing
+        // service, so both must fail identically.
+        let empty = pricing::PricingService::new(HashMap::new(), HashMap::new());
+        for (label, pricing) in [
+            ("no service at all", None),
+            ("a service with no dataset", Some(&empty)),
+        ] {
+            let Err(error) = build_graph_from_messages(
+                vec![message.clone()],
+                pricing,
+                GraphPricingRequirement::Submission,
+                std::time::Instant::now(),
+                &crate::bucket_tz::BucketTimezone::Local,
+            ) else {
+                panic!("submission must fail with {label}");
+            };
+
+            assert_eq!(error, "pricing data is unavailable for submission");
+        }
+    }
+
+    /// A missing pricing dataset only matters if something needed pricing.
+    /// Provider-reported costs are authoritative, so a batch made entirely of
+    /// them must still submit during a total upstream outage.
+    #[test]
+    fn submission_without_pricing_data_still_accepts_provider_reported_usage() {
+        let mut message = UnifiedMessage::new(
+            "opencode",
+            "some-model",
+            "anthropic",
+            "provider-reported",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 1_000,
+                output: 500,
+                ..Default::default()
+            },
+            0.05,
+        );
+        message.mark_provider_reported_cost();
+        let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
+
+        let graph = build_graph_from_messages(
             vec![message],
-            None,
+            Some(&pricing),
             GraphPricingRequirement::Submission,
             std::time::Instant::now(),
             &crate::bucket_tz::BucketTimezone::Local,
         )
-        .expect_err("submission must still fail when no pricing dataset loaded");
+        .expect("authoritative costs must not need a pricing dataset");
 
-        assert_eq!(error, "pricing data is unavailable for submission");
+        assert_eq!(graph.summary.total_tokens, 1_500);
+        assert!(graph.unpriced_submission_exclusions.is_empty());
     }
 
     #[test]
@@ -8296,7 +8402,8 @@ mod tests {
             },
             0.0,
         );
-        let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
+        // Populated but not covering this model — see `unrelated_litellm_dataset`.
+        let pricing = pricing::PricingService::new(unrelated_litellm_dataset(), HashMap::new());
 
         let graph = build_graph_from_messages(
             vec![concrete],

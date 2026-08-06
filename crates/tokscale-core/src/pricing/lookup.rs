@@ -158,6 +158,17 @@ impl PricingLookup {
         Self::new_with_models_dev(litellm, openrouter, cursor, HashMap::new(), HashMap::new())
     }
 
+    // @keep: the omission of cursor/sakana is the whole point and reads like a bug otherwise.
+    /// True when at least one *fetchable* upstream dataset loaded.
+    ///
+    /// The `cursor` and `sakana` tables are compiled-in constants that are
+    /// present on every run, so they are deliberately not consulted: counting
+    /// them would report healthy pricing during a total upstream outage, which
+    /// is exactly the condition callers use this to detect.
+    pub fn has_upstream_dataset(&self) -> bool {
+        !self.litellm.is_empty() || !self.openrouter.is_empty() || !self.models_dev.is_empty()
+    }
+
     pub fn new_with_models_dev(
         litellm: HashMap<String, ModelPricing>,
         openrouter: HashMap<String, ModelPricing>,
