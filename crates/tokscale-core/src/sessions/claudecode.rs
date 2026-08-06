@@ -1016,8 +1016,13 @@ fn extract_claude_tool_result_message(
         // arrived in a different transcript (a subagent sidechain resets the
         // per-file suppression flag), so re-check the inherited value instead of
         // trusting `suppress_unattributed` alone. Without this, the placeholder
-        // becomes a `model_id` carrying a char-based estimate and submission
-        // fails with "pricing is unavailable for submitted token usage".
+        // becomes a `model_id` carrying a char-based estimate.
+        //
+        // That used to abort the whole submission with "pricing is unavailable
+        // for submitted token usage". Since #1053 it no longer does: the row is
+        // excluded with a warning and the rest is submitted, so the fabricated
+        // usage fails quietly rather than loudly. The guard matters more for it,
+        // not less — a regression here is now invisible in normal use.
         None => match context.last_model {
             Some(model) if is_claude_synthetic_placeholder_model(model) => return None,
             Some(model) => model.to_string(),
