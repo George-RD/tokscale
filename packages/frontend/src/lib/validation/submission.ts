@@ -72,6 +72,19 @@ const DailyContributionSchema = z.object({
     tokens: NonNegativeIntegerSchema,
     cost: NonNegativeNumberSchema,
     messages: NonNegativeIntegerSchema,
+    /**
+     * Whether `cost` accounts for every token counted in `tokens`.
+     *
+     * `cost` alone cannot distinguish "this day cost $0.00" from "I could not
+     * price this day", and the write path overwrites cost per day, so a client
+     * with degraded pricing coverage would silently lower recorded spend
+     * (#1044). Sending `false` declares the cost a floor rather than a total,
+     * and the server then refuses to let it reduce what is already stored.
+     *
+     * Optional, and absent means complete — every already-released CLI keeps
+     * exact overwrite semantics, including downward corrections.
+     */
+    costIsComplete: z.boolean().optional(),
   }),
   intensity: NonNegativeIntegerSchema.max(4),
   tokenBreakdown: TokenBreakdownSchema,

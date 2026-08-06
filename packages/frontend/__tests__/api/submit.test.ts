@@ -460,6 +460,61 @@ describe('POST /api/submit - Client-Level Merge', () => {
     });
   });
 
+  describe("costIsComplete (#1044)", () => {
+    it("preserves a declared-incomplete flag through validation", () => {
+      const payload = createValidationPayload();
+      (
+        payload.contributions[0].totals as { costIsComplete?: boolean }
+      ).costIsComplete = false;
+
+      const result = validateSubmission(payload);
+
+      expect(result.valid).toBe(true);
+      expect(result.errors).toHaveLength(0);
+      // Asserting the parsed value, not just validity: Zod strips unknown keys,
+      // so a schema that never declared this field would still validate here
+      // and silently drop the flag before the route could act on it.
+      expect(result.data?.contributions[0].totals.costIsComplete).toBe(false);
+    });
+
+    it("leaves the flag undefined when omitted, so released CLIs keep working", () => {
+      const payload = createValidationPayload();
+
+      const result = validateSubmission(payload);
+
+      expect(result.valid).toBe(true);
+      expect(result.errors).toHaveLength(0);
+      expect(
+        result.data?.contributions[0].totals.costIsComplete
+      ).toBeUndefined();
+    });
+
+    it("rejects a non-boolean flag rather than coercing it", () => {
+      const payload = createValidationPayload();
+      (
+        payload.contributions[0].totals as { costIsComplete?: unknown }
+      ).costIsComplete = "false";
+
+      const result = validateSubmission(payload);
+
+      expect(result.valid).toBe(false);
+    });
+
+    it("does not treat an incomplete day as a totals mismatch", () => {
+      // The declared cost is a floor, not a different number: the consistency
+      // checks must still compare it against the summary the same way.
+      const payload = createValidationPayload({ totalCost: 12.5 });
+      (
+        payload.contributions[0].totals as { costIsComplete?: boolean }
+      ).costIsComplete = false;
+
+      const result = validateSubmission(payload);
+
+      expect(result.valid).toBe(true);
+      expect(result.errors).toHaveLength(0);
+    });
+  });
+
   describe("Submission validation guardrails", () => {
     it("accepts internally consistent high-volume one-day token totals", () => {
       // Size caps were removed in feat/remove-submission-size-caps; this test

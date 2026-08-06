@@ -650,6 +650,7 @@ export async function POST(request: Request) {
         timestampMs: number | null;
         activeTimeMs: number | null;
         sourceBreakdown: Record<string, ClientBreakdownData>;
+        costIsComplete: boolean;
       }> = [];
 
       const toUpdate: Array<{
@@ -661,6 +662,7 @@ export async function POST(request: Request) {
         timestampMs: number | null;
         activeTimeMs: number | null;
         sourceBreakdown: Record<string, ClientBreakdownData>;
+        costIsComplete: boolean;
       }> = [];
 
       for (const incomingDay of data.contributions) {
@@ -770,6 +772,9 @@ export async function POST(request: Request) {
             timestampMs: mergeTimestampMs(existingDay.timestampMs, incomingDay.timestampMs ?? null),
             activeTimeMs: mergeActiveTimeMs(existingDay.activeTimeMs, incomingDay.activeTimeMs),
             sourceBreakdown: mergedClientBreakdown,
+            // Absent means complete: released CLIs cannot send this, and must
+            // keep exact overwrite semantics including downward corrections.
+            costIsComplete: incomingDay.totals?.costIsComplete ?? true,
           });
         } else {
           const dayTotals = recalculateDayTotals(incomingClientBreakdown);
@@ -785,6 +790,7 @@ export async function POST(request: Request) {
             timestampMs: incomingDay.timestampMs ?? null,
             activeTimeMs: incomingDay.activeTimeMs ?? null,
             sourceBreakdown: incomingClientBreakdown,
+            costIsComplete: incomingDay.totals?.costIsComplete ?? true,
           });
         }
       }
@@ -800,7 +806,7 @@ export async function POST(request: Request) {
         const chunk = toInsert.slice(i, i + INSERT_CHUNK_SIZE);
         const insertValuesClauses = chunk.map(
           (row) =>
-            sql`(${row.submissionId}::uuid, ${row.submittedDeviceId}::uuid, ${row.date}, ${row.tokens}::bigint, ${row.cost}::numeric(14,4), ${row.inputTokens}::bigint, ${row.outputTokens}::bigint, ${row.timestampMs}::bigint, ${row.activeTimeMs}::bigint, ${JSON.stringify(row.sourceBreakdown)}::jsonb)`
+            sql`(${row.submissionId}::uuid, ${row.submittedDeviceId}::uuid, ${row.date}, ${row.tokens}::bigint, ${row.cost}::numeric(14,4), ${row.inputTokens}::bigint, ${row.outputTokens}::bigint, ${row.timestampMs}::bigint, ${row.activeTimeMs}::bigint, ${JSON.stringify(row.sourceBreakdown)}::jsonb, ${row.costIsComplete}::boolean)`
         );
 
         const insertValuesList = sql.join(insertValuesClauses, sql`, `);
@@ -808,12 +814,28 @@ export async function POST(request: Request) {
         await tx.execute(sql`
           INSERT INTO daily_breakdown (
             submission_id, submitted_device_id, date, tokens, cost,
-            input_tokens, output_tokens, timestamp_ms, active_time_ms, source_breakdown
+            input_tokens, output_tokens, timestamp_ms, active_time_ms, source_breakdown,
+            cost_is_complete
           )
           VALUES ${insertValuesList}
           ON CONFLICT (submission_id, submitted_device_id, date) DO UPDATE SET
             tokens = EXCLUDED.tokens,
-            cost = EXCLUDED.cost,
+            -- A submission that declares its own pricing incomplete may raise a
+            -- day's cost but never lower it: its cost is a floor, not a total,
+            -- and this write overwrites per day (#1044). Complete submissions
+            -- keep exact overwrite semantics, downward corrections included.
+            cost = CASE
+                     WHEN EXCLUDED.cost_is_complete THEN EXCLUDED.cost
+                     ELSE GREATEST(daily_breakdown.cost, EXCLUDED.cost)
+                   END,
+            -- Describes the cost actually stored above, so the flag cannot
+            -- claim a number is unreliable when the guard just kept a complete
+            -- one, nor claim completeness after an incomplete floor won.
+            cost_is_complete = CASE
+                                 WHEN EXCLUDED.cost_is_complete THEN true
+                                 WHEN EXCLUDED.cost > daily_breakdown.cost THEN false
+                                 ELSE daily_breakdown.cost_is_complete
+                               END,
             input_tokens = EXCLUDED.input_tokens,
             output_tokens = EXCLUDED.output_tokens,
             timestamp_ms = EXCLUDED.timestamp_ms,
@@ -832,7 +854,7 @@ export async function POST(request: Request) {
         const chunk = toUpdate.slice(i, i + INSERT_CHUNK_SIZE);
         const valuesClauses = chunk.map(
           (row) =>
-            sql`(${row.id}::uuid, ${row.tokens}::bigint, ${row.cost}::numeric(14,4), ${row.inputTokens}::bigint, ${row.outputTokens}::bigint, ${row.timestampMs}::bigint, ${row.activeTimeMs}::bigint, ${JSON.stringify(row.sourceBreakdown)}::jsonb)`
+            sql`(${row.id}::uuid, ${row.tokens}::bigint, ${row.cost}::numeric(14,4), ${row.inputTokens}::bigint, ${row.outputTokens}::bigint, ${row.timestampMs}::bigint, ${row.activeTimeMs}::bigint, ${JSON.stringify(row.sourceBreakdown)}::jsonb, ${row.costIsComplete}::boolean)`
         );
 
         const valuesList = sql.join(valuesClauses, sql`, `);
@@ -840,14 +862,25 @@ export async function POST(request: Request) {
         await tx.execute(sql`
           UPDATE daily_breakdown AS d SET
             tokens = batch.tokens,
-            cost = batch.cost,
+            -- Same guard as the ON CONFLICT arm above; this is the path #1044
+            -- named explicitly, and leaving it unguarded would reopen the hole
+            -- for every day that already had a row for this device.
+            cost = CASE
+                     WHEN batch.cost_is_complete THEN batch.cost
+                     ELSE GREATEST(d.cost, batch.cost)
+                   END,
+            cost_is_complete = CASE
+                                 WHEN batch.cost_is_complete THEN true
+                                 WHEN batch.cost > d.cost THEN false
+                                 ELSE d.cost_is_complete
+                               END,
             input_tokens = batch.input_tokens,
             output_tokens = batch.output_tokens,
             timestamp_ms = batch.timestamp_ms,
             active_time_ms = batch.active_time_ms,
             source_breakdown = batch.source_breakdown
           FROM (VALUES ${valuesList})
-            AS batch(id, tokens, cost, input_tokens, output_tokens, timestamp_ms, active_time_ms, source_breakdown)
+            AS batch(id, tokens, cost, input_tokens, output_tokens, timestamp_ms, active_time_ms, source_breakdown, cost_is_complete)
           WHERE d.id = batch.id
         `);
       }
