@@ -110,9 +110,13 @@ pub fn calculate_summary(contributions: &[DailyContribution]) -> DataSummary {
         .fold(0i64, i64::saturating_add);
     // @keep: the trailing `+ 0.0` looks redundant and is not.
     // `Sum for f64` folds from `-0.0`, the additive identity that preserves the
-    // sign of every addend, so summing an empty (or all-zero) set yields `-0.0`
-    // and `{:.2}` renders it as "-0.00". Adding `+0.0` normalizes the sign
-    // without changing any other value, matching the report aggregators.
+    // sign of every addend, so an empty set sums to `-0.0` and `{:.2}` renders
+    // it as "-0.00". Adding `+0.0` normalizes that sign without changing any
+    // other value, matching the report aggregators.
+    //
+    // Only an empty set, or one whose addends are exclusively `-0.0`, reaches
+    // the fold's identity unchanged. A single `+0.0` contribution already
+    // produced `+0.0` before this fix, since `-0.0 + 0.0 == +0.0`.
     let total_cost: f64 = contributions.iter().map(|c| c.totals.cost).sum::<f64>() + 0.0;
     let active_days = contributions
         .iter()
@@ -899,6 +903,26 @@ mod tests {
     #[test]
     fn empty_summary_cost_does_not_format_as_negative_zero() {
         let summary = calculate_summary(&[]);
+        assert_eq!(format!("${:.2}", summary.total_cost), "$0.00");
+    }
+
+    /// Pins the boundary the `+ 0.0` comment describes. Only the empty fold
+    /// (and an all-`-0.0` one) ever reached the `-0.0` identity: a single
+    /// `+0.0` addend already normalized it, because `-0.0 + 0.0 == +0.0`.
+    /// Without this, "all-zero" reads as if every zero-cost day was affected.
+    #[test]
+    fn a_positive_zero_contribution_was_never_the_negative_zero_case() {
+        let messages = vec![mock_unified_message(
+            "2024-01-01",
+            0,
+            0.0,
+            "claude-sonnet-4-20250514",
+            "claude",
+        )];
+        let contributions = aggregate_by_date(messages);
+        let summary = calculate_summary(&contributions);
+
+        assert!(!summary.total_cost.is_sign_negative());
         assert_eq!(format!("${:.2}", summary.total_cost), "$0.00");
     }
 
