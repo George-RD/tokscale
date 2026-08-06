@@ -108,7 +108,12 @@ pub fn calculate_summary(contributions: &[DailyContribution]) -> DataSummary {
         .iter()
         .map(|c| c.totals.tokens)
         .fold(0i64, i64::saturating_add);
-    let total_cost: f64 = contributions.iter().map(|c| c.totals.cost).sum();
+    // @keep: the trailing `+ 0.0` looks redundant and is not.
+    // `Sum for f64` folds from `-0.0`, the additive identity that preserves the
+    // sign of every addend, so summing an empty (or all-zero) set yields `-0.0`
+    // and `{:.2}` renders it as "-0.00". Adding `+0.0` normalizes the sign
+    // without changing any other value, matching the report aggregators.
+    let total_cost: f64 = contributions.iter().map(|c| c.totals.cost).sum::<f64>() + 0.0;
     let active_days = contributions
         .iter()
         .filter(|c| c.totals.tokens > 0 || c.totals.cost > 0.0 || c.totals.messages > 0)
@@ -882,6 +887,19 @@ mod tests {
         assert_eq!(summary.active_days, 0);
         assert_eq!(summary.average_per_day, 0.0);
         assert_eq!(summary.max_cost_in_single_day, 0.0);
+        // `-0.0 == 0.0` under IEEE, so the assertion above cannot catch a
+        // negative zero. The CLI formats this straight through, and "$-0.00"
+        // is what the user sees when every row was excluded from a submission.
+        assert!(
+            !summary.total_cost.is_sign_negative(),
+            "an empty summary must not carry a negative zero cost"
+        );
+    }
+
+    #[test]
+    fn empty_summary_cost_does_not_format_as_negative_zero() {
+        let summary = calculate_summary(&[]);
+        assert_eq!(format!("${:.2}", summary.total_cost), "$0.00");
     }
 
     #[test]
