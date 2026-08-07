@@ -217,6 +217,20 @@ export const submissions = pgTable(
      */
     hasBackfill: boolean("has_backfill").notNull().default(false),
 
+    /**
+     * Whether `total_cost` accounts for every token in `total_tokens`.
+     *
+     * Composed as `BOOL_AND` over this user's `daily_breakdown` rows, so ONE
+     * device or day submitting a floored cost makes the whole total a lower
+     * bound. Not sticky, unlike `has_backfill`: it is recomputed from the day
+     * rows on every submit, so a user whose pricing recovers gets an exact
+     * total back once every contributing row is complete again.
+     *
+     * Defaults true, which is correct for every row written before the day
+     * rows could express incompleteness (#1044).
+     */
+    costIsComplete: boolean("cost_is_complete").notNull().default(true),
+
     totalActiveTimeMs: bigint("total_active_time_ms", { mode: "number" }),
     longestContinuousMs: bigint("longest_continuous_ms", { mode: "number" }),
     maxConcurrentSessions: integer("max_concurrent_sessions"),

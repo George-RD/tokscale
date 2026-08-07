@@ -567,6 +567,18 @@ describe('POST /api/submit - Client-Level Merge', () => {
       expect(breakdownCostIsComplete(merged)).toBe(true);
     });
 
+    it("makes a day incomplete when any single client is floored", () => {
+      // The submission-level BOOL_AND composes the same way one level up: one
+      // floored device makes the account total a lower bound, not an exact
+      // figure. This pins the day-level half of that AND semantics.
+      const mixed = {
+        claude: client(100, 10, false),
+        codex: client(50, 5),
+      };
+
+      expect(breakdownCostIsComplete(mixed)).toBe(false);
+    });
+
     it("treats an untagged breakdown as complete", () => {
       expect(breakdownCostIsComplete({ claude: client(10, 1) })).toBe(true);
       expect(breakdownCostIsComplete({})).toBe(true);

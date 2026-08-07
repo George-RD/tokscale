@@ -913,6 +913,10 @@ export async function POST(request: Request) {
           dateEnd: sql<string>`MAX(${dailyBreakdown.date})`,
           activeDays: sql<number>`COUNT(DISTINCT CASE WHEN ${dailyBreakdown.tokens} > 0 THEN ${dailyBreakdown.date} END)::int`,
           rowCount: sql<number>`COUNT(*)::int`,
+          // One floored day on ONE device makes the summed total a lower bound,
+          // so completeness composes with AND, not OR (#1044). COALESCE covers
+          // the no-rows case, where an empty total is trivially complete.
+          costIsComplete: sql<boolean>`COALESCE(BOOL_AND(${dailyBreakdown.costIsComplete}), true)`,
         })
         .from(dailyBreakdown)
         .where(eq(dailyBreakdown.submissionId, submissionId));
@@ -1005,6 +1009,10 @@ export async function POST(request: Request) {
           // key entirely, so it can never reset an account's backfill flag —
           // the merged totals still include the imported history.
           ...(isBackfill ? { hasBackfill: true } : {}),
+          // Deliberately NOT sticky, unlike hasBackfill: recomputed from the
+          // day rows every submit, so a user whose pricing recovers earns an
+          // exact total back once every contributing row is complete.
+          costIsComplete: aggregates.costIsComplete,
           submitCount: sql`COALESCE(submit_count, 0) + 1`,
           schemaVersion: sql`GREATEST(COALESCE(${submissions.schemaVersion}, 0), ${submitDevice.schemaVersion})`,
           // Derived from the per-device high-water marks (see deviceTotals
