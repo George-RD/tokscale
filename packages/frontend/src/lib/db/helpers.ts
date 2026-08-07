@@ -234,12 +234,25 @@ export function mergeClientBreakdownsWithRegressionGuard(
         // the incoming value clears the largest single contribution to that
         // fold — consistent with a complete-day recomputation rather than a
         // partial re-parse. Let it replace the fold instead of defending it.
-        merged[clientName] = nextClient;
+        //
+        // The heal gate is evidence about TOKENS (incoming >= the largest
+        // component), which says nothing about pricing coverage. So the cost
+        // still goes through the #1044 floor: an incomplete submission heals
+        // the token count but must not be trusted to restate the cost. Keeping
+        // the folded (inflated) cost is no worse than declining to heal, and
+        // the tag lets a later complete submission correct it exactly.
+        merged[clientName] = applyCostCompleteness(
+          nextClient,
+          existingClient,
+          incomingCostIsComplete
+        );
         foldPreservedClients.delete(clientName);
         const existingTokens = formatTokens(existingClient.tokens);
         const nextTokens = formatTokens(nextClient.tokens);
         warnings.push(
-          `Healed ${clientName} alias-folded double count for this same-device resubmit: replaced ${existingTokens} tokens with ${nextTokens} tokens from the complete incoming day.`
+          `Healed ${clientName} alias-folded double count for this same-device resubmit: replaced ${existingTokens} tokens with ${nextTokens} tokens from the incoming day${
+            incomingCostIsComplete ? "" : " (cost kept as a floor: pricing was incomplete)"
+          }.`
         );
         continue;
       }

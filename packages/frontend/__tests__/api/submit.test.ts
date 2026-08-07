@@ -567,6 +567,43 @@ describe('POST /api/submit - Client-Level Merge', () => {
       expect(breakdownCostIsComplete(merged)).toBe(true);
     });
 
+    it("floors cost on the alias-heal branch too", () => {
+      // Regression: the heal branch assigned the incoming client raw and
+      // `continue`d, skipping the floor entirely. An incomplete submission
+      // could then drop a folded $20 to $1 AND mark the day complete — the
+      // exact data loss this whole mechanism exists to prevent.
+      //
+      // The heal gate is evidence about tokens, not pricing, so the token
+      // count still heals; only the cost is held at the floor.
+      const { merged } = mergeClientBreakdownsWithRegressionGuard(
+        { kilo: client(200, 20) }, // normalized fold of kilocode+kilo
+        { kilo: client(100, 1) },
+        new Set(["kilo"]),
+        new Map([["kilo", 100]]), // heal floor = largest single component
+        false
+      );
+
+      expect(merged.kilo.tokens).toBe(100); // healed
+      expect(merged.kilo.cost).toBe(20); // floored, not $1
+      expect(merged.kilo.provenance?.costIsComplete).toBe(false);
+      expect(breakdownCostIsComplete(merged)).toBe(false);
+    });
+
+    it("still heals cost exactly when the healing submission is complete", () => {
+      // The floor must not break the heal's original purpose.
+      const { merged } = mergeClientBreakdownsWithRegressionGuard(
+        { kilo: client(200, 20) },
+        { kilo: client(100, 1) },
+        new Set(["kilo"]),
+        new Map([["kilo", 100]]),
+        true
+      );
+
+      expect(merged.kilo.tokens).toBe(100);
+      expect(merged.kilo.cost).toBe(1); // inflated fold replaced outright
+      expect(breakdownCostIsComplete(merged)).toBe(true);
+    });
+
     it("makes a day incomplete when any single client is floored", () => {
       // The submission-level BOOL_AND composes the same way one level up: one
       // floored device makes the account total a lower bound, not an exact
