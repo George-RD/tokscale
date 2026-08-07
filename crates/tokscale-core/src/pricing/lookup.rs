@@ -365,6 +365,13 @@ impl PricingLookup {
         // `try_strip_unknown_suffix` below.
         let normalized_owned = strip_parenthesized_reasoning_tier(&lower).map(str::to_owned);
 
+        // A tier suffix does not turn a router into a model: `auto(high)`
+        // normalizes to `auto` below and would otherwise reach the model-part
+        // fallback and elect an unrelated vendor, exactly as the bare form did.
+        if normalized_owned.as_deref().is_some_and(is_routing_label) {
+            return None;
+        }
+
         // Guard against silent misresolution: if the input ends with `(...)`
         // but the contents are not a recognized CLIProxyAPI level, refuse the
         // lookup. Falling through to `try_strip_unknown_suffix` would split on
@@ -432,6 +439,14 @@ impl PricingLookup {
         // the `/`-scoped fallbacks already used by the Cursor/Sakana exact
         // matchers.
         if let Some(terminal) = strip_generic_provider_prefix(lower_ref) {
+            // Reaching here means no dataset key matched the qualified id, so
+            // an unrecognized vendor prefix is being dropped to retry the bare
+            // model. A real `morph/auto` resolved long before this point; a
+            // made-up `cx/auto` would arrive here and be billed as Morph.
+            if is_routing_label(terminal) {
+                return None;
+            }
+
             if let Some(result) = guarded_lookup(terminal) {
                 return Some(result);
             }
@@ -6389,6 +6404,13 @@ mod tests {
         assert!(lookup.lookup("auto").is_none());
         assert!(lookup.lookup("AUTO").is_none());
         assert!(lookup.lookup("agent_review").is_none());
+
+        // A tier suffix does not make it a model: this normalizes to `auto`
+        // before the model-part fallback runs.
+        assert!(lookup.lookup("auto(high)").is_none());
+        // Nor does an unrecognized vendor prefix, which is dropped to retry
+        // the bare id. A real `morph/auto` never reaches that fallback.
+        assert!(lookup.lookup("cx/auto").is_none());
 
         // A qualified id names a real vendor's model and still prices.
         assert!(lookup.lookup("morph/auto").is_some());
