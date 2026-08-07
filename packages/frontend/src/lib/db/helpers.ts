@@ -307,10 +307,40 @@ function applyCostCompleteness(
     return { ...next, provenance };
   }
 
-  const flooredCost = Math.max(existing?.cost ?? 0, next.cost);
+  // The floor has to reach the NESTED model costs, not just the client
+  // aggregate. `model:`-filtered leaderboards and profile model breakdowns sum
+  // `models[*].cost` rather than the client total, so flooring only the
+  // aggregate leaves a row whose client says $10 while its models rank at $0 —
+  // the same scalar-vs-JSON divergence one level deeper.
+  //
+  // Every model in the union is floored: one present in both takes the higher
+  // cost, and one the incomplete payload dropped entirely is preserved rather
+  // than allowed to vanish (its usage did not stop existing because this
+  // submission could not price it).
+  const models: Record<string, ModelBreakdownData> = {};
+  for (const [modelId, model] of Object.entries(existing?.models ?? {})) {
+    models[modelId] = { ...model };
+  }
+  for (const [modelId, model] of Object.entries(next.models ?? {})) {
+    const priorCost = models[modelId]?.cost ?? 0;
+    models[modelId] = { ...model, cost: Math.max(priorCost, model.cost) };
+  }
+
+  // Derive the client total from those floors rather than taking
+  // max(existing, next) independently. Deriving is what makes the three levels
+  // agree by construction: day = Σ clients (recalculateDayTotals) and now
+  // client = Σ models. Taking the max here instead can land between the two —
+  // e.g. existing {A:6,B:4}=10 against incoming {A:0,C:5}=5 floors to
+  // {A:6,B:4,C:5}=15, which max(10,5)=10 would contradict.
+  const modelCosts = Object.values(models);
+  const flooredCost = modelCosts.length
+    ? modelCosts.reduce((sum, model) => sum + (model.cost || 0), 0)
+    : Math.max(existing?.cost ?? 0, next.cost);
+
   return {
     ...next,
     cost: flooredCost,
+    models,
     provenance: {
       ...(next.provenance ?? deriveClientBreakdownProvenance(next)),
       costIsComplete: false,

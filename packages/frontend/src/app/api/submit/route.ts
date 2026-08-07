@@ -38,7 +38,7 @@ import { LEGACY_DEVICE_KEY } from "@/lib/devices/shared";
 const LEGACY_SUBMIT_DEVICE_KEY = LEGACY_DEVICE_KEY;
 const LEGACY_SUBMIT_DEVICE_NAME = "Legacy submissions";
 // PostgreSQL caps a single statement at 65,535 bound parameters. Each
-// inserted row binds 10 params, so chunk large backfills (e.g. ~6,500+ days)
+// inserted row binds 11 params, so chunk large backfills (e.g. ~6,000+ days)
 // across multiple INSERT statements to stay well under that limit.
 const INSERT_CHUNK_SIZE = 1000;
 
@@ -808,7 +808,7 @@ export async function POST(request: Request) {
       }
 
       // Batch INSERT new days via raw SQL VALUES list, chunked to stay under
-      // PostgreSQL's 65,535 bound-parameter limit (10 params/row here --
+      // PostgreSQL's 65,535 bound-parameter limit (11 params/row here --
       // a large historical backfill can otherwise exceed it in one statement).
       // ON CONFLICT (submission_id, submitted_device_id, date) is a defensive
       // fallback for concurrent submits from the same device racing between

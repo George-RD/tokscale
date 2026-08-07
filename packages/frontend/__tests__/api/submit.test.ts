@@ -567,6 +567,88 @@ describe('POST /api/submit - Client-Level Merge', () => {
       expect(breakdownCostIsComplete(merged)).toBe(true);
     });
 
+    function withModels(
+      models: Record<string, number>,
+      costIsComplete?: boolean
+    ): ClientBreakdownData {
+      const entries = Object.entries(models);
+      const total = entries.reduce((sum, [, cost]) => sum + cost, 0);
+      const base = client(100, total, costIsComplete);
+      return {
+        ...base,
+        models: Object.fromEntries(
+          entries.map(([modelId, cost]) => [
+            modelId,
+            {
+              tokens: 100,
+              cost,
+              input: 100,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              reasoning: 0,
+              messages: 1,
+            },
+          ])
+        ),
+      };
+    }
+
+    it("floors nested model costs, not just the client aggregate", () => {
+      // Regression: flooring only the client total left `models[*].cost` at the
+      // incomplete payload's value. Model-filtered leaderboards sum the nested
+      // costs, so the row would rank at $0 while its client said $10.
+      const { merged } = mergeClientBreakdownsWithRegressionGuard(
+        { claude: withModels({ "opus-4": 10 }) },
+        { claude: withModels({ "opus-4": 0 }) },
+        new Set(["claude"]),
+        undefined,
+        false
+      );
+
+      expect(merged.claude.models["opus-4"].cost).toBe(10);
+      expect(merged.claude.cost).toBe(10);
+    });
+
+    it("preserves a model the incomplete payload dropped", () => {
+      // Its usage did not stop existing because this submission could not
+      // price it, and losing it would put the client total above the sum of
+      // its models again.
+      const { merged } = mergeClientBreakdownsWithRegressionGuard(
+        { claude: withModels({ "opus-4": 6, "sonnet-4": 4 }) },
+        { claude: withModels({ "opus-4": 0, "haiku-4": 5 }) },
+        new Set(["claude"]),
+        undefined,
+        false
+      );
+
+      expect(Object.keys(merged.claude.models).sort()).toEqual([
+        "haiku-4",
+        "opus-4",
+        "sonnet-4",
+      ]);
+      expect(merged.claude.models["sonnet-4"].cost).toBe(4);
+      // Derived from the floors, so client == sum(models) by construction.
+      expect(merged.claude.cost).toBe(15);
+    });
+
+    it("keeps day, client and model costs mutually consistent", () => {
+      const { merged } = mergeClientBreakdownsWithRegressionGuard(
+        { claude: withModels({ "opus-4": 6, "sonnet-4": 4 }) },
+        { claude: withModels({ "opus-4": 1 }) },
+        new Set(["claude"]),
+        undefined,
+        false
+      );
+
+      const modelSum = Object.values(merged.claude.models).reduce(
+        (sum, m) => sum + m.cost,
+        0
+      );
+      expect(merged.claude.cost).toBe(modelSum);
+      expect(recalculateDayTotals(merged).cost).toBe(modelSum);
+    });
+
     it("floors cost on the alias-heal branch too", () => {
       // Regression: the heal branch assigned the incoming client raw and
       // `continue`d, skipping the floor entirely. An incomplete submission
@@ -663,18 +745,22 @@ describe('POST /api/submit - Client-Level Merge', () => {
       expect(result.valid).toBe(false);
     });
 
-    it("does not treat an incomplete day as a totals mismatch", () => {
-      // The declared cost is a floor, not a different number: the consistency
-      // checks must still compare it against the summary the same way.
+    it("does not loosen the totals consistency check", () => {
+      // The flag declares the cost a floor; it must NOT become a licence to
+      // send internally inconsistent numbers. The earlier version of this test
+      // set summary and day cost to the same value, so it passed whether or
+      // not the flag did anything — it asserted nothing.
       const payload = createValidationPayload({ totalCost: 12.5 });
       (
         payload.contributions[0].totals as { costIsComplete?: boolean }
       ).costIsComplete = false;
+      // Summary now disagrees with the day it summarises.
+      payload.summary.totalCost = 99.5;
 
       const result = validateSubmission(payload);
 
-      expect(result.valid).toBe(true);
-      expect(result.errors).toHaveLength(0);
+      expect(result.valid).toBe(false);
+      expect(result.errors.join(" ")).toMatch(/cost/i);
     });
   });
 
