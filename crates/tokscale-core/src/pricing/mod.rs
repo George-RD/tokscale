@@ -107,43 +107,63 @@ impl PricingService {
     // so real upstream entries (including provider-prefixed like openai/gpt-5.3-codex)
     // always win. Source citations are required for audit trail.
     fn build_cursor_overrides() -> HashMap<String, ModelPricing> {
-        let entries: &[(&str, f64, f64, Option<f64>)] = &[
+        // @keep: the difference between `None` and `Some(0.0)` here is load-bearing.
+        // The 5th field is cache CREATION. `None` means "rate unknown", and
+        // `covers_usage` then reports the row as not covering any usage that
+        // populates cache_write — which excludes it from submission entirely.
+        // `Some(0.0)` means "documented free". `compute_cost` already reads an
+        // absent rate as 0.0, so the two produce an identical cost; only the
+        // coverage verdict differs. Set it ONLY where Cursor documents cache
+        // creation as free — guessing a rate would invent spend.
+        /// `(model id, input, output, cache read, cache creation)`, per token.
+        ///
+        /// Both cache rates distinguish "unknown" from "free": `None` means the
+        /// rate is undocumented, `Some(0.0)` means Cursor publishes it as free.
+        type CursorRateRow = (&'static str, f64, f64, Option<f64>, Option<f64>);
+
+        let entries: &[CursorRateRow] = &[
             // GPT-5.3 family: $1.75/$14.00 per 1M tokens, $0.175 cache read
             // Source: Cursor docs (cursor.com/en-US/docs/models), llm-stats.com
-            ("gpt-5.3", 0.00000175, 0.000014, Some(1.75e-7)),
-            ("gpt-5.3-codex", 0.00000175, 0.000014, Some(1.75e-7)),
-            ("gpt-5.3-codex-spark", 0.00000175, 0.000014, Some(1.75e-7)),
+            ("gpt-5.3", 0.00000175, 0.000014, Some(1.75e-7), None),
+            ("gpt-5.3-codex", 0.00000175, 0.000014, Some(1.75e-7), None),
+            (
+                "gpt-5.3-codex-spark",
+                0.00000175,
+                0.000014,
+                Some(1.75e-7),
+                None,
+            ),
             // Composer 1: $1.25/$10.00 per 1M tokens, $0.125 cache read
             // Source: Cursor docs (cursor.com/docs/models#model-pricing)
-            ("composer 1", 0.00000125, 0.00001, Some(1.25e-7)),
-            ("composer-1", 0.00000125, 0.00001, Some(1.25e-7)),
+            ("composer 1", 0.00000125, 0.00001, Some(1.25e-7), None),
+            ("composer-1", 0.00000125, 0.00001, Some(1.25e-7), None),
             // Composer 1.5: $3.50/$17.50 per 1M tokens, $0.35 cache read
             // Source: Cursor docs (cursor.com/docs/models#model-pricing), issue #276
-            ("composer 1.5", 0.0000035, 0.0000175, Some(3.5e-7)),
-            ("composer-1.5", 0.0000035, 0.0000175, Some(3.5e-7)),
+            ("composer 1.5", 0.0000035, 0.0000175, Some(3.5e-7), None),
+            ("composer-1.5", 0.0000035, 0.0000175, Some(3.5e-7), None),
             // Composer 2: $0.50/$2.50 per 1M input/output, $0.20/M cache read; cache creation free
             // Composer 2 Fast: $1.50/$7.50 per 1M, $0.35/M cache read; cache creation free
             // Source: Cursor docs (cursor.com/docs/models#model-pricing)
-            ("composer 2", 5e-7, 2.5e-6, Some(2e-7)),
-            ("composer-2", 5e-7, 2.5e-6, Some(2e-7)),
-            ("composer 2 fast", 1.5e-6, 7.5e-6, Some(3.5e-7)),
-            ("composer-2-fast", 1.5e-6, 7.5e-6, Some(3.5e-7)),
+            ("composer 2", 5e-7, 2.5e-6, Some(2e-7), Some(0.0)),
+            ("composer-2", 5e-7, 2.5e-6, Some(2e-7), Some(0.0)),
+            ("composer 2 fast", 1.5e-6, 7.5e-6, Some(3.5e-7), Some(0.0)),
+            ("composer-2-fast", 1.5e-6, 7.5e-6, Some(3.5e-7), Some(0.0)),
             // Composer 2: $0.50/$2.50 per 1M input/output, $0.20/M cache read; cache creation free
             // Composer 2 Fast: $1.50/$7.50 per 1M, $0.35/M cache read; cache creation free
             // Source: Cursor docs (cursor.com/docs/models#model-pricing)
-            ("composer-2.5", 5e-7, 2.5e-6, Some(2e-7)),
-            ("composer-2.5-fast", 1.5e-6, 7.5e-6, Some(3.5e-7)),
+            ("composer-2.5", 5e-7, 2.5e-6, Some(2e-7), Some(0.0)),
+            ("composer-2.5-fast", 1.5e-6, 7.5e-6, Some(3.5e-7), Some(0.0)),
         ];
 
         let mut overrides = HashMap::with_capacity(entries.len());
-        for (model_id, input, output, cache_read) in entries {
+        for (model_id, input, output, cache_read, cache_creation) in entries {
             overrides.insert(
                 model_id.to_string(),
                 ModelPricing {
                     input_cost_per_token: Some(*input),
                     output_cost_per_token: Some(*output),
                     cache_read_input_token_cost: *cache_read,
-                    cache_creation_input_token_cost: None,
+                    cache_creation_input_token_cost: *cache_creation,
                     ..Default::default()
                 },
             );
@@ -1165,7 +1185,10 @@ mod tests {
         assert_eq!(result.pricing.input_cost_per_token, Some(5e-7));
         assert_eq!(result.pricing.output_cost_per_token, Some(2.5e-6));
         assert_eq!(result.pricing.cache_read_input_token_cost, Some(2e-7));
-        assert_eq!(result.pricing.cache_creation_input_token_cost, None);
+        // Cursor documents cache creation as FREE for the Composer 2 family.
+        // Some(0.0) and None compute the same cost, but only Some(0.0)
+        // makes covers_usage accept cache_write usage for submission.
+        assert_eq!(result.pricing.cache_creation_input_token_cost, Some(0.0));
     }
 
     #[test]
@@ -1185,7 +1208,10 @@ mod tests {
         assert_eq!(result.pricing.input_cost_per_token, Some(1.5e-6));
         assert_eq!(result.pricing.output_cost_per_token, Some(7.5e-6));
         assert_eq!(result.pricing.cache_read_input_token_cost, Some(3.5e-7));
-        assert_eq!(result.pricing.cache_creation_input_token_cost, None);
+        // Cursor documents cache creation as FREE for the Composer 2 family.
+        // Some(0.0) and None compute the same cost, but only Some(0.0)
+        // makes covers_usage accept cache_write usage for submission.
+        assert_eq!(result.pricing.cache_creation_input_token_cost, Some(0.0));
     }
 
     #[test]
@@ -1240,7 +1266,10 @@ mod tests {
         assert_eq!(result.pricing.input_cost_per_token, Some(5e-7));
         assert_eq!(result.pricing.output_cost_per_token, Some(2.5e-6));
         assert_eq!(result.pricing.cache_read_input_token_cost, Some(2e-7));
-        assert_eq!(result.pricing.cache_creation_input_token_cost, None);
+        // Cursor documents cache creation as FREE for the Composer 2 family.
+        // Some(0.0) and None compute the same cost, but only Some(0.0)
+        // makes covers_usage accept cache_write usage for submission.
+        assert_eq!(result.pricing.cache_creation_input_token_cost, Some(0.0));
     }
 
     #[test]
@@ -1254,7 +1283,10 @@ mod tests {
         assert_eq!(result.pricing.input_cost_per_token, Some(1.5e-6));
         assert_eq!(result.pricing.output_cost_per_token, Some(7.5e-6));
         assert_eq!(result.pricing.cache_read_input_token_cost, Some(3.5e-7));
-        assert_eq!(result.pricing.cache_creation_input_token_cost, None);
+        // Cursor documents cache creation as FREE for the Composer 2 family.
+        // Some(0.0) and None compute the same cost, but only Some(0.0)
+        // makes covers_usage accept cache_write usage for submission.
+        assert_eq!(result.pricing.cache_creation_input_token_cost, Some(0.0));
     }
 
     #[test]
@@ -1326,6 +1358,36 @@ mod tests {
             lower.unwrap().pricing.input_cost_per_token,
             upper.unwrap().pricing.input_cost_per_token
         );
+    }
+
+    /// Regression: Composer 2's cache creation is documented FREE, but it was
+    /// encoded as `None` ("rate unknown"), so `covers_usage` reported the row
+    /// as not covering any usage with cache_write and submission excluded it.
+    /// The cost is unchanged either way — `compute_cost` reads an absent rate
+    /// as 0.0 — so this is purely about the coverage verdict.
+    #[test]
+    fn cursor_documented_free_cache_creation_covers_cache_write_usage() {
+        let overrides = PricingService::build_cursor_overrides();
+        let usage = crate::TokenBreakdown {
+            input: 1_000,
+            output: 500,
+            cache_read: 200,
+            cache_write: 300,
+            ..Default::default()
+        };
+
+        let composer2 = overrides.get("composer-2").expect("composer-2 override");
+        assert_eq!(composer2.cache_creation_input_token_cost, Some(0.0));
+        assert!(
+            composer2.covers_usage(&usage),
+            "documented-free cache creation must count as covered"
+        );
+
+        // Composer 1 has no documented cache-creation rate, so it stays unknown
+        // rather than being guessed at zero. Excluding it is the honest answer.
+        let composer1 = overrides.get("composer-1").expect("composer-1 override");
+        assert_eq!(composer1.cache_creation_input_token_cost, None);
+        assert!(!composer1.covers_usage(&usage));
     }
 
     #[test]
