@@ -55,24 +55,21 @@ jobs:
   # x86_64/aarch64-pc-windows-msvc artifacts - but until #997 nothing ever
   # *executed* a test there, so Windows-only defects reached users unseen.
   #
-  # The windows leg is advisory (`continue-on-error`) and Ubuntu stays a hard
-  # gate. That split is deliberate and temporary. Running the suite for the
-  # first time found 33 pre-existing failures that no one has ever seen,
-  # because cargo used to stop at the first failing binary and nine of the ten
-  # never ran at all. They are not one bug: they span at least six unrelated
-  # root causes, and two of those groups (the crush registry scan returning
-  # nothing, cc-mirror attributing the wrong provider) look like real Windows
-  # defects rather than test artefacts. Blocking every PR on them would mean
-  # either reverting this job or landing a 30-plus-fix change nobody can
-  # review, so the signal goes in first and the failures get fixed against a
-  # visible baseline. See #1014 for the enumerated groups.
+  # The leg was advisory (`continue-on-error`) while the 33 pre-existing
+  # failures that first run exposed were worked through: six unrelated root
+  # causes, including two real Windows product defects (the crush registry
+  # scan returning nothing, cc-mirror attributing the wrong provider). Those
+  # landed in #1007, #1012 and #1046, and the suite now completes green across
+  # all 11 binaries.
   #
-  # This must not become permanent: an advisory job nobody reads is how #997
-  # happened. Flip `continue-on-error` off as soon as #1014 closes.
+  # It is a HARD GATE as of this change. The advisory phase was explicitly
+  # temporary - an advisory job nobody reads is how #997 happened in the first
+  # place - so a Windows regression must now fail the build like any other.
+  # Do not reintroduce `continue-on-error` here to land a red PR; fix the
+  # failure or revert the change that caused it.
   tests:
     name: Tests
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       # Both platforms must report. Cancelling the Windows leg the moment
       # Ubuntu fails (or vice versa) would hide whether a failure is
