@@ -470,7 +470,7 @@ tokscale pricing list-overrides
 }
 ```
 
-覆盖价格以每百万 Token 的美元数输入，这与大多数 API 提供商公布价格的方式一致；Tokscale 会在内部将其转换为每 Token 的费率。`input_cost_per_million_tokens` 或 `output_cost_per_million_tokens` 中至少要有一个存在且为正值，缓存读取/缓存创建字段为可选。为兼容复制粘贴，也接受 LiteLLM 风格的每 Token 字段名，例如 `input_cost_per_token`、`output_cost_per_token` 和 `cache_read_input_token_cost`，但推荐面向用户使用每百万的命名形式。要省略某个层级或缓存价格，直接不写该字段即可；负值或非有限值会被视为无效，并跳过整个模型条目，以免拼写错误悄悄改变统计。可选的 `source` 和 `notes` 字段会被 Tokscale 忽略，可用于您自己的记账。
+覆盖价格以每百万 Token 的美元数输入，这与大多数 API 提供商公布价格的方式一致；Tokscale 会在内部将其转换为每 Token 的费率。`input_cost_per_million_tokens` 或 `output_cost_per_million_tokens` 中至少要有一个存在，缓存读取/缓存创建字段为可选。显式的 `0` 是允许的，这正是声明免费模型的方式——`0` 是一个陈述（“这不收费”），而省略字段表示费率未知，会导致该用量未被定价。为兼容复制粘贴，也接受 LiteLLM 风格的每 Token 字段名，例如 `input_cost_per_token`、`output_cost_per_token` 和 `cache_read_input_token_cost`，但推荐面向用户使用每百万的命名形式。要省略某个层级或缓存价格，直接不写该字段即可；负值或非有限值会被视为无效，并跳过整个模型条目，以免拼写错误悄悄改变统计。可选的 `source` 和 `notes` 字段会被 Tokscale 忽略，可用于您自己的记账。
 
 覆盖是仅精确匹配且不区分大小写的。Tokscale 先检查原始模型 ID，再检查现有的合成 `/models/` 归一化，然后才在没有覆盖匹配时回退到 LiteLLM、OpenRouter、Cursor 定价和模糊匹配。原始精确匹配优先于归一化精确匹配，因此 `accounts/fireworks/routers/kimi-k2p6-turbo` 可以覆盖某个特定网关的模型，而 `kimi-k2p6-turbo` 可以覆盖归一化的 `/models/` 路径。覆盖在启动时仅加载一次；编辑文件后请重启命令。这是在等待上游 LiteLLM 价格更新期间，针对错误模型定价 Bug 的推荐本地修复方案。
 
