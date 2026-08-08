@@ -23,6 +23,31 @@ fn canonicalize_provider_segment(segment: &str) -> Option<String> {
         "minimax" | "minimaxai" | "minimax_ai" => "minimax",
         "mistral" | "mistralai" => "mistralai",
         "ai21" => "ai21",
+        // The `-ai` suffix is a spelling of the vendor, not a different
+        // vendor. DeepSeek is the case that actually costs us: the live
+        // datasets split the same model almost evenly between the two
+        // spellings depending on who is reselling it —
+        // `zenmux/deepseek/deepseek-v3.2-exp` and `kilo/deepseek/...` against
+        // `nano-gpt/deepseek-ai/deepseek-v3.2-exp` and `siliconflow/...` — so
+        // whether usage of one model carried the vendor tag `deepseek` or
+        // `deepseek_ai` was decided by which reseller served it.
+        //
+        // Folding is only safe because the two spellings never name the same
+        // row: no reseller in either dataset lists a model under both, and
+        // `deepseek-ai` is never a top-level provider (it is the HuggingFace
+        // org name, always a nested segment), so nothing here collapses two
+        // separately-priced rows into one.
+        "deepseek" | "deepseek_ai" => "deepseek",
+        "novita" | "novita_ai" => "novita",
+        "stepfun" | "stepfun_ai" => "stepfun",
+        // A `-cn` suffix is NOT a spelling variant and must never be folded in
+        // here, however much it looks like one. It marks a regional endpoint
+        // with its own price sheet: `alibaba` and `alibaba-cn` share 45 models
+        // and disagree on 41 of them, with `qwen-max` at $1.60/$6.40 against
+        // $0.345/$1.377 — a 4.6x error in whichever direction the fold went.
+        // `siliconflow` and `siliconflow-cn` disagree on 7 of 35. Adding those
+        // arms to "finish the pattern" would silently misprice every user on
+        // the endpoint that lost the fold.
         // For unknown segments, reject if they contain digits — those are
         // almost certainly model-name fragments (e.g., "gpt-4", "claude-3")
         // rather than provider identifiers.
@@ -474,5 +499,50 @@ mod tests {
         // misattributing it. This guards the unknown-provider passthrough path.
         assert_eq!(canonical_provider("gjc-model-4o"), None);
         assert_eq!(canonical_provider("<unset>"), None);
+    }
+
+    #[test]
+    fn vendor_ai_suffix_is_one_vendor() {
+        // The datasets split the same DeepSeek model between two vendor
+        // spellings depending on the reseller, so before this fold the tag a
+        // user's usage carried was decided by who served it.
+        for spelling in ["deepseek", "deepseek-ai", "deepseek_ai", "DeepSeek-AI"] {
+            assert_eq!(
+                canonical_provider(spelling),
+                Some("deepseek".into()),
+                "{spelling} must canonicalize to deepseek"
+            );
+        }
+
+        // Real dataset keys, where the vendor sits in a nested segment.
+        assert_eq!(
+            provider_tags("nano-gpt/deepseek-ai/deepseek-v3.2-exp"),
+            vec!["nano_gpt", "deepseek"]
+        );
+        assert_eq!(
+            provider_tags("zenmux/deepseek/deepseek-v3.2-exp"),
+            vec!["zenmux", "deepseek"]
+        );
+
+        assert_eq!(canonical_provider("novita-ai"), Some("novita".into()));
+        assert_eq!(canonical_provider("stepfun-ai"), Some("stepfun".into()));
+    }
+
+    #[test]
+    fn regional_cn_endpoint_is_not_folded_into_the_global_one() {
+        // Guards the comment above the `-ai` arms. `-cn` reads like the same
+        // kind of suffix and is not: alibaba and alibaba-cn share 45 models
+        // and disagree on 41, qwen-max among them at $1.60/$6.40 against
+        // $0.345/$1.377. Folding these would misprice by 4.6x, so they must
+        // stay distinct providers.
+        assert_ne!(
+            canonical_provider("alibaba-cn"),
+            canonical_provider("alibaba")
+        );
+        assert_ne!(
+            canonical_provider("siliconflow-cn"),
+            canonical_provider("siliconflow")
+        );
+        assert_eq!(canonical_provider("alibaba-cn"), Some("alibaba_cn".into()));
     }
 }
