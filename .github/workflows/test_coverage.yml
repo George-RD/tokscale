@@ -56,11 +56,26 @@ jobs:
   # *executed* a test there, so Windows-only defects reached users unseen.
   #
   # The leg was advisory (`continue-on-error`) while the 33 pre-existing
-  # failures that first run exposed were worked through: six unrelated root
-  # causes, including two real Windows product defects (the crush registry
-  # scan returning nothing, cc-mirror attributing the wrong provider). Those
-  # landed in #1007, #1012 and #1046, and the suite now completes green across
-  # all 11 binaries.
+  # failures that first run exposed were worked through, across six unrelated
+  # root causes (#1014). Those landed in #1007, #1012 and #1046, and the suite
+  # now completes green across all 11 binaries.
+  #
+  # Most of the 33 were the harness lying, not the product: fixtures built
+  # JSON with `format!` and dropped a raw path inside a string, so on Windows
+  # `C:\Users\RUNNER~1\...` put `\U` and `\A` in the document and serde_json
+  # rejected it. Both readers treat unparseable config as absent, so the Crush
+  # registry scan returned nothing and cc-mirror sessions fell back to plain
+  # Claude - failures that read like product defects several files from the
+  # cause. The real writers (Go `encoding/json`, Node `JSON.stringify`) escape
+  # correctly, so only the tests ever emitted invalid JSON.
+  #
+  # Four genuine Windows product defects did surface underneath: lock and PID
+  # probes silently failing off Unix (#1007), TZ leaving a device unpinnable,
+  # the bare `default` token fuzzy-matching a priced key, and a cache entry
+  # keyed by path separator rather than by file (all #1046). The `default` one
+  # is the same class of bug as #1062 - a generic token with no model identity
+  # electing some provider's priced row - found here only because the Windows
+  # leg ran the test that caught it.
   #
   # It is a HARD GATE as of this change. The advisory phase was explicitly
   # temporary - an advisory job nobody reads is how #997 happened in the first
