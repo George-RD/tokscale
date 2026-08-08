@@ -89,6 +89,21 @@ static MODEL_ALIASES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     m.insert("claude-opus-4.6", "claude-opus-4-6");
     m.insert("claude-sonnet-4.6", "claude-sonnet-4-6");
     m.insert("claude-haiku-4.6", "claude-haiku-4-6");
+    // Anthropic's "-0" suffix is their documented moving alias for the latest
+    // snapshot of a model line (claude-opus-4-0 -> newest Opus 4). Datasets
+    // publish the dated key instead, so the alias form resolved to nothing and
+    // real first-party usage was excluded from submission as unpriced.
+    m.insert("claude-opus-4-0", "claude-opus-4");
+    m.insert("claude-sonnet-4-0", "claude-sonnet-4");
+    // GitHub Copilot reports Claude 4.1 without the separator. Copilot usage is
+    // priced at the underlying model's rates (its own $0.00 subscription rows
+    // are filtered out by EXCLUDED_LITELLM_PREFIXES), so this must resolve the
+    // same way github_copilot/gpt-4o already resolves to gpt-4o.
+    // Deliberately opus-only: `claude-sonnet-4-1` currently resolves to
+    // `databricks/databricks-claude-sonnet-4-1` via a cross-vendor fuzzy match
+    // (#1062), so aliasing the Copilot spelling onto it would route Sonnet 4.1
+    // usage to Databricks rates. Add it once #1062 makes that target safe.
+    m.insert("claude-opus-41", "claude-opus-4-1");
     m.insert("anthropic/claude-4-5-opus", "claude-opus-4-5");
     m.insert("anthropic/claude-4-5-sonnet", "claude-sonnet-4-5");
     m.insert("anthropic/claude-4-5-haiku", "claude-haiku-4-5");
@@ -235,5 +250,36 @@ mod tests {
 
         assert_eq!(m187_result.matched_key, "google/gemini-3.5-flash");
         assert_eq!(m20_result.matched_key, "google/gemini-3.5-flash");
+    }
+
+    /// Regression: Anthropic's "-0" suffix is a documented moving alias for the
+    /// latest snapshot of a model line, and GitHub Copilot reports 4.1 without
+    /// the separator. Neither form resolved, so real first-party usage was
+    /// excluded from submission as unpriced — 41M tokens of claude-opus-4-0 in
+    /// one reported case.
+    #[test]
+    fn anthropic_moving_aliases_and_copilot_spelling_resolve() {
+        assert_eq!(
+            super::resolve_alias("claude-opus-4-0"),
+            Some("claude-opus-4")
+        );
+        assert_eq!(
+            super::resolve_alias("claude-sonnet-4-0"),
+            Some("claude-sonnet-4")
+        );
+        assert_eq!(
+            super::resolve_alias("claude-opus-41"),
+            Some("claude-opus-4-1")
+        );
+        // Case-insensitive, since clients report mixed casing.
+        assert_eq!(
+            super::resolve_alias("Claude-Opus-4-0"),
+            Some("claude-opus-4")
+        );
+
+        // Deliberately absent: `claude-sonnet-4-1` resolves cross-vendor to
+        // `databricks/databricks-claude-sonnet-4-1` today (#1062), so aliasing
+        // the Copilot spelling onto it would route usage to the wrong rates.
+        assert_eq!(super::resolve_alias("claude-sonnet-41"), None);
     }
 }
