@@ -348,6 +348,13 @@ impl PricingLookup {
         force_source: Option<&str>,
         provider_id: Option<&str>,
     ) -> Option<LookupResult> {
+        // A router is not a model. Resolving one by model-part match elects
+        // whatever unrelated vendor publishes the same word, and the result is
+        // billed as if it were the real thing (#1062).
+        if is_routing_label(model_id) {
+            return None;
+        }
+
         let provider_id = normalize_provider_hint(provider_id);
         let canonical = aliases::resolve_alias(model_id).unwrap_or(model_id);
         let lower = canonical.to_lowercase();
@@ -357,6 +364,13 @@ impl PricingLookup {
         // Mirrors the dash-suffix path (e.g. `-xhigh`), which is handled by
         // `try_strip_unknown_suffix` below.
         let normalized_owned = strip_parenthesized_reasoning_tier(&lower).map(str::to_owned);
+
+        // A tier suffix does not turn a router into a model: `auto(high)`
+        // normalizes to `auto` below and would otherwise reach the model-part
+        // fallback and elect an unrelated vendor, exactly as the bare form did.
+        if normalized_owned.as_deref().is_some_and(is_routing_label) {
+            return None;
+        }
 
         // Guard against silent misresolution: if the input ends with `(...)`
         // but the contents are not a recognized CLIProxyAPI level, refuse the
@@ -425,6 +439,14 @@ impl PricingLookup {
         // the `/`-scoped fallbacks already used by the Cursor/Sakana exact
         // matchers.
         if let Some(terminal) = strip_generic_provider_prefix(lower_ref) {
+            // Reaching here means no dataset key matched the qualified id, so
+            // an unrecognized vendor prefix is being dropped to retry the bare
+            // model. A real `morph/auto` resolved long before this point; a
+            // made-up `cx/auto` would arrive here and be billed as Morph.
+            if is_routing_label(terminal) {
+                return None;
+            }
+
             if let Some(result) = guarded_lookup(terminal) {
                 return Some(result);
             }
@@ -2211,18 +2233,59 @@ where
 /// race, keeping existing resolutions stable), with lexicographic order
 /// breaking length ties so the result no longer depends on HashMap iteration
 /// order.
+// @keep: the shortest-key fallback is arbitrary and actively harmful; the
+// original-provider preference in front of it is what makes this defensible.
+/// Elect between two dataset keys that share a model part.
+///
+/// Preferring the ORIGINAL provider generalizes what used to be a hardcoded
+/// `anthropic/` special case. The rule it encodes is the same one that
+/// motivated that case: when several vendors publish a key ending in the same
+/// model name, the vendor who made the model is the one whose rates describe
+/// it — a reseller or aggregator row is at best a repackaging.
+///
+/// Length is the last resort and is a coin-flip, not a signal. It is what
+/// elected `morph/auto` ($0.85/$1.55) over three $0.00 router rows for the
+/// model part `auto` (#1062), i.e. the single worst-priced candidate purely
+/// because its key was ten characters. Routing labels no longer reach here at
+/// all, but the same hazard remains for any model part several vendors share,
+/// so prefer adding the real vendor to ORIGINAL_PROVIDER_PREFIXES over
+/// relying on the tie-break to land correctly.
 fn prefers_model_part_key(candidate: &str, existing: &str) -> bool {
     let candidate_lower = candidate.to_lowercase();
     let existing_lower = existing.to_lowercase();
-    let is_anthropic = |key: &str| key.split('/').next() == Some("anthropic");
     match (
-        is_anthropic(&candidate_lower),
-        is_anthropic(&existing_lower),
+        is_original_provider(&candidate_lower),
+        is_original_provider(&existing_lower),
     ) {
         (true, false) => true,
         (false, true) => false,
         _ => (candidate_lower.len(), candidate_lower) < (existing_lower.len(), existing_lower),
     }
+}
+
+// @keep: these look like model names and are not, which is the whole problem.
+/// Model ids that name a ROUTER, not a model.
+///
+/// Cursor, Copilot Desktop, Copilot VS Code, Kiro and Workbuddy all emit a
+/// bare `auto` when the product chose the model on the user's behalf
+/// (`sessions/cursor.rs:356`, `copilot_desktop.rs:123`, `copilot_vscode.rs:110`,
+/// `kiro.rs:1135`, `workbuddy.rs:127`); `agent_review` is a Cursor feature.
+/// Nothing in the session log records which model actually served the
+/// request, so any rate attached to these describes a different model.
+///
+/// Left to the normal chain, `auto` matches by model part against every
+/// dataset key ending in `/auto` and — because ties break on shortest key —
+/// elects `morph/auto` at $0.85/$1.55, an unrelated code-apply vendor. That
+/// is real money billed from a coincidence of spelling (#1062).
+///
+/// BARE ids only. A qualified `morph/auto` is a genuine Morph model and still
+/// resolves. `custom-pricing.json` is consulted before this, so a user who
+/// knows their router's effective rate can still state it.
+const ROUTING_LABELS: &[&str] = &["auto", "agent_review"];
+
+fn is_routing_label(model_id: &str) -> bool {
+    let lower = model_id.trim().to_lowercase();
+    ROUTING_LABELS.contains(&lower.as_str())
 }
 
 fn is_original_provider(key: &str) -> bool {
@@ -6310,5 +6373,66 @@ mod tests {
             r_unknown.matched_key, r_none.matched_key,
             "unknown hint via source_and_provider should behave like None"
         );
+    }
+
+    /// Regression (#1062): a bare router label must not be priced from a
+    /// coincidence of spelling. `auto` used to elect `morph/auto` at
+    /// $0.85/$1.55 — an unrelated code-apply vendor — and submit at those
+    /// rates, because covers_usage only demands rates for populated buckets.
+    #[test]
+    fn bare_routing_labels_do_not_resolve_but_qualified_ones_do() {
+        let mut models_dev = HashMap::new();
+        for key in ["morph/auto", "llmgateway/auto", "cursor/agent_review"] {
+            models_dev.insert(
+                key.to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(8.5e-7),
+                    output_cost_per_token: Some(1.55e-6),
+                    ..Default::default()
+                },
+            );
+        }
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        // Five parsers emit these bare; nothing records the real model.
+        assert!(lookup.lookup("auto").is_none());
+        assert!(lookup.lookup("AUTO").is_none());
+        assert!(lookup.lookup("agent_review").is_none());
+
+        // A tier suffix does not make it a model: this normalizes to `auto`
+        // before the model-part fallback runs.
+        assert!(lookup.lookup("auto(high)").is_none());
+        // Nor does an unrecognized vendor prefix, which is dropped to retry
+        // the bare id. A real `morph/auto` never reaches that fallback.
+        assert!(lookup.lookup("cx/auto").is_none());
+
+        // A qualified id names a real vendor's model and still prices.
+        assert!(lookup.lookup("morph/auto").is_some());
+    }
+
+    /// The shortest-key tie-break is a coin flip. Preferring the original
+    /// provider generalizes the `anthropic/` special case it replaced, so a
+    /// reseller no longer wins on key length alone.
+    #[test]
+    fn model_part_tie_break_prefers_the_original_provider_over_a_shorter_key() {
+        assert!(super::prefers_model_part_key(
+            "openai/some-model",
+            "xy/some-model"
+        ));
+        assert!(!super::prefers_model_part_key(
+            "xy/some-model",
+            "openai/some-model"
+        ));
+        // Neither is an original provider: length still decides.
+        assert!(super::prefers_model_part_key(
+            "ab/some-model",
+            "abcd/some-model"
+        ));
     }
 }
