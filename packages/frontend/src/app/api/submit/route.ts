@@ -15,6 +15,8 @@ import {
   clientContributionToBreakdownData,
   deriveClientBreakdownProvenance,
   mergeTimestampMs,
+  breakdownCostIsComplete,
+  tagBreakdownCostCompleteness,
   type ClientBreakdownData,
 } from "@/lib/db/helpers";
 import {
@@ -36,7 +38,7 @@ import { LEGACY_DEVICE_KEY } from "@/lib/devices/shared";
 const LEGACY_SUBMIT_DEVICE_KEY = LEGACY_DEVICE_KEY;
 const LEGACY_SUBMIT_DEVICE_NAME = "Legacy submissions";
 // PostgreSQL caps a single statement at 65,535 bound parameters. Each
-// inserted row binds 10 params, so chunk large backfills (e.g. ~6,500+ days)
+// inserted row binds 11 params, so chunk large backfills (e.g. ~6,000+ days)
 // across multiple INSERT statements to stay well under that limit.
 const INSERT_CHUNK_SIZE = 1000;
 
@@ -650,6 +652,7 @@ export async function POST(request: Request) {
         timestampMs: number | null;
         activeTimeMs: number | null;
         sourceBreakdown: Record<string, ClientBreakdownData>;
+        costIsComplete: boolean;
       }> = [];
 
       const toUpdate: Array<{
@@ -661,6 +664,7 @@ export async function POST(request: Request) {
         timestampMs: number | null;
         activeTimeMs: number | null;
         sourceBreakdown: Record<string, ClientBreakdownData>;
+        costIsComplete: boolean;
       }> = [];
 
       for (const incomingDay of data.contributions) {
@@ -730,7 +734,8 @@ export async function POST(request: Request) {
             existingClientBreakdown,
             incomingClientBreakdown,
             submittedClients,
-            foldedClientFloors
+            foldedClientFloors,
+            incomingDay.totals?.costIsComplete ?? true
           );
           warnings.push(
             ...mergeResult.warnings.map((warning) => `Day ${incomingDay.date}: ${warning}`)
@@ -770,9 +775,21 @@ export async function POST(request: Request) {
             timestampMs: mergeTimestampMs(existingDay.timestampMs, incomingDay.timestampMs ?? null),
             activeTimeMs: mergeActiveTimeMs(existingDay.activeTimeMs, incomingDay.activeTimeMs),
             sourceBreakdown: mergedClientBreakdown,
+            // Derived from the MERGED breakdown, not the incoming day: a
+            // filtered resubmit naming only healthy clients must not clear a
+            // preserved sibling's incompleteness. The merge has already
+            // floored each incoming client's cost, so this agrees with the
+            // scalar recomputed above by construction.
+            costIsComplete: breakdownCostIsComplete(mergedClientBreakdown),
           });
         } else {
-          const dayTotals = recalculateDayTotals(incomingClientBreakdown);
+          // A day with no stored row has nothing to floor against, but its
+          // clients still carry the tag forward for later merges.
+          const insertedClientBreakdown = tagBreakdownCostCompleteness(
+            incomingClientBreakdown,
+            incomingDay.totals?.costIsComplete ?? true
+          );
+          const dayTotals = recalculateDayTotals(insertedClientBreakdown);
 
           toInsert.push({
             submissionId,
@@ -784,13 +801,14 @@ export async function POST(request: Request) {
             outputTokens: dayTotals.outputTokens,
             timestampMs: incomingDay.timestampMs ?? null,
             activeTimeMs: incomingDay.activeTimeMs ?? null,
-            sourceBreakdown: incomingClientBreakdown,
+            sourceBreakdown: insertedClientBreakdown,
+            costIsComplete: breakdownCostIsComplete(insertedClientBreakdown),
           });
         }
       }
 
       // Batch INSERT new days via raw SQL VALUES list, chunked to stay under
-      // PostgreSQL's 65,535 bound-parameter limit (10 params/row here --
+      // PostgreSQL's 65,535 bound-parameter limit (11 params/row here --
       // a large historical backfill can otherwise exceed it in one statement).
       // ON CONFLICT (submission_id, submitted_device_id, date) is a defensive
       // fallback for concurrent submits from the same device racing between
@@ -800,7 +818,7 @@ export async function POST(request: Request) {
         const chunk = toInsert.slice(i, i + INSERT_CHUNK_SIZE);
         const insertValuesClauses = chunk.map(
           (row) =>
-            sql`(${row.submissionId}::uuid, ${row.submittedDeviceId}::uuid, ${row.date}, ${row.tokens}::bigint, ${row.cost}::numeric(14,4), ${row.inputTokens}::bigint, ${row.outputTokens}::bigint, ${row.timestampMs}::bigint, ${row.activeTimeMs}::bigint, ${JSON.stringify(row.sourceBreakdown)}::jsonb)`
+            sql`(${row.submissionId}::uuid, ${row.submittedDeviceId}::uuid, ${row.date}, ${row.tokens}::bigint, ${row.cost}::numeric(14,4), ${row.inputTokens}::bigint, ${row.outputTokens}::bigint, ${row.timestampMs}::bigint, ${row.activeTimeMs}::bigint, ${JSON.stringify(row.sourceBreakdown)}::jsonb, ${row.costIsComplete}::boolean)`
         );
 
         const insertValuesList = sql.join(insertValuesClauses, sql`, `);
@@ -808,12 +826,20 @@ export async function POST(request: Request) {
         await tx.execute(sql`
           INSERT INTO daily_breakdown (
             submission_id, submitted_device_id, date, tokens, cost,
-            input_tokens, output_tokens, timestamp_ms, active_time_ms, source_breakdown
+            input_tokens, output_tokens, timestamp_ms, active_time_ms, source_breakdown,
+            cost_is_complete
           )
           VALUES ${insertValuesList}
           ON CONFLICT (submission_id, submitted_device_id, date) DO UPDATE SET
             tokens = EXCLUDED.tokens,
+            -- Both of these are plain overwrites on purpose. The #1044 floor is
+            -- applied per client during the in-memory merge, so cost here is
+            -- already recomputed from the floored breakdown and cannot be lower
+            -- than what an incomplete submission is allowed to store. Guarding
+            -- the scalar in SQL while replacing source_breakdown wholesale
+            -- would instead leave the row's two representations disagreeing.
             cost = EXCLUDED.cost,
+            cost_is_complete = EXCLUDED.cost_is_complete,
             input_tokens = EXCLUDED.input_tokens,
             output_tokens = EXCLUDED.output_tokens,
             timestamp_ms = EXCLUDED.timestamp_ms,
@@ -832,7 +858,7 @@ export async function POST(request: Request) {
         const chunk = toUpdate.slice(i, i + INSERT_CHUNK_SIZE);
         const valuesClauses = chunk.map(
           (row) =>
-            sql`(${row.id}::uuid, ${row.tokens}::bigint, ${row.cost}::numeric(14,4), ${row.inputTokens}::bigint, ${row.outputTokens}::bigint, ${row.timestampMs}::bigint, ${row.activeTimeMs}::bigint, ${JSON.stringify(row.sourceBreakdown)}::jsonb)`
+            sql`(${row.id}::uuid, ${row.tokens}::bigint, ${row.cost}::numeric(14,4), ${row.inputTokens}::bigint, ${row.outputTokens}::bigint, ${row.timestampMs}::bigint, ${row.activeTimeMs}::bigint, ${JSON.stringify(row.sourceBreakdown)}::jsonb, ${row.costIsComplete}::boolean)`
         );
 
         const valuesList = sql.join(valuesClauses, sql`, `);
@@ -840,14 +866,17 @@ export async function POST(request: Request) {
         await tx.execute(sql`
           UPDATE daily_breakdown AS d SET
             tokens = batch.tokens,
+            -- Plain overwrites for the same reason as the ON CONFLICT arm: the
+            -- floor lives in the merge, so this value already respects it.
             cost = batch.cost,
+            cost_is_complete = batch.cost_is_complete,
             input_tokens = batch.input_tokens,
             output_tokens = batch.output_tokens,
             timestamp_ms = batch.timestamp_ms,
             active_time_ms = batch.active_time_ms,
             source_breakdown = batch.source_breakdown
           FROM (VALUES ${valuesList})
-            AS batch(id, tokens, cost, input_tokens, output_tokens, timestamp_ms, active_time_ms, source_breakdown)
+            AS batch(id, tokens, cost, input_tokens, output_tokens, timestamp_ms, active_time_ms, source_breakdown, cost_is_complete)
           WHERE d.id = batch.id
         `);
       }
@@ -884,6 +913,10 @@ export async function POST(request: Request) {
           dateEnd: sql<string>`MAX(${dailyBreakdown.date})`,
           activeDays: sql<number>`COUNT(DISTINCT CASE WHEN ${dailyBreakdown.tokens} > 0 THEN ${dailyBreakdown.date} END)::int`,
           rowCount: sql<number>`COUNT(*)::int`,
+          // One floored day on ONE device makes the summed total a lower bound,
+          // so completeness composes with AND, not OR (#1044). COALESCE covers
+          // the no-rows case, where an empty total is trivially complete.
+          costIsComplete: sql<boolean>`COALESCE(BOOL_AND(${dailyBreakdown.costIsComplete}), true)`,
         })
         .from(dailyBreakdown)
         .where(eq(dailyBreakdown.submissionId, submissionId));
@@ -976,6 +1009,10 @@ export async function POST(request: Request) {
           // key entirely, so it can never reset an account's backfill flag —
           // the merged totals still include the imported history.
           ...(isBackfill ? { hasBackfill: true } : {}),
+          // Deliberately NOT sticky, unlike hasBackfill: recomputed from the
+          // day rows every submit, so a user whose pricing recovers earns an
+          // exact total back once every contributing row is complete.
+          costIsComplete: aggregates.costIsComplete,
           submitCount: sql`COALESCE(submit_count, 0) + 1`,
           schemaVersion: sql`GREATEST(COALESCE(${submissions.schemaVersion}, 0), ${submitDevice.schemaVersion})`,
           // Derived from the per-device high-water marks (see deviceTotals

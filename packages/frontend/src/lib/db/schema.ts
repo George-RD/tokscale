@@ -217,6 +217,20 @@ export const submissions = pgTable(
      */
     hasBackfill: boolean("has_backfill").notNull().default(false),
 
+    /**
+     * Whether `total_cost` accounts for every token in `total_tokens`.
+     *
+     * Composed as `BOOL_AND` over this user's `daily_breakdown` rows, so ONE
+     * device or day submitting a floored cost makes the whole total a lower
+     * bound. Not sticky, unlike `has_backfill`: it is recomputed from the day
+     * rows on every submit, so a user whose pricing recovers gets an exact
+     * total back once every contributing row is complete again.
+     *
+     * Defaults true, which is correct for every row written before the day
+     * rows could express incompleteness (#1044).
+     */
+    costIsComplete: boolean("cost_is_complete").notNull().default(true),
+
     totalActiveTimeMs: bigint("total_active_time_ms", { mode: "number" }),
     longestContinuousMs: bigint("longest_continuous_ms", { mode: "number" }),
     maxConcurrentSessions: integer("max_concurrent_sessions"),
@@ -364,6 +378,23 @@ export const dailyBreakdown = pgTable(
     >(),
     /** Total active coding time in this UTC day bucket (milliseconds). NULL for legacy data. */
     activeTimeMs: bigint("active_time_ms", { mode: "number" }),
+
+    /**
+     * Whether `cost` accounts for every token the client counted for this day.
+     *
+     * The submission protocol previously had no way to say "I do not know what
+     * this cost", only "this cost is $0.00", while the write path overwrote
+     * `cost` unconditionally. A client whose pricing coverage degraded — a
+     * dataset failing to load, a stale cache, a proxy blocking the fetch —
+     * would therefore lower a day's recorded spend permanently (#1044).
+     *
+     * `false` means the client knowingly submitted a day whose cost is a floor,
+     * not a total, and the write path refuses to let it reduce what is already
+     * stored. Defaults to `true` so every already-released CLI, which cannot
+     * send the flag, keeps exact overwrite semantics including downward
+     * corrections.
+     */
+    costIsComplete: boolean("cost_is_complete").notNull().default(true),
   },
   (table) => [
     index("idx_daily_breakdown_submission_id").on(table.submissionId),

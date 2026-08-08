@@ -5,8 +5,10 @@ import {
   validateSubmission,
 } from "../../src/lib/validation/submission";
 import {
+  breakdownCostIsComplete,
   deriveClientBreakdownProvenance,
   mergeClientBreakdownsWithRegressionGuard,
+  recalculateDayTotals,
   type ClientBreakdownData,
 } from "../../src/lib/db/helpers";
 
@@ -457,6 +459,308 @@ describe('POST /api/submit - Client-Level Merge', () => {
 
       expect(result.valid).toBe(true);
       expect(result.errors).toHaveLength(0);
+    });
+  });
+
+  describe("costIsComplete merge floor (#1044)", () => {
+    function client(
+      tokens: number,
+      cost: number,
+      costIsComplete?: boolean
+    ): ClientBreakdownData {
+      return {
+        tokens,
+        cost,
+        input: tokens,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        reasoning: 0,
+        messages: 1,
+        models: {},
+        ...(costIsComplete === false
+          ? {
+              provenance: {
+                schemaVersion: 1,
+                messageCount: 1,
+                modelCount: 0,
+                costIsComplete: false,
+              },
+            }
+          : {}),
+      };
+    }
+
+    it("floors a client's cost when the submission declares itself incomplete", () => {
+      // More tokens at a LOWER cost: the token guard accepts the client, so
+      // without a floor the day's recorded spend drops permanently.
+      const { merged } = mergeClientBreakdownsWithRegressionGuard(
+        { claude: client(100, 10) },
+        { claude: client(110, 5) },
+        new Set(["claude"]),
+        undefined,
+        false
+      );
+
+      expect(merged.claude.cost).toBe(10);
+      expect(merged.claude.tokens).toBe(110);
+      expect(breakdownCostIsComplete(merged)).toBe(false);
+    });
+
+    it("marks the client incomplete even when its own cost was kept", () => {
+      // The stored $10 was complete for the OLD token set. Deriving the tag
+      // from "did the new value win?" would call this complete, which is the
+      // defect adversarial review found in the earlier SQL-side design.
+      const { merged } = mergeClientBreakdownsWithRegressionGuard(
+        { claude: client(100, 10) },
+        { claude: client(110, 5) },
+        new Set(["claude"]),
+        undefined,
+        false
+      );
+
+      expect(merged.claude.provenance?.costIsComplete).toBe(false);
+    });
+
+    it("keeps the day scalar reconcilable with the stored breakdown", () => {
+      // The scalar is recomputed from this breakdown, so flooring here (rather
+      // than in SQL) is what stops the row's two representations diverging.
+      const { merged } = mergeClientBreakdownsWithRegressionGuard(
+        { claude: client(100, 10) },
+        { claude: client(110, 5) },
+        new Set(["claude"]),
+        undefined,
+        false
+      );
+
+      expect(recalculateDayTotals(merged).cost).toBe(10);
+    });
+
+    it("does not let a filtered healthy resubmit clear a sibling's incompleteness", () => {
+      // Day holds incomplete A and complete B; a healthy submit naming only B
+      // must leave A's state alone. Day-level state cannot express this.
+      const { merged } = mergeClientBreakdownsWithRegressionGuard(
+        { claude: client(100, 10, false), codex: client(50, 5) },
+        { codex: client(60, 6) },
+        new Set(["codex"]),
+        undefined,
+        true
+      );
+
+      expect(merged.claude.provenance?.costIsComplete).toBe(false);
+      expect(merged.codex.provenance?.costIsComplete).toBeUndefined();
+      expect(breakdownCostIsComplete(merged)).toBe(false);
+    });
+
+    it("clears the floor once a complete submission covers the client", () => {
+      // Recovery, and the reason downward corrections still work.
+      const { merged } = mergeClientBreakdownsWithRegressionGuard(
+        { claude: client(100, 10, false) },
+        { claude: client(100, 4) },
+        new Set(["claude"]),
+        undefined,
+        true
+      );
+
+      expect(merged.claude.cost).toBe(4);
+      expect(merged.claude.provenance?.costIsComplete).toBeUndefined();
+      expect(breakdownCostIsComplete(merged)).toBe(true);
+    });
+
+    function withModels(
+      models: Record<string, number>,
+      costIsComplete?: boolean
+    ): ClientBreakdownData {
+      const entries = Object.entries(models);
+      const total = entries.reduce((sum, [, cost]) => sum + cost, 0);
+      const base = client(100, total, costIsComplete);
+      return {
+        ...base,
+        models: Object.fromEntries(
+          entries.map(([modelId, cost]) => [
+            modelId,
+            {
+              tokens: 100,
+              cost,
+              input: 100,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              reasoning: 0,
+              messages: 1,
+            },
+          ])
+        ),
+      };
+    }
+
+    it("floors nested model costs, not just the client aggregate", () => {
+      // Regression: flooring only the client total left `models[*].cost` at the
+      // incomplete payload's value. Model-filtered leaderboards sum the nested
+      // costs, so the row would rank at $0 while its client said $10.
+      const { merged } = mergeClientBreakdownsWithRegressionGuard(
+        { claude: withModels({ "opus-4": 10 }) },
+        { claude: withModels({ "opus-4": 0 }) },
+        new Set(["claude"]),
+        undefined,
+        false
+      );
+
+      expect(merged.claude.models["opus-4"].cost).toBe(10);
+      expect(merged.claude.cost).toBe(10);
+    });
+
+    it("preserves a model the incomplete payload dropped", () => {
+      // Its usage did not stop existing because this submission could not
+      // price it, and losing it would put the client total above the sum of
+      // its models again.
+      const { merged } = mergeClientBreakdownsWithRegressionGuard(
+        { claude: withModels({ "opus-4": 6, "sonnet-4": 4 }) },
+        { claude: withModels({ "opus-4": 0, "haiku-4": 5 }) },
+        new Set(["claude"]),
+        undefined,
+        false
+      );
+
+      expect(Object.keys(merged.claude.models).sort()).toEqual([
+        "haiku-4",
+        "opus-4",
+        "sonnet-4",
+      ]);
+      expect(merged.claude.models["sonnet-4"].cost).toBe(4);
+      // Derived from the floors, so client == sum(models) by construction.
+      expect(merged.claude.cost).toBe(15);
+    });
+
+    it("keeps day, client and model costs mutually consistent", () => {
+      const { merged } = mergeClientBreakdownsWithRegressionGuard(
+        { claude: withModels({ "opus-4": 6, "sonnet-4": 4 }) },
+        { claude: withModels({ "opus-4": 1 }) },
+        new Set(["claude"]),
+        undefined,
+        false
+      );
+
+      const modelSum = Object.values(merged.claude.models).reduce(
+        (sum, m) => sum + m.cost,
+        0
+      );
+      expect(merged.claude.cost).toBe(modelSum);
+      expect(recalculateDayTotals(merged).cost).toBe(modelSum);
+    });
+
+    it("floors cost on the alias-heal branch too", () => {
+      // Regression: the heal branch assigned the incoming client raw and
+      // `continue`d, skipping the floor entirely. An incomplete submission
+      // could then drop a folded $20 to $1 AND mark the day complete — the
+      // exact data loss this whole mechanism exists to prevent.
+      //
+      // The heal gate is evidence about tokens, not pricing, so the token
+      // count still heals; only the cost is held at the floor.
+      const { merged } = mergeClientBreakdownsWithRegressionGuard(
+        { kilo: client(200, 20) }, // normalized fold of kilocode+kilo
+        { kilo: client(100, 1) },
+        new Set(["kilo"]),
+        new Map([["kilo", 100]]), // heal floor = largest single component
+        false
+      );
+
+      expect(merged.kilo.tokens).toBe(100); // healed
+      expect(merged.kilo.cost).toBe(20); // floored, not $1
+      expect(merged.kilo.provenance?.costIsComplete).toBe(false);
+      expect(breakdownCostIsComplete(merged)).toBe(false);
+    });
+
+    it("still heals cost exactly when the healing submission is complete", () => {
+      // The floor must not break the heal's original purpose.
+      const { merged } = mergeClientBreakdownsWithRegressionGuard(
+        { kilo: client(200, 20) },
+        { kilo: client(100, 1) },
+        new Set(["kilo"]),
+        new Map([["kilo", 100]]),
+        true
+      );
+
+      expect(merged.kilo.tokens).toBe(100);
+      expect(merged.kilo.cost).toBe(1); // inflated fold replaced outright
+      expect(breakdownCostIsComplete(merged)).toBe(true);
+    });
+
+    it("makes a day incomplete when any single client is floored", () => {
+      // The submission-level BOOL_AND composes the same way one level up: one
+      // floored device makes the account total a lower bound, not an exact
+      // figure. This pins the day-level half of that AND semantics.
+      const mixed = {
+        claude: client(100, 10, false),
+        codex: client(50, 5),
+      };
+
+      expect(breakdownCostIsComplete(mixed)).toBe(false);
+    });
+
+    it("treats an untagged breakdown as complete", () => {
+      expect(breakdownCostIsComplete({ claude: client(10, 1) })).toBe(true);
+      expect(breakdownCostIsComplete({})).toBe(true);
+      expect(breakdownCostIsComplete(null)).toBe(true);
+    });
+  });
+
+  describe("costIsComplete (#1044)", () => {
+    it("preserves a declared-incomplete flag through validation", () => {
+      const payload = createValidationPayload();
+      (
+        payload.contributions[0].totals as { costIsComplete?: boolean }
+      ).costIsComplete = false;
+
+      const result = validateSubmission(payload);
+
+      expect(result.valid).toBe(true);
+      expect(result.errors).toHaveLength(0);
+      // Asserting the parsed value, not just validity: Zod strips unknown keys,
+      // so a schema that never declared this field would still validate here
+      // and silently drop the flag before the route could act on it.
+      expect(result.data?.contributions[0].totals.costIsComplete).toBe(false);
+    });
+
+    it("leaves the flag undefined when omitted, so released CLIs keep working", () => {
+      const payload = createValidationPayload();
+
+      const result = validateSubmission(payload);
+
+      expect(result.valid).toBe(true);
+      expect(result.errors).toHaveLength(0);
+      expect(
+        result.data?.contributions[0].totals.costIsComplete
+      ).toBeUndefined();
+    });
+
+    it("rejects a non-boolean flag rather than coercing it", () => {
+      const payload = createValidationPayload();
+      (
+        payload.contributions[0].totals as { costIsComplete?: unknown }
+      ).costIsComplete = "false";
+
+      const result = validateSubmission(payload);
+
+      expect(result.valid).toBe(false);
+    });
+
+    it("does not loosen the totals consistency check", () => {
+      // The flag declares the cost a floor; it must NOT become a licence to
+      // send internally inconsistent numbers. The earlier version of this test
+      // set summary and day cost to the same value, so it passed whether or
+      // not the flag did anything — it asserted nothing.
+      const payload = createValidationPayload({ totalCost: 12.5 });
+      (
+        payload.contributions[0].totals as { costIsComplete?: boolean }
+      ).costIsComplete = false;
+      // Summary now disagrees with the day it summarises.
+      payload.summary.totalCost = 99.5;
+
+      const result = validateSubmission(payload);
+
+      expect(result.valid).toBe(false);
+      expect(result.errors.join(" ")).toMatch(/cost/i);
     });
   });
 
