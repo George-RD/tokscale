@@ -224,6 +224,13 @@ const SubmissionProvenanceSchema = z.object({
 const SubmissionDataSchema = z.preprocess(normalizeLegacySources, z.object({
   meta: ExportMetaSchema,
   device: SubmitDeviceSchema.optional(),
+  // Parser versions are per client, not the CLI package version. A declaration
+  // is sent only for an unbounded scan of that client and lets the server
+  // perform one conservative, token-conserving redistribution when attribution
+  // semantics change. Optional for every previously released CLI.
+  scanScope: z.object({
+    parserVersions: z.record(SourceSchema, NonNegativeIntegerSchema.min(1)),
+  }).optional(),
   summary: DataSummarySchema,
   years: z.array(YearSummarySchema),
   // Each date must appear at most once. The submit route builds its insert

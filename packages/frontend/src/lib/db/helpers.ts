@@ -167,6 +167,139 @@ export function mergeClientBreakdowns(
   return merged;
 }
 
+
+export interface ParserVersionDaySnapshot {
+  date: string;
+  breakdown: Record<string, ClientBreakdownData> | null | undefined;
+}
+
+export interface ParserVersionIncomingDay {
+  date: string;
+  clients: Array<{
+    client: string;
+    tokens: {
+      input: number;
+      output: number;
+      cacheRead: number;
+      cacheWrite: number;
+      reasoning?: number;
+    };
+  }>;
+}
+
+export interface ParserVersionRedistributionPlan {
+  client: string;
+  incomingVersion: number;
+  storedVersion?: number;
+  transition: boolean;
+  stale: boolean;
+  /** Dates whose lower incoming value may replace the stored value. */
+  authorizedDecreaseDates: Set<string>;
+}
+
+function incomingClientTokens(day: ParserVersionIncomingDay, client: string): number {
+  return day.clients
+    .filter((entry) => entry.client === client)
+    .reduce(
+      (sum, entry) =>
+        sum +
+        entry.tokens.input +
+        entry.tokens.output +
+        entry.tokens.cacheRead +
+        entry.tokens.cacheWrite +
+        (entry.tokens.reasoning ?? 0),
+      0
+    );
+}
+
+/**
+ * Plan a one-time forward parser-version redistribution without treating an
+ * omitted day as proof that its stored usage vanished.
+ *
+ * Version 1 is the implicit generation of rows written before parser versions
+ * were persisted. A transition exists only when the incoming generation is
+ * strictly newer than the device/client generation. Positive per-day deltas
+ * in the new full snapshot are the sole budget for whole-day decreases. This
+ * conserves an exact re-attribution while preserving unmatched stored history.
+ */
+export function planParserVersionRedistribution(
+  existingDays: ParserVersionDaySnapshot[],
+  incomingDays: ParserVersionIncomingDay[],
+  client: string,
+  incomingVersion: number,
+  persistedVersion?: number
+): ParserVersionRedistributionPlan {
+  const existingTokens = new Map<string, number>();
+  for (const day of existingDays) {
+    const existing = day.breakdown?.[client];
+    if (existing) existingTokens.set(day.date, existing.tokens || 0);
+  }
+
+  // All pre-rollout stored rows were produced by parser generation 1. Do not
+  // infer generation from the daily JSON: the accepted generation is device
+  // state and is committed atomically with the healed rows.
+  const storedVersion =
+    persistedVersion ?? (existingTokens.size > 0 ? 1 : undefined);
+  const stale = storedVersion != null && incomingVersion < storedVersion;
+  const transition =
+    storedVersion != null &&
+    incomingVersion > storedVersion &&
+    existingTokens.size > 0;
+
+  const authorizedDecreaseDates = new Set<string>();
+  if (!transition) {
+    return {
+      client,
+      incomingVersion,
+      storedVersion,
+      transition,
+      stale,
+      authorizedDecreaseDates,
+    };
+  }
+
+  const incomingTokens = new Map(
+    incomingDays.map((day) => [day.date, incomingClientTokens(day, client)])
+  );
+  const dates = new Set([...existingTokens.keys(), ...incomingTokens.keys()]);
+  let increaseBudget = 0;
+  const decreases: Array<{ date: string; amount: number }> = [];
+
+  for (const date of dates) {
+    const existing = existingTokens.get(date) ?? 0;
+    const incoming = incomingTokens.get(date) ?? 0;
+    if (incoming > existing) {
+      increaseBudget += incoming - existing;
+    } else if (existing > incoming) {
+      decreases.push({ date, amount: existing - incoming });
+    }
+  }
+
+  // Copilot moved attribution from creation time to later shutdown time. Spend
+  // the conserved budget newest-first so deleted older history is the surplus
+  // we retain when local history is incomplete.
+  decreases.sort((a, b) => b.date.localeCompare(a.date));
+  for (const decrease of decreases) {
+    if (decrease.amount > increaseBudget) continue;
+    authorizedDecreaseDates.add(decrease.date);
+    increaseBudget -= decrease.amount;
+  }
+
+  return {
+    client,
+    incomingVersion,
+    storedVersion,
+    transition,
+    stale,
+    authorizedDecreaseDates,
+  };
+}
+
+export interface MergeRegressionGuardOptions {
+  allowParserVersionDecreases?: ReadonlySet<string>;
+  staleParserClients?: ReadonlySet<string>;
+}
+
 export function mergeClientBreakdownsWithRegressionGuard(
   existing: Record<string, ClientBreakdownData> | null | undefined,
   incoming: Record<string, ClientBreakdownData>,
@@ -197,7 +330,8 @@ export function mergeClientBreakdownsWithRegressionGuard(
   // different readers use different ones (profile totals read the scalar,
   // filtered leaderboards sum the JSON). Flooring the breakdown keeps them
   // reconcilable by construction.
-  incomingCostIsComplete: boolean = true
+  incomingCostIsComplete: boolean = true,
+  options: MergeRegressionGuardOptions = {}
 ): MergeClientBreakdownsResult {
   const merged: Record<string, ClientBreakdownData> = { ...(existing || {}) };
   const warnings: string[] = [];
@@ -211,9 +345,29 @@ export function mergeClientBreakdownsWithRegressionGuard(
   for (const clientName of incomingClients) {
     const existingClient = existing?.[clientName];
     const incomingClient = incoming[clientName];
+    if (options.staleParserClients?.has(clientName)) {
+      if (existingClient) {
+        merged[clientName] = withDerivedProvenance(existingClient);
+      } else {
+        delete merged[clientName];
+      }
+      warnings.push(
+        `Ignored ${clientName} from an older or undeclared parser version; kept the newest same-device attribution.`
+      );
+      continue;
+    }
 
     if (!incomingClient) {
-      if (existingClient && existingClient.tokens > 0) {
+      if (
+        existingClient &&
+        options.allowParserVersionDecreases?.has(clientName)
+      ) {
+        delete merged[clientName];
+        foldPreservedClients.delete(clientName);
+        warnings.push(
+          `Re-attributed ${clientName} after a parser upgrade: removed ${formatTokens(existingClient.tokens)} tokens from this day.`
+        );
+      } else if (existingClient && existingClient.tokens > 0) {
         merged[clientName] = withDerivedProvenance(existingClient);
         warnings.push(
           `Preserved ${clientName} because it disappeared from this same-device resubmit; kept ${formatTokens(existingClient.tokens)} tokens.`
@@ -227,6 +381,19 @@ export function mergeClientBreakdownsWithRegressionGuard(
 
     const nextClient = withDerivedProvenance(incomingClient);
     if (existingClient && nextClient.tokens < existingClient.tokens) {
+      if (options.allowParserVersionDecreases?.has(clientName)) {
+        merged[clientName] = applyCostCompleteness(
+          nextClient,
+          existingClient,
+          incomingCostIsComplete
+        );
+        foldPreservedClients.delete(clientName);
+        warnings.push(
+          `Re-attributed ${clientName} after a parser upgrade: replaced ${formatTokens(existingClient.tokens)} tokens with ${formatTokens(nextClient.tokens)} tokens on this day.`
+        );
+        continue;
+      }
+
       const healFloor = foldedClientFloors?.get(clientName);
       if (healFloor !== undefined && nextClient.tokens >= healFloor) {
         // The existing value is an alias-folded double count (e.g. stale
