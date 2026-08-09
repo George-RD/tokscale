@@ -40,6 +40,7 @@ import {
 import { normalizeUsernameCacheKey, revalidateUsernamePaths } from "@/lib/db/usernameLookup";
 import { revalidateUserGroupLeaderboards } from "@/lib/groups/cache";
 import { LEGACY_DEVICE_KEY } from "@/lib/devices/shared";
+import { createSafeRecord, ownValue } from "@/lib/safeRecord";
 
 const LEGACY_SUBMIT_DEVICE_KEY = LEGACY_DEVICE_KEY;
 const LEGACY_SUBMIT_DEVICE_NAME = "Legacy submissions";
@@ -57,19 +58,6 @@ const INSERT_CHUNK_SIZE = 1000;
 // the two as the SAME client instead of summing them as disjoint clients
 // (which would double-count the same underlying usage).
 const LEGACY_CLIENT_ALIASES: Record<string, string> = { kilocode: "kilo" };
-
-function dictionary<T>(): Record<string, T> {
-  return Object.create(null) as Record<string, T>;
-}
-
-function ownValue<T>(
-  source: Record<string, T> | undefined,
-  key: string
-): T | undefined {
-  return source && Object.prototype.hasOwnProperty.call(source, key)
-    ? source[key]
-    : undefined;
-}
 
 function mergeModelBreakdowns(
   target: Record<string, ClientBreakdownData["models"][string]>,
@@ -108,7 +96,7 @@ function mergeModelBreakdowns(
 // is why day totals and the leaderboard stayed correct while per-model views
 // drifted.
 function cloneClientBreakdownForFold(data: ClientBreakdownData): ClientBreakdownData {
-  const models = dictionary<ClientBreakdownData["models"][string]>();
+  const models = createSafeRecord<ClientBreakdownData["models"][string]>();
   for (const [modelId, modelData] of Object.entries(data.models ?? {})) {
     models[modelId] = { ...modelData };
   }
@@ -127,7 +115,7 @@ type FoldableClientContribution = Parameters<
 export function foldIncomingClientContributions(
   clients: FoldableClientContribution[]
 ): Record<string, ClientBreakdownData> {
-  const incomingClientBreakdown = dictionary<ClientBreakdownData>();
+  const incomingClientBreakdown = createSafeRecord<ClientBreakdownData>();
   for (const clientContribution of clients) {
     const modelData = clientContributionToBreakdownData(clientContribution);
     const existing = ownValue(incomingClientBreakdown, clientContribution.client);
@@ -156,7 +144,7 @@ export function foldIncomingClientContributions(
       }
       existing.provenance = deriveClientBreakdownProvenance(existing);
     } else {
-      const models = dictionary<ClientBreakdownData["models"][string]>();
+      const models = createSafeRecord<ClientBreakdownData["models"][string]>();
       models[clientContribution.modelId] = { ...modelData };
       const clientBreakdown = { ...modelData, models };
       incomingClientBreakdown[clientContribution.client] = {
@@ -186,7 +174,7 @@ interface NormalizedClientBreakdownAliases {
 function normalizeClientBreakdownAliases(
   breakdown: Record<string, ClientBreakdownData>
 ): NormalizedClientBreakdownAliases {
-  const normalized = dictionary<ClientBreakdownData>();
+  const normalized = createSafeRecord<ClientBreakdownData>();
   const foldedClients = new Set<string>();
   const largestComponentTokens = new Map<string, number>();
 
@@ -738,12 +726,13 @@ export async function POST(request: Request) {
             persistedVersion: submittedDevice.parserVersions?.copilot,
           })
         : { mode: "status-quo" as const, increments: {} };
-      const freezeCopilot =
-        copilotPlan.mode === "freeze" ||
+      const freezeCopilot = copilotPlan.mode === "freeze";
+      const applyCopilotIncrements =
+        copilotPlan.mode === "incremental" ||
         copilotPlan.mode === "baseline-legacy";
       if (copilotPlan.mode === "baseline-legacy") {
         warnings.push(
-          "Established the Copilot parser generation 2 baseline without adding it; existing same-device history was preserved."
+          "Established the Copilot parser generation 2 baseline; existing same-device history was preserved and only bounded lifetime growth was added."
         );
       } else if (copilotPlan.mode === "freeze") {
         warnings.push(
@@ -805,7 +794,7 @@ export async function POST(request: Request) {
 
         if (freezeCopilot) {
           delete incomingClientBreakdown.copilot;
-        } else if (copilotPlan.mode === "incremental") {
+        } else if (applyCopilotIncrements) {
           // The full snapshot itself is never merged. Only the bounded growth
           // calculated against the persisted generation high-water is eligible.
           const increment = copilotPlan.increments[incomingDay.date];
@@ -814,6 +803,16 @@ export async function POST(request: Request) {
           } else {
             delete incomingClientBreakdown.copilot;
           }
+        }
+
+        const clientsToMerge = new Set(submittedClients);
+        if (
+          (freezeCopilot || applyCopilotIncrements) &&
+          !incomingClientBreakdown.copilot
+        ) {
+          // A frozen/zero-increment Copilot plan is a no-op for that client,
+          // not a request to delete its stored row from this day.
+          clientsToMerge.delete("copilot");
         }
 
         const existingDay = existingDaysMap.get(incomingDay.date);
@@ -826,8 +825,7 @@ export async function POST(request: Request) {
           const { breakdown: existingClientBreakdown, foldedClientFloors } =
             normalizeClientBreakdownAliases(rawExistingBreakdown);
           if (
-            copilotPlan.mode === "incremental" &&
-            incomingClientBreakdown.copilot
+            applyCopilotIncrements && incomingClientBreakdown.copilot
           ) {
             incomingClientBreakdown.copilot = addClientBreakdownIncrement(
               existingClientBreakdown.copilot,
@@ -837,7 +835,7 @@ export async function POST(request: Request) {
           const mergeResult = mergeClientBreakdownsWithRegressionGuard(
             existingClientBreakdown,
             incomingClientBreakdown,
-            submittedClients,
+            clientsToMerge,
             foldedClientFloors,
             incomingDay.totals?.costIsComplete ?? true
           );
@@ -855,7 +853,7 @@ export async function POST(request: Request) {
           }
           const mergedClientBreakdown = mergeResult.merged;
           if (
-            copilotPlan.mode === "incremental" &&
+            applyCopilotIncrements &&
             existingClientBreakdown.copilot?.provenance?.costIsComplete === false &&
             mergedClientBreakdown.copilot
           ) {

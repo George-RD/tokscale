@@ -3,6 +3,7 @@ import {
   type ClientBreakdownData,
   type ModelBreakdownData,
 } from "./helpers";
+import { createSafeRecord, ownValue } from "../safeRecord";
 
 export const SUPPORTED_VERSIONED_PARSERS: Readonly<Record<string, number>> = {
   copilot: 2,
@@ -29,6 +30,8 @@ export interface ParserAggregateHighWater {
 
 export interface ParserClientHighWaterState {
   version: number;
+  /** False when identity was accepted from a partial scan but no baseline exists. */
+  baselineEstablished?: boolean;
   aggregate: ParserAggregateHighWater;
   /** Cellwise maxima for attribution of bounded aggregate growth. */
   days: Record<string, ClientBreakdownData>;
@@ -66,27 +69,14 @@ export interface ParserHighWaterPlan {
   nextState?: ParserClientHighWaterState;
 }
 
-function dictionary<T>(): Record<string, T> {
-  return Object.create(null) as Record<string, T>;
-}
-
 function copyDictionary<T>(source?: Record<string, T>): Record<string, T> {
-  return Object.assign(dictionary<T>(), source);
-}
-
-function ownValue<T>(
-  source: Record<string, T> | undefined,
-  key: string
-): T | undefined {
-  return source && Object.prototype.hasOwnProperty.call(source, key)
-    ? source[key]
-    : undefined;
+  return Object.assign(createSafeRecord<T>(), source);
 }
 
 function copyModels(
   source?: Record<string, ModelBreakdownData>
 ): Record<string, ModelBreakdownData> {
-  const result = dictionary<ModelBreakdownData>();
+  const result = createSafeRecord<ModelBreakdownData>();
   for (const [modelId, model] of Object.entries(source ?? {})) {
     result[modelId] = { ...model };
   }
@@ -169,7 +159,7 @@ export function foldParserClientSnapshot(
   for (const day of contributions) {
     for (const contribution of day.clients) {
       if (contribution.client !== client) continue;
-      const models = modelsByDay.get(day.date) ?? dictionary<ModelBreakdownData>();
+      const models = modelsByDay.get(day.date) ?? createSafeRecord<ModelBreakdownData>();
       const incoming = modelFromContribution(contribution);
       const model = ownValue(models, contribution.modelId) ?? emptyModel();
       for (const field of TOKEN_FIELDS) model[field] += incoming[field];
@@ -181,7 +171,7 @@ export function foldParserClientSnapshot(
     }
   }
 
-  const days = dictionary<ClientBreakdownData>();
+  const days = createSafeRecord<ClientBreakdownData>();
   for (const [date, models] of modelsByDay) {
     days[date] = breakdownFromModels(models);
   }
@@ -216,7 +206,9 @@ function maxModel(
   // Cost is contextual data for the token high-water snapshot, never its own
   // monotonic signal: repricing alone must not authorize spend.
   result.cost = quantizeCost(
-    tokenHighWaterAdvanced ? positive(incoming.cost) : previous?.cost ?? 0
+    tokenHighWaterAdvanced
+      ? Math.max(positive(previous?.cost ?? 0), positive(incoming.cost))
+      : previous?.cost ?? 0
   );
   result.messages = Math.max(
     positive(previous?.messages ?? 0),
@@ -283,10 +275,10 @@ function allocateIncrements(
     cacheWrite: positive(incomingAggregate.cacheWrite - previousAggregate.cacheWrite),
     reasoning: positive(incomingAggregate.reasoning - previousAggregate.reasoning),
   };
-  const increments = dictionary<ClientBreakdownData>();
+  const increments = createSafeRecord<ClientBreakdownData>();
   const dates = Object.keys(incomingDays).sort((a, b) => b.localeCompare(a));
   for (const date of dates) {
-    const incrementModels = dictionary<ModelBreakdownData>();
+    const incrementModels = createSafeRecord<ModelBreakdownData>();
     const incoming = incomingDays[date];
     const previous = ownValue(previousDays, date);
     for (const modelId of Object.keys(incoming.models).sort()) {
@@ -393,25 +385,48 @@ export function planParserHighWaterSubmission(args: {
     return { mode: "freeze", increments: {} };
   }
   if (!args.fullHistory) {
-    const legacyAggregate = aggregateSnapshot(args.existingLegacyDays);
-    return args.state || legacyAggregate.tokens > 0
-      ? { mode: "freeze", increments: {} }
-      : { mode: "status-quo", increments: {} };
+    if (args.state) return { mode: "freeze", increments: {} };
+    // Identity is trustworthy even though coverage is not. Persist a pending
+    // state so every later old/undeclared submit freezes, but do not let this
+    // partial snapshot establish or advance any token/cost high-water.
+    return {
+      mode: "freeze",
+      increments: {},
+      nextState: {
+        version: supportedVersion,
+        baselineEstablished: false,
+        aggregate: emptyAggregate(),
+        days: createSafeRecord<ClientBreakdownData>(),
+      },
+    };
   }
 
   const incomingAggregate = aggregateSnapshot(args.incomingDays);
-  if (args.state == null) {
+  if (args.state == null || args.state.baselineEstablished === false) {
     const legacyAggregate = aggregateSnapshot(args.existingLegacyDays);
+    const hasLegacy = legacyAggregate.tokens > 0;
+    // At transition, preserving all legacy rows and crediting at most positive
+    // lifetime aggregate growth is non-destructive. With deleted old usage D
+    // and genuinely new usage N, incoming - legacy = N - D <= N; the existing
+    // rows remain untouched and the normal aggregate/cell caps allocate only
+    // that provable remainder.
+    const increments = hasLegacy
+      ? allocateIncrements(
+          args.existingLegacyDays,
+          args.incomingDays,
+          legacyAggregate,
+          incomingAggregate
+        )
+      : createSafeRecord<ClientBreakdownData>();
     const nextState: ParserClientHighWaterState = {
       version: supportedVersion,
-      // Anchor the cumulative cap to both sides. If local history was missing
-      // from the first v2 scan, restoring it later must not look like new work.
+      baselineEstablished: true,
       aggregate: advanceAggregate(legacyAggregate, incomingAggregate),
-      days: args.incomingDays,
+      days: advanceDays(args.existingLegacyDays, args.incomingDays),
     };
     return {
-      mode: legacyAggregate.tokens > 0 ? "baseline-legacy" : "baseline-new",
-      increments: {},
+      mode: hasLegacy ? "baseline-legacy" : "baseline-new",
+      increments,
       nextState,
     };
   }
@@ -429,6 +444,7 @@ export function planParserHighWaterSubmission(args: {
     ),
     nextState: {
       version: supportedVersion,
+      baselineEstablished: true,
       aggregate: advanceAggregate(args.state.aggregate, incomingAggregate),
       days: advanceDays(args.state.days, args.incomingDays),
     },

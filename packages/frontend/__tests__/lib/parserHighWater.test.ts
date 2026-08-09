@@ -116,6 +116,51 @@ describe("non-destructive parser generation high-water", () => {
     expect(plan.nextState?.aggregate.tokens).toBe(100);
   });
 
+  it.each([
+    { incoming: 50, expected: 0 },
+    { incoming: 100, expected: 0 },
+    { incoming: 150, expected: 50 },
+  ])(
+    "credits only bounded transition growth when deleted legacy usage is replaced by $incoming new tokens",
+    ({ incoming, expected }) => {
+      const plan = baseline(
+        legacy(contribution("2026-06-01", 100, "legacy-model", 10)),
+        snapshot(contribution("2026-07-01", incoming, "new-model", 15))
+      );
+      const credited = Object.values(plan.increments).reduce(
+        (sum, day) => sum + day.tokens,
+        0
+      );
+
+      expect(plan.mode).toBe("baseline-legacy");
+      expect(credited).toBe(expected);
+      expect(plan.nextState?.aggregate.tokens).toBe(Math.max(100, incoming));
+    }
+  );
+
+  it("does not mint transition usage from a pure token-bucket move", () => {
+    const plan = baseline(
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 100, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+          10,
+          1
+        )
+      ),
+      snapshot(
+        bucketContribution(
+          "2026-07-02",
+          { input: 0, output: 100, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+          10,
+          1
+        )
+      )
+    );
+
+    expect(plan.increments).toEqual({});
+  });
+
   it("is idempotent when the same v2 full snapshot is replayed", () => {
     const first = baseline({}, snapshot(contribution("2026-07-01", 100)));
     const replay = next(
@@ -202,6 +247,46 @@ describe("non-destructive parser generation high-water", () => {
       cost: 10,
       messages: 1,
     });
+  });
+
+  it("does not lower cost context when a snapshot temporarily loses history", () => {
+    const first = baseline(
+      {},
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 100, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+          10,
+          1
+        )
+      )
+    );
+    const truncated = next(
+      first.nextState!,
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 80, output: 30, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+          2,
+          1
+        )
+      )
+    );
+    const restored = next(
+      truncated.nextState!,
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 100, output: 40, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+          13,
+          1
+        )
+      )
+    );
+
+    expect(truncated.increments["2026-07-01"].cost).toBe(0);
+    expect(truncated.nextState?.days["2026-07-01"].models["model-a"].cost).toBe(10);
+    expect(restored.increments["2026-07-01"].cost).toBe(3);
   });
 
   it("retains a new message even when its token growth is a tiny fraction", () => {
@@ -403,6 +488,26 @@ describe("non-destructive parser generation high-water", () => {
     });
 
     expect(plan.mode).toBe("freeze");
+    expect(plan.nextState?.baselineEstablished).toBe(false);
+
+    const oldAfterIdentity = planParserHighWaterSubmission({
+      client: "copilot",
+      fullHistory: false,
+      existingLegacyDays: legacy(contribution("2026-07-01", 100)),
+      incomingDays: snapshot(contribution("2026-07-03", 200)),
+      state: plan.nextState,
+    });
+    expect(oldAfterIdentity.mode).toBe("freeze");
+
+    const fullBaseline = planParserHighWaterSubmission({
+      client: "copilot",
+      incomingVersion: 2,
+      fullHistory: true,
+      existingLegacyDays: legacy(contribution("2026-07-01", 100)),
+      incomingDays: snapshot(contribution("2026-07-01", 100)),
+      state: plan.nextState,
+    });
+    expect(fullBaseline.nextState?.baselineEstablished).toBe(true);
   });
 
   it("keeps old CLI status quo before transition and freezes it afterward", () => {
