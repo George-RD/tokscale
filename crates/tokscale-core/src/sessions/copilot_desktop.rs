@@ -38,6 +38,12 @@ struct SessionStateMetadata {
 /// immutable `created_at`.
 #[derive(Debug)]
 struct ShutdownUsage {
+    /// Identity of the originating event, used to build a dedup key that
+    /// survives rotation or compaction of `events.jsonl`. Position in the file
+    /// would not: dropping one earlier line renumbers every record after it,
+    /// so already-submitted rows would come back under new keys and be counted
+    /// twice. The event's own `id` is a UUID; its `timestamp` is the fallback.
+    event_id: String,
     timestamp_ms: i64,
     model: String,
     input: i64,
@@ -189,7 +195,7 @@ fn session_row_to_messages(db_path: &Path, row: CopilotDesktopSessionRow) -> Vec
     };
 
     let mut messages = Vec::with_capacity(metadata.shutdowns.len() + 1);
-    for (index, shutdown) in metadata.shutdowns.iter().enumerate() {
+    for shutdown in &metadata.shutdowns {
         let model_id = match shutdown.model.trim() {
             "" | "auto" => fallback_model.clone(),
             model => model.to_string(),
@@ -210,8 +216,8 @@ fn session_row_to_messages(db_path: &Path, row: CopilotDesktopSessionRow) -> Vec
                 shutdown.reasoning,
             ),
             format!(
-                "copilot-desktop:{}:shutdown:{index}:{}",
-                row.id, shutdown.model
+                "copilot-desktop:{}:shutdown:{}:{}",
+                row.id, shutdown.event_id, shutdown.model
             ),
         ));
     }
@@ -320,6 +326,15 @@ fn collect_shutdown_usage(event: &Value, out: &mut Vec<ShutdownUsage>) {
     else {
         return;
     };
+    // `events.jsonl` is append-only in practice, but nothing guarantees it
+    // stays that way, so key off the event's own identity rather than its
+    // position in the file.
+    let event_id = event
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map_or_else(|| format!("ts-{timestamp_ms}"), str::to_string);
     let Some(metrics) = payload
         .get("modelMetrics")
         .or_else(|| event.get("modelMetrics"))
@@ -334,6 +349,7 @@ fn collect_shutdown_usage(event: &Value, out: &mut Vec<ShutdownUsage>) {
         };
         let read = |key: &str| usage.get(key).and_then(Value::as_i64).unwrap_or(0).max(0);
         let shutdown = ShutdownUsage {
+            event_id: event_id.clone(),
             timestamp_ms,
             model: model.clone(),
             input: read("inputTokens"),
@@ -609,6 +625,13 @@ mod tests {
         assert_eq!(message.tokens.output, 50);
         assert_eq!(message.tokens.cache_read, 25);
         assert_eq!(message.tokens.reasoning, 10);
+        assert_eq!(
+            message.dedup_key.as_deref(),
+            Some(
+                "copilot-desktop:session-1:shutdown:9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02:gpt-5.1-codex"
+            ),
+            "the shutdown message is keyed by the event's own id"
+        );
     }
 
     /// Whatever the shutdown records do not account for still has to be kept,
@@ -745,6 +768,48 @@ mod tests {
         assert_eq!(message.tokens.output, 29);
         assert_eq!(message.tokens.cache_read, 19_968);
         assert_eq!(message.tokens.reasoning, 22);
+        assert_eq!(
+            message.dedup_key.as_deref(),
+            Some("copilot-desktop:session-1:shutdown:c1a4b7e2-90d3-4f61-8ba5-7d2e6f0c9134:gpt-5.4")
+        );
+    }
+
+    /// The dedup key has to identify the record, not its offset. Keying on the
+    /// enumeration index holds only while `events.jsonl` is strictly
+    /// append-only: rotate, truncate, or compact away an earlier shutdown and
+    /// every later index shifts down, so usage that was already submitted comes
+    /// back under a fresh key and the server counts it twice.
+    #[test]
+    fn shutdown_dedup_key_survives_an_earlier_shutdown_being_rotated_away() {
+        let first = r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"outputTokens":50}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01","timestamp":"2026-07-01T20:00:00.000Z","parentId":null}"#;
+        let second = r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":200,"outputTokens":60}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":null}"#;
+
+        let key_of_second = |lines: &[&str]| -> String {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("data.db");
+            let conn = create_copilot_desktop_db(&db_path);
+            insert_session(&conn, "session-1", "gpt-5.1-codex", 300, 110, 0, 0);
+            drop(conn);
+            write_events(dir.path(), "session-1", lines);
+
+            parse_copilot_desktop_db(&db_path)
+                .iter()
+                .find(|message| message.timestamp == 1_782_950_400_000)
+                .and_then(|message| message.dedup_key.clone())
+                .expect("the second shutdown is always emitted")
+        };
+
+        let whole_history = key_of_second(&[first, second]);
+        let after_rotation = key_of_second(&[second]);
+
+        assert_eq!(
+            whole_history, after_rotation,
+            "dropping the earlier shutdown must not re-key the later one"
+        );
+        assert_eq!(
+            whole_history,
+            "copilot-desktop:session-1:shutdown:9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02:gpt-5.1-codex"
+        );
     }
 
     #[test]
