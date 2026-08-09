@@ -519,9 +519,10 @@ impl PricingLookup {
                     return Some(result);
                 }
             } else {
-                if let Some(result) = choose_best_source_result(
+                if let Some(result) = choose_best_source_result_with_models_dev(
                     self.exact_match_litellm_for_provider(stripped, provider_id),
                     self.exact_match_openrouter_for_provider(stripped, provider_id),
+                    self.exact_match_models_dev_for_provider(stripped, provider_id),
                     provider_id,
                 ) {
                     return Some(result);
@@ -542,9 +543,10 @@ impl PricingLookup {
             return exact_litellm;
         }
 
-        if let Some(result) = choose_best_source_result(
+        if let Some(result) = choose_best_source_result_with_models_dev(
             self.exact_match_litellm_for_provider(model_id, provider_id),
             self.exact_match_openrouter_for_provider(model_id, provider_id),
+            self.exact_match_models_dev_for_provider(model_id, provider_id),
             provider_id,
         ) {
             return Some(result);
@@ -587,9 +589,10 @@ impl PricingLookup {
         // for UNhinted lookups: the provider-scoped passes above and below
         // keep provider-hinted resolutions pinned to the hinted provider.
         if let Some(version_normalized) = normalize_version_separator(model_id) {
-            if let Some(result) = choose_best_source_result(
+            if let Some(result) = choose_best_source_result_with_models_dev(
                 self.exact_match_litellm_for_provider(&version_normalized, provider_id),
                 self.exact_match_openrouter_for_provider(&version_normalized, provider_id),
+                self.exact_match_models_dev_for_provider(&version_normalized, provider_id),
                 provider_id,
             ) {
                 return Some(result);
@@ -621,9 +624,10 @@ impl PricingLookup {
         }
 
         if let Some(normalized) = normalize_model_name(model_id) {
-            if let Some(result) = choose_best_source_result(
+            if let Some(result) = choose_best_source_result_with_models_dev(
                 self.exact_match_litellm_for_provider(&normalized, provider_id),
                 self.exact_match_openrouter_for_provider(&normalized, provider_id),
+                self.exact_match_models_dev_for_provider(&normalized, provider_id),
                 provider_id,
             ) {
                 return Some(result);
@@ -2327,10 +2331,8 @@ fn key_root_is_cross_provider_alias(key: &str, provider_id: &str) -> bool {
     let root = normalize_root(key);
     let hint = normalize_root(provider_id);
 
-    matches!(
-        (root.as_str(), hint.as_str()),
-        ("vertex" | "vertex_ai", "anthropic") | ("anthropic", "vertex" | "vertex_ai")
-    )
+    let is_claude_endpoint = |value: &str| matches!(value, "anthropic" | "vertex" | "vertex_ai");
+    root != hint && is_claude_endpoint(&root) && is_claude_endpoint(&hint)
 }
 
 fn key_root_matches_provider_hint(key: &str, provider_id: &str) -> bool {
@@ -2614,6 +2616,30 @@ fn choose_best_source_result(
         (Some(_), None) => litellm_result,
         (None, Some(_)) => openrouter_result,
         (None, None) => None,
+    }
+}
+
+/// Run the normal LiteLLM/OpenRouter arbitration, but let a literal
+/// provider-root match from Models.dev displace an alias-only winner. Models.dev
+/// otherwise remains the long-tail fallback at its established precedence.
+fn choose_best_source_result_with_models_dev(
+    litellm_result: Option<LookupResult>,
+    openrouter_result: Option<LookupResult>,
+    models_dev_result: Option<LookupResult>,
+    provider_id: Option<&str>,
+) -> Option<LookupResult> {
+    let primary = choose_best_source_result(litellm_result, openrouter_result, provider_id);
+    let models_dev_matches_root = models_dev_result.as_ref().is_some_and(|result| {
+        provider_id.is_some_and(|hint| key_root_matches_provider_hint(&result.matched_key, hint))
+    });
+    let primary_is_cross_provider_alias = primary.as_ref().is_some_and(|result| {
+        provider_id.is_some_and(|hint| key_root_is_cross_provider_alias(&result.matched_key, hint))
+    });
+
+    if models_dev_matches_root && primary_is_cross_provider_alias {
+        models_dev_result
+    } else {
+        primary
     }
 }
 
@@ -6891,6 +6917,156 @@ mod tests {
                 .expect("anthropic-hinted claude-sonnet-4 must price");
             assert_eq!(anthropic.matched_key, "anthropic/claude-sonnet-4");
             assert_eq!(anthropic.source, "OpenRouter");
+        }
+    }
+
+    /// `vertex` and `vertex_ai` share a provider tag for fallback reachability,
+    /// but are distinct billing endpoints. The literal root must win in either
+    /// direction even though the longer `vertex_ai` key is ordered first.
+    #[test]
+    fn vertex_endpoint_aliases_do_not_impersonate_each_others_own_root() {
+        let mut litellm = HashMap::new();
+        for key in ["vertex/claude-sonnet-4", "vertex_ai/claude-sonnet-4"] {
+            litellm.insert(
+                key.to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000003),
+                    output_cost_per_token: Some(0.000015),
+                    ..Default::default()
+                },
+            );
+        }
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        for hint in ["vertex", "vertex_ai"] {
+            let result = lookup
+                .lookup_with_provider("claude-sonnet-4", Some(hint))
+                .unwrap_or_else(|| panic!("{hint}-hinted claude-sonnet-4 must price"));
+            assert_eq!(result.matched_key, format!("{hint}/claude-sonnet-4"));
+        }
+    }
+
+    #[test]
+    fn vertex_endpoint_literal_root_survives_cross_source_arbitration() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "vertex/claude-sonnet-4".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000003),
+                output_cost_per_token: Some(0.000015),
+                ..Default::default()
+            },
+        );
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "vertex_ai/claude-sonnet-4".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000004),
+                output_cost_per_token: Some(0.000020),
+                ..Default::default()
+            },
+        );
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+        for (hint, key, source) in [
+            ("vertex", "vertex/claude-sonnet-4", "LiteLLM"),
+            ("vertex_ai", "vertex_ai/claude-sonnet-4", "OpenRouter"),
+        ] {
+            let result = lookup
+                .lookup_with_provider("claude-sonnet-4", Some(hint))
+                .unwrap_or_else(|| panic!("{hint}-hinted claude-sonnet-4 must price"));
+            assert_eq!(result.matched_key, key);
+            assert_eq!(result.source, source);
+        }
+    }
+
+    /// A literal provider root in Models.dev must participate in the same
+    /// arbitration as LiteLLM and OpenRouter instead of losing to their
+    /// alias-only row merely because Models.dev is normally the long-tail
+    /// fallback. Exercise both directions of the Anthropic/Vertex relation.
+    #[test]
+    fn models_dev_literal_root_outranks_cross_source_endpoint_alias() {
+        for (hint, own_root, alias_root) in [
+            ("vertex", "vertex", "anthropic"),
+            ("vertex_ai", "vertex_ai", "anthropic"),
+            ("anthropic", "anthropic", "vertex"),
+            ("anthropic", "anthropic", "vertex_ai"),
+        ] {
+            let mut litellm = HashMap::new();
+            litellm.insert(
+                format!("{alias_root}/claude-sonnet-4"),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000003),
+                    output_cost_per_token: Some(0.000015),
+                    ..Default::default()
+                },
+            );
+            let mut models_dev = HashMap::new();
+            let own_key = format!("{own_root}/claude-sonnet-4");
+            models_dev.insert(
+                own_key.clone(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000004),
+                    output_cost_per_token: Some(0.000020),
+                    ..Default::default()
+                },
+            );
+            let lookup = PricingLookup::new_with_models_dev(
+                litellm,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                models_dev,
+            );
+
+            let result = lookup
+                .lookup_with_provider("claude-sonnet-4", Some(hint))
+                .unwrap_or_else(|| panic!("{hint}-hinted claude-sonnet-4 must price"));
+            assert_eq!(result.matched_key, own_key);
+            assert_eq!(result.source, "Models.dev");
+        }
+    }
+
+    #[test]
+    fn normalized_models_dev_literal_root_outranks_cross_source_endpoint_alias() {
+        for (hint, own_root, alias_root) in [
+            ("vertex", "vertex", "anthropic"),
+            ("vertex_ai", "vertex_ai", "anthropic"),
+            ("anthropic", "anthropic", "vertex"),
+            ("anthropic", "anthropic", "vertex_ai"),
+        ] {
+            let mut openrouter = HashMap::new();
+            openrouter.insert(
+                format!("{alias_root}/claude-sonnet-4-6"),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000003),
+                    output_cost_per_token: Some(0.000015),
+                    ..Default::default()
+                },
+            );
+            let mut models_dev = HashMap::new();
+            let own_key = format!("{own_root}/claude-sonnet-4-6");
+            models_dev.insert(
+                own_key.clone(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.000004),
+                    output_cost_per_token: Some(0.000020),
+                    ..Default::default()
+                },
+            );
+            let lookup = PricingLookup::new_with_models_dev(
+                HashMap::new(),
+                openrouter,
+                HashMap::new(),
+                HashMap::new(),
+                models_dev,
+            );
+
+            let result = lookup
+                .lookup_with_provider("claude-sonnet-4.6", Some(hint))
+                .unwrap_or_else(|| panic!("normalized {hint}-hinted Claude must price"));
+            assert_eq!(result.matched_key, own_key);
+            assert_eq!(result.source, "Models.dev");
         }
     }
 
