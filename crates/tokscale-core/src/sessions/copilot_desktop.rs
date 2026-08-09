@@ -309,9 +309,12 @@ fn collect_shutdown_usage(event: &Value, out: &mut Vec<ShutdownUsage>) {
     // accepted too so a shutdown that omits the envelope still reports usage
     // rather than silently contributing nothing.
     let payload = event.get("data").unwrap_or(event);
-    let Some(timestamp_ms) = payload
-        .get("ts")
-        .or_else(|| event.get("ts"))
+    // The timestamp lives on the envelope next to `id`/`parentId`, not in the
+    // payload, and it is an ISO-8601 string. Reading the payload first only
+    // matters for a flat record that has no envelope to read from.
+    let Some(timestamp_ms) = event
+        .get("timestamp")
+        .or_else(|| payload.get("timestamp"))
         .and_then(Value::as_str)
         .and_then(parse_iso8601_timestamp_ms)
     else {
@@ -589,7 +592,7 @@ mod tests {
             dir.path(),
             "session-1",
             &[
-                r#"{"type":"session.shutdown","data":{"ts":"2026-07-02T00:00:00Z","shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"outputTokens":50,"cacheReadTokens":25,"cacheWriteTokens":0,"reasoningTokens":10}}}}}"#,
+                r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"requests":{"count":1,"cost":1},"usage":{"inputTokens":100,"outputTokens":50,"cacheReadTokens":25,"cacheWriteTokens":0,"reasoningTokens":10}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01"}"#,
             ],
         );
 
@@ -622,7 +625,7 @@ mod tests {
             dir.path(),
             "session-1",
             &[
-                r#"{"type":"session.shutdown","data":{"ts":"2026-07-02T00:00:00Z","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"outputTokens":50,"cacheReadTokens":25,"cacheWriteTokens":0,"reasoningTokens":10}}}}}"#,
+                r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"requests":{"count":1,"cost":1},"usage":{"inputTokens":100,"outputTokens":50,"cacheReadTokens":25,"cacheWriteTokens":0,"reasoningTokens":10}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01"}"#,
             ],
         );
 
@@ -660,7 +663,7 @@ mod tests {
             dir.path(),
             "session-1",
             &[
-                r#"{"type":"session.shutdown","data":{"ts":"2026-07-02T00:00:00Z","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"outputTokens":50,"cacheReadTokens":25,"cacheWriteTokens":7,"reasoningTokens":10}}}}}"#,
+                r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"requests":{"count":1,"cost":1},"usage":{"inputTokens":100,"outputTokens":50,"cacheReadTokens":25,"cacheWriteTokens":7,"reasoningTokens":10}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01"}"#,
             ],
         );
 
@@ -687,7 +690,7 @@ mod tests {
             dir.path(),
             "session-1",
             &[
-                r#"{"type":"session.shutdown","data":{"ts":"2026-07-02T00:00:00Z","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"outputTokens":20}},"claude-sonnet-4-5":{"usage":{"inputTokens":200,"outputTokens":40}}}}}"#,
+                r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"outputTokens":20}},"claude-sonnet-4-5":{"usage":{"inputTokens":200,"outputTokens":40}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01"}"#,
             ],
         );
 
@@ -705,6 +708,43 @@ mod tests {
         assert_eq!(codex.provider_id, "openai");
         assert_eq!(claude.tokens.input, 200);
         assert_eq!(claude.provider_id, "anthropic");
+    }
+
+    /// A `session.shutdown` record captured verbatim from a real
+    /// `~/.copilot/session-state/<id>/events.jsonl` on macOS (Copilot CLI
+    /// 1.0.25), with only the two UUIDs replaced. It pins the shape the desktop
+    /// app actually writes: `timestamp` is an ISO-8601 string on the envelope
+    /// next to `id`/`parentId`, `modelMetrics` is nested under `data`, and the
+    /// usage bucket carries `cacheWriteTokens`. Reading the timestamp from a
+    /// `ts` key under `data` finds nothing and drops the record.
+    #[test]
+    fn real_shutdown_record_attributes_usage_to_its_own_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("data.db");
+        let conn = create_copilot_desktop_db(&db_path);
+        insert_session(&conn, "session-1", "gpt-5.4", 21_067, 29, 19_968, 22);
+        drop(conn);
+        write_events(
+            dir.path(),
+            "session-1",
+            &[
+                r#"{"type":"session.shutdown","data":{"shutdownType":"routine","totalPremiumRequests":1,"totalApiDurationMs":2970,"sessionStartTime":1776192215193,"codeChanges":{"linesAdded":0,"linesRemoved":0,"filesModified":[]},"modelMetrics":{"gpt-5.4":{"requests":{"count":1,"cost":1},"usage":{"inputTokens":21067,"outputTokens":29,"cacheReadTokens":19968,"cacheWriteTokens":0,"reasoningTokens":22}}},"currentModel":"gpt-5.4","currentTokens":22592,"systemTokens":9923,"conversationTokens":83,"toolDefinitionsTokens":12583},"id":"c1a4b7e2-90d3-4f61-8ba5-7d2e6f0c9134","timestamp":"2026-04-14T18:43:44.922Z","parentId":"5b8f3d10-2c47-4e89-a6f0-11d9c4e78a25"}"#,
+            ],
+        );
+
+        let messages = parse_copilot_desktop_db(&db_path);
+
+        assert_eq!(messages.len(), 1, "the row total is fully accounted for");
+        let message = &messages[0];
+        assert_eq!(
+            message.timestamp, 1_776_192_224_922,
+            "the envelope timestamp is the run's own time, not `created_at`"
+        );
+        assert_eq!(message.model_id, "gpt-5.4");
+        assert_eq!(message.tokens.input, 1_099);
+        assert_eq!(message.tokens.output, 29);
+        assert_eq!(message.tokens.cache_read, 19_968);
+        assert_eq!(message.tokens.reasoning, 22);
     }
 
     #[test]
