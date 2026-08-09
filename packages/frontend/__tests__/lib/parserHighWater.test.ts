@@ -69,6 +69,22 @@ function next(
 }
 
 describe("non-destructive parser generation high-water", () => {
+  it("treats prototype-named model IDs as ordinary untrusted keys", () => {
+    const first = baseline(
+      {},
+      snapshot(contribution("2026-07-01", 100, "__proto__", 10))
+    );
+    const plan = next(
+      first.nextState!,
+      snapshot(contribution("2026-07-01", 150, "__proto__", 15))
+    );
+
+    const model = plan.increments["2026-07-01"].models["__proto__"];
+    expect(Object.getPrototypeOf(plan.increments["2026-07-01"].models)).toBeNull();
+    expect(model).toMatchObject({ input: 50, tokens: 50, cost: 5 });
+    expect((Object.prototype as { input?: number }).input).toBeUndefined();
+  });
+
   it("preserves legacy rows and records the first v2 full snapshot as a no-add baseline", () => {
     const plan = baseline(
       legacy(contribution("2026-07-01", 100)),

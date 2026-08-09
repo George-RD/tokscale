@@ -65,6 +65,23 @@ export interface ParserHighWaterPlan {
   nextState?: ParserClientHighWaterState;
 }
 
+function dictionary<T>(): Record<string, T> {
+  return Object.create(null) as Record<string, T>;
+}
+
+function copyDictionary<T>(source?: Record<string, T>): Record<string, T> {
+  return Object.assign(dictionary<T>(), source);
+}
+
+function ownValue<T>(
+  source: Record<string, T> | undefined,
+  key: string
+): T | undefined {
+  return source && Object.prototype.hasOwnProperty.call(source, key)
+    ? source[key]
+    : undefined;
+}
+
 function emptyAggregate(): ParserAggregateHighWater {
   return {
     tokens: 0,
@@ -140,9 +157,9 @@ export function foldParserClientSnapshot(
   for (const day of contributions) {
     for (const contribution of day.clients) {
       if (contribution.client !== client) continue;
-      const models = modelsByDay.get(day.date) ?? {};
+      const models = modelsByDay.get(day.date) ?? dictionary<ModelBreakdownData>();
       const incoming = modelFromContribution(contribution);
-      const model = models[contribution.modelId] ?? emptyModel();
+      const model = ownValue(models, contribution.modelId) ?? emptyModel();
       for (const field of TOKEN_FIELDS) model[field] += incoming[field];
       model.tokens = TOKEN_FIELDS.reduce((sum, field) => sum + model[field], 0);
       model.cost += incoming.cost;
@@ -152,9 +169,11 @@ export function foldParserClientSnapshot(
     }
   }
 
-  return Object.fromEntries(
-    [...modelsByDay].map(([date, models]) => [date, breakdownFromModels(models)])
-  );
+  const days = dictionary<ClientBreakdownData>();
+  for (const [date, models] of modelsByDay) {
+    days[date] = breakdownFromModels(models);
+  }
+  return days;
 }
 
 function aggregateSnapshot(
@@ -196,12 +215,12 @@ function advanceDays(
   previous: Record<string, ClientBreakdownData>,
   incoming: Record<string, ClientBreakdownData>
 ): Record<string, ClientBreakdownData> {
-  const next = { ...previous };
+  const next = copyDictionary(previous);
   for (const [date, day] of Object.entries(incoming)) {
-    const prior = previous[date];
-    const models = { ...(prior?.models ?? {}) };
+    const prior = ownValue(previous, date);
+    const models = copyDictionary(prior?.models);
     for (const [modelId, model] of Object.entries(day.models)) {
-      models[modelId] = maxModel(prior?.models?.[modelId], model);
+      models[modelId] = maxModel(ownValue(prior?.models, modelId), model);
     }
     next[date] = breakdownFromModels(models);
   }
@@ -246,15 +265,15 @@ function allocateIncrements(
     cacheWrite: positive(incomingAggregate.cacheWrite - previousAggregate.cacheWrite),
     reasoning: positive(incomingAggregate.reasoning - previousAggregate.reasoning),
   };
-  const increments: Record<string, ClientBreakdownData> = {};
+  const increments = dictionary<ClientBreakdownData>();
   const dates = Object.keys(incomingDays).sort((a, b) => b.localeCompare(a));
   for (const date of dates) {
-    const incrementModels: Record<string, ModelBreakdownData> = {};
+    const incrementModels = dictionary<ModelBreakdownData>();
     const incoming = incomingDays[date];
-    const previous = previousDays[date];
+    const previous = ownValue(previousDays, date);
     for (const modelId of Object.keys(incoming.models).sort()) {
       const model = incoming.models[modelId];
-      const prior = previous?.models?.[modelId];
+      const prior = ownValue(previous?.models, modelId);
       const increment = emptyModel();
       for (const field of TOKEN_FIELDS) {
         const candidate = positive(model[field] - (prior?.[field] ?? 0));
@@ -329,7 +348,7 @@ export function planParserHighWaterSubmission(args: {
   state?: ParserClientHighWaterState;
   persistedVersion?: number;
 }): ParserHighWaterPlan {
-  const supportedVersion = SUPPORTED_VERSIONED_PARSERS[args.client];
+  const supportedVersion = ownValue(SUPPORTED_VERSIONED_PARSERS, args.client);
   // A generation marker without its high-water can exist after an interrupted
   // rollout or state corruption. Re-baselining could re-credit old history, so
   // fail closed until an operator repairs the state.
@@ -390,7 +409,7 @@ export function addClientBreakdownIncrement(
   increment: ClientBreakdownData
 ): ClientBreakdownData {
   if (!existing) return increment;
-  const models = { ...(existing.models ?? {}) };
+  const models = copyDictionary(existing.models);
   const represented = breakdownFromModels(models);
   const remainder = emptyModel();
   for (const field of TOKEN_FIELDS) {
@@ -406,7 +425,7 @@ export function addClientBreakdownIncrement(
   remainder.messages = positive((existing.messages || 0) - represented.messages);
   if (remainder.tokens > 0 || remainder.cost > 0 || remainder.messages > 0) {
     const remainderModel = existing.modelId || "unknown";
-    const prior = { ...(models[remainderModel] ?? emptyModel()) };
+    const prior = { ...(ownValue(models, remainderModel) ?? emptyModel()) };
     for (const field of TOKEN_FIELDS) prior[field] += remainder[field];
     prior.tokens = TOKEN_FIELDS.reduce((sum, field) => sum + prior[field], 0);
     prior.cost = quantizeCost(prior.cost + remainder.cost);
@@ -414,7 +433,7 @@ export function addClientBreakdownIncrement(
     models[remainderModel] = prior;
   }
   for (const [modelId, delta] of Object.entries(increment.models)) {
-    const model = { ...(models[modelId] ?? emptyModel()) };
+    const model = { ...(ownValue(models, modelId) ?? emptyModel()) };
     for (const field of TOKEN_FIELDS) model[field] = (model[field] || 0) + delta[field];
     model.tokens = TOKEN_FIELDS.reduce((sum, field) => sum + model[field], 0);
     model.cost = quantizeCost((model.cost || 0) + delta.cost);
