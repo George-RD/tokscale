@@ -500,8 +500,15 @@ fn headless_capture_timeout_fires_near_its_deadline() {
     // Sampling lazily cannot hide a regression. A second sample is taken only
     // when the test is already failing, and a minimum can only move the estimate
     // down, so the retry can rescue a spike that inflated the measurement and
-    // nothing else: a deadline that really is 5x too long measures ~50s twice,
-    // and a deadline that fires early measures short twice. Both still fail.
+    // nothing else: a deadline that really is 5x too long measures ~50s twice
+    // and still fails.
+    //
+    // That the minimum only moves down is also why the resample is conditioned
+    // on the upper bound alone. A measurement below `low` — a deadline that
+    // fired early, or a baseline that padded the run — cannot be moved back up
+    // into the band by a minimum, so resampling it would spend another full
+    // `HEADLESS_SLOW_TIMEOUT_MS` to reach the failure it had already reached.
+    // The too-short case fails on the first sample.
     //
     // `saturating_sub` rather than `-`: a baseline longer than the timed-out run
     // means the deadline was not waited on at all, which is a failure to report,
@@ -513,7 +520,7 @@ fn headless_capture_timeout_fires_near_its_deadline() {
         HEADLESS_SLOW_TIMEOUT_MS,
     );
     let mut measured_deadline = slow.saturating_sub(baseline);
-    if measured_deadline < low || measured_deadline > high {
+    if measured_deadline > high {
         slow = slow.min(time_headless_capture(
             fake_bin.path(),
             "deadline-slow-resample",
