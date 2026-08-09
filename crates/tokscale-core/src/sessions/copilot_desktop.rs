@@ -30,6 +30,11 @@ struct SessionStateMetadata {
     model: Option<String>,
     cwd: Option<String>,
     shutdowns: Vec<ShutdownUsage>,
+    /// Usage the shutdown snapshots account for. This is normally the sum of
+    /// `shutdowns`, but not when a snapshot was swallowed as an unknown
+    /// baseline: that usage is accounted for without being emitted, and the
+    /// row residual has to know it so it is not re-emitted on `created_at`.
+    consumed: UsageBuckets,
 }
 
 /// One model's usage from a single `session.shutdown` record.
@@ -94,6 +99,17 @@ impl ShutdownUsage {
     }
 }
 
+/// What one session's shutdown snapshots resolve to: the increments to emit,
+/// and the usage they account for.
+struct ShutdownAttribution {
+    /// One entry per snapshot that added usage, already differenced into the
+    /// increment it contributed.
+    deltas: Vec<ShutdownUsage>,
+    /// The total the snapshots account for, which the caller subtracts from the
+    /// row's lifetime total. Not necessarily the sum of `deltas`.
+    consumed: UsageBuckets,
+}
+
 /// Convert cumulative shutdown snapshots into the usage each one actually
 /// added, so summing them reconciles against the row's lifetime total instead
 /// of multiplying it.
@@ -112,7 +128,24 @@ impl ShutdownUsage {
 /// so the deltas always sum to that model's highest observed snapshot and can
 /// never exceed it. Anything the snapshots leave unexplained is still
 /// reconciled by the caller's residual against the `sessions` row.
-fn shutdown_deltas(mut snapshots: Vec<ShutdownUsage>) -> Vec<ShutdownUsage> {
+///
+/// `complete_from_start` says whether the log still begins where the session
+/// did. When it does, the first snapshot seen for a model really is that
+/// model's first, and zero is the right baseline to difference it from. When
+/// it does not, an earlier snapshot may have been rotated away: that snapshot's
+/// increment was already submitted under a dedup key this parse can no longer
+/// reproduce, so differencing the survivor from zero would re-emit it under a
+/// key whose day is only ever ratcheted upwards. The survivor is treated as an
+/// unknown baseline instead — it sets the peak and contributes nothing.
+///
+/// That is deliberately the conservative direction. On a machine that had
+/// already submitted the rotated-away snapshot it is exact; on one scanning a
+/// truncated log for the first time it under-reports the baseline rather than
+/// re-dating it, because nothing on disk distinguishes the two cases.
+fn shutdown_deltas(
+    mut snapshots: Vec<ShutdownUsage>,
+    complete_from_start: bool,
+) -> ShutdownAttribution {
     // A record repeated verbatim — the same event written twice by a
     // re-flushed or replayed log — describes one shutdown and must count once.
     let mut seen = HashSet::new();
@@ -125,12 +158,24 @@ fn shutdown_deltas(mut snapshots: Vec<ShutdownUsage>) -> Vec<ShutdownUsage> {
     let mut peaks: HashMap<String, UsageBuckets> = HashMap::new();
     let mut deltas = Vec::with_capacity(snapshots.len());
     for snapshot in snapshots {
-        let peak = peaks.entry(snapshot.model.clone()).or_default();
         let current = snapshot.buckets();
+        let baseline = match peaks.get(&snapshot.model) {
+            Some(peak) => Some(*peak),
+            None if complete_from_start => Some(UsageBuckets::default()),
+            None => None,
+        };
+
+        let peak = peaks.entry(snapshot.model.clone()).or_insert(current);
+        for (index, value) in current.iter().enumerate() {
+            peak[index] = peak[index].max(*value);
+        }
+
+        let Some(baseline) = baseline else {
+            continue;
+        };
         let mut delta = UsageBuckets::default();
         for (index, value) in current.iter().enumerate() {
-            delta[index] = value.saturating_sub(peak[index]).max(0);
-            peak[index] = peak[index].max(*value);
+            delta[index] = value.saturating_sub(baseline[index]).max(0);
         }
         if delta.iter().all(|bucket| *bucket == 0) {
             continue;
@@ -138,7 +183,20 @@ fn shutdown_deltas(mut snapshots: Vec<ShutdownUsage>) -> Vec<ShutdownUsage> {
         deltas.push(snapshot.with_buckets(delta));
     }
 
-    deltas
+    // Every model's peak is the highest total it was ever observed holding, so
+    // summing the peaks is what the snapshots account for whether or not each
+    // one was emitted. Using the emitted deltas instead would hand a swallowed
+    // baseline back to the residual and re-date it to `created_at`.
+    let consumed = peaks
+        .values()
+        .fold(UsageBuckets::default(), |mut total, peak| {
+            for (index, value) in peak.iter().enumerate() {
+                total[index] = total[index].saturating_add(*value);
+            }
+            total
+        });
+
+    ShutdownAttribution { deltas, consumed }
 }
 
 pub fn parse_copilot_desktop_db(db_path: &Path) -> Vec<UnifiedMessage> {
@@ -318,26 +376,22 @@ fn session_row_to_messages(db_path: &Path, row: CopilotDesktopSessionRow) -> Vec
         ));
     }
 
-    // Safe to sum only because the snapshots were differenced into increments;
-    // summing the raw records would subtract more than the row ever held.
-    let consumed = |pick: fn(&ShutdownUsage) -> i64| -> i64 {
-        metadata
-            .shutdowns
-            .iter()
-            .map(pick)
-            .fold(0i64, i64::saturating_add)
-    };
+    // What the snapshots account for, which is not always what they emitted: a
+    // snapshot swallowed as an unknown baseline stands for usage that is
+    // already attributed elsewhere, so it must not come back as a remainder.
+    let consumed = metadata.consumed;
     // The row's own cache-write column does not exist, so the shutdown records
     // are the only source for that bucket and there is nothing to reconcile.
     let residual = super::copilot::normalize_input_tokens(
-        (row.total_input_tokens - consumed(|usage| usage.input)).max(0),
-        (row.total_output_tokens - consumed(|usage| usage.output)).max(0),
-        (row.total_cached_tokens - consumed(|usage| usage.cache_read)).max(0),
+        (row.total_input_tokens - consumed[0]).max(0),
+        (row.total_output_tokens - consumed[1]).max(0),
+        (row.total_cached_tokens - consumed[2]).max(0),
         0,
-        (row.total_reasoning_tokens - consumed(|usage| usage.reasoning)).max(0),
+        (row.total_reasoning_tokens - consumed[4]).max(0),
     );
 
-    if messages.is_empty() || residual.total() > 0 {
+    let nothing_accounted = consumed.iter().all(|bucket| *bucket == 0);
+    if (messages.is_empty() && nothing_accounted) || residual.total() > 0 {
         messages.push(build(
             fallback_model,
             created_at_ms,
@@ -368,6 +422,12 @@ fn read_events_metadata(events_path: &Path) -> SessionStateMetadata {
     };
 
     let mut metadata = SessionStateMetadata::default();
+    // The SDK builds a session by replaying this file and rejects one whose
+    // first event is not `session.start`, and the only removal it performs
+    // keeps the prefix and drops the tail. A log that does not open with
+    // `session.start` has therefore lost its head to something else, and the
+    // records that used to precede the survivors are unrecoverable.
+    let mut first_event_type: Option<String> = None;
     for line in lossy_lines(BufReader::new(file)) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -380,6 +440,9 @@ fn read_events_metadata(events_path: &Path) -> SessionStateMetadata {
         let Some(event_type) = event.get("type").and_then(Value::as_str) else {
             continue;
         };
+        if first_event_type.is_none() {
+            first_event_type = Some(event_type.to_string());
+        }
 
         match event_type {
             "session.start" if metadata.cwd.is_none() => {
@@ -407,7 +470,10 @@ fn read_events_metadata(events_path: &Path) -> SessionStateMetadata {
 
     // Everything downstream treats one entry as one run's spend, so hand back
     // increments rather than the cumulative snapshots the app writes.
-    metadata.shutdowns = shutdown_deltas(metadata.shutdowns);
+    let complete_from_start = first_event_type.as_deref() == Some("session.start");
+    let attribution = shutdown_deltas(std::mem::take(&mut metadata.shutdowns), complete_from_start);
+    metadata.shutdowns = attribution.deltas;
+    metadata.consumed = attribution.consumed;
     metadata
 }
 
@@ -715,6 +781,7 @@ mod tests {
             dir.path(),
             "session-1",
             &[
+                SESSION_START,
                 r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"requests":{"count":1,"cost":1},"usage":{"inputTokens":100,"outputTokens":50,"cacheReadTokens":25,"cacheWriteTokens":0,"reasoningTokens":10}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01"}"#,
             ],
         );
@@ -755,6 +822,7 @@ mod tests {
             dir.path(),
             "session-1",
             &[
+                SESSION_START,
                 r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"requests":{"count":1,"cost":1},"usage":{"inputTokens":100,"outputTokens":50,"cacheReadTokens":25,"cacheWriteTokens":0,"reasoningTokens":10}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01"}"#,
             ],
         );
@@ -793,6 +861,7 @@ mod tests {
             dir.path(),
             "session-1",
             &[
+                SESSION_START,
                 r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"requests":{"count":1,"cost":1},"usage":{"inputTokens":100,"outputTokens":50,"cacheReadTokens":25,"cacheWriteTokens":7,"reasoningTokens":10}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01"}"#,
             ],
         );
@@ -820,6 +889,7 @@ mod tests {
             dir.path(),
             "session-1",
             &[
+                SESSION_START,
                 r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"outputTokens":20}},"claude-sonnet-4-5":{"usage":{"inputTokens":200,"outputTokens":40}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01"}"#,
             ],
         );
@@ -858,6 +928,7 @@ mod tests {
             dir.path(),
             "session-1",
             &[
+                SESSION_START,
                 r#"{"type":"session.shutdown","data":{"shutdownType":"routine","totalPremiumRequests":1,"totalApiDurationMs":2970,"sessionStartTime":1776192215193,"codeChanges":{"linesAdded":0,"linesRemoved":0,"filesModified":[]},"modelMetrics":{"gpt-5.4":{"requests":{"count":1,"cost":1},"usage":{"inputTokens":21067,"outputTokens":29,"cacheReadTokens":19968,"cacheWriteTokens":0,"reasoningTokens":22}}},"currentModel":"gpt-5.4","currentTokens":22592,"systemTokens":9923,"conversationTokens":83,"toolDefinitionsTokens":12583},"id":"c1a4b7e2-90d3-4f61-8ba5-7d2e6f0c9134","timestamp":"2026-04-14T18:43:44.922Z","parentId":"5b8f3d10-2c47-4e89-a6f0-11d9c4e78a25"}"#,
             ],
         );
@@ -908,8 +979,11 @@ mod tests {
                 .expect("the second shutdown is always emitted")
         };
 
-        let whole_history = key_of_second(&[first, second]);
-        let after_rotation = key_of_second(&[second]);
+        let whole_history = key_of_second(&[SESSION_START, first, second]);
+        // The earlier shutdown is gone but the log still opens where the
+        // session did, so the survivor is still differenced and emitted; what
+        // must not change is the key it is emitted under.
+        let after_rotation = key_of_second(&[SESSION_START, second]);
 
         assert_eq!(
             whole_history, after_rotation,
@@ -939,6 +1013,7 @@ mod tests {
             dir.path(),
             "session-1",
             &[
+                SESSION_START,
                 r#"{"type":"session.shutdown","data":{"shutdownType":"error","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"outputTokens":50}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01","timestamp":"2026-07-01T20:00:00.000Z","parentId":null}"#,
                 r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":200,"outputTokens":100}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":null}"#,
             ],
@@ -989,7 +1064,7 @@ mod tests {
         insert_session(&conn, "session-1", "gpt-5.1-codex", 100, 50, 0, 0);
         drop(conn);
         let record = r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"outputTokens":50}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":null}"#;
-        write_events(dir.path(), "session-1", &[record, record]);
+        write_events(dir.path(), "session-1", &[SESSION_START, record, record]);
 
         let messages = parse_copilot_desktop_db(&db_path);
 
@@ -1016,6 +1091,7 @@ mod tests {
             dir.path(),
             "session-1",
             &[
+                SESSION_START,
                 r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":200,"outputTokens":100}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01","timestamp":"2026-07-01T20:00:00.000Z","parentId":null}"#,
                 r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":50,"outputTokens":20}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":null}"#,
             ],
@@ -1067,6 +1143,7 @@ mod tests {
             dir.path(),
             "session-1",
             &[
+                SESSION_START,
                 r#"{"type":"session.shutdown","data":{"shutdownType":"error","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"outputTokens":50,"cacheReadTokens":25,"cacheWriteTokens":0,"reasoningTokens":10}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01","timestamp":"2026-07-01T20:00:00.000Z","parentId":null}"#,
                 r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":150,"outputTokens":75,"cacheReadTokens":40,"cacheWriteTokens":0,"reasoningTokens":15}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":null}"#,
             ],
@@ -1160,6 +1237,68 @@ mod tests {
             ],
             "one dedup identity per model: the key names the model the message \
              is attributed to, not the raw spelling it happened to be written with"
+        );
+    }
+
+    /// `events.jsonl` is not guaranteed append-only, and losing the head of the
+    /// file takes an earlier shutdown snapshot with it. The later record was
+    /// already submitted as an increment under a dedup key that does not
+    /// change, so differencing it from zero again would raise its day to the
+    /// full cumulative total while the earlier day keeps the usage it was
+    /// already credited with — permanently adding the rotated-away snapshot on
+    /// top of a total that was already complete.
+    ///
+    /// The invariant: a record's emitted usage never grows because a snapshot
+    /// before it disappeared, and the usage it stands for is not re-emitted
+    /// somewhere else either.
+    #[test]
+    fn a_rotated_away_predecessor_does_not_grow_the_later_shutdown() {
+        let first = r#"{"type":"session.shutdown","data":{"shutdownType":"error","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"outputTokens":50}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01","timestamp":"2026-07-01T20:00:00.000Z","parentId":null}"#;
+        let second = r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":200,"outputTokens":60}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":null}"#;
+
+        let parse = |lines: &[&str]| -> Vec<UnifiedMessage> {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("data.db");
+            let conn = create_copilot_desktop_db(&db_path);
+            // The later snapshot restates the earlier one, so the row's
+            // lifetime total is the final snapshot rather than their sum.
+            insert_session(&conn, "session-1", "gpt-5.1-codex", 200, 60, 0, 0);
+            drop(conn);
+            write_events(dir.path(), "session-1", lines);
+            parse_copilot_desktop_db(&db_path)
+        };
+        let second_day = |messages: &[UnifiedMessage]| -> i64 {
+            messages
+                .iter()
+                .find(|message| message.timestamp == 1_782_950_400_000)
+                .map_or(0, |message| message.tokens.input)
+        };
+
+        let whole_history = parse(&[SESSION_START, first, second]);
+        assert_eq!(
+            second_day(&whole_history),
+            100,
+            "with both snapshots the later record is only its own increment"
+        );
+
+        // Compaction: the head of the log is gone, so `session.start` and the
+        // earlier snapshot went with it and only the later record survives.
+        let after_compaction = parse(&[second]);
+
+        assert!(
+            second_day(&after_compaction) <= 100,
+            "the later record must not grow into the full cumulative total when \
+             its predecessor is rotated away; it reported {}",
+            second_day(&after_compaction)
+        );
+        let emitted: i64 = after_compaction
+            .iter()
+            .map(|message| message.tokens.total())
+            .sum();
+        assert_eq!(
+            emitted, 0,
+            "the surviving snapshot restates usage that is already attributed, \
+             so it is not re-emitted on the creation day either"
         );
     }
 
