@@ -163,9 +163,22 @@ pub(crate) fn matches_provider_spelling(dataset_key: &str, provider_id: &str) ->
         return false;
     }
 
+    // The final component is the model name, but an AWS-style id carries the
+    // provider in a dotted prefix of it — `amazon-bedrock/us.deepseek.r1-v1:0`
+    // is DeepSeek's row, not Amazon's own model. `key_provider_tags` already
+    // splits that component on `.` for exactly this reason, so read the same
+    // segments here: dropping them lets a `deepseek` hint miss the row that
+    // spells the vendor its way and fall through to a differently spelled
+    // reseller. Only the dotted *prefix* counts; the trailing piece is the
+    // model name and is never a vendor spelling.
+    let last = key_parts[key_parts.len() - 1];
+    let dotted_provider_prefix = last.rsplit_once('.').map(|(prefix, _)| prefix);
+
     key_parts[..key_parts.len() - 1]
         .iter()
-        .flat_map(|segment| raw_provider_segments(segment))
+        .copied()
+        .chain(dotted_provider_prefix)
+        .flat_map(raw_provider_segments)
         .any(|key_segment| hint_segments.iter().any(|hint| hint == &key_segment))
 }
 
@@ -642,6 +655,42 @@ mod tests {
         assert!(!matches_provider_spelling(
             "some-vendor/deepseek",
             "deepseek"
+        ));
+    }
+
+    #[test]
+    fn provider_spelling_reads_the_dotted_prefix_of_the_final_key_component() {
+        // AWS-style ids carry the provider in a dotted prefix of the final key
+        // component, which is why `key_provider_tags` splits it on `.`. The
+        // spelling predicate has to read the same segments, or a `deepseek`
+        // hint fails to recognise the row that spells the vendor its way and
+        // falls through to a differently spelled reseller.
+        assert_eq!(
+            key_provider_tags("amazon-bedrock/us.deepseek.r1-v1:0"),
+            vec!["amazon_bedrock", "us", "deepseek"]
+        );
+        assert!(matches_provider_spelling(
+            "amazon-bedrock/us.deepseek.r1-v1:0",
+            "deepseek"
+        ));
+        assert!(matches_provider_spelling(
+            "bedrock/us-east-1/deepseek.v3.2",
+            "deepseek"
+        ));
+        assert!(!matches_provider_spelling(
+            "amazon-bedrock/us.deepseek.r1-v1:0",
+            "deepseek-ai"
+        ));
+
+        // The trailing piece is still the model name, not a vendor spelling,
+        // and an undotted final component contributes nothing at all.
+        assert!(!matches_provider_spelling(
+            "amazon-bedrock/us.deepseek.r1-v1:0",
+            "r1-v1:0"
+        ));
+        assert!(!matches_provider_spelling(
+            "some-router/deepseek-ai",
+            "deepseek-ai"
         ));
     }
 }
