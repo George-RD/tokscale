@@ -65,6 +65,8 @@ struct ShutdownUsage {
     /// emitted message is attributed to, which is trimmed too: two spellings
     /// that differ only by padding are one model everywhere or nowhere.
     model: String,
+    /// Concrete model active for this shutdown when the tracker key is `auto`.
+    attributed_model: Option<String>,
     input: i64,
     output: i64,
     cache_read: i64,
@@ -387,10 +389,10 @@ fn session_row_to_messages(db_path: &Path, row: CopilotDesktopSessionRow) -> Vec
         // own dedup key even when it is attributed to the resolved model.
         // Folding it into `fallback_model` before differencing would subtract
         // one counter's peak from another counter's total.
-        let model_id = match shutdown.model.as_str() {
-            "" | "auto" => fallback_model.clone(),
-            model => model.to_string(),
-        };
+        let model_id = shutdown
+            .attributed_model
+            .clone()
+            .unwrap_or_else(|| fallback_model.clone());
         messages.push(build(
             model_id,
             shutdown.timestamp_ms,
@@ -559,15 +561,29 @@ fn collect_shutdown_usage(event: &Value, out: &mut Vec<ShutdownUsage>) {
         return;
     };
 
+    let current_model = payload
+        .get("currentModel")
+        .or_else(|| event.get("currentModel"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && *model != "auto")
+        .map(str::to_string);
+
     for (model, entry) in metrics {
         let Some(usage) = entry.get("usage") else {
             continue;
         };
         let read = |key: &str| usage.get(key).and_then(Value::as_i64).unwrap_or(0).max(0);
+        let tracker_model = model.trim().to_string();
+        let attributed_model = match tracker_model.as_str() {
+            "" | "auto" => current_model.clone(),
+            _ => Some(tracker_model.clone()),
+        };
         let shutdown = ShutdownUsage {
             event_id: event_id.clone(),
             timestamp_ms,
-            model: model.trim().to_string(),
+            model: tracker_model,
+            attributed_model,
             input: read("inputTokens"),
             output: read("outputTokens"),
             cache_read: read("cacheReadTokens"),
@@ -972,6 +988,46 @@ mod tests {
                 .sum::<i32>(),
             1,
             "splitting one session across models must not inflate its count"
+        );
+    }
+
+    /// `currentModel` belongs to each shutdown payload. Using the final session
+    /// model for every `auto` tracker fragment would move an earlier run to a
+    /// model selected only later.
+    #[test]
+    fn auto_shutdowns_keep_the_model_active_for_each_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("data.db");
+        let conn = create_copilot_desktop_db(&db_path);
+        insert_session(&conn, "session-1", "auto", 200, 0, 0, 0);
+        drop(conn);
+        write_events(
+            dir.path(),
+            "session-1",
+            &[
+                SESSION_START,
+                r#"{"type":"session.shutdown","data":{"currentModel":"gpt-5.1-codex","modelMetrics":{"auto":{"usage":{"inputTokens":100}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01","timestamp":"2026-07-01T20:00:00.000Z","parentId":null}"#,
+                r#"{"type":"session.shutdown","data":{"currentModel":"claude-sonnet-4-5","modelMetrics":{"auto":{"usage":{"inputTokens":200}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":null}"#,
+            ],
+        );
+
+        let messages = parse_copilot_desktop_db(&db_path);
+        let first = messages
+            .iter()
+            .find(|message| message.timestamp == 1_782_936_000_000)
+            .expect("first shutdown");
+        let second = messages
+            .iter()
+            .find(|message| message.timestamp == 1_782_950_400_000)
+            .expect("second shutdown");
+
+        assert_eq!(
+            (first.model_id.as_str(), first.tokens.input),
+            ("gpt-5.1-codex", 100)
+        );
+        assert_eq!(
+            (second.model_id.as_str(), second.tokens.input),
+            ("claude-sonnet-4-5", 100)
         );
     }
 
