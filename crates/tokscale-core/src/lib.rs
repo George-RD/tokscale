@@ -3027,10 +3027,25 @@ fn build_graph_from_messages(
     Ok(result)
 }
 
-const GEMINI_DEFAULT_UNPRICED_REASON: &str =
+const ROUTING_LABEL_UNPRICED_REASON: &str =
     "generic routing label has no authoritative model-to-price mapping";
 const MISSING_MODEL_PRICING_REASON: &str = "no authoritative model-to-price mapping";
 const INCOMPLETE_MODEL_PRICING_REASON: &str = "pricing does not cover every populated token bucket";
+
+/// Routing labels name the router that served the request, never the model
+/// that answered it, so they have no authoritative model-to-price mapping.
+/// This defers to `lookup::is_routing_label` (lookup.rs) rather than restating
+/// its `ROUTING_LABELS` list: the reason a row is excluded has to name the same
+/// labels the resolver refuses at its top, and a second copy of the list would
+/// drift the moment a label is added to one side. Trimming matches for the same
+/// reason — the resolver trims, so ` auto ` must not read as a routing label
+/// here while being refused there. The historical `gemini-default` pair is
+/// provider-scoped and lives only in this reason, not in the resolver gate.
+fn is_generic_routing_label(provider_id: &str, model_id: &str) -> bool {
+    (provider_id.eq_ignore_ascii_case("google")
+        && model_id.trim().eq_ignore_ascii_case("gemini-default"))
+        || pricing::lookup::is_routing_label(model_id)
+}
 
 fn has_positive_token_usage(tokens: &TokenBreakdown) -> bool {
     tokens.input > 0
@@ -3062,11 +3077,18 @@ fn exclude_unpriced_submission_messages(
             );
 
         if is_unpriced {
-            let reason = if message.provider_id.eq_ignore_ascii_case("google")
-                && message.model_id.eq_ignore_ascii_case("gemini-default")
-            {
-                GEMINI_DEFAULT_UNPRICED_REASON
-            } else if pricing
+            // Resolution is consulted before the routing-label reason, not
+            // after. `custom-pricing.json` is read first by
+            // `lookup_with_source_and_provider`, and stating a rate for `auto`
+            // there is the user asserting the label does name something for
+            // them — the escape hatch `lookup::ROUTING_LABELS` documents.
+            // Checking the label first told that user their label "has no
+            // authoritative model-to-price mapping" while their own file held
+            // one, hiding the fixable gap (a bucket their entry omits).
+            // Nothing regresses for unpriced labels: the resolver refuses
+            // routing labels outright, so with no custom entry this returns
+            // None and the routing-label reason still applies.
+            let reason = if pricing
                 .lookup_with_source_and_provider(
                     &message.model_id,
                     None,
@@ -3075,6 +3097,8 @@ fn exclude_unpriced_submission_messages(
                 .is_some()
             {
                 INCOMPLETE_MODEL_PRICING_REASON
+            } else if is_generic_routing_label(&message.provider_id, &message.model_id) {
+                ROUTING_LABEL_UNPRICED_REASON
             } else {
                 MISSING_MODEL_PRICING_REASON
             };
@@ -4383,13 +4407,14 @@ mod tests {
     use super::{
         aggregate_model_usage_entries, apply_pricing_if_available, build_graph_from_messages,
         dedupe_latest_trae_messages, filter_messages_for_report,
-        generate_graph_with_loaded_pricing, get_home_dir_string, message_cache,
-        normalize_model_for_grouping, parse_all_messages_with_pricing_with_env_strategy,
-        parse_local_clients, parsed_to_unified, paths, pricing, retain_for_requested_clients,
-        scanner, select_local_parse_pricing, unified_to_parsed, validate_priced_messages, ClientId,
-        GraphPricingRequirement, GroupBy, LocalParseOptions, ReportOptions, TokenBreakdown,
-        UnifiedMessage, UnpricedSubmissionExclusion, GEMINI_DEFAULT_UNPRICED_REASON,
-        INCOMPLETE_MODEL_PRICING_REASON, MISSING_MODEL_PRICING_REASON, UNKNOWN_WORKSPACE_LABEL,
+        generate_graph_with_loaded_pricing, get_home_dir_string, is_generic_routing_label,
+        message_cache, normalize_model_for_grouping,
+        parse_all_messages_with_pricing_with_env_strategy, parse_local_clients, parsed_to_unified,
+        paths, pricing, retain_for_requested_clients, scanner, select_local_parse_pricing,
+        unified_to_parsed, validate_priced_messages, ClientId, GraphPricingRequirement, GroupBy,
+        LocalParseOptions, ReportOptions, TokenBreakdown, UnifiedMessage,
+        UnpricedSubmissionExclusion, INCOMPLETE_MODEL_PRICING_REASON, MISSING_MODEL_PRICING_REASON,
+        ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL,
     };
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
@@ -8382,7 +8407,199 @@ mod tests {
                 model_id: "gemini-default".to_string(),
                 message_count: 7,
                 total_tokens: 18,
-                reason: GEMINI_DEFAULT_UNPRICED_REASON,
+                reason: ROUTING_LABEL_UNPRICED_REASON,
+            }
+        );
+    }
+
+    #[test]
+    fn submission_excludes_unpriced_auto_routing_label() {
+        // `auto` is the unknown-model label Kiro emits and the default-model
+        // label Cursor/Copilot record in usage rows. A models.dev `morph/auto`
+        // paid row exists, so before the resolver refused routing labels the
+        // bare label resolved to it and slipped through submission at morph's
+        // rates (#1062). The fixture quotes a cache-read rate precisely so the
+        // pre-fix fallback covers all three populated buckets (7 input, 11
+        // cache-read, 0 output) and submits the row — without it, the row
+        // would fail coverage on the missing cache rate and the test would
+        // pass even with the bug. The label must instead be excluded with the
+        // routing-label reason.
+        let mut models_dev = HashMap::new();
+        models_dev.insert(
+            "morph/auto".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(8.5e-7),
+                output_cost_per_token: Some(1.55e-6),
+                cache_read_input_token_cost: Some(1.6e-7),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new_with_custom_and_models_dev(
+            pricing::custom::CustomPricing::default(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+        let mut auto = UnifiedMessage::new(
+            "kiro",
+            "auto",
+            "amazon-bedrock",
+            "generic",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 7,
+                cache_read: 11,
+                ..Default::default()
+            },
+            0.0,
+        );
+        auto.message_count = 7;
+
+        let graph = build_graph_from_messages(
+            vec![auto],
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("routing label must not abort submission");
+
+        assert_eq!(graph.summary.total_tokens, 0);
+        assert_eq!(graph.unpriced_submission_exclusions.len(), 1);
+        assert_eq!(
+            graph.unpriced_submission_exclusions[0],
+            UnpricedSubmissionExclusion {
+                provider_id: "amazon-bedrock".to_string(),
+                model_id: "auto".to_string(),
+                message_count: 7,
+                total_tokens: 18,
+                reason: ROUTING_LABEL_UNPRICED_REASON,
+            }
+        );
+    }
+
+    #[test]
+    fn whitespace_padded_routing_label_is_classified_the_same_by_resolver_and_reason() {
+        // `lookup::is_routing_label` trims before comparing, so the resolver
+        // refuses to price ` auto `. The exclusion reason has to agree, or the
+        // row is reported as having no model-to-price mapping while the reason
+        // it is unpriced is that it names a router. Both paths now read the
+        // same list, so a label added to `lookup::ROUTING_LABELS` cannot drift
+        // out of the reason.
+        assert_eq!(
+            crate::pricing::lookup::is_routing_label(" auto "),
+            is_generic_routing_label("amazon-bedrock", " auto "),
+            "resolver and exclusion reason must classify a padded routing label alike"
+        );
+
+        // The models.dev `morph/auto` row is fully priced, so if the resolver
+        // did not refuse the padded label the row would submit at Morph rates
+        // (#1062) instead of reaching the exclusion path at all.
+        let mut models_dev = HashMap::new();
+        models_dev.insert(
+            "morph/auto".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(8.5e-7),
+                output_cost_per_token: Some(1.55e-6),
+                cache_read_input_token_cost: Some(1.6e-7),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new_with_custom_and_models_dev(
+            pricing::custom::CustomPricing::default(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+        let mut padded = UnifiedMessage::new(
+            "kiro",
+            " auto ",
+            "amazon-bedrock",
+            "generic",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 7,
+                cache_read: 11,
+                ..Default::default()
+            },
+            0.0,
+        );
+        padded.message_count = 7;
+
+        let graph = build_graph_from_messages(
+            vec![padded],
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("routing label must not abort submission");
+
+        assert_eq!(graph.summary.total_tokens, 0);
+        assert_eq!(graph.unpriced_submission_exclusions.len(), 1);
+        assert_eq!(
+            graph.unpriced_submission_exclusions[0].reason, ROUTING_LABEL_UNPRICED_REASON,
+            "padded routing label must report the routing-label reason"
+        );
+    }
+
+    #[test]
+    fn custom_priced_routing_label_reports_incomplete_pricing_not_missing_mapping() {
+        // A `custom-pricing.json` entry for a routing label is the user
+        // stating what their router actually costs them — the escape hatch
+        // `ROUTING_LABELS` documents. Telling that user the label "has no
+        // authoritative model-to-price mapping" contradicts the mapping they
+        // just wrote. Here the custom entry quotes an input rate but no cache
+        // rate, so the row still fails coverage; the reason must name the gap
+        // that is actually fixable (the missing cache-read rate), not deny the
+        // mapping exists.
+        let mut custom_models = HashMap::new();
+        custom_models.insert(
+            "auto".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(3e-6),
+                output_cost_per_token: Some(1.5e-5),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new_with_custom(
+            pricing::custom::CustomPricing::from_models(custom_models),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let mut auto = UnifiedMessage::new(
+            "kiro",
+            "auto",
+            "amazon-bedrock",
+            "generic",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 7,
+                cache_read: 11,
+                ..Default::default()
+            },
+            0.0,
+        );
+        auto.message_count = 7;
+
+        let graph = build_graph_from_messages(
+            vec![auto],
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("routing label must not abort submission");
+
+        assert_eq!(graph.unpriced_submission_exclusions.len(), 1);
+        assert_eq!(
+            graph.unpriced_submission_exclusions[0],
+            UnpricedSubmissionExclusion {
+                provider_id: "amazon-bedrock".to_string(),
+                model_id: "auto".to_string(),
+                message_count: 7,
+                total_tokens: 18,
+                reason: INCOMPLETE_MODEL_PRICING_REASON,
             }
         );
     }
