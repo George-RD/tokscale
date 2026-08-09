@@ -181,7 +181,21 @@ fn create_fake_codex_bin() -> TempDir {
     tmp
 }
 
-fn headless_capture_command(fake_bin: &Path, output_path: &Path, mode: &str) -> Command {
+/// Build the `tokscale headless codex` invocation for one `headless_capture_*`
+/// test.
+///
+/// `timeout_ms` is the parent's `TOKSCALE_NATIVE_TIMEOUT_MS` and is per-test on
+/// purpose: the two `fast` tests and the `slow` test need the parent's deadline
+/// on opposite sides of the child's runtime, so a single shared constant cannot
+/// serve both. It is passed through `Settings::get_native_timeout`, which clamps
+/// to `[5_000, 3_600_000]` ms — keep any value here inside that range or the
+/// test will silently run against a different deadline than it asserts on.
+fn headless_capture_command(
+    fake_bin: &Path,
+    output_path: &Path,
+    mode: &str,
+    timeout_ms: u64,
+) -> Command {
     let mut cmd = cargo_bin_cmd!("tokscale");
     let path = std::env::var_os("PATH").unwrap_or_default();
     let joined_path = std::env::join_paths(
@@ -191,7 +205,7 @@ fn headless_capture_command(fake_bin: &Path, output_path: &Path, mode: &str) -> 
 
     cmd.env("HOME", fake_bin)
         .env("TOKSCALE_FAKE_CODEX_MODE", mode)
-        .env("TOKSCALE_NATIVE_TIMEOUT_MS", "10000")
+        .env("TOKSCALE_NATIVE_TIMEOUT_MS", timeout_ms.to_string())
         .env("PATH", joined_path)
         .args([
             "headless",
@@ -204,19 +218,53 @@ fn headless_capture_command(fake_bin: &Path, output_path: &Path, mode: &str) -> 
     cmd
 }
 
+/// The parent deadline the two `fast` tests give `tokscale`, and the elapsed
+/// bound they assert against it.
+///
+/// These tests time a whole `tokscale` process spawn, so the measurement always
+/// includes startup, and the useful question is not "how tight can the bound be"
+/// but "is the gap between the two outcomes bigger than the noise". The two
+/// outcomes are: the parent notices its child already exited and returns at once,
+/// or it wrongly sits on its deadline. So the gap *is* the timeout, and the bound
+/// only has to land somewhere inside it.
+///
+/// With the previous constants — a 10s deadline and an 8s bound — the gap was 10s
+/// and the noise was larger than that. All three of these tests failed on the
+/// `windows-latest` leg of run 31196968982 (job 93170461116) with correct
+/// behaviour and wrong timings: `fast failure waited too long: 11.0576809s` and
+/// `fast success waited too long: 11.16815s`, i.e. startup alone exceeded the
+/// very interval the assertion exists to detect. No value between 0 and 10s could
+/// have separated the two outcomes there, which is why the bound was not simply
+/// raised again — see the `slow` test below for the previous attempt at that.
+///
+/// A 60s deadline with a 30s bound sits in the middle of a 60s gap: 27s of
+/// headroom above a healthy run, which costs ~3.2s locally, and 30s below the
+/// failure mode. A parent that waits for its deadline takes at least 60s and
+/// fails; runner slowness would have to add ~27s to produce a false red.
+/// The cost is that a genuinely hung parent now takes up to 60s to be reported
+/// instead of 10s, which is the right trade against a gate that blocks unrelated
+/// changes.
+const HEADLESS_FAST_TIMEOUT_MS: u64 = 60_000;
+const HEADLESS_FAST_MAX_ELAPSED: Duration = Duration::from_secs(30);
+
 #[test]
 fn headless_capture_fast_success_does_not_wait_for_timeout() {
     let fake_bin = create_fake_codex_bin();
     let output_path = fake_bin.path().join("success.jsonl");
 
     let started = Instant::now();
-    headless_capture_command(fake_bin.path(), &output_path, "success")
-        .assert()
-        .success();
+    headless_capture_command(
+        fake_bin.path(),
+        &output_path,
+        "success",
+        HEADLESS_FAST_TIMEOUT_MS,
+    )
+    .assert()
+    .success();
     let elapsed = started.elapsed();
 
     assert!(
-        elapsed < Duration::from_secs(8),
+        elapsed < HEADLESS_FAST_MAX_ELAPSED,
         "fast success waited too long: {elapsed:?}"
     );
     assert_eq!(fs::read_to_string(output_path).unwrap(), "captured ok");
@@ -228,18 +276,37 @@ fn headless_capture_fast_nonzero_preserves_exit_code() {
     let output_path = fake_bin.path().join("fail.jsonl");
 
     let started = Instant::now();
-    headless_capture_command(fake_bin.path(), &output_path, "fail")
-        .assert()
-        .failure()
-        .code(17);
+    headless_capture_command(
+        fake_bin.path(),
+        &output_path,
+        "fail",
+        HEADLESS_FAST_TIMEOUT_MS,
+    )
+    .assert()
+    .failure()
+    .code(17);
     let elapsed = started.elapsed();
 
     assert!(
-        elapsed < Duration::from_secs(8),
+        elapsed < HEADLESS_FAST_MAX_ELAPSED,
         "fast failure waited too long: {elapsed:?}"
     );
     assert_eq!(fs::read_to_string(output_path).unwrap(), "captured fail");
 }
+
+/// The parent deadline for the `slow` test, and the window the elapsed time has
+/// to land in. Kept deliberately far from `FAKE_CODEX_SLOW_SLEEP_SECS`, which is
+/// the child's own sleep in `src/bin/fake_codex.rs`.
+///
+/// This window answers "did the *parent* end this run", not "did it end it on
+/// time". `headless_capture_timeout_fires_near_its_deadline` below answers the
+/// second question, because this window deliberately cannot: it is 50s wide
+/// above the deadline, so a regression that stretched the effective deadline to
+/// 50s would still kill the 120s child, still report 124, and still land inside
+/// it. The two assertions are complementary and both are needed.
+const HEADLESS_SLOW_TIMEOUT_MS: u64 = 10_000;
+const HEADLESS_SLOW_MIN_ELAPSED: Duration = Duration::from_secs(10);
+const HEADLESS_SLOW_MAX_ELAPSED: Duration = Duration::from_secs(60);
 
 #[test]
 fn headless_capture_slow_command_times_out() {
@@ -247,35 +314,228 @@ fn headless_capture_slow_command_times_out() {
     let output_path = fake_bin.path().join("slow.jsonl");
 
     let started = Instant::now();
-    headless_capture_command(fake_bin.path(), &output_path, "slow")
-        .assert()
-        .failure()
-        .code(124);
+    headless_capture_command(
+        fake_bin.path(),
+        &output_path,
+        "slow",
+        HEADLESS_SLOW_TIMEOUT_MS,
+    )
+    .assert()
+    .failure()
+    .code(124);
     let elapsed = started.elapsed();
 
     // The discriminating fact is that the *parent's* 10s timeout ended this run,
-    // not the child's own 20s sleep. The lower bound proves the parent waited for
+    // not the child's own sleep. The lower bound proves the parent waited for
     // its deadline instead of failing early; the upper bound proves it did not
     // simply outlive the child.
     //
-    // The upper bound is set against the child's 20s sleep, not against a
-    // teardown budget. The previous 14s left only 4s for everything outside the
-    // deadline — `tokscale`'s own process startup, `child.kill()`, `child.wait()`
-    // and joining the stdout pump — and on a Windows runner startup alone can
-    // consume most of that. It failed at 14.83s in CI (job 92167428621) while
-    // still killing the child correctly, so the bound was measuring runner speed
-    // rather than the behaviour this test is named for.
+    // The upper bound is therefore set against the child's sleep, not against a
+    // teardown budget. It has been wrong twice, in the same way both times:
     //
-    // 18s keeps a 2s margin below the child's sleep, so a parent that hung until
-    // the child exited on its own is still caught.
+    //   - 14s left only 4s for everything outside the deadline — `tokscale`'s own
+    //     process startup, `child.kill()`, `child.wait()` and joining the stdout
+    //     pump — and on a Windows runner startup alone can consume most of that.
+    //     It failed at 14.83s in CI (job 92167428621) while still killing the
+    //     child correctly, so the bound was measuring runner speed rather than
+    //     the behaviour this test is named for.
+    //   - 18s, its replacement, kept a 2s margin below the child's then-20s sleep
+    //     and failed at 21.17s in CI (run 31196968982, job 93170461116) — past the
+    //     child's sleep entirely. At that point the bound could no longer separate
+    //     "the parent killed the child at its deadline" from "the parent outlived
+    //     the child", which is the one thing it exists to do, so raising it to 22s
+    //     would have kept the test green while making it vacuous.
+    //
+    // Both failures came from squeezing the bound into a narrow gap between the
+    // deadline and the child's sleep. The fix is to widen that gap instead: the
+    // child now sleeps `FAKE_CODEX_SLOW_SLEEP_SECS` (120s) against the parent's
+    // 10s deadline, so the two outcomes are 110s apart and the 60s bound has 50s
+    // of headroom above the deadline and 60s below the child's sleep. A parent
+    // that outlived the child cannot finish before 120s, and the ~11s of runner
+    // startup that broke the 18s bound is a fifth of the headroom here.
+    //
+    // The lower bound stays at the parent's own deadline. It is exact by
+    // construction: the child cannot exit on its own before then, so anything
+    // faster means the parent gave up early.
     //
     // Note this test cannot catch #1049: the stand-in spawns nothing, so its pipe
     // closes the moment it is killed, and the unbounded `output_handle.join()`
-    // after the kill is never exercised. Widening the bound does not hide that —
+    // after the kill is never exercised. Widening the gap does not hide that —
     // it was never covered.
     assert!(
-        elapsed >= Duration::from_secs(10) && elapsed < Duration::from_secs(18),
+        elapsed >= HEADLESS_SLOW_MIN_ELAPSED && elapsed < HEADLESS_SLOW_MAX_ELAPSED,
         "slow command timeout duration was unexpected: {elapsed:?}"
+    );
+}
+
+/// How far the measured deadline may sit from the configured one in
+/// `headless_capture_timeout_fires_near_its_deadline`.
+///
+/// See that test for why five seconds against a ten second deadline is both
+/// generous and meaningful.
+const HEADLESS_DEADLINE_TOLERANCE: Duration = Duration::from_secs(5);
+
+/// Time one `headless capture` run of `mode` under `timeout_ms`, asserting the
+/// outcome the mode is defined to produce, and return how long it took.
+///
+/// Shared by `headless_capture_timeout_fires_near_its_deadline` so its baseline
+/// and its timed-out run differ in exactly one thing — the deadline — and every
+/// other cost is measured the same way on both sides of the subtraction.
+fn time_headless_capture(fake_bin: &Path, label: &str, mode: &str, timeout_ms: u64) -> Duration {
+    let output_path = fake_bin.join(format!("{label}.jsonl"));
+    let started = Instant::now();
+    let assertion = headless_capture_command(fake_bin, &output_path, mode, timeout_ms).assert();
+    match mode {
+        "success" => {
+            assertion.success();
+        }
+        "slow" => {
+            assertion.failure().code(124);
+        }
+        other => panic!("time_headless_capture does not know mode {other:?}"),
+    }
+    let elapsed = started.elapsed();
+    if mode == "success" {
+        assert_eq!(fs::read_to_string(&output_path).unwrap(), "captured ok");
+    }
+    elapsed
+}
+
+#[test]
+fn headless_capture_timeout_fires_near_its_deadline() {
+    // `headless_capture_slow_command_times_out` proves the parent killed the
+    // child rather than outliving it. It cannot prove the parent killed it *at
+    // the deadline it was given*: its window is `[10s, 60s)`, so a regression
+    // that stretched the effective deadline to 50s would still kill the 120s
+    // child, still report 124, and still land inside that window. This test pins
+    // the deadline itself.
+    //
+    // It does so by subtracting two runs instead of bounding one. Everything a
+    // run pays outside the deadline — `tokscale`'s process spawn, dynamic
+    // linking, argument parsing, settings load, spawning and reaping the
+    // stand-in on PATH — is paid by a fast run and a timed-out run alike, so it
+    // cancels. What is left is the wait on the deadline.
+    //
+    // The numbers from the CI failure that forced the previous bound open (run
+    // 31196968982, job 93170461116) show how completely it cancels. Against a
+    // configured 10s deadline:
+    //
+    //     fast_success 11.16815s    fast_fail 11.0576809s    slow 21.173129s
+    //     slow - fast_success = 10.0050s
+    //     slow - fast_fail    = 10.1154s
+    //
+    // Every absolute number there is ~11s of runner overhead away from anything
+    // a fixed threshold could use — that overhead alone is longer than the
+    // deadline being measured, which is why no absolute bound survived. The
+    // differences recover the deadline to within 0.12s, on the very runner that
+    // was too slow for a bound of any width. The ~11s of startup noise is not
+    // something this assertion tolerates; it is something it subtracts away.
+    let fake_bin = create_fake_codex_bin();
+
+    // The overhead is only common-mode once it is in steady state, and the first
+    // run of the test binary is not. Measured locally: the first `tokscale`
+    // spawn in this test costs 3.5-6.1s (paging in a debug binary, linking,
+    // first execution of the freshly copied stand-in), and every spawn after it
+    // costs ~45ms. Subtracting a cold baseline from a warm timed-out run charges
+    // that one-off to the deadline and understates it — an early draft of this
+    // test failed exactly that way, reporting a 3.96s deadline for a 10s
+    // configured one because its single baseline happened to cost 6.09s.
+    //
+    // So the baseline is the minimum of two samples rather than one sample. The
+    // noise here is one-sided — nothing can make a run finish faster than the
+    // work it has to do, only slower — so the smallest sample is the best
+    // estimate of the floor, and one unlucky sample no longer moves it. The
+    // symmetric risk, a one-off landing on the timed-out run instead, is what
+    // the tolerance below is sized for.
+    let baseline = time_headless_capture(
+        fake_bin.path(),
+        "deadline-baseline-a",
+        "success",
+        HEADLESS_FAST_TIMEOUT_MS,
+    )
+    .min(time_headless_capture(
+        fake_bin.path(),
+        "deadline-baseline-b",
+        "success",
+        HEADLESS_FAST_TIMEOUT_MS,
+    ));
+
+    let configured_deadline = Duration::from_millis(HEADLESS_SLOW_TIMEOUT_MS);
+
+    // Five seconds against a ten second deadline, i.e. an accepted band of
+    // `[5s, 15s]`.
+    //
+    // Generous: the largest residual ever measured is the 0.12s above, on a
+    // `windows-latest` runner loaded enough to fail three tests at once, and a
+    // warm local run lands within ~50ms. Five seconds is roughly forty times the
+    // worst of those, so this is not the next bound that gets widened.
+    //
+    // Meaningful: it still fails loudly for the case the coarse window misses.
+    // An effective deadline of 50s lands 35s outside the band; so does 2x; so
+    // does anything past 1.5x. Five seconds is the largest tolerance that keeps
+    // "the deadline is half again as long as it was configured to be" a red
+    // test. It catches the opposite regression too — a deadline collapsing
+    // toward zero — which the `[10s, 60s)` lower bound only appears to catch
+    // because startup pads the measurement past 10s on its own.
+    //
+    // Widening this is a change of meaning, not of margin: the check is worth
+    // having only while `configured * 1.5` stays outside the band.
+    let low = configured_deadline.saturating_sub(HEADLESS_DEADLINE_TOLERANCE);
+    let high = configured_deadline + HEADLESS_DEADLINE_TOLERANCE;
+
+    // The timed-out run: the same overhead, plus one wait on
+    // `HEADLESS_SLOW_TIMEOUT_MS`. Run adjacent in time to the baseline on the
+    // same machine, so the overhead the subtraction removes is the overhead that
+    // was actually paid.
+    //
+    // The one-sided-noise argument that makes the baseline a minimum of two
+    // samples applies to this side too, and this is the side that drives the
+    // upper bound: a scheduling hit worth more than the tolerance would report a
+    // deadline longer than the one that actually fired. So this side is a
+    // minimum of samples as well — it is just sampled lazily, because each
+    // sample costs a full `HEADLESS_SLOW_TIMEOUT_MS` and the baseline's cost
+    // ~45ms once warm. The second sample is taken only when the first disagrees
+    // with the configured deadline, so the steady-state cost stays one wait.
+    //
+    // Sampling lazily cannot hide a regression. A second sample is taken only
+    // when the test is already failing, and a minimum can only move the estimate
+    // down, so the retry can rescue a spike that inflated the measurement and
+    // nothing else: a deadline that really is 5x too long measures ~50s twice
+    // and still fails.
+    //
+    // That the minimum only moves down is also why the resample is conditioned
+    // on the upper bound alone. A measurement below `low` — a deadline that
+    // fired early, or a baseline that padded the run — cannot be moved back up
+    // into the band by a minimum, so resampling it would spend another full
+    // `HEADLESS_SLOW_TIMEOUT_MS` to reach the failure it had already reached.
+    // The too-short case fails on the first sample.
+    //
+    // `saturating_sub` rather than `-`: a baseline longer than the timed-out run
+    // means the deadline was not waited on at all, which is a failure to report,
+    // not a subtraction overflow to panic on.
+    let mut slow = time_headless_capture(
+        fake_bin.path(),
+        "deadline-slow",
+        "slow",
+        HEADLESS_SLOW_TIMEOUT_MS,
+    );
+    let mut measured_deadline = slow.saturating_sub(baseline);
+    if measured_deadline > high {
+        slow = slow.min(time_headless_capture(
+            fake_bin.path(),
+            "deadline-slow-resample",
+            "slow",
+            HEADLESS_SLOW_TIMEOUT_MS,
+        ));
+        measured_deadline = slow.saturating_sub(baseline);
+    }
+
+    assert!(
+        measured_deadline >= low && measured_deadline <= high,
+        "timeout did not fire near its configured deadline: \
+         configured {configured_deadline:?}, measured {measured_deadline:?} \
+         (timed-out run {slow:?} - baseline run {baseline:?}), \
+         accepted {low:?}..={high:?}"
     );
 }
 
