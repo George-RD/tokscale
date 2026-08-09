@@ -31,6 +31,12 @@ import {
   foldContributionsIntoReportedRows,
   recordDailyBreakdownReported,
 } from "@/lib/db/dailyBreakdownReported";
+import {
+  addClientBreakdownIncrement,
+  foldParserClientSnapshot,
+  planParserHighWaterSubmission,
+  type DeviceParserStates,
+} from "@/lib/db/parserHighWater";
 import { normalizeUsernameCacheKey, revalidateUsernamePaths } from "@/lib/db/usernameLookup";
 import { revalidateUserGroupLeaderboards } from "@/lib/groups/cache";
 import { LEGACY_DEVICE_KEY } from "@/lib/devices/shared";
@@ -535,7 +541,11 @@ export async function POST(request: Request) {
               : {}),
           },
         })
-        .returning({ id: submittedDevices.id });
+        .returning({
+          id: submittedDevices.id,
+          parserVersions: submittedDevices.parserVersions,
+          parserStates: submittedDevices.parserStates,
+        });
 
       // ------------------------------------------
       // STEP 3b: Fetch existing daily breakdown for merge
@@ -634,6 +644,52 @@ export async function POST(request: Request) {
         existingDeviceDays = await fetchExistingDeviceDays();
       }
 
+      const deviceParserStates = (submittedDevice.parserStates ?? {}) as DeviceParserStates;
+      const copilotIncomingDays = foldParserClientSnapshot(
+        data.contributions,
+        "copilot"
+      );
+      const existingCopilotDays = Object.fromEntries(
+        existingDeviceDays.flatMap((day) => {
+          const breakdown = day.sourceBreakdown as Record<string, ClientBreakdownData> | null;
+          return breakdown?.copilot ? [[day.date, breakdown.copilot] as const] : [];
+        })
+      );
+      const copilotWasScanned =
+        submittedClients.has("copilot") ||
+        Boolean(
+          data.scanScope &&
+            Object.prototype.hasOwnProperty.call(
+              data.scanScope.parserVersions,
+              "copilot"
+            )
+        );
+      const copilotPlan = copilotWasScanned
+        ? planParserHighWaterSubmission({
+            client: "copilot",
+            incomingVersion: isBackfill
+              ? undefined
+              : data.scanScope?.parserVersions.copilot,
+            fullHistory: data.scanScope?.fullHistory === true,
+            existingLegacyDays: existingCopilotDays,
+            incomingDays: copilotIncomingDays,
+            state: deviceParserStates.copilot,
+            persistedVersion: submittedDevice.parserVersions?.copilot,
+          })
+        : { mode: "status-quo" as const, increments: {} };
+      const freezeCopilot =
+        copilotPlan.mode === "freeze" ||
+        copilotPlan.mode === "baseline-legacy";
+      if (copilotPlan.mode === "baseline-legacy") {
+        warnings.push(
+          "Established the Copilot parser generation 2 baseline without adding it; existing same-device history was preserved."
+        );
+      } else if (copilotPlan.mode === "freeze") {
+        warnings.push(
+          "Ignored Copilot changes because this parser generation or partial snapshot cannot safely advance the device high-water."
+        );
+      }
+
       const existingDaysMap = new Map(
         existingDeviceDays.map((d) => [d.date, d])
       );
@@ -721,6 +777,19 @@ export async function POST(request: Request) {
           }
         }
 
+        if (freezeCopilot) {
+          delete incomingClientBreakdown.copilot;
+        } else if (copilotPlan.mode === "incremental") {
+          // The full snapshot itself is never merged. Only the bounded growth
+          // calculated against the persisted generation high-water is eligible.
+          const increment = copilotPlan.increments[incomingDay.date];
+          if (increment) {
+            incomingClientBreakdown.copilot = increment;
+          } else {
+            delete incomingClientBreakdown.copilot;
+          }
+        }
+
         const existingDay = existingDaysMap.get(incomingDay.date);
 
         if (existingDay) {
@@ -730,6 +799,15 @@ export async function POST(request: Request) {
           >;
           const { breakdown: existingClientBreakdown, foldedClientFloors } =
             normalizeClientBreakdownAliases(rawExistingBreakdown);
+          if (
+            copilotPlan.mode === "incremental" &&
+            incomingClientBreakdown.copilot
+          ) {
+            incomingClientBreakdown.copilot = addClientBreakdownIncrement(
+              existingClientBreakdown.copilot,
+              incomingClientBreakdown.copilot
+            );
+          }
           const mergeResult = mergeClientBreakdownsWithRegressionGuard(
             existingClientBreakdown,
             incomingClientBreakdown,
@@ -750,6 +828,16 @@ export async function POST(request: Request) {
             );
           }
           const mergedClientBreakdown = mergeResult.merged;
+          if (
+            copilotPlan.mode === "incremental" &&
+            existingClientBreakdown.copilot?.provenance?.costIsComplete === false &&
+            mergedClientBreakdown.copilot
+          ) {
+            mergedClientBreakdown.copilot.provenance = {
+              ...deriveClientBreakdownProvenance(mergedClientBreakdown.copilot),
+              costIsComplete: false,
+            };
+          }
           // A preserved fold must keep its ORIGINAL raw alias keys in storage
           // (e.g. both "kilocode" and "kilo"), not the collapsed sum: the
           // collapsed form is indistinguishable from real usage, so writing it
@@ -790,6 +878,7 @@ export async function POST(request: Request) {
             incomingDay.totals?.costIsComplete ?? true
           );
           const dayTotals = recalculateDayTotals(insertedClientBreakdown);
+          if (Object.keys(insertedClientBreakdown).length === 0) continue;
 
           toInsert.push({
             submissionId,
@@ -805,6 +894,22 @@ export async function POST(request: Request) {
             costIsComplete: breakdownCostIsComplete(insertedClientBreakdown),
           });
         }
+      }
+
+      if (copilotPlan.nextState) {
+        await tx
+          .update(submittedDevices)
+          .set({
+            parserVersions: {
+              ...(submittedDevice.parserVersions ?? {}),
+              copilot: copilotPlan.nextState.version,
+            },
+            parserStates: {
+              ...deviceParserStates,
+              copilot: copilotPlan.nextState,
+            },
+          })
+          .where(eq(submittedDevices.id, submittedDevice.id));
       }
 
       // Batch INSERT new days via raw SQL VALUES list, chunked to stay under
