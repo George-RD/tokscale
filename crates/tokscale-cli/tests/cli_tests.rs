@@ -460,20 +460,6 @@ fn headless_capture_timeout_fires_near_its_deadline() {
         HEADLESS_FAST_TIMEOUT_MS,
     ));
 
-    // The same overhead, plus one wait on `HEADLESS_SLOW_TIMEOUT_MS`. Run
-    // adjacent in time to the baseline on the same machine, so the overhead the
-    // subtraction removes is the overhead that was actually paid.
-    let slow = time_headless_capture(
-        fake_bin.path(),
-        "deadline-slow",
-        "slow",
-        HEADLESS_SLOW_TIMEOUT_MS,
-    );
-
-    // `saturating_sub` rather than `-`: a baseline longer than the timed-out run
-    // means the deadline was not waited on at all, which is a failure to report,
-    // not a subtraction overflow to panic on.
-    let measured_deadline = slow.saturating_sub(baseline);
     let configured_deadline = Duration::from_millis(HEADLESS_SLOW_TIMEOUT_MS);
 
     // Five seconds against a ten second deadline, i.e. an accepted band of
@@ -496,6 +482,47 @@ fn headless_capture_timeout_fires_near_its_deadline() {
     // having only while `configured * 1.5` stays outside the band.
     let low = configured_deadline.saturating_sub(HEADLESS_DEADLINE_TOLERANCE);
     let high = configured_deadline + HEADLESS_DEADLINE_TOLERANCE;
+
+    // The timed-out run: the same overhead, plus one wait on
+    // `HEADLESS_SLOW_TIMEOUT_MS`. Run adjacent in time to the baseline on the
+    // same machine, so the overhead the subtraction removes is the overhead that
+    // was actually paid.
+    //
+    // The one-sided-noise argument that makes the baseline a minimum of two
+    // samples applies to this side too, and this is the side that drives the
+    // upper bound: a scheduling hit worth more than the tolerance would report a
+    // deadline longer than the one that actually fired. So this side is a
+    // minimum of samples as well — it is just sampled lazily, because each
+    // sample costs a full `HEADLESS_SLOW_TIMEOUT_MS` and the baseline's cost
+    // ~45ms once warm. The second sample is taken only when the first disagrees
+    // with the configured deadline, so the steady-state cost stays one wait.
+    //
+    // Sampling lazily cannot hide a regression. A second sample is taken only
+    // when the test is already failing, and a minimum can only move the estimate
+    // down, so the retry can rescue a spike that inflated the measurement and
+    // nothing else: a deadline that really is 5x too long measures ~50s twice,
+    // and a deadline that fires early measures short twice. Both still fail.
+    //
+    // `saturating_sub` rather than `-`: a baseline longer than the timed-out run
+    // means the deadline was not waited on at all, which is a failure to report,
+    // not a subtraction overflow to panic on.
+    let mut slow = time_headless_capture(
+        fake_bin.path(),
+        "deadline-slow",
+        "slow",
+        HEADLESS_SLOW_TIMEOUT_MS,
+    );
+    let mut measured_deadline = slow.saturating_sub(baseline);
+    if measured_deadline < low || measured_deadline > high {
+        slow = slow.min(time_headless_capture(
+            fake_bin.path(),
+            "deadline-slow-resample",
+            "slow",
+            HEADLESS_SLOW_TIMEOUT_MS,
+        ));
+        measured_deadline = slow.saturating_sub(baseline);
+    }
+
     assert!(
         measured_deadline >= low && measured_deadline <= high,
         "timeout did not fire near its configured deadline: \
