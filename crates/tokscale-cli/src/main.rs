@@ -1079,6 +1079,7 @@ pub enum ClientFilter {
     Reasonix,
     #[value(name = "prime-agent")]
     PrimeAgent,
+    Freebuff,
     Synthetic,
 }
 
@@ -1133,6 +1134,7 @@ impl ClientFilter {
             Self::Kimchi => "kimchi",
             Self::Reasonix => "reasonix",
             Self::PrimeAgent => "prime-agent",
+            Self::Freebuff => "freebuff",
             Self::Synthetic => "synthetic",
         }
     }
@@ -1190,6 +1192,7 @@ impl ClientFilter {
             Self::Kimchi => Some(ClientId::Kimchi),
             Self::Reasonix => Some(ClientId::Reasonix),
             Self::PrimeAgent => Some(ClientId::PrimeAgent),
+            Self::Freebuff => Some(ClientId::Freebuff),
             Self::Synthetic => None,
         }
     }
@@ -1243,6 +1246,7 @@ impl ClientFilter {
             ClientId::Kimchi => Self::Kimchi,
             ClientId::Reasonix => Self::Reasonix,
             ClientId::PrimeAgent => Self::PrimeAgent,
+            ClientId::Freebuff => Self::Freebuff,
         }
     }
 
@@ -3899,6 +3903,7 @@ fn capitalize_client(client: &str) -> String {
         "gemini" => "Gemini".to_string(),
         "amp" => "Amp".to_string(),
         "codebuff" => "Codebuff".to_string(),
+        "freebuff" => "Freebuff".to_string(),
         "droid" => "Droid".to_string(),
         "crush" => "Crush".to_string(),
         "openclaw" => "openclaw".to_string(),
