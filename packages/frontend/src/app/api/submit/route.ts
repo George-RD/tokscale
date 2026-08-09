@@ -17,9 +17,7 @@ import {
   mergeTimestampMs,
   breakdownCostIsComplete,
   tagBreakdownCostCompleteness,
-  planParserVersionRedistribution,
   type ClientBreakdownData,
-  type ParserVersionRedistributionPlan,
 } from "@/lib/db/helpers";
 import {
   buildDualDerivationRecord,
@@ -388,12 +386,6 @@ export async function POST(request: Request) {
     if (submittedClients.has("kilo")) {
       submittedClients.add("kilocode" as SubmissionData["summary"]["clients"][number]);
     }
-    // A version declaration is also an explicit scan of that client. It must
-    // stay in scope even when the corrected snapshot contains zero rows for
-    // the client (the fully re-attributed creation-day case).
-    for (const client of Object.keys(data.scanScope?.parserVersions ?? {})) {
-      submittedClients.add(client as SubmissionData["summary"]["clients"][number]);
-    }
     const hashData: SubmissionData = {
       ...data,
       summary: {
@@ -543,10 +535,7 @@ export async function POST(request: Request) {
               : {}),
           },
         })
-        .returning({
-          id: submittedDevices.id,
-          parserVersions: submittedDevices.parserVersions,
-        });
+        .returning({ id: submittedDevices.id });
 
       // ------------------------------------------
       // STEP 3b: Fetch existing daily breakdown for merge
@@ -645,48 +634,6 @@ export async function POST(request: Request) {
         existingDeviceDays = await fetchExistingDeviceDays();
       }
 
-      const parserVersions = new Map<string, number>(
-        Object.entries(isBackfill ? {} : data.scanScope?.parserVersions ?? {})
-      );
-      const storedParserVersions = new Map<string, number>(
-        Object.entries(submittedDevice.parserVersions ?? {})
-      );
-      const parserPlans = new Map<string, ParserVersionRedistributionPlan>();
-      for (const [client, parserVersion] of parserVersions) {
-        const plan = planParserVersionRedistribution(
-          existingDeviceDays.map((day) => ({
-            date: day.date,
-            breakdown: day.sourceBreakdown as Record<string, ClientBreakdownData> | null,
-          })),
-          data.contributions,
-          client,
-          parserVersion,
-          storedParserVersions.get(client)
-        );
-        parserPlans.set(client, plan);
-      }
-
-      // An explicit downgrade is never allowed to recreate rows healed by a
-      // newer parser. An undeclared (old-CLI) client keeps status quo until a
-      // forward transition has actually been accepted; after that it is also
-      // stale for that client, while unrelated clients continue normally.
-      const staleParserClients = new Set<string>();
-      for (const client of submittedClients) {
-        const storedVersion = storedParserVersions.get(client);
-        const incomingVersion = parserVersions.get(client);
-        if (
-          storedVersion != null &&
-          (incomingVersion == null
-            ? storedVersion > 1
-            : incomingVersion < storedVersion)
-        ) {
-          staleParserClients.add(client);
-        }
-      }
-      for (const plan of parserPlans.values()) {
-        if (plan.stale) staleParserClients.add(plan.client);
-      }
-
       const existingDaysMap = new Map(
         existingDeviceDays.map((d) => [d.date, d])
       );
@@ -774,17 +721,6 @@ export async function POST(request: Request) {
           }
         }
 
-        const allowParserVersionDecreases = new Set<string>();
-        for (const plan of parserPlans.values()) {
-          if (plan.authorizedDecreaseDates.has(incomingDay.date)) {
-            allowParserVersionDecreases.add(plan.client);
-          }
-        }
-
-        for (const client of staleParserClients) {
-          delete incomingClientBreakdown[client];
-        }
-
         const existingDay = existingDaysMap.get(incomingDay.date);
 
         if (existingDay) {
@@ -794,28 +730,13 @@ export async function POST(request: Request) {
           >;
           const { breakdown: existingClientBreakdown, foldedClientFloors } =
             normalizeClientBreakdownAliases(rawExistingBreakdown);
-          const incomingCostIsComplete =
-            incomingDay.totals?.costIsComplete ?? true;
-          const mergeResult =
-            allowParserVersionDecreases.size > 0 || staleParserClients.size > 0
-              ? mergeClientBreakdownsWithRegressionGuard(
-                  existingClientBreakdown,
-                  incomingClientBreakdown,
-                  submittedClients,
-                  foldedClientFloors,
-                  incomingCostIsComplete,
-                  {
-                    allowParserVersionDecreases,
-                    staleParserClients,
-                  }
-                )
-              : mergeClientBreakdownsWithRegressionGuard(
-                  existingClientBreakdown,
-                  incomingClientBreakdown,
-                  submittedClients,
-                  foldedClientFloors,
-                  incomingCostIsComplete
-                );
+          const mergeResult = mergeClientBreakdownsWithRegressionGuard(
+            existingClientBreakdown,
+            incomingClientBreakdown,
+            submittedClients,
+            foldedClientFloors,
+            incomingDay.totals?.costIsComplete ?? true
+          );
           warnings.push(
             ...mergeResult.warnings.map((warning) => `Day ${incomingDay.date}: ${warning}`)
           );
@@ -884,78 +805,6 @@ export async function POST(request: Request) {
             costIsComplete: breakdownCostIsComplete(insertedClientBreakdown),
           });
         }
-      }
-
-      // The normal loop only visits payload days. A parser transition may
-      // legitimately make an old attribution day disappear entirely, so visit
-      // existing-only days as well. They are never treated as authoritative
-      // zero by themselves: the planner authorizes that decrease only when a
-      // positive delta elsewhere supplies an equal token budget. Unmatched
-      // history is preserved. The device-level generation is still advanced
-      // atomically below, so the transition allowance cannot be replayed.
-      const incomingDates = new Set(data.contributions.map((day) => day.date));
-      for (const existingDay of existingDeviceDays) {
-        if (incomingDates.has(existingDay.date)) continue;
-
-        const rawExistingBreakdown = (existingDay.sourceBreakdown ?? {}) as Record<
-          string,
-          ClientBreakdownData
-        >;
-        const nextBreakdown: Record<string, ClientBreakdownData> = {
-          ...rawExistingBreakdown,
-        };
-        let changed = false;
-
-        for (const plan of parserPlans.values()) {
-          if (!plan.transition || plan.stale) continue;
-          const existingClient = rawExistingBreakdown[plan.client];
-          if (!existingClient) continue;
-
-          if (!plan.authorizedDecreaseDates.has(existingDay.date)) continue;
-
-          delete nextBreakdown[plan.client];
-          warnings.push(
-            `Day ${existingDay.date}: Re-attributed ${plan.client} after parser version ${plan.incomingVersion}: moved ${Math.round(existingClient.tokens).toLocaleString("en-US")} tokens to newly attributed days.`
-          );
-          changed = true;
-        }
-
-        if (!changed) continue;
-        const dayTotals = recalculateDayTotals(nextBreakdown);
-        toUpdate.push({
-          id: existingDay.id,
-          tokens: dayTotals.tokens,
-          cost: dayTotals.cost.toFixed(4),
-          inputTokens: dayTotals.inputTokens,
-          outputTokens: dayTotals.outputTokens,
-          timestampMs: existingDay.timestampMs,
-          activeTimeMs: existingDay.activeTimeMs,
-          sourceBreakdown: nextBreakdown,
-          costIsComplete: breakdownCostIsComplete(nextBreakdown),
-        });
-      }
-
-      // Accept parser generations only after their guarded plans have been
-      // computed. This device row was locked by the upsert above, and this
-      // update commits in the same transaction as all daily changes, making a
-      // forward redistribution a one-shot operation even under concurrency.
-      const acceptedParserVersions = { ...submittedDevice.parserVersions };
-      for (const [client, incomingVersion] of parserVersions) {
-        if (!staleParserClients.has(client)) {
-          acceptedParserVersions[client] = incomingVersion;
-        }
-      }
-      if (
-        Object.keys(acceptedParserVersions).some(
-          (client) =>
-            acceptedParserVersions[client] !==
-            submittedDevice.parserVersions?.[client]
-        )
-      ) {
-        await tx
-          .update(submittedDevices)
-          .set({ parserVersions: acceptedParserVersions })
-          .where(eq(submittedDevices.id, submittedDevice.id));
       }
 
       // Batch INSERT new days via raw SQL VALUES list, chunked to stay under

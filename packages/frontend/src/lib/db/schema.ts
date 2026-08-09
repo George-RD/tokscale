@@ -302,17 +302,6 @@ export const submittedDevices = pgTable(
     longestContinuousMs: bigint("longest_continuous_ms", { mode: "number" }),
     maxConcurrentSessions: integer("max_concurrent_sessions"),
     sessionCount: integer("session_count"),
-
-    /**
-     * Highest parser generation accepted for each fully scanned client on this
-     * device. Missing entries are generation 1 for pre-rollout history.
-     * Updated in the same transaction as any one-time redistribution so the
-     * allowance cannot be replayed by a concurrent or repeated submission.
-     */
-    parserVersions: jsonb("parser_versions")
-      .$type<Record<string, number>>()
-      .notNull()
-      .default({}),
   },
   (table) => [
     index("idx_submitted_devices_user_id").on(table.userId),
