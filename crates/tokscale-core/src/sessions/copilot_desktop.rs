@@ -124,9 +124,10 @@ struct ShutdownAttribution {
 ///
 /// A snapshot that reports *less* than one before it (the tracker restarted
 /// with the session, or the records arrived out of order) contributes nothing
-/// rather than a negative bucket: each model's running peak is the baseline,
-/// so the deltas always sum to that model's highest observed snapshot and can
-/// never exceed it. Anything the snapshots leave unexplained is still
+/// rather than a negative bucket: each model's running peak is the baseline.
+/// Cache-read growth is additionally capped by inclusive-input growth in the
+/// same snapshot, because input includes cache reads and the two cannot safely
+/// advance independently. Anything the snapshots leave unexplained is still
 /// reconciled by the caller's residual against the `sessions` row.
 ///
 /// `complete_from_start` says whether the log still begins where the session
@@ -177,6 +178,13 @@ fn shutdown_deltas(
         for (index, value) in current.iter().enumerate() {
             delta[index] = value.saturating_sub(baseline[index]).max(0);
         }
+        // `inputTokens` includes cache reads. If a reset/out-of-order snapshot
+        // lowers inclusive input while raising cache reads, emitting that cache
+        // growth independently would mint tokens: normalization would subtract
+        // it from a zero input delta and then retain it as a cache bucket. Any
+        // cache-read increment is therefore bounded by the inclusive-input
+        // increment observed in the same snapshot.
+        delta[2] = delta[2].min(delta[0]);
         if delta.iter().all(|bucket| *bucket == 0) {
             continue;
         }
@@ -401,6 +409,15 @@ fn session_row_to_messages(db_path: &Path, row: CopilotDesktopSessionRow) -> Vec
             residual,
             format!("copilot-desktop:{}", row.id),
         ));
+    }
+
+    // The SQLite row has always represented one Copilot session/message. The
+    // shutdown metadata only splits that row by time and model; it must not
+    // turn one legacy count into one count per attributed fragment. Assign the
+    // authoritative count to exactly one fragment and make every other split
+    // row count-neutral.
+    for (index, message) in messages.iter_mut().enumerate() {
+        message.message_count = i32::from(index == 0);
     }
 
     messages
@@ -849,6 +866,14 @@ mod tests {
 
         let total_input: i64 = messages.iter().map(|message| message.tokens.input).sum();
         assert_eq!(total_input, 150, "the row total is preserved exactly");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.message_count)
+                .sum::<i32>(),
+            1,
+            "a shutdown plus residual still represents one SQLite session"
+        );
     }
 
     /// The `sessions` table has no cache-write column, so that bucket was
@@ -911,6 +936,14 @@ mod tests {
         assert_eq!(codex.provider_id, "openai");
         assert_eq!(claude.tokens.input, 200);
         assert_eq!(claude.provider_id, "anthropic");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.message_count)
+                .sum::<i32>(),
+            1,
+            "splitting one session across models must not inflate its count"
+        );
     }
 
     /// A `session.shutdown` record captured verbatim from a real
@@ -1124,6 +1157,44 @@ mod tests {
                 .iter()
                 .any(|message| message.timestamp == 1_782_950_400_000),
             "a snapshot that explains no new usage is not emitted at all"
+        );
+    }
+
+    /// Inclusive input and cache reads are not independent totals. A reset or
+    /// out-of-order snapshot may lower inclusive input while raising the cache
+    /// sub-bucket, but that cannot authorize more lifetime input usage.
+    #[test]
+    fn cache_growth_without_inclusive_input_growth_does_not_mint_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("data.db");
+        let conn = create_copilot_desktop_db(&db_path);
+        insert_session(&conn, "session-1", "gpt-5.1-codex", 100, 0, 90, 0);
+        drop(conn);
+        write_events(
+            dir.path(),
+            "session-1",
+            &[
+                SESSION_START,
+                r#"{"type":"session.shutdown","data":{"modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"cacheReadTokens":80}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01","timestamp":"2026-07-01T20:00:00.000Z","parentId":null}"#,
+                r#"{"type":"session.shutdown","data":{"modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":90,"cacheReadTokens":90}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":null}"#,
+            ],
+        );
+
+        let messages = parse_copilot_desktop_db(&db_path);
+        let total_input: i64 = messages
+            .iter()
+            .map(|message| message.tokens.input + message.tokens.cache_read)
+            .sum();
+
+        assert_eq!(
+            total_input, 100,
+            "the row lifetime input remains authoritative"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.timestamp == 1_782_950_400_000),
+            "cache growth without inclusive input growth is not emitted"
         );
     }
 
