@@ -2,6 +2,19 @@
  * Client-level merge helpers for submission API
  */
 
+function dictionary<T>(): Record<string, T> {
+  return Object.create(null) as Record<string, T>;
+}
+
+function ownValue<T>(
+  source: Record<string, T> | undefined,
+  key: string
+): T | undefined {
+  return source && Object.prototype.hasOwnProperty.call(source, key)
+    ? source[key]
+    : undefined;
+}
+
 export interface ModelBreakdownData {
   tokens: number;
   cost: number;
@@ -317,12 +330,12 @@ function applyCostCompleteness(
   // cost, and one the incomplete payload dropped entirely is preserved rather
   // than allowed to vanish (its usage did not stop existing because this
   // submission could not price it).
-  const models: Record<string, ModelBreakdownData> = {};
+  const models = dictionary<ModelBreakdownData>();
   for (const [modelId, model] of Object.entries(existing?.models ?? {})) {
     models[modelId] = { ...model };
   }
   for (const [modelId, model] of Object.entries(next.models ?? {})) {
-    const priorCost = models[modelId]?.cost ?? 0;
+    const priorCost = ownValue(models, modelId)?.cost ?? 0;
     models[modelId] = { ...model, cost: Math.max(priorCost, model.cost) };
   }
 

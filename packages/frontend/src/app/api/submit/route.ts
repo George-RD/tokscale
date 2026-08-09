@@ -58,12 +58,25 @@ const INSERT_CHUNK_SIZE = 1000;
 // (which would double-count the same underlying usage).
 const LEGACY_CLIENT_ALIASES: Record<string, string> = { kilocode: "kilo" };
 
+function dictionary<T>(): Record<string, T> {
+  return Object.create(null) as Record<string, T>;
+}
+
+function ownValue<T>(
+  source: Record<string, T> | undefined,
+  key: string
+): T | undefined {
+  return source && Object.prototype.hasOwnProperty.call(source, key)
+    ? source[key]
+    : undefined;
+}
+
 function mergeModelBreakdowns(
   target: Record<string, ClientBreakdownData["models"][string]>,
   incoming: Record<string, ClientBreakdownData["models"][string]>
 ): void {
   for (const [modelId, modelData] of Object.entries(incoming)) {
-    const existingModel = target[modelId];
+    const existingModel = ownValue(target, modelId);
     if (existingModel) {
       existingModel.tokens += modelData.tokens || 0;
       existingModel.cost += modelData.cost || 0;
@@ -95,7 +108,7 @@ function mergeModelBreakdowns(
 // is why day totals and the leaderboard stayed correct while per-model views
 // drifted.
 function cloneClientBreakdownForFold(data: ClientBreakdownData): ClientBreakdownData {
-  const models: ClientBreakdownData["models"] = {};
+  const models = dictionary<ClientBreakdownData["models"][string]>();
   for (const [modelId, modelData] of Object.entries(data.models ?? {})) {
     models[modelId] = { ...modelData };
   }
@@ -105,6 +118,54 @@ function cloneClientBreakdownForFold(data: ClientBreakdownData): ClientBreakdown
     models,
     ...(data.provenance ? { provenance: { ...data.provenance } } : {}),
   };
+}
+
+type FoldableClientContribution = Parameters<
+  typeof clientContributionToBreakdownData
+>[0] & { client: string };
+
+export function foldIncomingClientContributions(
+  clients: FoldableClientContribution[]
+): Record<string, ClientBreakdownData> {
+  const incomingClientBreakdown = dictionary<ClientBreakdownData>();
+  for (const clientContribution of clients) {
+    const modelData = clientContributionToBreakdownData(clientContribution);
+    const existing = ownValue(incomingClientBreakdown, clientContribution.client);
+    if (existing) {
+      existing.tokens += modelData.tokens;
+      existing.cost += modelData.cost;
+      existing.input += modelData.input;
+      existing.output += modelData.output;
+      existing.cacheRead += modelData.cacheRead;
+      existing.cacheWrite += modelData.cacheWrite;
+      existing.reasoning = (existing.reasoning || 0) + modelData.reasoning;
+      existing.messages += modelData.messages;
+      const existingModel = ownValue(existing.models, clientContribution.modelId);
+      if (existingModel) {
+        existingModel.tokens += modelData.tokens;
+        existingModel.cost += modelData.cost;
+        existingModel.input += modelData.input;
+        existingModel.output += modelData.output;
+        existingModel.cacheRead += modelData.cacheRead;
+        existingModel.cacheWrite += modelData.cacheWrite;
+        existingModel.reasoning =
+          (existingModel.reasoning || 0) + modelData.reasoning;
+        existingModel.messages += modelData.messages;
+      } else {
+        existing.models[clientContribution.modelId] = { ...modelData };
+      }
+      existing.provenance = deriveClientBreakdownProvenance(existing);
+    } else {
+      const models = dictionary<ClientBreakdownData["models"][string]>();
+      models[clientContribution.modelId] = { ...modelData };
+      const clientBreakdown = { ...modelData, models };
+      incomingClientBreakdown[clientContribution.client] = {
+        ...clientBreakdown,
+        provenance: deriveClientBreakdownProvenance(clientBreakdown),
+      };
+    }
+  }
+  return incomingClientBreakdown;
 }
 
 interface NormalizedClientBreakdownAliases {
@@ -125,13 +186,13 @@ interface NormalizedClientBreakdownAliases {
 function normalizeClientBreakdownAliases(
   breakdown: Record<string, ClientBreakdownData>
 ): NormalizedClientBreakdownAliases {
-  const normalized: Record<string, ClientBreakdownData> = {};
+  const normalized = dictionary<ClientBreakdownData>();
   const foldedClients = new Set<string>();
   const largestComponentTokens = new Map<string, number>();
 
   for (const [rawClientName, data] of Object.entries(breakdown)) {
-    const clientName = LEGACY_CLIENT_ALIASES[rawClientName] ?? rawClientName;
-    const existing = normalized[clientName];
+    const clientName = ownValue(LEGACY_CLIENT_ALIASES, rawClientName) ?? rawClientName;
+    const existing = ownValue(normalized, clientName);
 
     largestComponentTokens.set(
       clientName,
@@ -724,44 +785,9 @@ export async function POST(request: Request) {
       }> = [];
 
       for (const incomingDay of data.contributions) {
-        const incomingClientBreakdown: Record<string, ClientBreakdownData> = {};
-        for (const client_contrib of incomingDay.clients) {
-          const modelData = clientContributionToBreakdownData(client_contrib);
-          const existing = incomingClientBreakdown[client_contrib.client];
-          if (existing) {
-            existing.tokens += modelData.tokens;
-            existing.cost += modelData.cost;
-            existing.input += modelData.input;
-            existing.output += modelData.output;
-            existing.cacheRead += modelData.cacheRead;
-            existing.cacheWrite += modelData.cacheWrite;
-            existing.reasoning = (existing.reasoning || 0) + modelData.reasoning;
-            existing.messages += modelData.messages;
-            const existingModel = existing.models[client_contrib.modelId];
-            if (existingModel) {
-              existingModel.tokens += modelData.tokens;
-              existingModel.cost += modelData.cost;
-              existingModel.input += modelData.input;
-              existingModel.output += modelData.output;
-              existingModel.cacheRead += modelData.cacheRead;
-              existingModel.cacheWrite += modelData.cacheWrite;
-              existingModel.reasoning = (existingModel.reasoning || 0) + modelData.reasoning;
-              existingModel.messages += modelData.messages;
-            } else {
-              existing.models[client_contrib.modelId] = modelData;
-            }
-            existing.provenance = deriveClientBreakdownProvenance(existing);
-          } else {
-            const clientBreakdown = {
-              ...modelData,
-              models: { [client_contrib.modelId]: modelData },
-            };
-            incomingClientBreakdown[client_contrib.client] = {
-              ...clientBreakdown,
-              provenance: deriveClientBreakdownProvenance(clientBreakdown),
-            };
-          }
-        }
+        const incomingClientBreakdown = foldIncomingClientContributions(
+          incomingDay.clients
+        );
 
         if (isBackfill) {
           // Stamp the per-client origin tag AFTER provenance derivation so it

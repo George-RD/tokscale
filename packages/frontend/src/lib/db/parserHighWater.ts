@@ -24,6 +24,7 @@ export interface ParserAggregateHighWater {
   cacheRead: number;
   cacheWrite: number;
   reasoning: number;
+  messages: number;
 }
 
 export interface ParserClientHighWaterState {
@@ -82,6 +83,16 @@ function ownValue<T>(
     : undefined;
 }
 
+function copyModels(
+  source?: Record<string, ModelBreakdownData>
+): Record<string, ModelBreakdownData> {
+  const result = dictionary<ModelBreakdownData>();
+  for (const [modelId, model] of Object.entries(source ?? {})) {
+    result[modelId] = { ...model };
+  }
+  return result;
+}
+
 function emptyAggregate(): ParserAggregateHighWater {
   return {
     tokens: 0,
@@ -90,6 +101,7 @@ function emptyAggregate(): ParserAggregateHighWater {
     cacheRead: 0,
     cacheWrite: 0,
     reasoning: 0,
+    messages: 0,
   };
 }
 
@@ -183,6 +195,7 @@ function aggregateSnapshot(
   for (const day of Object.values(days)) {
     for (const field of TOKEN_FIELDS) aggregate[field] += day[field] || 0;
     aggregate.tokens += day.tokens || 0;
+    aggregate.messages += day.messages || 0;
   }
   return aggregate;
 }
@@ -205,9 +218,10 @@ function maxModel(
   result.cost = quantizeCost(
     tokenHighWaterAdvanced ? positive(incoming.cost) : previous?.cost ?? 0
   );
-  result.messages = tokenHighWaterAdvanced
-    ? positive(incoming.messages)
-    : previous?.messages ?? 0;
+  result.messages = Math.max(
+    positive(previous?.messages ?? 0),
+    positive(incoming.messages)
+  );
   return result;
 }
 
@@ -238,6 +252,7 @@ function advanceAggregate(
     cacheRead: Math.max(previous.cacheRead, incoming.cacheRead),
     cacheWrite: Math.max(previous.cacheWrite, incoming.cacheWrite),
     reasoning: Math.max(previous.reasoning, incoming.reasoning),
+    messages: Math.max(previous.messages, incoming.messages),
   };
 }
 
@@ -258,6 +273,9 @@ function allocateIncrements(
   incomingAggregate: ParserAggregateHighWater
 ): Record<string, ClientBreakdownData> {
   let tokenBudget = positive(incomingAggregate.tokens - previousAggregate.tokens);
+  let messageBudget = positive(
+    incomingAggregate.messages - previousAggregate.messages
+  );
   const bucketBudgets: Record<TokenField, number> = {
     input: positive(incomingAggregate.input - previousAggregate.input),
     output: positive(incomingAggregate.output - previousAggregate.output),
@@ -275,8 +293,10 @@ function allocateIncrements(
       const model = incoming.models[modelId];
       const prior = ownValue(previous?.models, modelId);
       const increment = emptyModel();
+      let candidateTokens = 0;
       for (const field of TOKEN_FIELDS) {
         const candidate = positive(model[field] - (prior?.[field] ?? 0));
+        candidateTokens += candidate;
         const accepted = Math.min(candidate, bucketBudgets[field], tokenBudget);
         increment[field] = accepted;
         bucketBudgets[field] -= accepted;
@@ -287,20 +307,29 @@ function allocateIncrements(
         0
       );
 
-      // Repricing may raise cumulative cost without any new work, so cost has
-      // no independent high-water budget. It follows the token increment
-      // authorized for this exact date/model cell, pro-rated from that cell's
-      // complete incoming representation. Zero token growth always adds $0.
+      // Metadata is cumulative in a date/model cell, so only its marginal
+      // growth can accompany new usage. If moves make cell growth exceed the
+      // device-wide token budget, the deterministic date/model ordering above
+      // receives the same fraction of marginal cost; the rest is deliberately
+      // not credited because no safe cell attribution exists. Repricing alone
+      // still cannot authorize spend.
       if (increment.tokens > 0) {
-        const incomingTokens = positive(model.tokens);
         const acceptedFraction =
-          incomingTokens > 0 ? increment.tokens / incomingTokens : 0;
-        increment.cost = quantizeCost(
-          positive(model.cost) * acceptedFraction
-        );
-        increment.messages = Math.floor(
-          positive(model.messages) * acceptedFraction
-        );
+          candidateTokens > 0 ? increment.tokens / candidateTokens : 0;
+        const marginalCost = positive(model.cost - (prior?.cost ?? 0));
+        increment.cost = quantizeCost(marginalCost * acceptedFraction);
+      }
+
+      // Counts have their own device/client lifetime high-water. That lets a
+      // one-token new session add one whole message without using a lossy
+      // token fraction, while pure date/model moves have zero count budget.
+      const candidateMessages = positive(
+        model.messages - (prior?.messages ?? 0)
+      );
+      increment.messages = Math.min(candidateMessages, messageBudget);
+      messageBudget -= increment.messages;
+
+      if (increment.tokens > 0 || increment.messages > 0) {
         incrementModels[modelId] = increment;
       }
     }
@@ -326,7 +355,9 @@ function validState(
         (field) =>
           Number.isFinite(state.aggregate[field]) &&
           state.aggregate[field] >= 0
-      )
+      ) &&
+      Number.isFinite(state.aggregate.messages) &&
+      state.aggregate.messages >= 0
   );
 }
 
@@ -409,7 +440,7 @@ export function addClientBreakdownIncrement(
   increment: ClientBreakdownData
 ): ClientBreakdownData {
   if (!existing) return increment;
-  const models = copyDictionary(existing.models);
+  const models = copyModels(existing.models);
   const represented = breakdownFromModels(models);
   const remainder = emptyModel();
   for (const field of TOKEN_FIELDS) {

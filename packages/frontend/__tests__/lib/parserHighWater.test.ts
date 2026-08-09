@@ -33,6 +33,25 @@ function contribution(
   };
 }
 
+function bucketContribution(
+  date: string,
+  tokens: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    reasoning: number;
+  },
+  cost: number,
+  messages: number,
+  modelId = "model-a"
+) {
+  return {
+    date,
+    clients: [{ client: "copilot", modelId, tokens, cost, messages }],
+  };
+}
+
 function snapshot(...rows: ReturnType<typeof contribution>[]) {
   return foldParserClientSnapshot(rows, "copilot");
 }
@@ -160,6 +179,91 @@ describe("non-destructive parser generation high-water", () => {
     });
   });
 
+  it("allocates marginal rather than cumulative cost and message metadata", () => {
+    const first = baseline(
+      {},
+      snapshot(contribution("2026-07-01", 100, "model-a", 1))
+    );
+    const plan = next(
+      first.nextState!,
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 100, output: 100, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+          11,
+          2
+        )
+      )
+    );
+
+    expect(plan.increments["2026-07-01"].models["model-a"]).toMatchObject({
+      tokens: 100,
+      output: 100,
+      cost: 10,
+      messages: 1,
+    });
+  });
+
+  it("retains a new message even when its token growth is a tiny fraction", () => {
+    const first = baseline(
+      {},
+      snapshot(contribution("2026-07-01", 100, "model-a", 1))
+    );
+    const plan = next(
+      first.nextState!,
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 101, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+          1.1,
+          2
+        )
+      )
+    );
+
+    expect(plan.increments["2026-07-01"].models["model-a"]).toMatchObject({
+      input: 1,
+      messages: 1,
+      cost: 0.1,
+    });
+  });
+
+  it("allocates growth independently across every token bucket", () => {
+    const first = baseline(
+      {},
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 10, output: 20, cacheRead: 30, cacheWrite: 40, reasoning: 50 },
+          1,
+          1
+        )
+      )
+    );
+    const plan = next(
+      first.nextState!,
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 11, output: 22, cacheRead: 33, cacheWrite: 44, reasoning: 55 },
+          2,
+          2
+        )
+      )
+    );
+
+    expect(plan.increments["2026-07-01"].models["model-a"]).toMatchObject({
+      input: 1,
+      output: 2,
+      cacheRead: 3,
+      cacheWrite: 4,
+      reasoning: 5,
+      tokens: 15,
+      cost: 1,
+      messages: 1,
+    });
+  });
+
   it("does not treat repricing without token growth as new spend", () => {
     const first = baseline(
       legacy(contribution("2026-07-01", 100, "model-a", 5)),
@@ -204,25 +308,41 @@ describe("non-destructive parser generation high-water", () => {
     expect(plan.increments).toEqual({});
   });
 
-  it("quantizes pro-rated model, client JSON, and scalar cost coherently", () => {
-    const initialDays = snapshot(contribution("2026-07-01", 2, "model-a", 1));
-    const first = baseline({}, initialDays);
+  it("quantizes partially authorized marginal cost coherently", () => {
+    const first = baseline(
+      {},
+      snapshot(contribution("2026-07-01", 2, "old-model", 1))
+    );
     const plan = next(
       first.nextState!,
-      snapshot(contribution("2026-07-01", 3, "model-a", 1))
+      snapshot(contribution("2026-07-02", 3, "model-a", 1))
     );
-    const increment = plan.increments["2026-07-01"];
-    const stored = addClientBreakdownIncrement(
-      initialDays["2026-07-01"],
-      increment
-    );
+    const increment = plan.increments["2026-07-02"];
+    const stored = addClientBreakdownIncrement(undefined, increment);
     const totals = recalculateDayTotals({ copilot: stored });
 
     expect(increment.models["model-a"].cost).toBe(0.3333);
     expect(increment.cost).toBe(0.3333);
-    expect(stored.models["model-a"].cost).toBe(1.3333);
-    expect(stored.cost).toBe(1.3333);
-    expect(totals.cost.toFixed(4)).toBe("1.3333");
+    expect(stored.models["model-a"].cost).toBe(0.3333);
+    expect(stored.cost).toBe(0.3333);
+    expect(totals.cost.toFixed(4)).toBe("0.3333");
+  });
+
+  it("does not mutate an existing breakdown while merging an increment", () => {
+    const existing = snapshot(
+      contribution("2026-07-01", 100, "model-a", 1.23456)
+    )["2026-07-01"];
+    existing.cost = 1.23456;
+    existing.models["model-a"].cost = 1.23456;
+    const before = structuredClone(existing);
+    const increment = snapshot(
+      contribution("2026-07-01", 1, "model-a", 0.1)
+    )["2026-07-01"];
+
+    addClientBreakdownIncrement(existing, increment);
+
+    expect(existing).toEqual(before);
+    expect(existing.models["model-a"].cost).toBe(1.23456);
   });
 
   it("adds only post-baseline cumulative growth and keeps representations coherent", () => {
