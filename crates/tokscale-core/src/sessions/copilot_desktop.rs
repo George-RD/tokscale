@@ -53,6 +53,12 @@ struct ShutdownUsage {
     /// twice. The event's own `id` is a UUID; its `timestamp` is the fallback.
     event_id: String,
     timestamp_ms: i64,
+    /// The `modelMetrics` key, trimmed. That key is the identity of the
+    /// tracker counter these numbers came from, so it is what the running peak,
+    /// the verbatim-record dedup, and the submitted dedup key are all grouped
+    /// by. Trimming it here keeps that grouping identical to the model the
+    /// emitted message is attributed to, which is trimmed too: two spellings
+    /// that differ only by padding are one model everywhere or nowhere.
     model: String,
     input: i64,
     output: i64,
@@ -95,6 +101,10 @@ impl ShutdownUsage {
 /// Without this, a session that emitted an error shutdown at 100 tokens and a
 /// routine one at 200 contributes 300 — the earlier snapshot counted twice,
 /// and spread across two different days.
+///
+/// Snapshots are grouped by their `modelMetrics` key, which is the identity of
+/// the tracker counter they were read from and the same identity the emitted
+/// message is keyed and attributed by.
 ///
 /// A snapshot that reports *less* than one before it (the tracker restarted
 /// with the session, or the records arrived out of order) contributes nothing
@@ -276,7 +286,13 @@ fn session_row_to_messages(db_path: &Path, row: CopilotDesktopSessionRow) -> Vec
 
     let mut messages = Vec::with_capacity(metadata.shutdowns.len() + 1);
     for shutdown in &metadata.shutdowns {
-        let model_id = match shutdown.model.trim() {
+        // `auto` is resolved for display and pricing only. It is a tracker
+        // counter of its own — `modelMetrics` is keyed by the model each
+        // `assistant.usage` event reported — so it keeps its own peak and its
+        // own dedup key even when it is attributed to the resolved model.
+        // Folding it into `fallback_model` before differencing would subtract
+        // one counter's peak from another counter's total.
+        let model_id = match shutdown.model.as_str() {
             "" | "auto" => fallback_model.clone(),
             model => model.to_string(),
         };
@@ -436,7 +452,7 @@ fn collect_shutdown_usage(event: &Value, out: &mut Vec<ShutdownUsage>) {
         let shutdown = ShutdownUsage {
             event_id: event_id.clone(),
             timestamp_ms,
-            model: model.clone(),
+            model: model.trim().to_string(),
             input: read("inputTokens"),
             output: read("outputTokens"),
             cache_read: read("cacheReadTokens"),
@@ -556,6 +572,12 @@ mod tests {
         )
         .unwrap();
     }
+
+    /// Every real `events.jsonl` opens with `session.start`: the SDK refuses to
+    /// load a session whose first event is anything else, so a log that does
+    /// not start with one has lost its head. Fixtures that exercise shutdown
+    /// attribution open with it for the same reason real logs do.
+    const SESSION_START: &str = r#"{"type":"session.start","data":{},"id":"3f0a1c22-6b41-4d0e-9c7a-5e2b8d4f1a00","timestamp":"2026-07-01T19:00:00.000Z"}"#;
 
     fn write_events(root: &Path, session_id: &str, lines: &[&str]) {
         let events_dir = root.join("session-state").join(session_id);
@@ -1068,6 +1090,76 @@ mod tests {
             days,
             vec![1_782_909_296_000, 1_782_936_000_000, 1_782_950_400_000],
             "the same total is spread over the creation day and both shutdown days"
+        );
+    }
+
+    /// A model's running peak, the verbatim-record dedup, and the dedup key the
+    /// message is submitted under all have to name the same model the message
+    /// is attributed to. They were keyed on the raw `modelMetrics` key while
+    /// the emitted `model_id` was trimmed, so `"gpt-5.1-codex"` and
+    /// `" gpt-5.1-codex "` landed on the same model with two separate peaks:
+    /// the later snapshot restated the earlier one's total instead of being
+    /// differenced against it, and the two records were submitted under keys
+    /// that differed only by invisible whitespace.
+    #[test]
+    fn model_spellings_that_differ_only_by_whitespace_share_one_snapshot_series() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("data.db");
+        let conn = create_copilot_desktop_db(&db_path);
+        // The later snapshot restates the earlier one, so the row's lifetime
+        // total is the final snapshot rather than their sum.
+        insert_session(&conn, "session-1", "gpt-5.1-codex", 200, 100, 0, 0);
+        drop(conn);
+        write_events(
+            dir.path(),
+            "session-1",
+            &[
+                SESSION_START,
+                r#"{"type":"session.shutdown","data":{"shutdownType":"error","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"outputTokens":50}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01","timestamp":"2026-07-01T20:00:00.000Z","parentId":null}"#,
+                r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{" gpt-5.1-codex ":{"usage":{"inputTokens":200,"outputTokens":100}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":null}"#,
+            ],
+        );
+
+        let messages = parse_copilot_desktop_db(&db_path);
+
+        let total_input: i64 = messages.iter().map(|message| message.tokens.input).sum();
+        let total_output: i64 = messages.iter().map(|message| message.tokens.output).sum();
+        assert_eq!(
+            (total_input, total_output),
+            (200, 100),
+            "one peak: the padded spelling is the same model, so the second \
+             snapshot restates the first instead of adding to it"
+        );
+
+        let second = messages
+            .iter()
+            .find(|message| message.timestamp == 1_782_950_400_000)
+            .expect("the second shutdown keeps its own day");
+        assert_eq!(
+            (second.tokens.input, second.tokens.output),
+            (100, 50),
+            "only the increment accrued since the previous snapshot"
+        );
+
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.model_id == "gpt-5.1-codex"),
+            "both spellings are attributed to the same model"
+        );
+        let mut keys: Vec<&str> = messages
+            .iter()
+            .filter_map(|message| message.dedup_key.as_deref())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "copilot-desktop:session-1:shutdown:9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01:gpt-5.1-codex",
+                "copilot-desktop:session-1:shutdown:9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02:gpt-5.1-codex",
+            ],
+            "one dedup identity per model: the key names the model the message \
+             is attributed to, not the raw spelling it happened to be written with"
         );
     }
 
