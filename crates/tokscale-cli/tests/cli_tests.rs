@@ -791,7 +791,7 @@ fn settings_json_path(base: &Path) -> std::path::PathBuf {
 /// forward slash survives from the `/`-joined client-table literal. An
 /// expectation built with `Path::join` would disagree on the relative half's
 /// separators (`...\.codex/sessions` against the emitted
-/// `...\.codex/sessions`), because `join` only normalizes the junction.
+/// `...\.codex\sessions`), because `join` only normalizes the junction.
 /// Changing the emitter means changing this helper in the same commit (#1048).
 fn client_scan_path(home: &Path, relative: &str) -> String {
     let mut path = home.to_path_buf();
