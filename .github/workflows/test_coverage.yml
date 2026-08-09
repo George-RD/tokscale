@@ -56,11 +56,38 @@ jobs:
   # *executed* a test there, so Windows-only defects reached users unseen.
   #
   # The leg was advisory (`continue-on-error`) while the 33 pre-existing
-  # failures that first run exposed were worked through: six unrelated root
-  # causes, including two real Windows product defects (the crush registry
-  # scan returning nothing, cc-mirror attributing the wrong provider). Those
-  # landed in #1007, #1012 and #1046, and the suite now completes green across
-  # all 11 binaries.
+  # failures that first run exposed were worked through, across six unrelated
+  # root causes (#1014). Those landed in #1007, #1012 and #1046, and the suite
+  # now completes green across all 10 test binaries.
+  #
+  # Most of the 33 were the harness lying, not the product: fixtures built
+  # JSON with `format!` and dropped a raw path inside a string, so on Windows
+  # `C:\Users\RUNNER~1\...` put `\U` and `\A` in the document and serde_json
+  # rejected it. Both readers treat unparseable config as absent, so the Crush
+  # registry scan returned nothing and cc-mirror sessions fell back to plain
+  # Claude - failures that read like product defects several files from the
+  # cause. The real writers (Go `encoding/json`, Node `JSON.stringify`) escape
+  # correctly, so only the tests ever emitted invalid JSON.
+  #
+  # Genuine product defects surfaced by the Windows leg did turn up
+  # underneath. From #1007: a contended lock classified as an error instead
+  # of "already running", so a scheduled autosubmit recorded a failure;
+  # `pid_is_alive` hardcoded false off Unix, so every sync lock looked stale
+  # and overlapping syncs could delete each other's artifacts; and manifest
+  # artifact paths rendered with the native separator, which the
+  # cache-relative validator rejected - so any Windows sync with an artifact
+  # to retire failed after the manifest was already written. From #1046: TZ
+  # leaving a device permanently unpinnable, the bare `default` token
+  # fuzzy-matching a priced key, and one file cached under two keys because
+  # the scan root joins with `/` while `WalkDir` appends `\`.
+  #
+  # The `default` one is the same class of bug as #1062 - a generic token
+  # with no model identity electing some provider's priced row - and it was
+  # never Windows-only: it mispriced on every platform. Its test is ungated
+  # and ran on the Ubuntu leg every PR, where the fixture's empty catalog
+  # starved the fuzzy matcher. What exposed it was the sandbox escape above,
+  # the child reading the runner's real `%APPDATA%` catalog and hitting real
+  # prices - a harness defect making a product defect visible.
   #
   # It is a HARD GATE as of this change. The advisory phase was explicitly
   # temporary - an advisory job nobody reads is how #997 happened in the first
