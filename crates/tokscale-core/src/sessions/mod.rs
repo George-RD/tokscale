@@ -37,6 +37,7 @@ pub mod openclaw;
 pub mod opencode;
 pub mod opencodereview;
 pub mod pi;
+pub mod prime_agent;
 pub mod qwen;
 pub mod reasonix;
 pub mod roocode;

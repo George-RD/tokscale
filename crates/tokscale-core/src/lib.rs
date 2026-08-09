@@ -1669,6 +1669,32 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
+    let prime_agent_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::PrimeAgent)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                message_cache::CacheIdentity::for_client(ClientId::PrimeAgent),
+                path,
+                &source_cache,
+                pricing,
+                sessions::prime_agent::parse_prime_agent_file,
+            )
+        })
+        .collect();
+    let mut prime_agent_seen: HashSet<String> = HashSet::new();
+    for outcome in prime_agent_outcomes {
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut prime_agent_seen, message)),
+        );
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     let kimchi_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Kimchi)
         .par_iter()
@@ -3683,6 +3709,21 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let pi_count = pi_msgs.len() as i32;
     counts.set(ClientId::Pi, pi_count);
     messages.extend(pi_msgs);
+
+    let prime_agent_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::PrimeAgent)
+        .par_iter()
+        .flat_map(|path| sessions::prime_agent::parse_prime_agent_file(path))
+        .collect();
+    let mut prime_agent_seen: HashSet<String> = HashSet::new();
+    let prime_agent_msgs: Vec<ParsedMessage> = prime_agent_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut prime_agent_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let prime_agent_count = prime_agent_msgs.len() as i32;
+    counts.set(ClientId::PrimeAgent, prime_agent_count);
+    messages.extend(prime_agent_msgs);
 
     let kimchi_msgs_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Kimchi)

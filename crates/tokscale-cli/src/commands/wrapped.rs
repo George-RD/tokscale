@@ -1472,6 +1472,7 @@ fn client_display_name(client: &str) -> Option<&'static str> {
         "junie" => Some("Junie"),
         "augment" => Some("Augment Code"),
         "kimchi" => Some("Kimchi"),
+        "prime-agent" => Some("Prime Agent"),
         "synthetic" => Some("Synthetic"),
         _ => None,
     }
@@ -1495,6 +1496,7 @@ fn client_logo_url(client_name: &str) -> Option<&'static str> {
         "OpenClaw" => Some("https://tokscale.ai/assets/logos/openclaw.png"),
         "Hermes Agent" => Some("https://tokscale.ai/assets/logos/hermes.png"),
         "Pi" => Some("https://tokscale.ai/assets/logos/pi.png"),
+        "Prime Agent" => Some("https://github.com/PrimeIntellect-ai.png"),
         "Kimi CLI" => Some("https://tokscale.ai/assets/logos/kimi.png"),
         "Qwen CLI" => Some("https://tokscale.ai/assets/logos/qwen.png"),
         "Roo Code" => Some("https://tokscale.ai/assets/logos/roocode.png"),
