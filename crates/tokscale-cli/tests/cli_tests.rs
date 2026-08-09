@@ -813,7 +813,10 @@ fn cmd_with_home(tmp: &Path) -> Command {
         .env_remove("GOOSE_PATH_ROOT")
         .env_remove("CODEBUFF_DATA_DIR")
         .env_remove("GEMINI_CLI_HOME")
-        .env_remove("HERMES_HOME");
+        .env_remove("HERMES_HOME")
+        .env_remove("PRIME_AGENT_CODING_AGENT_DIR")
+        .env_remove("PRIME_AGENT_SESSION_DIR")
+        .env_remove("PRIME_AGENT_CODING_AGENT_SESSION_DIR");
     cmd
 }
 
@@ -849,7 +852,10 @@ fn offline_cmd_with_home(tmp: &Path) -> Command {
         .env_remove("GOOSE_PATH_ROOT")
         .env_remove("CODEBUFF_DATA_DIR")
         .env_remove("GEMINI_CLI_HOME")
-        .env_remove("HERMES_HOME");
+        .env_remove("HERMES_HOME")
+        .env_remove("PRIME_AGENT_CODING_AGENT_DIR")
+        .env_remove("PRIME_AGENT_SESSION_DIR")
+        .env_remove("PRIME_AGENT_CODING_AGENT_SESSION_DIR");
     cmd
 }
 

@@ -1614,6 +1614,8 @@ mod tests {
         assert_eq!(clients[39], ClientId::Senpi);
         assert_eq!(clients[40], ClientId::Augment);
         assert_eq!(clients[41], ClientId::Kimchi);
+        assert_eq!(clients[42], ClientId::Reasonix);
+        assert_eq!(clients[43], ClientId::PrimeAgent);
     }
 
     #[test]
@@ -1725,6 +1727,10 @@ mod tests {
             crate::tui::client_ui::display_name(ClientId::Kimchi),
             "Kimchi"
         );
+        assert_eq!(
+            crate::tui::client_ui::display_name(ClientId::PrimeAgent),
+            "Prime Agent"
+        );
     }
 
     #[test]
@@ -1762,6 +1768,7 @@ mod tests {
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::WorkBuddy), 'B');
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::Augment), 'A');
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::Kimchi), 'K');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::PrimeAgent), 'P');
     }
 
     #[test]
@@ -1877,6 +1884,10 @@ mod tests {
         assert_eq!(
             crate::tui::client_ui::from_hotkey('K'),
             Some(ClientId::Kimchi)
+        );
+        assert_eq!(
+            crate::tui::client_ui::from_hotkey('P'),
+            Some(ClientId::PrimeAgent)
         );
     }
 

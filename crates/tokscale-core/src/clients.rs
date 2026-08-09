@@ -725,6 +725,21 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // Prime Agent uses the Pi append-only JSONL session format. Root sessions
+    // live in `<agent dir>/sessions`; RLM child sessions are discovered from
+    // the sibling `session-artifacts` tree by the scanner.
+    PrimeAgent = 43 => {
+        id: "prime-agent",
+        root: PathRoot::EnvVar {
+            var: "PRIME_AGENT_CODING_AGENT_DIR",
+            fallback_relative: ".prime/agent",
+        },
+        relative: "sessions",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -808,13 +823,29 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 43);
+        assert_eq!(ClientId::COUNT, 44);
     }
 
     #[test]
     fn test_senpi_client_registered_as_local_session_source() {
         let client = ClientId::from_str("senpi").expect("senpi client should be registered");
         assert_eq!(client.data().relative_path, "sessions");
+        assert_eq!(client.data().pattern, "*.jsonl");
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
+        assert!(!client.data().headless);
+    }
+
+    #[test]
+    fn test_prime_agent_client_registered_as_local_session_source() {
+        let client =
+            ClientId::from_str("prime-agent").expect("prime-agent client should be registered");
+        assert_eq!(
+            client
+                .data()
+                .resolve_path_with_env_strategy("/tmp/home", false),
+            native_join(std::path::Path::new("/tmp/home"), ".prime/agent/sessions")
+        );
         assert_eq!(client.data().pattern, "*.jsonl");
         assert!(client.data().parse_local);
         assert!(client.data().submit_default);

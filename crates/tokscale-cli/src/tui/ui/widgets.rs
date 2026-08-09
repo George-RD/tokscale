@@ -492,6 +492,7 @@ pub fn get_client_color(client: &str) -> Color {
         "gjc" => Color::Rgb(220, 38, 38),          // #DC2626 gajae-code red-claw
         "jcode" => Color::Rgb(245, 158, 11),       // #F59E0B Jcode amber
         "junie" => Color::Rgb(123, 97, 255),       // #7B61FF Junie violet
+        "prime-agent" => Color::Rgb(108, 99, 255), // #6C63FF Prime violet
         _ => Color::Rgb(136, 136, 136),            // #888888
     }
 }

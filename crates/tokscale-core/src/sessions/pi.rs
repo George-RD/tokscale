@@ -26,6 +26,8 @@ pub struct PiSessionHeader {
     pub timestamp: Option<String>,
     #[allow(dead_code)]
     pub cwd: Option<String>,
+    #[serde(rename = "rlmDepth")]
+    pub rlm_depth: Option<u32>,
 }
 
 /// Loose type-only probe for a JSONL line, used to identify pre-session
@@ -63,6 +65,8 @@ pub struct PiMessage {
     pub usage: Option<PiUsage>,
     pub model: Option<String>,
     pub provider: Option<String>,
+    #[serde(rename = "responseId")]
+    pub response_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,7 +137,7 @@ pub(crate) fn parse_pi_format_file(
     client: &str,
     fallback_provider: &'static str,
 ) -> Vec<UnifiedMessage> {
-    parse_pi_format_file_inner(path, client, fallback_provider, None)
+    parse_pi_format_file_inner(path, client, fallback_provider, None, false, false)
 }
 
 /// Parse a Pi-format session and retain message ids in namespaced dedup keys.
@@ -144,7 +148,21 @@ pub(crate) fn parse_pi_format_file_with_dedup(
     client: &str,
     fallback_provider: &'static str,
 ) -> Vec<UnifiedMessage> {
-    parse_pi_format_file_inner(path, client, fallback_provider, Some(client))
+    parse_pi_format_file_inner(path, client, fallback_provider, Some(client), false, false)
+}
+
+/// Parse a Pi-format session whose `session_info.name` identifies an RLM
+/// subagent when the session header has `rlmDepth > 0`.
+///
+/// Deduplication is intentionally cross-session: Prime Agent forks copy prior
+/// message entries into a file with a new session id. Provider response ids are
+/// preferred; the message id plus immutable event fields is the fallback.
+pub(crate) fn parse_pi_format_rlm_file(
+    path: &Path,
+    client: &str,
+    fallback_provider: &'static str,
+) -> Vec<UnifiedMessage> {
+    parse_pi_format_file_inner(path, client, fallback_provider, Some(client), true, true)
 }
 
 fn parse_pi_format_file_inner(
@@ -152,6 +170,8 @@ fn parse_pi_format_file_inner(
     client: &str,
     fallback_provider: &'static str,
     dedup_namespace: Option<&str>,
+    rlm_session_name_as_agent: bool,
+    cross_session_dedup: bool,
 ) -> Vec<UnifiedMessage> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -168,6 +188,7 @@ fn parse_pi_format_file_inner(
     let mut workspace_key: Option<String> = None;
     let mut workspace_label: Option<String> = None;
     let mut agent: Option<String> = None;
+    let mut is_rlm_subagent = false;
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
@@ -204,6 +225,7 @@ fn parse_pi_format_file_inner(
             session_id = Some(header.id);
             workspace_key = header.cwd.as_deref().and_then(normalize_workspace_key);
             workspace_label = workspace_key.as_deref().and_then(workspace_label_from_key);
+            is_rlm_subagent = header.rlm_depth.unwrap_or(0) > 0;
             continue;
         }
 
@@ -215,7 +237,11 @@ fn parse_pi_format_file_inner(
         };
 
         if entry.entry_type == "session_info" {
-            agent = entry.name.as_deref().and_then(pi_subagent_name);
+            agent = if rlm_session_name_as_agent && is_rlm_subagent {
+                entry.name.filter(|name| !name.trim().is_empty())
+            } else {
+                entry.name.as_deref().and_then(pi_subagent_name)
+            };
             continue;
         }
 
@@ -233,6 +259,7 @@ fn parse_pi_format_file_inner(
             continue;
         }
 
+        let response_id = message.response_id;
         let usage = match message.usage {
             Some(u) => u,
             None => continue,
@@ -255,11 +282,11 @@ fn parse_pi_format_file_inner(
                 .to_string(),
         };
 
-        let timestamp = entry
+        let recorded_timestamp = entry
             .timestamp
             .and_then(|ts| chrono::DateTime::parse_from_rfc3339(&ts).ok())
-            .map(|dt| dt.timestamp_millis())
-            .unwrap_or(fallback_timestamp);
+            .map(|dt| dt.timestamp_millis());
+        let timestamp = recorded_timestamp.unwrap_or(fallback_timestamp);
 
         // `usage.reasoning` is read but deliberately not mapped onto
         // `TokenBreakdown::reasoning`. In the Pi format reasoning tokens are a
@@ -268,8 +295,8 @@ fn parse_pi_format_file_inner(
         // through would double count.
         let mut unified = UnifiedMessage::new_with_agent(
             client,
-            model,
-            provider,
+            model.as_str(),
+            provider.as_str(),
             session_id.clone().unwrap_or_else(|| "unknown".to_string()),
             timestamp,
             TokenBreakdown {
@@ -283,7 +310,31 @@ fn parse_pi_format_file_inner(
             agent.clone(),
         );
         if let Some(namespace) = dedup_namespace {
-            if let Some(message_id) = message_id.as_deref().filter(|id| !id.trim().is_empty()) {
+            if cross_session_dedup {
+                unified.dedup_key = response_id
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty())
+                    .map(|id| format!("{namespace}:response:{id}"))
+                    .or_else(|| {
+                        message_id
+                            .as_deref()
+                            .filter(|id| !id.trim().is_empty())
+                            .map(|id| {
+                                let stable_timestamp = recorded_timestamp
+                                    .map(|timestamp| timestamp.to_string())
+                                    .unwrap_or_else(|| "missing".to_string());
+                                format!(
+                                    "{namespace}:message:{id}:{stable_timestamp}:{provider}:{model}:{}:{}:{}:{}",
+                                    unified.tokens.input,
+                                    unified.tokens.output,
+                                    unified.tokens.cache_read,
+                                    unified.tokens.cache_write,
+                                )
+                            })
+                    });
+            } else if let Some(message_id) =
+                message_id.as_deref().filter(|id| !id.trim().is_empty())
+            {
                 let session_id = session_id.as_deref().unwrap_or("unknown");
                 unified.dedup_key = Some(format!("{namespace}:{session_id}:{message_id}"));
             }

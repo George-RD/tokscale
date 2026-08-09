@@ -224,6 +224,70 @@ impl ScanResult {
     }
 }
 
+fn expand_tilde_path_with_home(value: &str, home_dir: &str) -> PathBuf {
+    if value == "~" {
+        return PathBuf::from(home_dir);
+    }
+    if let Some(relative) = value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\"))
+    {
+        return PathBuf::from(home_dir).join(relative);
+    }
+    PathBuf::from(value)
+}
+
+fn prime_agent_session_dir_from_settings(agent_dir: &Path, home_dir: &str) -> Option<PathBuf> {
+    fn read_session_dir(path: &Path) -> Option<String> {
+        let content = std::fs::read_to_string(path).ok()?;
+        let settings: Value = serde_json::from_str(&content).ok()?;
+        settings
+            .as_object()?
+            .get("sessionDir")?
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    let global = read_session_dir(&agent_dir.join("settings.json"));
+    let project = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| read_session_dir(&cwd.join(".prime/agent/settings.json")));
+    project
+        .or(global)
+        .map(|path| expand_tilde_path_with_home(&path, home_dir))
+}
+
+/// Resolve Prime Agent's root-session and RLM-artifact scan roots using the
+/// same environment precedence and tilde expansion as Prime Agent itself.
+pub fn prime_agent_session_roots_with_env_strategy(
+    home_dir: &str,
+    use_env_roots: bool,
+) -> [PathBuf; 2] {
+    let sessions = if use_env_roots {
+        let session_override = std::env::var("PRIME_AGENT_SESSION_DIR")
+            .ok()
+            .or_else(|| std::env::var("PRIME_AGENT_CODING_AGENT_SESSION_DIR").ok());
+        if let Some(path) = session_override.filter(|value| !value.is_empty()) {
+            expand_tilde_path_with_home(&path, home_dir)
+        } else {
+            let agent_dir = std::env::var("PRIME_AGENT_CODING_AGENT_DIR")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|path| expand_tilde_path_with_home(&path, home_dir))
+                .unwrap_or_else(|| PathBuf::from(home_dir).join(".prime/agent"));
+            prime_agent_session_dir_from_settings(&agent_dir, home_dir)
+                .unwrap_or_else(|| agent_dir.join("sessions"))
+        }
+    } else {
+        PathBuf::from(home_dir).join(".prime/agent/sessions")
+    };
+    let artifacts = sessions
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join("session-artifacts");
+    [sessions, artifacts]
+}
+
 pub fn headless_roots_with_env_strategy(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
     if use_env_roots {
         if let Ok(path) = std::env::var("TOKSCALE_HEADLESS_DIR") {
@@ -302,6 +366,9 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                 "*.json" => file_name.ends_with(".json"),
                 "*.json|*.jsonl" => file_name.ends_with(".json") || file_name.ends_with(".jsonl"),
                 "*.jsonl" => file_name.ends_with(".jsonl"),
+                "prime-agent-session" => {
+                    file_name.ends_with(".jsonl") && file_name != "rlm-subagents.jsonl"
+                }
                 "*.ndjson" => file_name.ends_with(".ndjson"),
                 "*.log" => file_name.ends_with(".log"),
                 "codebuddy-extension-log" => {
@@ -1264,6 +1331,7 @@ fn scan_all_clients_with_env_strategy_inner(
                 | ClientId::MiMoCode
                 | ClientId::DevinCli
                 | ClientId::Grok
+                | ClientId::PrimeAgent
         ) {
             continue;
         }
@@ -1580,6 +1648,27 @@ fn scan_all_clients_with_env_strategy_inner(
     if enabled.contains(&ClientId::Pi) {
         let omp_path = join_native(home_dir, ".omp/agent/sessions");
         push_unique_scan_task(&mut tasks, &mut seen_scan_roots, ClientId::Pi, omp_path);
+    }
+
+    if enabled.contains(&ClientId::PrimeAgent) {
+        // Prime Agent lets the session directory move independently from its
+        // agent directory. Its RLM child session tree is always a sibling of
+        // the effective session directory (`dirname(sessions)/session-artifacts`).
+        let [sessions, artifacts] =
+            prime_agent_session_roots_with_env_strategy(home_dir, use_env_roots);
+        push_unique_scan_task(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::PrimeAgent,
+            sessions,
+        );
+        push_unique_scan_task_with_pattern(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::PrimeAgent,
+            artifacts,
+            "prime-agent-session",
+        );
     }
 
     if include_synthetic {
@@ -3827,6 +3916,132 @@ mod tests {
         assert_eq!(result.get(ClientId::Pi).len(), 1);
         assert!(result.get(ClientId::OpenCode).is_empty());
         assert!(result.get(ClientId::Claude).is_empty());
+    }
+
+    #[test]
+    fn test_scan_all_clients_prime_agent_includes_root_and_rlm_child_sessions() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let root_dir = home.join(".prime/agent/sessions");
+        let child_dir = home.join(".prime/agent/session-artifacts/root/sub-deadbeef");
+        fs::create_dir_all(&root_dir).unwrap();
+        fs::create_dir_all(&child_dir).unwrap();
+        File::create(root_dir.join("root.jsonl")).unwrap();
+        File::create(child_dir.join("child.jsonl")).unwrap();
+        File::create(home.join(".prime/agent/session-artifacts/root/rlm-subagents.jsonl")).unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["prime-agent".to_string()],
+            false,
+        );
+
+        assert_eq!(result.get(ClientId::PrimeAgent).len(), 2);
+        assert!(result
+            .get(ClientId::PrimeAgent)
+            .iter()
+            .any(|path| path.ends_with("root.jsonl")));
+        assert!(result
+            .get(ClientId::PrimeAgent)
+            .iter()
+            .any(|path| path.ends_with("child.jsonl")));
+        assert!(result.get(ClientId::Pi).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_prime_agent_honors_session_dir_override() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let custom_root = home.join("custom/sessions");
+        let child_dir = home.join("custom/session-artifacts/root/sub-deadbeef");
+        fs::create_dir_all(&custom_root).unwrap();
+        fs::create_dir_all(&child_dir).unwrap();
+        File::create(custom_root.join("root.jsonl")).unwrap();
+        File::create(child_dir.join("child.jsonl")).unwrap();
+
+        let mut env = EnvGuard::capture(&[
+            "PRIME_AGENT_SESSION_DIR",
+            "PRIME_AGENT_CODING_AGENT_SESSION_DIR",
+            "PRIME_AGENT_CODING_AGENT_DIR",
+        ]);
+        env.set("PRIME_AGENT_SESSION_DIR", "~/custom/sessions");
+        env.remove("PRIME_AGENT_CODING_AGENT_SESSION_DIR");
+        env.set(
+            "PRIME_AGENT_CODING_AGENT_DIR",
+            home.join("unused-agent-dir"),
+        );
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["prime-agent".to_string()],
+            true,
+        );
+
+        assert_eq!(result.get(ClientId::PrimeAgent).len(), 2);
+        assert!(result
+            .get(ClientId::PrimeAgent)
+            .iter()
+            .all(|path| path.starts_with(home.join("custom"))));
+    }
+
+    #[test]
+    #[serial]
+    fn test_prime_agent_roots_honor_agent_dir_and_legacy_session_override() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let mut env = EnvGuard::capture(&[
+            "PRIME_AGENT_SESSION_DIR",
+            "PRIME_AGENT_CODING_AGENT_SESSION_DIR",
+            "PRIME_AGENT_CODING_AGENT_DIR",
+        ]);
+        env.remove("PRIME_AGENT_SESSION_DIR");
+        env.remove("PRIME_AGENT_CODING_AGENT_SESSION_DIR");
+        env.set("PRIME_AGENT_CODING_AGENT_DIR", "~/custom-agent");
+
+        let roots = prime_agent_session_roots_with_env_strategy(home.to_str().unwrap(), true);
+        assert_eq!(roots[0], home.join("custom-agent/sessions"));
+        assert_eq!(roots[1], home.join("custom-agent/session-artifacts"));
+
+        let legacy_sessions = home.join("legacy/sessions");
+        env.set("PRIME_AGENT_CODING_AGENT_SESSION_DIR", &legacy_sessions);
+        let roots = prime_agent_session_roots_with_env_strategy(home.to_str().unwrap(), true);
+        assert_eq!(roots[0], legacy_sessions);
+        assert_eq!(roots[1], home.join("legacy/session-artifacts"));
+
+        // Match Prime Agent's `primary ?? legacy` environment lookup exactly:
+        // an explicitly empty primary value suppresses the legacy variable,
+        // then falls through to settings/default resolution.
+        env.set("PRIME_AGENT_SESSION_DIR", "");
+        let roots = prime_agent_session_roots_with_env_strategy(home.to_str().unwrap(), true);
+        assert_eq!(roots[0], home.join("custom-agent/sessions"));
+        assert_eq!(roots[1], home.join("custom-agent/session-artifacts"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_prime_agent_roots_honor_settings_session_dir() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let agent_dir = home.join("custom-agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"sessionDir":"~/settings-sessions"}"#,
+        )
+        .unwrap();
+
+        let mut env = EnvGuard::capture(&[
+            "PRIME_AGENT_SESSION_DIR",
+            "PRIME_AGENT_CODING_AGENT_SESSION_DIR",
+            "PRIME_AGENT_CODING_AGENT_DIR",
+        ]);
+        env.remove("PRIME_AGENT_SESSION_DIR");
+        env.remove("PRIME_AGENT_CODING_AGENT_SESSION_DIR");
+        env.set("PRIME_AGENT_CODING_AGENT_DIR", &agent_dir);
+
+        let roots = prime_agent_session_roots_with_env_strategy(home.to_str().unwrap(), true);
+        assert_eq!(roots[0], home.join("settings-sessions"));
+        assert_eq!(roots[1], home.join("session-artifacts"));
     }
 
     #[test]
