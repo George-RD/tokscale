@@ -376,9 +376,12 @@ fn session_row_to_messages(db_path: &Path, row: CopilotDesktopSessionRow) -> Vec
         ));
     }
 
-    // What the snapshots account for, which is not always what they emitted: a
-    // snapshot swallowed as an unknown baseline stands for usage that is
-    // already attributed elsewhere, so it must not come back as a remainder.
+    // What the snapshots account for, which is not always what they emitted.
+    // An unknown baseline may already have been submitted before the log head
+    // disappeared, so re-emitting it would inflate that machine permanently.
+    // On a first-ever scan of an already-truncated log this deliberately
+    // under-reports instead; no remaining record can distinguish those cases
+    // (see shutdown_deltas' safety tradeoff above).
     let consumed = metadata.consumed;
     // The row's own cache-write column does not exist, so the shutdown records
     // are the only source for that bucket and there is nothing to reconcile.
