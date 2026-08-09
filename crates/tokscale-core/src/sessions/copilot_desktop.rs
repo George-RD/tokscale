@@ -9,6 +9,7 @@ use crate::provider_identity::inferred_provider_from_model;
 use chrono::{DateTime, NaiveDateTime};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
 use std::path::Path;
 use tracing::warn;
@@ -36,7 +37,14 @@ struct SessionStateMetadata {
 /// These carry their own timestamp, which is the only per-run timing the
 /// desktop app exposes: the `sessions` row has a lifetime total and an
 /// immutable `created_at`.
-#[derive(Debug)]
+///
+/// As read off disk the numbers are **cumulative**, not per-run: the Copilot
+/// SDK's `UsageMetricsTracker` only ever adds to its per-model counters and
+/// exposes no reset, and `Session.shutdown()` emits whatever the tracker holds
+/// at that moment with no one-shot guard. So a session that shuts down twice
+/// writes two snapshots of the same running total. [`shutdown_deltas`] turns
+/// them into the per-run increments the rest of this module assumes.
+#[derive(Debug, Clone)]
 struct ShutdownUsage {
     /// Identity of the originating event, used to build a dedup key that
     /// survives rotation or compaction of `events.jsonl`. Position in the file
@@ -51,6 +59,76 @@ struct ShutdownUsage {
     cache_read: i64,
     cache_write: i64,
     reasoning: i64,
+}
+
+/// The five token buckets a shutdown record reports, in a fixed order so
+/// cumulative snapshots can be differenced bucket-by-bucket.
+type UsageBuckets = [i64; 5];
+
+impl ShutdownUsage {
+    fn buckets(&self) -> UsageBuckets {
+        [
+            self.input,
+            self.output,
+            self.cache_read,
+            self.cache_write,
+            self.reasoning,
+        ]
+    }
+
+    fn with_buckets(self, buckets: UsageBuckets) -> Self {
+        Self {
+            input: buckets[0],
+            output: buckets[1],
+            cache_read: buckets[2],
+            cache_write: buckets[3],
+            reasoning: buckets[4],
+            ..self
+        }
+    }
+}
+
+/// Convert cumulative shutdown snapshots into the usage each one actually
+/// added, so summing them reconciles against the row's lifetime total instead
+/// of multiplying it.
+///
+/// Without this, a session that emitted an error shutdown at 100 tokens and a
+/// routine one at 200 contributes 300 — the earlier snapshot counted twice,
+/// and spread across two different days.
+///
+/// A snapshot that reports *less* than one before it (the tracker restarted
+/// with the session, or the records arrived out of order) contributes nothing
+/// rather than a negative bucket: each model's running peak is the baseline,
+/// so the deltas always sum to that model's highest observed snapshot and can
+/// never exceed it. Anything the snapshots leave unexplained is still
+/// reconciled by the caller's residual against the `sessions` row.
+fn shutdown_deltas(mut snapshots: Vec<ShutdownUsage>) -> Vec<ShutdownUsage> {
+    // A record repeated verbatim — the same event written twice by a
+    // re-flushed or replayed log — describes one shutdown and must count once.
+    let mut seen = HashSet::new();
+    snapshots.retain(|snapshot| seen.insert((snapshot.event_id.clone(), snapshot.model.clone())));
+
+    // Order by the envelope timestamp so "previous snapshot" means what it
+    // says; the sort is stable, so records sharing a timestamp keep file order.
+    snapshots.sort_by_key(|snapshot| snapshot.timestamp_ms);
+
+    let mut peaks: HashMap<String, UsageBuckets> = HashMap::new();
+    let mut deltas = Vec::with_capacity(snapshots.len());
+    for snapshot in snapshots {
+        let peak = peaks.entry(snapshot.model.clone()).or_default();
+        let current = snapshot.buckets();
+        let mut delta = UsageBuckets::default();
+        for (index, value) in current.iter().enumerate() {
+            delta[index] = value.saturating_sub(peak[index]).max(0);
+            peak[index] = peak[index].max(*value);
+        }
+        if delta.iter().all(|bucket| *bucket == 0) {
+            continue;
+        }
+        deltas.push(snapshot.with_buckets(delta));
+    }
+
+    deltas
 }
 
 pub fn parse_copilot_desktop_db(db_path: &Path) -> Vec<UnifiedMessage> {
@@ -144,6 +222,8 @@ pub fn parse_copilot_desktop_db(db_path: &Path) -> Vec<UnifiedMessage> {
 ///
 /// `session.shutdown` records carry their own timestamp and a per-model
 /// breakdown, so each one is emitted at its own time and under its own model.
+/// Their token counts are cumulative, so [`shutdown_deltas`] has already
+/// reduced them to per-run increments by the time they arrive here.
 /// Whatever they do not account for — a run that died before writing its
 /// shutdown, or a session recorded by the CLI rather than the desktop app —
 /// stays on `created_at` under the row's original dedup key, so the row
@@ -222,6 +302,8 @@ fn session_row_to_messages(db_path: &Path, row: CopilotDesktopSessionRow) -> Vec
         ));
     }
 
+    // Safe to sum only because the snapshots were differenced into increments;
+    // summing the raw records would subtract more than the row ever held.
     let consumed = |pick: fn(&ShutdownUsage) -> i64| -> i64 {
         metadata
             .shutdowns
@@ -307,6 +389,9 @@ fn read_events_metadata(events_path: &Path) -> SessionStateMetadata {
         }
     }
 
+    // Everything downstream treats one entry as one run's spend, so hand back
+    // increments rather than the cumulative snapshots the app writes.
+    metadata.shutdowns = shutdown_deltas(metadata.shutdowns);
     metadata
 }
 
@@ -788,7 +873,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let db_path = dir.path().join("data.db");
             let conn = create_copilot_desktop_db(&db_path);
-            insert_session(&conn, "session-1", "gpt-5.1-codex", 300, 110, 0, 0);
+            // The later snapshot restates the earlier one, so the row's
+            // lifetime total is the final snapshot rather than their sum.
+            insert_session(&conn, "session-1", "gpt-5.1-codex", 200, 60, 0, 0);
             drop(conn);
             write_events(dir.path(), "session-1", lines);
 
@@ -809,6 +896,178 @@ mod tests {
         assert_eq!(
             whole_history,
             "copilot-desktop:session-1:shutdown:9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02:gpt-5.1-codex"
+        );
+    }
+
+    /// `session.shutdown` reports the tracker's running total, not the spend
+    /// since the last shutdown: the SDK's `UsageMetricsTracker` only ever adds
+    /// to its per-model counters and never resets, and `Session.shutdown()`
+    /// emits `modelMetrics` as-is with no one-shot guard, so an error shutdown
+    /// followed by a routine one writes two snapshots of the same total.
+    /// Summing them counted the earlier snapshot twice and dated the phantom
+    /// tokens to a day they were never spent on.
+    #[test]
+    fn cumulative_shutdown_snapshots_are_differenced_not_summed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("data.db");
+        let conn = create_copilot_desktop_db(&db_path);
+        insert_session(&conn, "session-1", "gpt-5.1-codex", 200, 100, 0, 0);
+        drop(conn);
+        write_events(
+            dir.path(),
+            "session-1",
+            &[
+                r#"{"type":"session.shutdown","data":{"shutdownType":"error","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"outputTokens":50}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01","timestamp":"2026-07-01T20:00:00.000Z","parentId":null}"#,
+                r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":200,"outputTokens":100}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":null}"#,
+            ],
+        );
+
+        let messages = parse_copilot_desktop_db(&db_path);
+
+        let total_input: i64 = messages.iter().map(|message| message.tokens.input).sum();
+        let total_output: i64 = messages.iter().map(|message| message.tokens.output).sum();
+        assert_eq!(
+            (total_input, total_output),
+            (200, 100),
+            "the second snapshot restates the first; summing them would report 300/150"
+        );
+
+        let first = messages
+            .iter()
+            .find(|message| message.timestamp == 1_782_936_000_000)
+            .expect("the first shutdown keeps its own day");
+        assert_eq!((first.tokens.input, first.tokens.output), (100, 50));
+
+        let second = messages
+            .iter()
+            .find(|message| message.timestamp == 1_782_950_400_000)
+            .expect("the second shutdown keeps its own day");
+        assert_eq!(
+            (second.tokens.input, second.tokens.output),
+            (100, 50),
+            "only the increment accrued since the previous snapshot"
+        );
+
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.dedup_key.as_deref() == Some("copilot-desktop:session-1")),
+            "the snapshots account for the whole row, so there is no remainder"
+        );
+    }
+
+    /// A record written twice — a replayed or re-flushed log — describes one
+    /// shutdown. Keying on the event id is only half the fix: the parser also
+    /// has to collapse the repeat before it reads the numbers off it.
+    #[test]
+    fn a_repeated_shutdown_record_counts_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("data.db");
+        let conn = create_copilot_desktop_db(&db_path);
+        insert_session(&conn, "session-1", "gpt-5.1-codex", 100, 50, 0, 0);
+        drop(conn);
+        let record = r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"outputTokens":50}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":null}"#;
+        write_events(dir.path(), "session-1", &[record, record]);
+
+        let messages = parse_copilot_desktop_db(&db_path);
+
+        assert_eq!(messages.len(), 1, "the repeated record is one shutdown");
+        assert_eq!(messages[0].timestamp, 1_782_950_400_000);
+        assert_eq!(
+            (messages[0].tokens.input, messages[0].tokens.output),
+            (100, 50)
+        );
+    }
+
+    /// A snapshot lower than the one before it means the tracker started over
+    /// with a fresh session object, or the records were read out of order.
+    /// Either way the difference is not negative usage, and it must not be
+    /// added on top of the peak already attributed.
+    #[test]
+    fn a_shutdown_snapshot_that_decreases_adds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("data.db");
+        let conn = create_copilot_desktop_db(&db_path);
+        insert_session(&conn, "session-1", "gpt-5.1-codex", 200, 100, 0, 0);
+        drop(conn);
+        write_events(
+            dir.path(),
+            "session-1",
+            &[
+                r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":200,"outputTokens":100}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01","timestamp":"2026-07-01T20:00:00.000Z","parentId":null}"#,
+                r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":50,"outputTokens":20}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":null}"#,
+            ],
+        );
+
+        let messages = parse_copilot_desktop_db(&db_path);
+
+        assert!(
+            messages.iter().all(|message| message.tokens.input >= 0
+                && message.tokens.output >= 0
+                && message.tokens.cache_read >= 0
+                && message.tokens.cache_write >= 0
+                && message.tokens.reasoning >= 0),
+            "a lower snapshot must never produce a negative bucket"
+        );
+
+        let total_input: i64 = messages.iter().map(|message| message.tokens.input).sum();
+        let total_output: i64 = messages.iter().map(|message| message.tokens.output).sum();
+        assert_eq!(
+            (total_input, total_output),
+            (200, 100),
+            "the row total is the authority; the lower snapshot adds nothing"
+        );
+
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.timestamp == 1_782_950_400_000),
+            "a snapshot that explains no new usage is not emitted at all"
+        );
+    }
+
+    /// Re-attribution only moves usage between days; it never creates or
+    /// destroys any. Summing every emitted message — the per-day increments
+    /// plus the remainder — reproduces the row's lifetime total exactly, with
+    /// `input + cache_read` compared against the row's input because the
+    /// normalizer moves the cached portion out of `input` into its own bucket.
+    ///
+    /// This invariant is what makes the placement change safe to reconcile:
+    /// the day a token is credited to changes, the total does not.
+    #[test]
+    fn re_attribution_conserves_the_row_lifetime_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("data.db");
+        let conn = create_copilot_desktop_db(&db_path);
+        insert_session(&conn, "session-1", "gpt-5.1-codex", 200, 100, 50, 20);
+        drop(conn);
+        write_events(
+            dir.path(),
+            "session-1",
+            &[
+                r#"{"type":"session.shutdown","data":{"shutdownType":"error","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"outputTokens":50,"cacheReadTokens":25,"cacheWriteTokens":0,"reasoningTokens":10}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01","timestamp":"2026-07-01T20:00:00.000Z","parentId":null}"#,
+                r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":150,"outputTokens":75,"cacheReadTokens":40,"cacheWriteTokens":0,"reasoningTokens":15}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":null}"#,
+            ],
+        );
+
+        let messages = parse_copilot_desktop_db(&db_path);
+
+        let sum = |pick: fn(&UnifiedMessage) -> i64| -> i64 { messages.iter().map(pick).sum() };
+        assert_eq!(
+            sum(|message| message.tokens.input) + sum(|message| message.tokens.cache_read),
+            200,
+            "input is conserved once the cached portion is added back"
+        );
+        assert_eq!(sum(|message| message.tokens.output), 100);
+        assert_eq!(sum(|message| message.tokens.cache_read), 50);
+        assert_eq!(sum(|message| message.tokens.reasoning), 20);
+
+        let mut days: Vec<i64> = messages.iter().map(|message| message.timestamp).collect();
+        days.sort_unstable();
+        assert_eq!(
+            days,
+            vec![1_782_909_296_000, 1_782_936_000_000, 1_782_950_400_000],
+            "the same total is spread over the creation day and both shutdown days"
         );
     }
 
