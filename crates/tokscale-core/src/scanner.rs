@@ -4007,6 +4007,14 @@ mod tests {
         let roots = prime_agent_session_roots_with_env_strategy(home.to_str().unwrap(), true);
         assert_eq!(roots[0], legacy_sessions);
         assert_eq!(roots[1], home.join("legacy/session-artifacts"));
+
+        // Match Prime Agent's `primary ?? legacy` environment lookup exactly:
+        // an explicitly empty primary value suppresses the legacy variable,
+        // then falls through to settings/default resolution.
+        env.set("PRIME_AGENT_SESSION_DIR", "");
+        let roots = prime_agent_session_roots_with_env_strategy(home.to_str().unwrap(), true);
+        assert_eq!(roots[0], home.join("custom-agent/sessions"));
+        assert_eq!(roots[1], home.join("custom-agent/session-artifacts"));
     }
 
     #[test]

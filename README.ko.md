@@ -1414,7 +1414,7 @@ AI 코딩 도구들은 크로스 플랫폼 위치에 세션 데이터를 저장�
 | Claude Code | `~/.claude/` | `%USERPROFILE%\.claude\` | 모든 플랫폼에서 동일한 경로 |
 | OpenClaw | `~/.openclaw/` (+ 레거시: `.clawdbot`, `.moltbot`, `.moldbot`) | `%USERPROFILE%\.openclaw\` (+ 레거시 경로) | 모든 플랫폼에서 동일한 경로 |
 | Codex CLI | `~/.codex/` | `%USERPROFILE%\.codex\` | `CODEX_HOME` 환경변수로 설정 가능 ([소스](https://github.com/openai/codex)) |
-| Prime Agent | `~/.prime/agent/` | `%USERPROFILE%\.prime\agent\` | 루트 세션 및 RLM 하위 세션; `settings.json`의 `sessionDir`, `PRIME_AGENT_CODING_AGENT_DIR` 또는 `PRIME_AGENT_SESSION_DIR`로 설정 가능 |
+| Prime Agent | `~/.prime/agent/` | `%USERPROFILE%\.prime\agent\` | 루트 세션 및 RLM 하위 세션; `settings.json`의 `sessionDir`, `PRIME_AGENT_CODING_AGENT_DIR`, `PRIME_AGENT_SESSION_DIR` 또는 레거시 `PRIME_AGENT_CODING_AGENT_SESSION_DIR`로 설정 가능 |
 | Copilot CLI | `~/.copilot/otel/ ` | `%USERPROFILE%\.copilot\otel\` | OTEL 파일 내보내기 필요; `COPILOT_OTEL_FILE_EXPORTER_PATH`도 자동 수집 |
 | Hermes Agent | `~/.hermes/` | `%USERPROFILE%\.hermes\` | `HERMES_HOME` 환경변수로 설정 가능 ([소스](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/developer-guide/session-storage.md)) |
 | Gemini CLI | `~/.gemini/` | `%USERPROFILE%\.gemini\` | `GEMINI_CLI_HOME` 환경변수로 설정 가능 |
@@ -1750,7 +1750,7 @@ Hermes는 세션 수준 사용량을 SQLite `sessions` 테이블에 저장합니
 
 ### Prime Agent
 
-위치: 루트 세션은 `~/.prime/agent/sessions/*.jsonl`, RLM 하위 세션은 `~/.prime/agent/session-artifacts/*/sub-*/*.jsonl`에 저장됩니다. 에이전트 루트는 `PRIME_AGENT_CODING_AGENT_DIR`로 이동할 수 있으며, `sessionDir` 설정 또는 `PRIME_AGENT_SESSION_DIR`로 세션 디렉터리를 별도로 이동할 수 있습니다.
+위치: 루트 세션은 `~/.prime/agent/sessions/*.jsonl`, RLM 하위 세션은 `~/.prime/agent/session-artifacts/*/sub-*/*.jsonl`에 저장됩니다. 에이전트 루트는 `PRIME_AGENT_CODING_AGENT_DIR`로 이동할 수 있으며, `sessionDir` 설정, `PRIME_AGENT_SESSION_DIR` 또는 레거시 `PRIME_AGENT_CODING_AGENT_SESSION_DIR`로 세션 디렉터리를 별도로 이동할 수 있습니다.
 
 Prime Agent는 Pi와 동일한 추가 전용 JSONL 메시지 형식을 사용합니다. Tokscale은 루트 세션과 하위 세션 파일을 별도 소스로 스캔하고 `child_usage_attributed` 장부 기록을 무시하여 RLM 하위 세션 토큰이 상위 집계와 하위 세션 자체 트랜스크립트에서 중복 계산되지 않도록 합니다. 이름이 지정된 RLM 세션은 에이전트 귀속 정보로 노출됩니다.
 

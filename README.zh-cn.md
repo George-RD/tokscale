@@ -1413,7 +1413,7 @@ AI 编程工具将会话数据存储在跨平台位置。大多数工具在所�
 | Claude Code | `~/.claude/` | `%USERPROFILE%\.claude\` | 所有平台使用相同路径 |
 | OpenClaw | `~/.openclaw/` (+ 旧版: `.clawdbot`, `.moltbot`, `.moldbot`) | `%USERPROFILE%\.openclaw\` (+ 旧版路径) | 所有平台使用相同路径 |
 | Codex CLI | `~/.codex/` | `%USERPROFILE%\.codex\` | 可通过 `CODEX_HOME` 环境变量配置（[源码](https://github.com/openai/codex)） |
-| Prime Agent | `~/.prime/agent/` | `%USERPROFILE%\.prime\agent\` | 根会话和 RLM 子会话；可通过 `settings.json` 中的 `sessionDir`、`PRIME_AGENT_CODING_AGENT_DIR` 或 `PRIME_AGENT_SESSION_DIR` 配置 |
+| Prime Agent | `~/.prime/agent/` | `%USERPROFILE%\.prime\agent\` | 根会话和 RLM 子会话；可通过 `settings.json` 中的 `sessionDir`、`PRIME_AGENT_CODING_AGENT_DIR`、`PRIME_AGENT_SESSION_DIR` 或旧版 `PRIME_AGENT_CODING_AGENT_SESSION_DIR` 配置 |
 | Copilot CLI | `~/.copilot/otel/` | `%USERPROFILE%\.copilot\otel\` | 需要 OTEL 文件导出；同时自动采集 `COPILOT_OTEL_FILE_EXPORTER_PATH` |
 | Hermes Agent | `~/.hermes/` | `%USERPROFILE%\.hermes\` | 可通过 `HERMES_HOME` 环境变量配置（[源码](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/developer-guide/session-storage.md)） |
 | Gemini CLI | `~/.gemini/` | `%USERPROFILE%\.gemini\` | 可通过 `GEMINI_CLI_HOME` 环境变量配置 |
@@ -1749,7 +1749,7 @@ Hermes 将会话级使用量存储在 SQLite `sessions` 表中。Tokscale 导入
 
 ### Prime Agent
 
-位置：根会话位于 `~/.prime/agent/sessions/*.jsonl`，RLM 子会话位于 `~/.prime/agent/session-artifacts/*/sub-*/*.jsonl`。可通过 `PRIME_AGENT_CODING_AGENT_DIR` 移动代理根目录，也可通过 `sessionDir` 设置或 `PRIME_AGENT_SESSION_DIR` 单独移动会话目录。
+位置：根会话位于 `~/.prime/agent/sessions/*.jsonl`，RLM 子会话位于 `~/.prime/agent/session-artifacts/*/sub-*/*.jsonl`。可通过 `PRIME_AGENT_CODING_AGENT_DIR` 移动代理根目录，也可通过 `sessionDir` 设置、`PRIME_AGENT_SESSION_DIR` 或旧版 `PRIME_AGENT_CODING_AGENT_SESSION_DIR` 单独移动会话目录。
 
 Prime Agent 使用与 Pi 相同的追加式 JSONL 消息格式。Tokscale 将根会话和子会话文件作为独立来源扫描，并忽略 `child_usage_attributed` 记账记录，从而避免 RLM 子会话的 Token 在父级汇总和子会话自身的会话记录中被重复计算。具名 RLM 会话的名称会作为 agent 归因信息展示。
 

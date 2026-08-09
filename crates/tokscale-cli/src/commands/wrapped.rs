@@ -2446,6 +2446,11 @@ mod tests {
     }
 
     #[test]
+    fn test_client_display_name_prime_agent() {
+        assert_eq!(client_display_name("prime-agent"), Some("Prime Agent"));
+    }
+
+    #[test]
     fn test_client_display_name_kilo() {
         assert_eq!(client_display_name("kilo"), Some("Kilo CLI"));
     }
@@ -2604,6 +2609,14 @@ mod tests {
         assert_eq!(
             client_logo_url("Pi"),
             Some("https://tokscale.ai/assets/logos/pi.png")
+        );
+    }
+
+    #[test]
+    fn test_client_logo_url_prime_agent() {
+        assert_eq!(
+            client_logo_url("Prime Agent"),
+            Some("https://github.com/PrimeIntellect-ai.png")
         );
     }
 

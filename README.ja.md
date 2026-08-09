@@ -1413,7 +1413,7 @@ AIコーディングツールはクロスプラットフォームの場所にセ
 | Claude Code | `~/.claude/` | `%USERPROFILE%\.claude\` | すべてのプラットフォームで同じパス |
 | OpenClaw | `~/.openclaw/` (+ レガシー: `.clawdbot`, `.moltbot`, `.moldbot`) | `%USERPROFILE%\.openclaw\` (+ レガシーパス) | すべてのプラットフォームで同じパス |
 | Codex CLI | `~/.codex/` | `%USERPROFILE%\.codex\` | `CODEX_HOME`環境変数で設定可能（[ソース](https://github.com/openai/codex)） |
-| Prime Agent | `~/.prime/agent/` | `%USERPROFILE%\.prime\agent\` | ルートセッションおよび RLM 子セッション。`settings.json` の `sessionDir`、`PRIME_AGENT_CODING_AGENT_DIR`、または `PRIME_AGENT_SESSION_DIR` で設定可能 |
+| Prime Agent | `~/.prime/agent/` | `%USERPROFILE%\.prime\agent\` | ルートセッションおよび RLM 子セッション。`settings.json` の `sessionDir`、`PRIME_AGENT_CODING_AGENT_DIR`、`PRIME_AGENT_SESSION_DIR`、またはレガシーの `PRIME_AGENT_CODING_AGENT_SESSION_DIR` で設定可能 |
 | Copilot CLI | `~/.copilot/otel/` | `%USERPROFILE%\.copilot\otel\` | OTELファイル書き出しが必要; `COPILOT_OTEL_FILE_EXPORTER_PATH`も自動取り込み |
 | Hermes Agent | `~/.hermes/` | `%USERPROFILE%\.hermes\` | `HERMES_HOME`環境変数で設定可能（[ソース](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/developer-guide/session-storage.md)） |
 | Gemini CLI | `~/.gemini/` | `%USERPROFILE%\.gemini\` | `GEMINI_CLI_HOME`環境変数で設定可能 |
@@ -1711,7 +1711,7 @@ HermesはSQLiteの`sessions`テーブルにセッションレベルの使用量�
 
 ### Prime Agent
 
-場所: ルートセッションは `~/.prime/agent/sessions/*.jsonl`、RLM 子セッションは `~/.prime/agent/session-artifacts/*/sub-*/*.jsonl` に保存されます。エージェントルートは `PRIME_AGENT_CODING_AGENT_DIR` で移動でき、`sessionDir` 設定または `PRIME_AGENT_SESSION_DIR` でセッションディレクトリだけを個別に移動できます。
+場所: ルートセッションは `~/.prime/agent/sessions/*.jsonl`、RLM 子セッションは `~/.prime/agent/session-artifacts/*/sub-*/*.jsonl` に保存されます。エージェントルートは `PRIME_AGENT_CODING_AGENT_DIR` で移動でき、`sessionDir` 設定、`PRIME_AGENT_SESSION_DIR`、またはレガシーの `PRIME_AGENT_CODING_AGENT_SESSION_DIR` でセッションディレクトリだけを個別に移動できます。
 
 Prime Agent は Pi と同じ追記専用 JSONL メッセージ形式を使用します。Tokscale はルートセッションと子セッションファイルを別々のソースとしてスキャンし、`child_usage_attributed` の会計レコードを無視するため、RLM 子セッションのトークンが親の集計と子自身のトランスクリプトで二重計上されることはありません。名前付き RLM セッションはエージェント帰属情報として扱われます。
 

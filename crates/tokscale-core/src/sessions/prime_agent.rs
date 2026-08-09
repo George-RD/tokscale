@@ -91,6 +91,25 @@ mod tests {
     }
 
     #[test]
+    fn copied_fork_history_without_response_or_event_timestamp_still_deduplicates() {
+        let original = session_file(
+            r#"{"type":"session","version":3,"id":"root-1","timestamp":"2026-08-08T00:00:00.000Z","cwd":"/tmp/project","rlmDepth":0}
+{"type":"message","id":"assistant-1","parentId":null,"message":{"role":"assistant","provider":"anthropic","model":"claude-opus-5","usage":{"input":100,"output":50,"cacheRead":20,"cacheWrite":10,"totalTokens":180}}}"#,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let fork = session_file(
+            r#"{"type":"session","version":3,"id":"fork-2","timestamp":"2026-08-08T01:00:00.000Z","cwd":"/tmp/project","parentSession":"/tmp/root.jsonl","rlmDepth":0}
+{"type":"message","id":"assistant-1","parentId":null,"message":{"role":"assistant","provider":"anthropic","model":"claude-opus-5","usage":{"input":100,"output":50,"cacheRead":20,"cacheWrite":10,"totalTokens":180}}}"#,
+        );
+
+        let original = parse_prime_agent_file(original.path());
+        let fork = parse_prime_agent_file(fork.path());
+
+        assert_ne!(original[0].timestamp, fork[0].timestamp);
+        assert_eq!(original[0].dedup_key, fork[0].dedup_key);
+    }
+
+    #[test]
     fn rejects_the_rlm_subagent_catalog_as_a_session() {
         let file = session_file(
             r#"{"type":"rlm_subagent","childId":"sub-deadbeef","sessionName":"worker","sessionFile":"/tmp/child.jsonl"}"#,

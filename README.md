@@ -1445,7 +1445,7 @@ AI coding tools store their session data in cross-platform locations. Most tools
 | Claude Code | `~/.claude/` | `%USERPROFILE%\.claude\` | Same path on all platforms |
 | OpenClaw | `~/.openclaw/` (+ legacy: `.clawdbot`, `.moltbot`, `.moldbot`) | `%USERPROFILE%\.openclaw\` (+ legacy paths) | Same path on all platforms |
 | Codex CLI | `~/.codex/` | `%USERPROFILE%\.codex\` | Configurable via `CODEX_HOME` env var ([source](https://github.com/openai/codex)) |
-| Prime Agent | `~/.prime/agent/` | `%USERPROFILE%\.prime\agent\` | Root sessions plus RLM child sessions; configurable via `sessionDir` in `settings.json`, `PRIME_AGENT_CODING_AGENT_DIR`, or `PRIME_AGENT_SESSION_DIR` |
+| Prime Agent | `~/.prime/agent/` | `%USERPROFILE%\.prime\agent\` | Root sessions plus RLM child sessions; configurable via `sessionDir` in `settings.json`, `PRIME_AGENT_CODING_AGENT_DIR`, `PRIME_AGENT_SESSION_DIR`, or legacy `PRIME_AGENT_CODING_AGENT_SESSION_DIR` |
 | Copilot CLI | `~/.copilot/otel/` | `%USERPROFILE%\.copilot\otel\` | Requires OTEL file export; also auto-ingests `COPILOT_OTEL_FILE_EXPORTER_PATH` |
 | Hermes Agent | `~/.hermes/` | `%USERPROFILE%\.hermes\` | Configurable via `HERMES_HOME` env var ([source](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/developer-guide/session-storage.md)) |
 | Gemini CLI | `~/.gemini/` | `%USERPROFILE%\.gemini\` | Configurable via `GEMINI_CLI_HOME` env var |
@@ -1781,7 +1781,7 @@ JSONL format with session header and message entries:
 
 ### Prime Agent
 
-Location: `~/.prime/agent/sessions/*.jsonl` for root sessions and `~/.prime/agent/session-artifacts/*/sub-*/*.jsonl` for RLM child sessions. The agent root can be moved with `PRIME_AGENT_CODING_AGENT_DIR`; the `sessionDir` setting or `PRIME_AGENT_SESSION_DIR` can move the session directory independently.
+Location: `~/.prime/agent/sessions/*.jsonl` for root sessions and `~/.prime/agent/session-artifacts/*/sub-*/*.jsonl` for RLM child sessions. The agent root can be moved with `PRIME_AGENT_CODING_AGENT_DIR`; the `sessionDir` setting, `PRIME_AGENT_SESSION_DIR`, or legacy `PRIME_AGENT_CODING_AGENT_SESSION_DIR` can move the session directory independently.
 
 Prime Agent uses the same append-only JSONL message format as Pi. Tokscale scans root and child session files as separate sources and ignores `child_usage_attributed` bookkeeping records, which prevents RLM child tokens from being counted both in the parent aggregate and in the child's own transcript. Named RLM sessions are exposed as agent attribution.
 

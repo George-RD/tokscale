@@ -282,11 +282,11 @@ fn parse_pi_format_file_inner(
                 .to_string(),
         };
 
-        let timestamp = entry
+        let recorded_timestamp = entry
             .timestamp
             .and_then(|ts| chrono::DateTime::parse_from_rfc3339(&ts).ok())
-            .map(|dt| dt.timestamp_millis())
-            .unwrap_or(fallback_timestamp);
+            .map(|dt| dt.timestamp_millis());
+        let timestamp = recorded_timestamp.unwrap_or(fallback_timestamp);
 
         // `usage.reasoning` is read but deliberately not mapped onto
         // `TokenBreakdown::reasoning`. In the Pi format reasoning tokens are a
@@ -320,8 +320,11 @@ fn parse_pi_format_file_inner(
                             .as_deref()
                             .filter(|id| !id.trim().is_empty())
                             .map(|id| {
+                                let stable_timestamp = recorded_timestamp
+                                    .map(|timestamp| timestamp.to_string())
+                                    .unwrap_or_else(|| "missing".to_string());
                                 format!(
-                                    "{namespace}:message:{id}:{timestamp}:{provider}:{model}:{}:{}:{}:{}",
+                                    "{namespace}:message:{id}:{stable_timestamp}:{provider}:{model}:{}:{}:{}:{}",
                                     unified.tokens.input,
                                     unified.tokens.output,
                                     unified.tokens.cache_read,
