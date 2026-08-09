@@ -1189,29 +1189,14 @@ fn render_selected_account(
         );
     }
     if lines.len() < detail_limit {
-        if let Some(account) = &selected.account {
-            push_kv_styled(
-                &mut lines,
-                app,
-                "Credential",
-                if account.is_active {
-                    "saved store, current Codex login"
-                } else {
-                    "saved store"
-                },
-                app.theme.secondary_text_style(),
-                inner.width as usize,
-            );
-        } else {
-            push_kv_styled(
-                &mut lines,
-                app,
-                "Credential",
-                "managed externally",
-                app.theme.secondary_text_style(),
-                inner.width as usize,
-            );
-        }
+        push_kv_styled(
+            &mut lines,
+            app,
+            "Credential",
+            &credential_detail(selected),
+            app.theme.secondary_text_style(),
+            inner.width as usize,
+        );
     }
     if lines.len() < detail_limit {
         if let Some(label) = credits_status_line(selected) {
@@ -1526,6 +1511,28 @@ fn selected_status_line(output: &UsageOutput) -> String {
     )
 }
 
+/// Name of the external tool that owns the credential, when the credential did
+/// not come from the saved store. Both the `Credential` detail row and the
+/// account actions row derive their wording from this so a single credential is
+/// never described two different ways.
+fn external_credential_manager(output: &UsageOutput) -> Option<&'static str> {
+    match output.credential_source.as_deref() {
+        Some("opencode") => Some("OpenCode"),
+        _ => None,
+    }
+}
+
+fn credential_detail(output: &UsageOutput) -> String {
+    match &output.account {
+        Some(account) if account.is_active => "saved store, current Codex login".to_string(),
+        Some(_) => "saved store".to_string(),
+        None => match external_credential_manager(output) {
+            Some(manager) => format!("managed by {manager}"),
+            None => "managed externally".to_string(),
+        },
+    }
+}
+
 fn selected_account_actions_line(
     app: &mut App,
     selected: &UsageOutput,
@@ -1558,10 +1565,11 @@ fn selected_account_actions_line(
         return Line::from(spans);
     }
 
-    Line::from(Span::styled(
-        "  Managed externally",
-        app.theme.subtle_text_style(),
-    ))
+    let label = match external_credential_manager(selected) {
+        Some(manager) => format!("  Managed by {manager}"),
+        None => "  Managed externally".to_string(),
+    };
+    Line::from(Span::styled(label, app.theme.subtle_text_style()))
 }
 
 fn account_plan_label(account: &str, plan: Option<&str>) -> String {
@@ -2509,6 +2517,7 @@ mod tests {
         UsageOutput {
             provider: provider.to_string(),
             account,
+            credential_source: None,
             plan: Some("Pro".to_string()),
             email: Some("user@example.com".to_string()),
             metrics: vec![UsageMetric {
@@ -2998,6 +3007,47 @@ mod tests {
         assert!(body.contains("Codex (personal)"), "{body}");
         assert!(body.contains("Use Account"), "{body}");
         assert!(body.contains("saved store"), "{body}");
+    }
+
+    #[test]
+    fn selected_opencode_fallback_names_its_external_credential_manager() {
+        let mut app = make_app();
+        let mut managed = output("Codex", None);
+        managed.credential_source = Some("opencode".to_string());
+        app.subscription_usage = vec![managed];
+
+        let body = render_body(&mut app, 150, 28);
+
+        assert!(body.contains("managed by OpenCode"), "{body}");
+        assert!(body.contains("Managed by OpenCode"), "{body}");
+        assert!(!body.contains("Managed externally"), "{body}");
+    }
+
+    #[test]
+    fn selected_account_actions_appear_only_for_saved_accounts() {
+        let mut app = make_app();
+        app.subscription_usage = vec![output(
+            "Codex",
+            Some(UsageAccount {
+                id: "acct_personal".to_string(),
+                label: Some("personal".to_string()),
+                is_active: false,
+            }),
+        )];
+
+        let saved = render_body(&mut app, 150, 28);
+
+        assert!(saved.contains("Use Account"), "{saved}");
+        assert!(saved.contains("Remove"), "{saved}");
+
+        let mut managed = output("Codex", None);
+        managed.credential_source = Some("opencode".to_string());
+        app.subscription_usage = vec![managed];
+
+        let external = render_body(&mut app, 150, 28);
+
+        assert!(!external.contains("Use Account"), "{external}");
+        assert!(!external.contains("Remove"), "{external}");
     }
 
     #[test]
@@ -3745,6 +3795,7 @@ mod tests {
                 label: None,
                 is_active: true,
             }),
+            credential_source: None,
             plan: Some("Pro".to_string()),
             email: Some("secret@example.com".to_string()),
             metrics: vec![UsageMetric {
