@@ -191,6 +191,35 @@ fn shutdown_deltas(
         deltas.push(snapshot.with_buckets(delta));
     }
 
+    // A later reset can reveal a higher cache-read composition without any
+    // inclusive-input growth. The cap above prevents minting tokens, then this
+    // pass uses spare cache capacity in already-authorized input increments so
+    // the emitted bucket totals still match the final cache high-water. Newest
+    // authorized increments receive the reclassification first; no increment
+    // can hold more cache reads than inclusive input.
+    for (model, peak) in &peaks {
+        let target_cache = peak[2].min(peak[0]);
+        let assigned_cache: i64 = deltas
+            .iter()
+            .filter(|delta| delta.model == *model)
+            .map(|delta| delta.cache_read)
+            .sum();
+        let mut remaining_cache = target_cache.saturating_sub(assigned_cache);
+        for delta in deltas
+            .iter_mut()
+            .rev()
+            .filter(|delta| delta.model == *model)
+        {
+            let capacity = delta.input.saturating_sub(delta.cache_read);
+            let reassigned = capacity.min(remaining_cache);
+            delta.cache_read = delta.cache_read.saturating_add(reassigned);
+            remaining_cache = remaining_cache.saturating_sub(reassigned);
+            if remaining_cache == 0 {
+                break;
+            }
+        }
+    }
+
     // Every model's peak is the highest total it was ever observed holding, so
     // summing the peaks is what the snapshots account for whether or not each
     // one was emitted. Using the emitted deltas instead would hand a swallowed
@@ -1189,6 +1218,14 @@ mod tests {
         assert_eq!(
             total_input, 100,
             "the row lifetime input remains authoritative"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.tokens.cache_read)
+                .sum::<i64>(),
+            90,
+            "the final cache high-water is preserved without increasing total input"
         );
         assert!(
             !messages

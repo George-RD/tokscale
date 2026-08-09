@@ -88,7 +88,10 @@ impl SessionBlock {
             .reasoning
             .saturating_add(span.msg.tokens.reasoning);
         self.cost += span.msg.cost;
-        self.message_count += span.msg.message_count.max(1);
+        // Zero is intentional for attribution fragments split from one
+        // authoritative source row; default construction already supplies one
+        // for ordinary messages, so coercing zero here inflates session counts.
+        self.message_count += span.msg.message_count.max(0);
     }
 }
 
@@ -547,6 +550,23 @@ mod tests {
         assert_eq!(result[1].active_duration_ms, 0);
         assert_eq!(result[1].wall_duration_ms, 0);
         assert_eq!(result[1].message_count, 1);
+    }
+
+    #[test]
+    fn test_sessionize_preserves_count_neutral_split_fragments() {
+        let mut counted = make_msg("copilot", "session-1", 1_000_000);
+        counted.message_count = 1;
+        let mut split_model = make_msg("copilot", "session-1", 1_010_000);
+        split_model.message_count = 0;
+        let mut residual = make_msg("copilot", "session-1", 1_020_000);
+        residual.message_count = 0;
+
+        let result = sessionize(&[counted, split_model, residual], DEFAULT_IDLE_GAP_MS);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].message_count, 1);
+        let metrics = compute_time_metrics(&result, DEFAULT_IDLE_GAP_MS);
+        assert_eq!(metrics.session_count, 1);
     }
 
     #[test]
