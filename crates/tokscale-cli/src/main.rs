@@ -1932,6 +1932,14 @@ impl ResolvedReportDate {
         let scanner_settings = tui::settings::load_scanner_settings_for_home(home_dir);
         let current_date =
             tokscale_core::BucketTimezone::from_scanner_settings(&scanner_settings).today();
+        Self::from_current_date(date, scanner_settings, current_date)
+    }
+
+    fn from_current_date(
+        date: &DateRangeFlags,
+        scanner_settings: tokscale_core::ScannerSettings,
+        current_date: chrono::NaiveDate,
+    ) -> Self {
         let (since, until) = build_date_filter_for_date(date, current_date);
         let year = normalize_year_filter(date);
         let date_range = get_date_range_label_for_date(date, current_date);
@@ -7441,8 +7449,18 @@ mod tests {
             month: true,
             ..DateRangeFlags::default()
         };
-        let kiritimati_report_date = ResolvedReportDate::new(&month, &kiritimati_home_path);
-        let niue_report_date = ResolvedReportDate::new(&month, &niue_home_path);
+        let kiritimati_settings =
+            tui::settings::load_scanner_settings_for_home(&kiritimati_home_path);
+        let niue_settings = tui::settings::load_scanner_settings_for_home(&niue_home_path);
+        let kiritimati_fixed_date = chrono::NaiveDate::from_ymd_opt(2026, 1, 31).unwrap();
+        let niue_fixed_date = chrono::NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
+        let kiritimati_report_date = ResolvedReportDate::from_current_date(
+            &month,
+            kiritimati_settings,
+            kiritimati_fixed_date,
+        );
+        let niue_report_date =
+            ResolvedReportDate::from_current_date(&month, niue_settings, niue_fixed_date);
         let report_settings = tui::settings::load_scanner_settings_for_home(&kiritimati_home_path);
 
         assert_eq!(
@@ -7460,12 +7478,12 @@ mod tests {
             Some("Pacific/Kiritimati"),
             "report must rebucket sessions with the --home profile's timezone"
         );
-        let expected_kiritimati = kiritimati.to_string();
-        let expected_niue = niue.to_string();
-        let expected_kiritimati_start = kiritimati.with_day(1).unwrap().to_string();
-        let expected_niue_start = niue.with_day(1).unwrap().to_string();
-        let expected_kiritimati_label = kiritimati.format("%B %Y").to_string();
-        let expected_niue_label = niue.format("%B %Y").to_string();
+        let expected_kiritimati = kiritimati_fixed_date.to_string();
+        let expected_niue = niue_fixed_date.to_string();
+        let expected_kiritimati_start = kiritimati_fixed_date.with_day(1).unwrap().to_string();
+        let expected_niue_start = niue_fixed_date.with_day(1).unwrap().to_string();
+        let expected_kiritimati_label = kiritimati_fixed_date.format("%B %Y").to_string();
+        let expected_niue_label = niue_fixed_date.format("%B %Y").to_string();
         assert_eq!(
             kiritimati_report_date.since.as_deref(),
             Some(expected_kiritimati_start.as_str()),

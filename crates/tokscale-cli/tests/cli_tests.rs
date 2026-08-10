@@ -3923,8 +3923,25 @@ fn test_monthly_light_output() {
 }
 
 #[test]
-fn test_monthly_light_title_includes_year_filter() {
+fn test_monthly_light_title_uses_pinned_bucket_month() {
     let tmp = create_temp_fixture_dir();
+    let config = tmp.path().join(if cfg!(windows) {
+        "AppData/Roaming/tokscale"
+    } else {
+        ".config/tokscale"
+    });
+    fs::create_dir_all(&config).unwrap();
+    fs::write(
+        config.join("settings.json"),
+        r#"{"scanner":{"bucketTimezone":"Pacific/Kiritimati"}}"#,
+    )
+    .unwrap();
+    let expected_month =
+        tokscale_core::BucketTimezone::from_pinned_name(Some("Pacific/Kiritimati"))
+            .today()
+            .format("%B %Y")
+            .to_string();
+
     cmd_with_home(tmp.path())
         .args([
             "monthly",
@@ -3932,14 +3949,13 @@ fn test_monthly_light_title_includes_year_filter() {
             "--client",
             "opencode",
             "--no-spinner",
-            "--year",
-            "2024",
+            "--month",
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "Monthly Token Usage Report (2024)",
-        ));
+        .stdout(predicate::str::contains(format!(
+            "Monthly Token Usage Report ({expected_month})"
+        )));
 }
 
 #[test]
