@@ -8,6 +8,8 @@
 //! (`if msg.cost <= 0.0 { apply_pricing_if_available(...) }`) to honour
 //! `usage.cost.total` verbatim. This test is the integration-level proof.
 
+mod common;
+
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -49,7 +51,7 @@ const EXPECTED_EMBEDDED_COST: f64 = 0.3;
 #[tokio::test]
 async fn test_gjc_cost_precedence_end_to_end() {
     // ── Build a temporary home directory with the gjc session file ──────────
-    let home_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+    let home_dir = common::temp_home();
     let home_path = home_dir.path();
 
     // Place the session file at <home>/.gjc/agent/sessions/<slug>/sess.jsonl
@@ -191,7 +193,7 @@ async fn test_gjc_workspace_key_from_dashed_slug() {
 
     // End-to-end: a session whose cwd header is set drives the message
     // workspace key/label, taking precedence over the on-disk dash-slug dir.
-    let home_dir = tempfile::TempDir::new().unwrap();
+    let home_dir = common::temp_home();
     let home_path = home_dir.path();
     let session_dir = home_path
         .join(".gjc")
@@ -235,7 +237,7 @@ async fn test_gjc_workspace_key_from_dashed_slug() {
 /// their (distinct) messages counted.
 #[tokio::test]
 async fn test_gjc_recursive_glob_depth1_and_depth2() {
-    let home_dir = tempfile::TempDir::new().unwrap();
+    let home_dir = common::temp_home();
     let home_path = home_dir.path();
     let slug_dir = home_path
         .join(".gjc")
@@ -310,7 +312,7 @@ async fn test_gjc_recursive_glob_depth1_and_depth2() {
 /// ONCE via should_keep_deduped_message.
 #[tokio::test]
 async fn test_gjc_message_dedup_across_replayed_files() {
-    let home_dir = tempfile::TempDir::new().unwrap();
+    let home_dir = common::temp_home();
     let home_path = home_dir.path();
     let slug_dir = home_path
         .join(".gjc")
