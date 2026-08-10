@@ -11,29 +11,42 @@ struct TestConfigIsolation {
 
 static TEST_CONFIG_ISOLATION: OnceLock<TestConfigIsolation> = OnceLock::new();
 
-/// Pin this integration-test process to one durable scratch config root.
+/// Initialize the integration binary's forced config isolation before the Rust
+/// test harness starts worker threads.
 ///
-/// `TOKSCALE_CONFIG_DIR` is process-global, so per-test guards can race when
-/// the test harness runs cases concurrently. A process-lifetime `OnceLock`
-/// makes initialization atomic and keeps the `TempDir` alive until exit.
+/// This process-lifetime redirect is deliberate: per-test environment guards
+/// race when tests execute concurrently, while restoring at process exit has no
+/// observable benefit. Every test in a binary that imports this module uses the
+/// same scratch cache, including future tests that forget to call `temp_home`.
+#[ctor::ctor]
+fn initialize_config_isolation() {
+    let previously_resolved_config_dir = tokscale_core::paths::get_config_dir();
+    let root = tempfile::TempDir::new().expect("create integration-test config root");
+    let config_dir = root.path().join("tokscale-config");
+    std::fs::create_dir_all(&config_dir).expect("create integration-test config directory");
+
+    // SAFETY: `ctor` runs before the test harness starts any worker threads, so
+    // no concurrent environment readers exist. The value is intentionally
+    // immutable for the remainder of this short-lived integration process.
+    unsafe { std::env::set_var("TOKSCALE_CONFIG_DIR", &config_dir) };
+
+    let isolation = TestConfigIsolation {
+        _root: root,
+        config_dir,
+        previously_resolved_config_dir,
+    };
+    assert!(
+        TEST_CONFIG_ISOLATION.set(isolation).is_ok(),
+        "integration-test config isolation initialized more than once"
+    );
+}
+
+/// Return the process-lifetime scratch config root and verify the cache resolver
+/// cannot escape it.
 pub fn isolate_config_dir() -> &'static Path {
-    let isolation = TEST_CONFIG_ISOLATION.get_or_init(|| {
-        let previously_resolved_config_dir = tokscale_core::paths::get_config_dir();
-        let root = tempfile::TempDir::new().expect("create integration-test config root");
-        let config_dir = root.path().join("tokscale-config");
-        std::fs::create_dir_all(&config_dir).expect("create integration-test config directory");
-
-        // SAFETY: initialization is serialized by OnceLock, every test in this
-        // process calls this helper before invoking a cache-aware core API, and
-        // the override is intentionally never restored before process exit.
-        unsafe { std::env::set_var("TOKSCALE_CONFIG_DIR", &config_dir) };
-
-        TestConfigIsolation {
-            _root: root,
-            config_dir,
-            previously_resolved_config_dir,
-        }
-    });
+    let isolation = TEST_CONFIG_ISOLATION
+        .get()
+        .expect("config isolation constructor must run before tests");
 
     let resolved = tokscale_core::paths::get_config_dir();
     assert_eq!(
