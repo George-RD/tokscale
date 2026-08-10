@@ -145,17 +145,21 @@ pub(crate) fn file_modified_timestamp_ms(path: &Path) -> i64 {
 }
 
 /// Open a SQLite file for read-only access with no mutex (single-threaded parser use).
-pub(crate) fn open_readonly_sqlite_result(path: &Path) -> rusqlite::Result<Connection> {
+///
+/// The `NO_MUTEX` flag is safe here because each parser uses its connection on
+/// one thread. Returning the original `rusqlite::Error` lets callers preserve
+/// useful open-failure context in their logs.
+pub(crate) fn open_readonly_sqlite(path: &Path) -> rusqlite::Result<Connection> {
     Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
 }
 
-/// Open a SQLite file for read-only access with no mutex (single-threaded parser use).
+/// Open a SQLite file for read-only access, discarding open errors.
 /// Returns `None` if the file cannot be opened — the caller treats that as "no sessions".
-pub(crate) fn open_readonly_sqlite(path: &Path) -> Option<Connection> {
-    open_readonly_sqlite_result(path).ok()
+pub(crate) fn open_readonly_sqlite_opt(path: &Path) -> Option<Connection> {
+    open_readonly_sqlite(path).ok()
 }
 
 /// Read a file into bytes, returning `None` on any I/O error instead of propagating.
@@ -251,25 +255,41 @@ mod tests {
     }
 
     #[test]
-    fn open_readonly_sqlite_result_uses_read_only_flags() {
+    fn open_readonly_sqlite_rejects_writes_but_reads_existing_data() {
+        use rusqlite::ffi::ErrorCode;
+
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("state.db");
         let conn = Connection::open(&db_path).unwrap();
         conn.execute("CREATE TABLE sessions (id TEXT)", []).unwrap();
         drop(conn);
 
-        let conn = open_readonly_sqlite_result(&db_path).unwrap();
-        assert!(conn
+        let conn = open_readonly_sqlite(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let error = conn
             .execute("INSERT INTO sessions (id) VALUES ('session')", [])
-            .is_err());
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            rusqlite::Error::SqliteFailure(error, _) if error.code == ErrorCode::ReadOnly
+        ));
     }
 
     #[test]
-    fn open_readonly_sqlite_result_preserves_open_error() {
+    fn open_readonly_sqlite_preserves_cannot_open_error() {
+        use rusqlite::ffi::ErrorCode;
+
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("missing.db");
-        let error = open_readonly_sqlite_result(&db_path).unwrap_err();
+        let error = open_readonly_sqlite(&db_path).unwrap_err();
 
-        assert!(error.to_string().contains("unable to open database file"));
+        assert!(matches!(
+            error,
+            rusqlite::Error::SqliteFailure(error, _) if error.code == ErrorCode::CannotOpen
+        ));
     }
 }

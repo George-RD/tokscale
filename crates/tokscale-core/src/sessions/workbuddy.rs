@@ -4,7 +4,7 @@
 //! Older installs also expose an aggregate `~/.workbuddy/workbuddy.db`; that
 //! database is kept as a fallback when detailed token sources are unavailable.
 
-use super::utils::open_readonly_sqlite_result;
+use super::utils::open_readonly_sqlite;
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::{provider_identity, TokenBreakdown};
 use std::path::Path;
@@ -42,7 +42,7 @@ struct WorkBuddyUsageRow {
 }
 
 pub fn parse_workbuddy_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
-    let conn = match open_readonly_sqlite_result(db_path) {
+    let conn = match open_readonly_sqlite(db_path) {
         Ok(conn) => conn,
         Err(err) => {
             warn!(

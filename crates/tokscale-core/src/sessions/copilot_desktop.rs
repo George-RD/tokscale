@@ -3,7 +3,7 @@
 //! The macOS desktop app stores aggregate token totals in `~/.copilot/data.db`
 //! and per-session event metadata in `~/.copilot/session-state/{session_id}`.
 
-use super::utils::{lossy_lines, open_readonly_sqlite_result};
+use super::utils::{lossy_lines, open_readonly_sqlite};
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::provider_identity::inferred_provider_from_model;
 use chrono::{DateTime, NaiveDateTime};
@@ -239,7 +239,7 @@ fn shutdown_deltas(
 }
 
 pub fn parse_copilot_desktop_db(db_path: &Path) -> Vec<UnifiedMessage> {
-    let conn = match open_readonly_sqlite_result(db_path) {
+    let conn = match open_readonly_sqlite(db_path) {
         Ok(conn) => conn,
         Err(err) => {
             warn!(

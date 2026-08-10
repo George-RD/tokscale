@@ -9,7 +9,7 @@
 //! ACP agents are billed and logged by their own providers/CLIs, and counting
 //! their Zed UI rows would duplicate those sources.
 
-use super::utils::{open_readonly_sqlite_result, parse_timestamp_str};
+use super::utils::{open_readonly_sqlite, parse_timestamp_str};
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::TokenBreakdown;
 use rusqlite::Connection;
@@ -34,7 +34,7 @@ struct ZedThreadRow {
 }
 
 pub fn parse_zed_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
-    let conn = match open_readonly_sqlite_result(db_path) {
+    let conn = match open_readonly_sqlite(db_path) {
         Ok(conn) => conn,
         Err(err) => {
             warn!(

@@ -13,9 +13,7 @@
 //! estimated from context_usage_percentage * context_window (input) and
 //! response_size / 4 (output).
 
-use super::utils::{
-    back_anchor_timestamp, file_modified_timestamp_ms, open_readonly_sqlite_result,
-};
+use super::utils::{back_anchor_timestamp, file_modified_timestamp_ms, open_readonly_sqlite};
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::TokenBreakdown;
 use serde::Deserialize;
@@ -1270,7 +1268,7 @@ pub(crate) fn suppress_snapshots_covered_by_executions(
 }
 
 pub fn parse_kiro_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
-    let conn = match open_readonly_sqlite_result(db_path) {
+    let conn = match open_readonly_sqlite(db_path) {
         Ok(c) => c,
         Err(err) => {
             warn!(
