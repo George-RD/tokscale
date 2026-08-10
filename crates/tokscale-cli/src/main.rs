@@ -1993,15 +1993,13 @@ impl LocalReportContext {
         resolved_date: ResolvedReportDate,
         spinner_message: Option<&'static str>,
     ) -> Self {
-        let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
-        let (had_cursor_cache, (spinner, cursor_sync_result)) = sample_cursor_cache_before_sync(
-            || has_cursor_usage_cache_for_report(&home_dir),
-            || {
-                let spinner = spinner_message.map(LightSpinner::start);
-                let cursor_sync_result = auto_sync_cursor_for_local_report(&home_dir, &clients);
-                (spinner, cursor_sync_result)
-            },
-        );
+        let (had_cursor_cache, explicit_cursor_filter, (spinner, cursor_sync_result)) =
+            prepare_cursor_report_setup(
+                || has_cursor_usage_cache_for_report(&home_dir),
+                || client_filter_explicitly_requests_cursor(&clients),
+                || spinner_message.map(LightSpinner::start),
+                || auto_sync_cursor_for_local_report(&home_dir, &clients),
+            );
         let cursor_setup_warnings = setup_warnings_for_report(&home_dir, &clients);
 
         Self {
@@ -2059,14 +2057,27 @@ impl LocalReportContext {
     }
 }
 
-fn sample_cursor_cache_before_sync<FCache, FSync, T>(sample_cache: FCache, sync: FSync) -> (bool, T)
+fn prepare_cursor_report_setup<FCache, FExplicit, FSpinner, FSync, Spinner, Sync>(
+    sample_cache: FCache,
+    explicit_filter: FExplicit,
+    spinner: FSpinner,
+    sync: FSync,
+) -> (bool, bool, (Spinner, Sync))
 where
     FCache: FnOnce() -> bool,
-    FSync: FnOnce() -> T,
+    FExplicit: FnOnce() -> bool,
+    FSpinner: FnOnce() -> Spinner,
+    FSync: FnOnce() -> Sync,
 {
     let had_cursor_cache = sample_cache();
+    let explicit_cursor_filter = explicit_filter();
+    let spinner = spinner();
     let sync_result = sync();
-    (had_cursor_cache, sync_result)
+    (
+        had_cursor_cache,
+        explicit_cursor_filter,
+        (spinner, sync_result),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7510,12 +7521,20 @@ mod tests {
     }
 
     #[test]
-    fn test_cursor_cache_is_sampled_before_sync() {
+    fn test_cursor_setup_preserves_cache_before_sync_order() {
         let events = std::cell::RefCell::new(Vec::new());
-        let (had_cache, sync_result) = sample_cursor_cache_before_sync(
+        let (had_cache, explicit_filter, (spinner, sync_result)) = prepare_cursor_report_setup(
             || {
                 events.borrow_mut().push("sample");
                 true
+            },
+            || {
+                events.borrow_mut().push("explicit");
+                false
+            },
+            || {
+                events.borrow_mut().push("spinner");
+                7
             },
             || {
                 events.borrow_mut().push("sync");
@@ -7524,8 +7543,10 @@ mod tests {
         );
 
         assert!(had_cache);
+        assert!(!explicit_filter);
+        assert_eq!(spinner, 7);
         assert_eq!(sync_result, 42);
-        assert_eq!(*events.borrow(), ["sample", "sync"]);
+        assert_eq!(*events.borrow(), ["sample", "explicit", "spinner", "sync"]);
     }
 
     #[test]
