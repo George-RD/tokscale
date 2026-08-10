@@ -268,11 +268,7 @@ fn sum_request_token_usage(value: Option<&Value>) -> (TokenBreakdown, i32) {
         if usage.total() <= 0 {
             continue;
         }
-        total.input = total.input.saturating_add(usage.input);
-        total.output = total.output.saturating_add(usage.output);
-        total.cache_read = total.cache_read.saturating_add(usage.cache_read);
-        total.cache_write = total.cache_write.saturating_add(usage.cache_write);
-        total.reasoning = total.reasoning.saturating_add(usage.reasoning);
+        total += &usage;
         count = count.saturating_add(1);
     }
 
