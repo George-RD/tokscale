@@ -2986,10 +2986,18 @@ fn aggregate_model_usage_entries_with_rollup(
     let mut model_map: HashMap<String, ModelUsage> = HashMap::new();
     let mut labeler = WorkspaceLabeler::default();
 
+    // Bucketing a workspace resolves its label, which reads the filesystem. Every
+    // other grouping discards that label a few lines below, so skip the work rather
+    // than paying it on `tokscale --light`, `monthly`, and every TUI refresh.
+    let needs_workspace = matches!(group_by, GroupBy::WorkspaceModel);
+
     for msg in messages {
         let normalized = model_name_for_grouping(&msg.client, &msg.provider_id, &msg.model_id);
-        let (workspace_group_key, workspace_key, workspace_label) =
-            workspace_bucket(&msg, rollup, &mut labeler);
+        let (workspace_group_key, workspace_key, workspace_label) = if needs_workspace {
+            workspace_bucket(&msg, rollup, &mut labeler)
+        } else {
+            (String::new(), None, String::new())
+        };
         let key = match group_by {
             GroupBy::Model => normalized.clone(),
             GroupBy::ClientModel => format!("{}:{}", msg.client, normalized),

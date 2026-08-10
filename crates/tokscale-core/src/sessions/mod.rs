@@ -643,12 +643,16 @@ fn resolve_slug_under(dir: &Path, remaining: &str) -> Option<String> {
     let mut candidates: Vec<String> = std::fs::read_dir(dir)
         .ok()?
         .flatten()
-        // `entry.path()` follows symlinks where `entry.file_type()` would not.
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        // Name filter first: it is pure string work, and it rejects nearly every
+        // entry in a large directory. The `is_dir` check below costs a `stat` per
+        // survivor, so ordering it second keeps the syscalls proportional to
+        // matches rather than to directory size.
+        .filter(|name| slug_matches_prefix(remaining, name))
+        // `Path::is_dir` follows symlinks where `DirEntry::file_type` would not.
         // Symlinked directories are load-bearing here: macOS reaches temp dirs
         // through `/var -> /private/var`, and users symlink project roots.
-        .filter(|entry| entry.path().is_dir())
-        .map(|entry| entry.file_name().to_string_lossy().to_string())
-        .filter(|name| slug_matches_prefix(remaining, name))
+        .filter(|name| dir.join(name).is_dir())
         .collect();
     // Ties are real: `a.b` and `a-b` encode identically and nothing on disk
     // distinguishes them, so order deterministically instead of trusting
@@ -791,6 +795,30 @@ mod tests {
 
         let decoded = decode_claude_project_slug(&slug_for(&real))
             .expect("slug should resolve to the directory it was built from");
+
+        assert_eq!(
+            std::fs::canonicalize(decoded).unwrap(),
+            std::fs::canonicalize(&real).unwrap()
+        );
+    }
+
+    #[test]
+    fn decode_claude_project_slug_handles_non_ascii_directory_names() {
+        // `slugify_path_segment` maps each non-alphanumeric CHAR to one '-', so a
+        // multi-byte name encodes SHORTER than its byte length ("café" is 5 bytes
+        // and encodes to "caf-" at 4; "日本語" is 9 and encodes to "---" at 3).
+        // `resolve_slug_under` then advances by the ENCODED length and slices
+        // `&remaining[consumed..]`, which is a byte index — so this pins that the
+        // walk stays aligned and never slices mid-character. What keeps it safe is
+        // `slug_matches_prefix`: it only admits a candidate whose encoded form is
+        // an ASCII prefix of `remaining`, so `consumed` always lands on a char
+        // boundary. Without that guard this input would panic rather than degrade.
+        let (_temp, root) = canonical_tempdir();
+        let real = root.join("café/日本語/my-app");
+        std::fs::create_dir_all(&real).unwrap();
+
+        let decoded = decode_claude_project_slug(&slug_for(&real))
+            .expect("non-ASCII directory names must still resolve");
 
         assert_eq!(
             std::fs::canonicalize(decoded).unwrap(),

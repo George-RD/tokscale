@@ -470,8 +470,16 @@ impl DataLoader {
             let normalized_model =
                 model_name_for_grouping(&msg.client, &msg.provider_id, &msg.model_id);
             let model_key = normalize_model_for_grouping(&msg.model_id);
-            let (workspace_group_key, workspace_key, workspace_label) =
-                tokscale_core::workspace_bucket(msg, self.worktree_rollup, &mut workspace_labeler);
+            // Resolving a workspace label reads the filesystem, and every grouping
+            // except this one throws it away — the TUI defaults to ClientModel and
+            // auto-refreshes, so paying it unconditionally is pure waste.
+            let (workspace_group_key, workspace_key, workspace_label) = if *group_by
+                == GroupBy::WorkspaceModel
+            {
+                tokscale_core::workspace_bucket(msg, self.worktree_rollup, &mut workspace_labeler)
+            } else {
+                (String::new(), None, String::new())
+            };
             let key = match group_by {
                 GroupBy::Model => normalized_model.clone(),
                 GroupBy::ClientModel => format!("{}:{}", msg.client, normalized_model),

@@ -11,25 +11,36 @@ use super::widgets::{
 use crate::tui::app::{App, SortDirection, SortField};
 use tokscale_core::GroupBy;
 
-/// Floor for the Workspace column. A `repo ⑃ worktree` label needs far more than
-/// the model column's share, so it takes `Min` and the rest of the row is fixed.
-const WORKSPACE_COLUMN_MIN_WIDTH: u16 = 28;
+/// Width the Workspace column gets when the row has no spare cells: what every
+/// other grouping's second column gets, so nothing is taken from its neighbors.
+const WORKSPACE_COLUMN_BASE_WIDTH: u16 = 18;
 
-/// Every fixed-width column in the workspace layout, in render order. Kept as
-/// data so [`workspace_column_width`] derives the leftover width from the same
-/// numbers the `widths` vector below uses — a hand-summed constant silently
-/// drifts the moment a column is added or resized.
-const WORKSPACE_LAYOUT_FIXED_COLUMNS: [u16; 12] = [3, 24, 16, 14, 10, 10, 12, 12, 10, 10, 10, 10];
+/// Width the Workspace column gets once the row has surplus to spend.
+///
+/// Enough for `repo ⑃ worktree` on a maximized terminal, which is the case the
+/// truncated-label bug was actually reported from.
+const WORKSPACE_COLUMN_WIDE_WIDTH: u16 = 44;
 
-/// Width available to the flexible Workspace column in a table of `total` cells.
-fn workspace_column_width(total: u16) -> usize {
-    let fixed: u16 = WORKSPACE_LAYOUT_FIXED_COLUMNS.iter().sum();
-    // ratatui puts one cell of spacing between adjacent columns: one gap per
-    // fixed column, since the Workspace column sits beside each of them.
-    let gaps = WORKSPACE_LAYOUT_FIXED_COLUMNS.len() as u16;
-    total
-        .saturating_sub(fixed + gaps)
-        .max(WORKSPACE_COLUMN_MIN_WIDTH) as usize
+/// Inner width at which the row first has cells to spare.
+///
+/// Below this every column is at its minimum and the layout is zero-sum: widening
+/// Workspace can only come out of Cost (clipping a dollar figure) or Model
+/// (collapsing it to 4 cells), which just relocates the unreadable-truncation bug
+/// instead of fixing it. Measured: the Model column sits at exactly its `Min(20)`
+/// up to 173 and only starts growing at 174, so that is where surplus begins.
+const WORKSPACE_SURPLUS_MIN_WIDTH: u16 = 174;
+
+/// Cells the Workspace column gets for a table rendered into `total`.
+///
+/// Deliberately a fixed `Length` at both sizes rather than a `Min`: `Min` outranks
+/// `Length` in ratatui's solver, so a flexible workspace column steals from its
+/// neighbors on any row that cannot satisfy everyone.
+fn workspace_column_width(total: u16) -> u16 {
+    if total >= WORKSPACE_SURPLUS_MIN_WIDTH {
+        WORKSPACE_COLUMN_WIDE_WIDTH
+    } else {
+        WORKSPACE_COLUMN_BASE_WIDTH
+    }
 }
 
 fn workspace_label(model: &crate::tui::data::ModelUsage) -> &str {
@@ -191,7 +202,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                     Cell::from(format!("{}", idx + 1)).style(Style::default().fg(theme_muted)),
                     Cell::from(truncate_to_width(
                         workspace_label(model),
-                        workspace_column_width(inner.width),
+                        workspace_column_width(inner.width) as usize,
                     ))
                     .style(
                         Style::default()
@@ -272,18 +283,24 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Percentage(25),
         ]
     } else if group_by == GroupBy::WorkspaceModel {
-        // Workspace is the row's identity under this grouping, so it gets the
-        // flexible column and the model name a fixed one -- the reverse of every
-        // other layout. `repo ⑃ worktree` labels are long, and a fixed 18 cells
-        // clipped them back to an indistinguishable shared prefix.
-        let mut widths = vec![Constraint::Length(WORKSPACE_LAYOUT_FIXED_COLUMNS[0])];
-        widths.push(Constraint::Min(WORKSPACE_COLUMN_MIN_WIDTH));
-        widths.extend(
-            WORKSPACE_LAYOUT_FIXED_COLUMNS[1..]
-                .iter()
-                .map(|w| Constraint::Length(*w)),
-        );
-        widths
+        // Same shape as the default layout, with a wider Workspace column once the
+        // row has surplus cells to give it. Model keeps the flexible slot so the
+        // workspace column can never widen at Cost's expense.
+        vec![
+            Constraint::Length(3),
+            Constraint::Length(workspace_column_width(inner.width)),
+            Constraint::Min(20),
+            Constraint::Length(16),
+            Constraint::Length(14),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+        ]
     } else {
         vec![
             Constraint::Length(3),
@@ -331,23 +348,115 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
 mod tests {
     use super::*;
 
+    /// Column widths for the workspace layout at a given inner width, mirroring
+    /// the `widths` vector in `render`.
+    fn workspace_layout_at(total: u16) -> Vec<u16> {
+        use ratatui::layout::Layout;
+        let widths = vec![
+            Constraint::Length(3),
+            Constraint::Length(workspace_column_width(total)),
+            Constraint::Min(20),
+            Constraint::Length(16),
+            Constraint::Length(14),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+        ];
+        Layout::horizontal(widths)
+            .spacing(1)
+            .split(Rect::new(0, 0, total, 1))
+            .iter()
+            .map(|r| r.width)
+            .collect()
+    }
+
+    /// The workspace layout as it stood before this change: Workspace pinned to 18
+    /// at every width. It is the correct bar to clear — the default (non-workspace)
+    /// layout has one fewer wide column, so it is not comparable, and holding this
+    /// layout to it would flag a 1-cell difference at width 84 that predates this
+    /// change and is inherent to rendering a Workspace column at all.
+    fn previous_workspace_layout_at(total: u16) -> Vec<u16> {
+        use ratatui::layout::Layout;
+        let widths = vec![
+            Constraint::Length(3),
+            Constraint::Length(18),
+            Constraint::Min(20),
+            Constraint::Length(16),
+            Constraint::Length(14),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+        ];
+        Layout::horizontal(widths)
+            .spacing(1)
+            .split(Rect::new(0, 0, total, 1))
+            .iter()
+            .map(|r| r.width)
+            .collect()
+    }
+
+    /// Widening Workspace must never come out of Cost, Cost/1M, or Model.
+    ///
+    /// ratatui's solver shrinks whatever it must to fit the row, so a workspace
+    /// column that grows on a row with no surplus silently pays for itself by
+    /// clipping a dollar figure or collapsing the model name — which relocates the
+    /// unreadable-truncation bug this change exists to fix rather than fixing it.
+    ///
+    /// Sweeps EVERY width in 78..=400 on purpose. The first version of this test
+    /// sampled six widths and passed while 18 widths in the same range were
+    /// clipping Cost by a cell; a solver-driven layout cannot be spot-checked.
     #[test]
-    fn workspace_column_takes_the_width_the_fixed_columns_leave_behind() {
-        let fixed: u16 = WORKSPACE_LAYOUT_FIXED_COLUMNS.iter().sum::<u16>()
-            + WORKSPACE_LAYOUT_FIXED_COLUMNS.len() as u16;
+    fn workspace_layout_never_starves_its_neighbors() {
+        for total in 78u16..=400 {
+            let ws = workspace_layout_at(total);
+            let base = previous_workspace_layout_at(total);
 
-        // Everything past the fixed columns belongs to Workspace.
-        assert_eq!(workspace_column_width(fixed + 40), 40);
+            // Cost (11) and Cost/1M (12) must be no narrower than before.
+            for (idx, name) in [(11usize, "Cost"), (12usize, "Cost/1M")] {
+                assert!(
+                    ws[idx] >= base[idx],
+                    "at {total} cols the Workspace column cost {name} {} cell(s)",
+                    base[idx] - ws[idx]
+                );
+            }
 
-        // Narrow terminals fall back to the floor rather than 0 (which would
-        // render an empty cell) or a negative wrap.
+            // Model keeps the flexible slot, so the wide Workspace column is paid
+            // for out of Model's SURPLUS -- never out of its Min(20) floor, and so
+            // never out of a column carrying a number.
+            assert!(
+                ws[2] >= 20 || ws[2] == base[2],
+                "at {total} cols Model fell below its floor: {} cells (was {})",
+                ws[2],
+                base[2]
+            );
+        }
+    }
+
+    /// The column has to actually get wider somewhere, or the fix does nothing.
+    #[test]
+    fn workspace_column_widens_once_the_row_has_surplus() {
         assert_eq!(
-            workspace_column_width(fixed),
-            WORKSPACE_COLUMN_MIN_WIDTH as usize
+            workspace_column_width(WORKSPACE_SURPLUS_MIN_WIDTH - 1),
+            WORKSPACE_COLUMN_BASE_WIDTH
         );
         assert_eq!(
-            workspace_column_width(0),
-            WORKSPACE_COLUMN_MIN_WIDTH as usize
+            workspace_column_width(WORKSPACE_SURPLUS_MIN_WIDTH),
+            WORKSPACE_COLUMN_WIDE_WIDTH
+        );
+        // `repo ⑃ worktree` for the reported case fits at the wide size.
+        assert!(
+            WORKSPACE_COLUMN_WIDE_WIDTH as usize
+                >= "ea-world-service ⑃ nicole-25-20".chars().count()
         );
     }
 

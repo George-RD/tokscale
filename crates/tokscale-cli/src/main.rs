@@ -657,6 +657,17 @@ fn main() -> Result<()> {
                 let year = normalize_year_filter(&date);
                 ensure_home_supported_for_tui(&cli.home)?;
                 auto_sync_cursor_before_tui(&cli.home, &clients)?;
+                // The TUI owns its own grouping state (`g` and `w`), so neither
+                // --group-by nor --merge-worktrees carries into it. Say so rather
+                // than dropping the flag silently.
+                if merge_worktrees {
+                    use colored::Colorize;
+                    eprintln!(
+                        "{}",
+                        "  Warning: --merge-worktrees applies to --light/--json output; in the TUI press 'w' to toggle worktree rollup"
+                            .yellow()
+                    );
+                }
                 tui::run(
                     cli.theme.as_deref().unwrap_or(""),
                     cli.refresh,
