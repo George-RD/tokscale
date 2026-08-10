@@ -44,17 +44,22 @@ fn workspace_column_width(total: u16) -> u16 {
     }
 }
 
-/// Cells the Workspace column is actually *granted*, which is what the label has
-/// to be truncated to.
+/// Column indices in the workspace layout, for callers that need a cell's budget.
+const WORKSPACE_COL_WORKSPACE: usize = 1;
+const WORKSPACE_COL_MODEL: usize = 2;
+
+/// Cells column `index` is actually *granted* in a row of `total` cells, which is
+/// what text in that cell has to be truncated to.
 ///
-/// A `Length` is a request, not a guarantee: the solver shrinks it when the row is
-/// too narrow, so truncating to the requested width leaves the overflow to be
-/// clipped by the renderer with no ellipsis — the same silent truncation this
-/// change exists to remove. Asking the layout closes that gap at every width
-/// instead of relying on a threshold being exactly right.
-fn workspace_column_granted_width(total: u16) -> usize {
+/// A `Length` is a request, not a guarantee, and `Min` floats: the solver resizes
+/// both to make the row fit. Truncating to the requested width leaves the overflow
+/// to be clipped by the renderer with no ellipsis — the same silent truncation this
+/// change exists to remove. Asking the layout closes that gap at every width for
+/// every column, instead of each cell carrying a constant that is right only for
+/// the widths someone happened to check.
+fn workspace_granted_width(total: u16, index: usize) -> usize {
     workspace_table_widths(total)
-        .get(1)
+        .get(index)
         .copied()
         .unwrap_or(WORKSPACE_COLUMN_BASE_WIDTH) as usize
 }
@@ -247,17 +252,23 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                     Cell::from(format!("{}", idx + 1)).style(Style::default().fg(theme_muted)),
                     Cell::from(truncate_to_width(
                         workspace_label(model),
-                        workspace_column_granted_width(inner.width),
+                        workspace_granted_width(inner.width, WORKSPACE_COL_WORKSPACE),
                     ))
                     .style(
                         Style::default()
                             .fg(theme_accent)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    // Cells, not code points: a full-width grapheme in a model id
-                    // counts as one char but occupies two cells, so a char budget
-                    // overflows the column and gets clipped with no ellipsis.
-                    Cell::from(truncate_to_width(&model.model, 24)).style(
+                    // Cells, not code points, and the granted width rather than a
+                    // constant: Model holds the flexible slot here, so the solver
+                    // hands it 20 cells on a narrow row and far more on a wide one.
+                    // A fixed 24 over-truncated at 97 widths and under-truncated at
+                    // the rest.
+                    Cell::from(truncate_to_width(
+                        &model.model,
+                        workspace_granted_width(inner.width, WORKSPACE_COL_MODEL),
+                    ))
+                    .style(
                         Style::default()
                             .fg(model_color)
                             .add_modifier(Modifier::BOLD),
@@ -391,33 +402,39 @@ mod tests {
         workspace_table_widths(total)
     }
 
-    /// The label is truncated to the width the table hands out, never to the width
+    /// Every text cell truncates to the width the table hands out, never to a width
     /// it merely asked for.
     ///
-    /// A `Length` is a request: between 174 and 192 cells the row could not satisfy
-    /// a 44-cell Workspace while Model held its `Min(20)`, so the solver granted
-    /// 25..43 while the formatter still cut to 44 — leaving the overflow to be
-    /// clipped with no ellipsis, which is exactly the silent truncation this change
-    /// exists to remove. Sweeps every width so no threshold can drift back into
-    /// that gap.
+    /// Both columns hit this. Between 174 and 192 cells the row could not satisfy a
+    /// 44-cell Workspace while Model held its `Min(20)`, so the solver granted 25..43
+    /// while the formatter cut to 44. Model had the mirror-image bug from the other
+    /// direction: a constant 24-cell budget against a floating `Min` that the solver
+    /// sets to 20 on a narrow row and 77 on a wide one — over-truncating at 97 widths
+    /// and silently clipping at the rest. Asserting per column across every width is
+    /// what makes a third cell unable to reintroduce it.
     #[test]
     fn workspace_column_request_matches_what_it_is_granted() {
         for total in 78u16..=400 {
-            assert_eq!(
-                workspace_column_granted_width(total),
-                workspace_layout_at(total)[1] as usize,
-                "at {total} cols the truncation width disagrees with the allocated column"
-            );
+            for (index, name) in [
+                (WORKSPACE_COL_WORKSPACE, "Workspace"),
+                (WORKSPACE_COL_MODEL, "Model"),
+            ] {
+                assert_eq!(
+                    workspace_granted_width(total, index),
+                    workspace_layout_at(total)[index] as usize,
+                    "at {total} cols the {name} truncation width disagrees with its allocation"
+                );
+            }
         }
 
         // And the wide request is genuinely satisfiable at its threshold, so the
         // extra width is real rather than immediately clawed back.
         let widths = workspace_layout_at(WORKSPACE_SURPLUS_MIN_WIDTH);
-        assert_eq!(widths[1], WORKSPACE_COLUMN_WIDE_WIDTH);
+        assert_eq!(widths[WORKSPACE_COL_WORKSPACE], WORKSPACE_COLUMN_WIDE_WIDTH);
         assert!(
-            widths[2] >= 20,
+            widths[WORKSPACE_COL_MODEL] >= 20,
             "Model fell to {} cells at the switch width",
-            widths[2]
+            widths[WORKSPACE_COL_MODEL]
         );
     }
 
