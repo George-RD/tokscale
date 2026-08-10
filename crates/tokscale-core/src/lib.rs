@@ -248,6 +248,18 @@ pub struct TokenBreakdown {
 }
 
 impl TokenBreakdown {
+    /// Add every token bucket from `other`, saturating each field independently.
+    ///
+    /// Use this for whole-breakdown aggregation so adding a new bucket cannot
+    /// silently leave one hand-written accumulation site incomplete.
+    pub fn add_assign_saturating(&mut self, other: &Self) {
+        self.input = self.input.saturating_add(other.input);
+        self.output = self.output.saturating_add(other.output);
+        self.cache_read = self.cache_read.saturating_add(other.cache_read);
+        self.cache_write = self.cache_write.saturating_add(other.cache_write);
+        self.reasoning = self.reasoning.saturating_add(other.reasoning);
+    }
+
     pub fn total(&self) -> i64 {
         // saturating so clamped (i64::MAX) buckets from a corrupt source can't
         // overflow the sum.
@@ -256,6 +268,12 @@ impl TokenBreakdown {
             .saturating_add(self.cache_read)
             .saturating_add(self.cache_write)
             .saturating_add(self.reasoning)
+    }
+}
+
+impl std::ops::AddAssign<&TokenBreakdown> for TokenBreakdown {
+    fn add_assign(&mut self, other: &TokenBreakdown) {
+        self.add_assign_saturating(other);
     }
 }
 
@@ -4722,6 +4740,59 @@ mod tests {
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
+
+    #[test]
+    fn token_breakdown_add_assign_includes_every_field() {
+        let mut total = TokenBreakdown {
+            input: 1,
+            output: 2,
+            cache_read: 3,
+            cache_write: 4,
+            reasoning: 5,
+        };
+        total += &TokenBreakdown {
+            input: 10,
+            output: 20,
+            cache_read: 30,
+            cache_write: 40,
+            reasoning: 50,
+        };
+
+        assert_eq!(
+            total,
+            TokenBreakdown {
+                input: 11,
+                output: 22,
+                cache_read: 33,
+                cache_write: 44,
+                reasoning: 55,
+            }
+        );
+    }
+
+    #[test]
+    fn token_breakdown_add_assign_saturates_each_field() {
+        let mut total = TokenBreakdown {
+            input: i64::MAX,
+            output: i64::MIN,
+            cache_read: i64::MAX - 1,
+            cache_write: i64::MIN + 1,
+            reasoning: 100,
+        };
+        total += &TokenBreakdown {
+            input: 1,
+            output: -1,
+            cache_read: 10,
+            cache_write: -10,
+            reasoning: 23,
+        };
+
+        assert_eq!(total.input, i64::MAX);
+        assert_eq!(total.output, i64::MIN);
+        assert_eq!(total.cache_read, i64::MAX);
+        assert_eq!(total.cache_write, i64::MIN);
+        assert_eq!(total.reasoning, 123);
+    }
 
     #[test]
     fn monthly_reasoning_matches_model_and_hourly_aggregation() {
