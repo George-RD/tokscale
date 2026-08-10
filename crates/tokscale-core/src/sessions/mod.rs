@@ -635,7 +635,13 @@ fn slug_root_and_remainder(key: &str) -> Option<(PathBuf, &str)> {
 /// which makes the result exact wherever the directory still exists on disk.
 fn resolve_slug_under(dir: &Path, remaining: &str) -> Option<String> {
     if remaining.is_empty() {
-        return Some(dir.to_string_lossy().to_string());
+        // Hand back a normalized key, not a native path. Every consumer compares
+        // against forward-slash markers (`workspace_repo_root` looks for
+        // `.claude/worktrees/`), and on Windows `Path::join` produces `\`, so
+        // returning the native spelling would silently defeat worktree rollup and
+        // make a decoded key unequal to the same directory recorded by a client
+        // that stores a real path.
+        return normalize_workspace_key(&dir.to_string_lossy());
     }
 
     // Longest candidate first: prefer `IngTian.github.io` over a shorter
@@ -823,6 +829,31 @@ mod tests {
         assert_eq!(
             std::fs::canonicalize(decoded).unwrap(),
             std::fs::canonicalize(&real).unwrap()
+        );
+    }
+
+    #[test]
+    fn decoded_slugs_use_normalized_separators() {
+        // The decoder builds its result with `Path::join`, which emits `\` on
+        // Windows. Every consumer compares against forward-slash markers, so a
+        // native-spelled key silently defeats worktree rollup there and never
+        // compares equal to the same directory recorded by a client that stores a
+        // real path. Asserting on the returned string keeps that platform-specific
+        // failure visible from any host.
+        let (_temp, root) = canonical_tempdir();
+        let real = root.join("repo-a/.claude/worktrees/feature-x");
+        std::fs::create_dir_all(&real).unwrap();
+
+        let decoded = decode_claude_project_slug(&slug_for(&real)).expect("slug should resolve");
+
+        assert!(
+            !decoded.contains('\\'),
+            "decoded key must not carry native separators: {decoded}"
+        );
+        // And the worktree marker must therefore be findable.
+        assert!(
+            workspace_repo_root(&decoded).is_some(),
+            "worktree marker must be visible in {decoded}"
         );
     }
 
