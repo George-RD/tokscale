@@ -9,6 +9,7 @@ use crate::provider_identity::inferred_provider_from_model;
 use chrono::{DateTime, NaiveDateTime};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
 use std::path::Path;
@@ -382,6 +383,15 @@ fn session_row_to_messages(db_path: &Path, row: CopilotDesktopSessionRow) -> Vec
     };
 
     let mut messages = Vec::with_capacity(metadata.shutdowns.len() + 1);
+    // The SQLite row is authoritative for every bucket it stores. The sidecar
+    // and DB are separate files, so a shutdown can be observed before the row
+    // catches up; consume a per-row budget to prevent that race from emitting
+    // more lifetime usage than the row. Cache-write has no SQLite column and
+    // remains sidecar-authoritative.
+    let mut remaining_input = row.total_input_tokens.max(0);
+    let mut remaining_output = row.total_output_tokens.max(0);
+    let mut remaining_cache_read = row.total_cached_tokens.max(0);
+    let mut remaining_reasoning = row.total_reasoning_tokens.max(0);
     for shutdown in &metadata.shutdowns {
         // `auto` is resolved for display and pricing only. It is a tracker
         // counter of its own — `modelMetrics` is keyed by the model each
@@ -393,21 +403,28 @@ fn session_row_to_messages(db_path: &Path, row: CopilotDesktopSessionRow) -> Vec
             .attributed_model
             .clone()
             .unwrap_or_else(|| fallback_model.clone());
+        let input = shutdown.input.min(remaining_input);
+        let output = shutdown.output.min(remaining_output);
+        let cache_read = shutdown.cache_read.min(remaining_cache_read).min(input);
+        let reasoning = shutdown.reasoning.min(remaining_reasoning);
+        remaining_input = remaining_input.saturating_sub(input);
+        remaining_output = remaining_output.saturating_sub(output);
+        remaining_cache_read = remaining_cache_read.saturating_sub(cache_read);
+        remaining_reasoning = remaining_reasoning.saturating_sub(reasoning);
+        let tokens = super::copilot::normalize_input_tokens(
+            input,
+            output,
+            cache_read,
+            shutdown.cache_write,
+            reasoning,
+        );
+        if tokens.total() == 0 {
+            continue;
+        }
         messages.push(build(
             model_id,
             shutdown.timestamp_ms,
-            // Copilot reports input tokens inclusive of cache reads (same
-            // convention as the OTEL exporter that feeds this same session
-            // data). Reuse the shared normalizer so the desktop-DB and OTEL
-            // paths never diverge and additive pricing does not double-charge
-            // the cached portion.
-            super::copilot::normalize_input_tokens(
-                shutdown.input,
-                shutdown.output,
-                shutdown.cache_read,
-                shutdown.cache_write,
-                shutdown.reasoning,
-            ),
+            tokens,
             format!(
                 "copilot-desktop:{}:shutdown:{}:{}",
                 row.id, shutdown.event_id, shutdown.model
@@ -552,7 +569,15 @@ fn collect_shutdown_usage(event: &Value, out: &mut Vec<ShutdownUsage>) {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|id| !id.is_empty())
-        .map_or_else(|| format!("ts-{timestamp_ms}"), str::to_string);
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            // Real records carry UUIDs. For a malformed/legacy record without
+            // one, hash the stable event content: a timestamp alone collides
+            // when two distinct shutdowns share the same millisecond, while a
+            // file ordinal would change when earlier lines rotate away.
+            let digest = Sha256::digest(event.to_string().as_bytes());
+            format!("anon-{digest:x}")
+        });
     let Some(metrics) = payload
         .get("modelMetrics")
         .or_else(|| event.get("modelMetrics"))
@@ -1083,7 +1108,7 @@ mod tests {
         let first = r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"outputTokens":50}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01","timestamp":"2026-07-01T20:00:00.000Z","parentId":null}"#;
         let second = r#"{"type":"session.shutdown","data":{"shutdownType":"routine","modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":200,"outputTokens":60}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02","timestamp":"2026-07-02T00:00:00.000Z","parentId":null}"#;
 
-        let key_of_second = |lines: &[&str]| -> String {
+        let key_of_second = |lines: &[&str]| -> (String, i64) {
             let dir = tempfile::tempdir().unwrap();
             let db_path = dir.path().join("data.db");
             let conn = create_copilot_desktop_db(&db_path);
@@ -1093,11 +1118,14 @@ mod tests {
             drop(conn);
             write_events(dir.path(), "session-1", lines);
 
-            parse_copilot_desktop_db(&db_path)
+            let messages = parse_copilot_desktop_db(&db_path);
+            let key = messages
                 .iter()
                 .find(|message| message.timestamp == 1_782_950_400_000)
                 .and_then(|message| message.dedup_key.clone())
-                .expect("the second shutdown is always emitted")
+                .expect("the second shutdown is always emitted");
+            let total_input = messages.iter().map(|message| message.tokens.input).sum();
+            (key, total_input)
         };
 
         let whole_history = key_of_second(&[SESSION_START, first, second]);
@@ -1107,12 +1135,17 @@ mod tests {
         let after_rotation = key_of_second(&[SESSION_START, second]);
 
         assert_eq!(
-            whole_history, after_rotation,
+            whole_history.0, after_rotation.0,
             "dropping the earlier shutdown must not re-key the later one"
         );
         assert_eq!(
-            whole_history,
+            whole_history.0,
             "copilot-desktop:session-1:shutdown:9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a02:gpt-5.1-codex"
+        );
+        assert_eq!(whole_history.1, 200);
+        assert_eq!(
+            after_rotation.1, 200,
+            "even a synthetic selective edit cannot exceed the authoritative row total"
         );
     }
 
@@ -1172,6 +1205,37 @@ mod tests {
                 .any(|message| message.dedup_key.as_deref() == Some("copilot-desktop:session-1")),
             "the snapshots account for the whole row, so there is no remainder"
         );
+    }
+
+    /// Distinct legacy/malformed records can share a millisecond. Their
+    /// fallback identity must come from stable content rather than timestamp or
+    /// mutable file position.
+    #[test]
+    fn idless_shutdowns_at_the_same_timestamp_keep_distinct_stable_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("data.db");
+        let conn = create_copilot_desktop_db(&db_path);
+        insert_session(&conn, "session-1", "gpt-5.1-codex", 200, 0, 0, 0);
+        drop(conn);
+        write_events(
+            dir.path(),
+            "session-1",
+            &[
+                SESSION_START,
+                r#"{"type":"session.shutdown","data":{"modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100}}}},"timestamp":"2026-07-02T00:00:00.000Z","parentId":"parent-a"}"#,
+                r#"{"type":"session.shutdown","data":{"modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":200}}}},"timestamp":"2026-07-02T00:00:00.000Z","parentId":"parent-b"}"#,
+            ],
+        );
+
+        let messages = parse_copilot_desktop_db(&db_path);
+        let keys: HashSet<&str> = messages
+            .iter()
+            .filter_map(|message| message.dedup_key.as_deref())
+            .collect();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(keys.len(), 2);
+        assert!(keys.iter().all(|key| key.contains(":shutdown:anon-")));
     }
 
     /// A record written twice — a replayed or re-flushed log — describes one
@@ -1243,6 +1307,33 @@ mod tests {
                 .any(|message| message.timestamp == 1_782_950_400_000),
             "a snapshot that explains no new usage is not emitted at all"
         );
+    }
+
+    /// The sidecar can be flushed before SQLite. A temporarily newer shutdown
+    /// must not exceed the row's authoritative lifetime buckets.
+    #[test]
+    fn shutdown_usage_is_bounded_by_the_sqlite_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("data.db");
+        let conn = create_copilot_desktop_db(&db_path);
+        insert_session(&conn, "session-1", "gpt-5.1-codex", 100, 50, 25, 10);
+        drop(conn);
+        write_events(
+            dir.path(),
+            "session-1",
+            &[
+                SESSION_START,
+                r#"{"type":"session.shutdown","data":{"modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":200,"outputTokens":100,"cacheReadTokens":80,"cacheWriteTokens":7,"reasoningTokens":20}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01","timestamp":"2026-07-01T20:00:00.000Z","parentId":null}"#,
+            ],
+        );
+
+        let messages = parse_copilot_desktop_db(&db_path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 75);
+        assert_eq!(messages[0].tokens.cache_read, 25);
+        assert_eq!(messages[0].tokens.output, 50);
+        assert_eq!(messages[0].tokens.reasoning, 10);
+        assert_eq!(messages[0].tokens.cache_write, 7);
     }
 
     /// Inclusive input and cache reads are not independent totals. A reset or
