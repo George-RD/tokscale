@@ -3923,6 +3923,26 @@ fn test_monthly_light_output() {
 }
 
 #[test]
+fn test_monthly_light_title_includes_year_filter() {
+    let tmp = create_temp_fixture_dir();
+    cmd_with_home(tmp.path())
+        .args([
+            "monthly",
+            "--light",
+            "--client",
+            "opencode",
+            "--no-spinner",
+            "--year",
+            "2024",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Monthly Token Usage Report (2024)",
+        ));
+}
+
+#[test]
 fn test_models_light_with_client_filter() {
     let tmp = create_temp_fixture_dir();
     cmd_with_home(tmp.path())

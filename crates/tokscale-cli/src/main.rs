@@ -763,13 +763,12 @@ fn main() -> Result<()> {
             benchmark,
             no_spinner,
         }) => {
-            let resolved_date = ResolvedReportDate::new(&date, &cli.home);
             let clients = build_client_filter(clients, &cli.home);
             run_graph_command(
                 output,
                 cli.home.clone(),
                 clients,
-                resolved_date,
+                &date,
                 benchmark,
                 no_spinner,
             )
@@ -893,9 +892,8 @@ fn main() -> Result<()> {
             date,
             no_spinner,
         }) => {
-            let resolved_date = ResolvedReportDate::new(&date, &cli.home);
             let clients = build_client_filter(clients, &cli.home);
-            run_time_metrics_report(json, cli.home.clone(), clients, resolved_date, no_spinner)
+            run_time_metrics_report(json, cli.home.clone(), clients, &date, no_spinner)
         }
         Some(Commands::WarmTuiCache) => run_warm_tui_cache(),
         Some(Commands::Config { subcommand }) => {
@@ -1768,11 +1766,6 @@ pub(crate) fn normalize_year_filter(date: &DateRangeFlags) -> Option<String> {
     }
 }
 
-#[cfg(test)]
-fn get_date_range_label(date: &DateRangeFlags) -> Option<String> {
-    get_date_range_label_for_date(date, chrono::Local::now().date_naive())
-}
-
 fn get_date_range_label_for_date(
     date: &DateRangeFlags,
     current_date: chrono::NaiveDate,
@@ -1981,26 +1974,12 @@ impl LocalReportContext {
         spinner_message: Option<&'static str>,
     ) -> Self {
         let resolved_date = ResolvedReportDate::new(date, &home_dir);
-        let mut context =
-            Self::from_resolved_date(home_dir, clients, resolved_date, spinner_message);
-        context.complete_timing_setup();
-        context
-    }
-
-    fn from_resolved_date(
-        home_dir: Option<String>,
-        clients: Option<Vec<String>>,
-        resolved_date: ResolvedReportDate,
-        spinner_message: Option<&'static str>,
-    ) -> Self {
-        let (had_cursor_cache, explicit_cursor_filter, (spinner, cursor_sync_result)) =
-            prepare_cursor_report_setup(
-                || has_cursor_usage_cache_for_report(&home_dir),
-                || client_filter_explicitly_requests_cursor(&clients),
-                || spinner_message.map(LightSpinner::start),
-                || auto_sync_cursor_for_local_report(&home_dir, &clients),
-            );
+        let had_cursor_cache = has_cursor_usage_cache_for_report(&home_dir);
+        let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
+        let spinner = spinner_message.map(LightSpinner::start);
+        let cursor_sync_result = auto_sync_cursor_for_local_report(&home_dir, &clients);
         let cursor_setup_warnings = setup_warnings_for_report(&home_dir, &clients);
+        let use_env_roots = use_env_roots(&home_dir);
 
         Self {
             home_dir,
@@ -2015,21 +1994,15 @@ impl LocalReportContext {
             spinner,
             cursor_sync_result,
             cursor_setup_warnings,
-            use_env_roots: false,
+            use_env_roots,
             start: std::time::Instant::now(),
         }
     }
 
-    fn complete_timing_setup(&mut self) {
-        self.resolve_env_roots();
-        self.start_timing();
-    }
-
-    fn resolve_env_roots(&mut self) {
-        self.use_env_roots = use_env_roots(&self.home_dir);
-    }
-
-    fn start_timing(&mut self) {
+    /// Graph emits progress before scanning, so restart its benchmark clock
+    /// after the progress prelude while retaining the constructor's complete
+    /// environment setup.
+    fn restart_timing(&mut self) {
         self.start = std::time::Instant::now();
     }
 
@@ -2055,29 +2028,6 @@ impl LocalReportContext {
             scanner_settings: self.scanner_settings.clone(),
         }
     }
-}
-
-fn prepare_cursor_report_setup<FCache, FExplicit, FSpinner, FSync, Spinner, Sync>(
-    sample_cache: FCache,
-    explicit_filter: FExplicit,
-    spinner: FSpinner,
-    sync: FSync,
-) -> (bool, bool, (Spinner, Sync))
-where
-    FCache: FnOnce() -> bool,
-    FExplicit: FnOnce() -> bool,
-    FSpinner: FnOnce() -> Spinner,
-    FSync: FnOnce() -> Sync,
-{
-    let had_cursor_cache = sample_cache();
-    let explicit_cursor_filter = explicit_filter();
-    let spinner = spinner();
-    let sync_result = sync();
-    (
-        had_cursor_cache,
-        explicit_cursor_filter,
-        (spinner, sync_result),
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5074,19 +5024,18 @@ fn run_time_metrics_report(
     json: bool,
     home_dir: Option<String>,
     clients: Option<Vec<String>>,
-    resolved_date: ResolvedReportDate,
+    date: &DateRangeFlags,
     no_spinner: bool,
 ) -> Result<()> {
     use tokio::runtime::Runtime;
     use tokscale_core::{get_time_metrics_report, GroupBy};
 
-    let mut context = LocalReportContext::from_resolved_date(
+    let mut context = LocalReportContext::new(
         home_dir,
         clients,
-        resolved_date,
+        date,
         (!no_spinner).then_some("Computing time metrics..."),
     );
-    context.complete_timing_setup();
     let rt = Runtime::new()?;
     let report = rt
         .block_on(async {
@@ -5166,7 +5115,7 @@ fn run_graph_command(
     output: Option<String>,
     home_dir: Option<String>,
     clients: Option<Vec<String>>,
-    resolved_date: ResolvedReportDate,
+    date: &DateRangeFlags,
     benchmark: bool,
     no_spinner: bool,
 ) -> Result<()> {
@@ -5174,18 +5123,16 @@ fn run_graph_command(
     use tokscale_core::{generate_local_graph_report, GroupBy};
 
     let show_progress = output.is_some() && !no_spinner;
-    let mut context =
-        LocalReportContext::from_resolved_date(home_dir, clients, resolved_date, None);
+    let mut context = LocalReportContext::new(home_dir, clients, date, None);
 
     if show_progress {
         eprintln!("  Scanning session data...");
     }
-    context.start_timing();
+    context.restart_timing();
 
     if show_progress {
         eprintln!("  Generating graph data...");
     }
-    context.resolve_env_roots();
     let rt = tokio::runtime::Runtime::new()?;
     let graph_result = rt
         .block_on(async {
@@ -7484,9 +7431,15 @@ mod tests {
         let kiritimati =
             current_bucket_date(&Some(kiritimati_home.path().to_string_lossy().into_owned()));
         let niue = current_bucket_date(&Some(niue_home.path().to_string_lossy().into_owned()));
-        let report_settings = tui::settings::load_scanner_settings_for_home(&Some(
-            kiritimati_home.path().to_string_lossy().into_owned(),
-        ));
+        let kiritimati_home_path = Some(kiritimati_home.path().to_string_lossy().into_owned());
+        let niue_home_path = Some(niue_home.path().to_string_lossy().into_owned());
+        let today = DateRangeFlags {
+            today: true,
+            ..DateRangeFlags::default()
+        };
+        let kiritimati_report_date = ResolvedReportDate::new(&today, &kiritimati_home_path);
+        let niue_report_date = ResolvedReportDate::new(&today, &niue_home_path);
+        let report_settings = tui::settings::load_scanner_settings_for_home(&kiritimati_home_path);
 
         assert_eq!(
             kiritimati,
@@ -7503,6 +7456,20 @@ mod tests {
             Some("Pacific/Kiritimati"),
             "report must rebucket sessions with the --home profile's timezone"
         );
+        let expected_kiritimati = kiritimati.to_string();
+        let expected_niue = niue.to_string();
+        assert_eq!(
+            kiritimati_report_date.since.as_deref(),
+            Some(expected_kiritimati.as_str()),
+            "resolved report dates must use the pinned --home timezone"
+        );
+        assert_eq!(
+            niue_report_date.since.as_deref(),
+            Some(expected_niue.as_str()),
+            "resolved report dates must use the pinned --home timezone"
+        );
+        assert_eq!(kiritimati_report_date.date_range.as_deref(), Some("Today"));
+        assert_eq!(niue_report_date.date_range.as_deref(), Some("Today"));
     }
 
     #[test]
@@ -7518,35 +7485,6 @@ mod tests {
         assert_eq!(since.as_deref(), Some("2026-03-01"));
         assert_eq!(until.as_deref(), Some("2026-03-01"));
         assert_eq!(label.as_deref(), Some("March 2026"));
-    }
-
-    #[test]
-    fn test_cursor_setup_preserves_cache_before_sync_order() {
-        let events = std::cell::RefCell::new(Vec::new());
-        let (had_cache, explicit_filter, (spinner, sync_result)) = prepare_cursor_report_setup(
-            || {
-                events.borrow_mut().push("sample");
-                true
-            },
-            || {
-                events.borrow_mut().push("explicit");
-                false
-            },
-            || {
-                events.borrow_mut().push("spinner");
-                7
-            },
-            || {
-                events.borrow_mut().push("sync");
-                42
-            },
-        );
-
-        assert!(had_cache);
-        assert!(!explicit_filter);
-        assert_eq!(spinner, 7);
-        assert_eq!(sync_result, 42);
-        assert_eq!(*events.borrow(), ["sample", "explicit", "spinner", "sync"]);
     }
 
     #[test]
@@ -7864,84 +7802,107 @@ mod tests {
 
     #[test]
     fn test_get_date_range_label_today() {
-        let label = get_date_range_label(&DateRangeFlags {
-            today: true,
-            ..DateRangeFlags::default()
-        });
+        let label = get_date_range_label_for_date(
+            &DateRangeFlags {
+                today: true,
+                ..DateRangeFlags::default()
+            },
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(),
+        );
         assert_eq!(label, Some("Today".to_string()));
     }
 
     #[test]
     fn test_get_date_range_label_yesterday() {
-        let label = get_date_range_label(&DateRangeFlags {
-            yesterday: true,
-            ..DateRangeFlags::default()
-        });
+        let label = get_date_range_label_for_date(
+            &DateRangeFlags {
+                yesterday: true,
+                ..DateRangeFlags::default()
+            },
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(),
+        );
         assert_eq!(label, Some("Yesterday".to_string()));
     }
 
     #[test]
     fn test_get_date_range_label_week() {
-        let label = get_date_range_label(&DateRangeFlags {
-            week: true,
-            ..DateRangeFlags::default()
-        });
+        let label = get_date_range_label_for_date(
+            &DateRangeFlags {
+                week: true,
+                ..DateRangeFlags::default()
+            },
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(),
+        );
         assert_eq!(label, Some("Last 7 days".to_string()));
     }
 
     #[test]
     fn test_get_date_range_label_month_uses_provided_local_date() {
-        let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
         let label = get_date_range_label_for_date(
             &DateRangeFlags {
                 month: true,
                 ..DateRangeFlags::default()
             },
-            today,
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(),
         );
         assert_eq!(label, Some("March 2026".to_string()));
     }
 
     #[test]
     fn test_get_date_range_label_year() {
-        let label = get_date_range_label(&DateRangeFlags {
-            year: Some("2024".to_string()),
-            ..DateRangeFlags::default()
-        });
+        let label = get_date_range_label_for_date(
+            &DateRangeFlags {
+                year: Some("2024".to_string()),
+                ..DateRangeFlags::default()
+            },
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(),
+        );
         assert_eq!(label, Some("2024".to_string()));
     }
 
     #[test]
     fn test_get_date_range_label_custom_since() {
-        let label = get_date_range_label(&DateRangeFlags {
-            since: Some("2024-01-01".to_string()),
-            ..DateRangeFlags::default()
-        });
+        let label = get_date_range_label_for_date(
+            &DateRangeFlags {
+                since: Some("2024-01-01".to_string()),
+                ..DateRangeFlags::default()
+            },
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(),
+        );
         assert_eq!(label, Some("from 2024-01-01".to_string()));
     }
 
     #[test]
     fn test_get_date_range_label_custom_until() {
-        let label = get_date_range_label(&DateRangeFlags {
-            until: Some("2024-12-31".to_string()),
-            ..DateRangeFlags::default()
-        });
+        let label = get_date_range_label_for_date(
+            &DateRangeFlags {
+                until: Some("2024-12-31".to_string()),
+                ..DateRangeFlags::default()
+            },
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(),
+        );
         assert_eq!(label, Some("to 2024-12-31".to_string()));
     }
 
     #[test]
     fn test_get_date_range_label_custom_range() {
-        let label = get_date_range_label(&DateRangeFlags {
-            since: Some("2024-01-01".to_string()),
-            until: Some("2024-12-31".to_string()),
-            ..DateRangeFlags::default()
-        });
+        let label = get_date_range_label_for_date(
+            &DateRangeFlags {
+                since: Some("2024-01-01".to_string()),
+                until: Some("2024-12-31".to_string()),
+                ..DateRangeFlags::default()
+            },
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(),
+        );
         assert_eq!(label, Some("from 2024-01-01 to 2024-12-31".to_string()));
     }
 
     #[test]
     fn test_get_date_range_label_none() {
-        let label = get_date_range_label(&DateRangeFlags::default());
+        let label = get_date_range_label_for_date(
+            &DateRangeFlags::default(),
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(),
+        );
         assert_eq!(label, None);
     }
 
