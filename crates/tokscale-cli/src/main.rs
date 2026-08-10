@@ -1921,6 +1921,8 @@ struct ResolvedReportDate {
     since: Option<String>,
     until: Option<String>,
     year: Option<String>,
+    // Text report renderers use this label; graph and time-metrics intentionally
+    // share the context without rendering a date-range title.
     date_range: Option<String>,
     scanner_settings: tokscale_core::ScannerSettings,
 }
@@ -7409,6 +7411,8 @@ mod tests {
     /// ignores its argument returns the same day for both homes.
     #[test]
     fn test_current_bucket_date_follows_the_home_overrides_pinned_zone() {
+        use chrono::Datelike;
+
         fn home_pinned_to(zone: &str) -> tempfile::TempDir {
             let home = tempfile::TempDir::new().unwrap();
             let config = home.path().join(if cfg!(windows) {
@@ -7433,12 +7437,12 @@ mod tests {
         let niue = current_bucket_date(&Some(niue_home.path().to_string_lossy().into_owned()));
         let kiritimati_home_path = Some(kiritimati_home.path().to_string_lossy().into_owned());
         let niue_home_path = Some(niue_home.path().to_string_lossy().into_owned());
-        let today = DateRangeFlags {
-            today: true,
+        let month = DateRangeFlags {
+            month: true,
             ..DateRangeFlags::default()
         };
-        let kiritimati_report_date = ResolvedReportDate::new(&today, &kiritimati_home_path);
-        let niue_report_date = ResolvedReportDate::new(&today, &niue_home_path);
+        let kiritimati_report_date = ResolvedReportDate::new(&month, &kiritimati_home_path);
+        let niue_report_date = ResolvedReportDate::new(&month, &niue_home_path);
         let report_settings = tui::settings::load_scanner_settings_for_home(&kiritimati_home_path);
 
         assert_eq!(
@@ -7458,18 +7462,38 @@ mod tests {
         );
         let expected_kiritimati = kiritimati.to_string();
         let expected_niue = niue.to_string();
+        let expected_kiritimati_start = kiritimati.with_day(1).unwrap().to_string();
+        let expected_niue_start = niue.with_day(1).unwrap().to_string();
+        let expected_kiritimati_label = kiritimati.format("%B %Y").to_string();
+        let expected_niue_label = niue.format("%B %Y").to_string();
         assert_eq!(
             kiritimati_report_date.since.as_deref(),
+            Some(expected_kiritimati_start.as_str()),
+            "resolved month filters must use the pinned --home timezone"
+        );
+        assert_eq!(
+            kiritimati_report_date.until.as_deref(),
             Some(expected_kiritimati.as_str()),
-            "resolved report dates must use the pinned --home timezone"
+            "resolved month filters must use the pinned --home timezone"
         );
         assert_eq!(
             niue_report_date.since.as_deref(),
-            Some(expected_niue.as_str()),
-            "resolved report dates must use the pinned --home timezone"
+            Some(expected_niue_start.as_str()),
+            "resolved month filters must use the pinned --home timezone"
         );
-        assert_eq!(kiritimati_report_date.date_range.as_deref(), Some("Today"));
-        assert_eq!(niue_report_date.date_range.as_deref(), Some("Today"));
+        assert_eq!(
+            niue_report_date.until.as_deref(),
+            Some(expected_niue.as_str()),
+            "resolved month filters must use the pinned --home timezone"
+        );
+        assert_eq!(
+            kiritimati_report_date.date_range.as_deref(),
+            Some(expected_kiritimati_label.as_str())
+        );
+        assert_eq!(
+            niue_report_date.date_range.as_deref(),
+            Some(expected_niue_label.as_str())
+        );
     }
 
     #[test]
