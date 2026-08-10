@@ -428,6 +428,7 @@ mod tests {
             until: None,
             year: None,
             initial_tab: Some(tab),
+            ..Default::default()
         };
         App::new_with_cached_data(config, Some(UsageData::default())).unwrap()
     }

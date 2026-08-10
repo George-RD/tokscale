@@ -21,16 +21,17 @@ const WORKSPACE_COLUMN_BASE_WIDTH: u16 = 18;
 /// truncated-label bug was actually reported from.
 const WORKSPACE_COLUMN_WIDE_WIDTH: u16 = 44;
 
-/// Inner width at which the row first has cells to spare.
+/// Inner width at which the row can actually satisfy the wide Workspace column
+/// without pushing Model below its `Min(20)`.
 ///
-/// Below this every column is at its minimum and the layout is zero-sum: widening
-/// Workspace can only come out of Cost (clipping a dollar figure) or Model
-/// (collapsing it to 4 cells), which just relocates the unreadable-truncation bug
-/// instead of fixing it. Measured: the Model column sits at exactly its `Min(20)`
-/// up to 173 and only starts growing at 174, so that is where surplus begins.
-const WORKSPACE_SURPLUS_MIN_WIDTH: u16 = 174;
+/// Below this the layout is zero-sum: widening Workspace can only come out of Cost
+/// (clipping a dollar figure) or Model, which just relocates the
+/// unreadable-truncation bug instead of fixing it. Measured against the solver —
+/// 193 is the first width where Workspace is granted the full 44 cells and Model
+/// still holds 20. Pinned by `workspace_column_request_matches_what_it_is_granted`.
+const WORKSPACE_SURPLUS_MIN_WIDTH: u16 = 193;
 
-/// Cells the Workspace column gets for a table rendered into `total`.
+/// Cells the Workspace column asks for in a table rendered into `total`.
 ///
 /// Deliberately a fixed `Length` at both sizes rather than a `Min`: `Min` outranks
 /// `Length` in ratatui's solver, so a flexible workspace column steals from its
@@ -41,6 +42,50 @@ fn workspace_column_width(total: u16) -> u16 {
     } else {
         WORKSPACE_COLUMN_BASE_WIDTH
     }
+}
+
+/// Cells the Workspace column is actually *granted*, which is what the label has
+/// to be truncated to.
+///
+/// A `Length` is a request, not a guarantee: the solver shrinks it when the row is
+/// too narrow, so truncating to the requested width leaves the overflow to be
+/// clipped by the renderer with no ellipsis — the same silent truncation this
+/// change exists to remove. Asking the layout closes that gap at every width
+/// instead of relying on a threshold being exactly right.
+fn workspace_column_granted_width(total: u16) -> usize {
+    workspace_table_widths(total)
+        .get(1)
+        .copied()
+        .unwrap_or(WORKSPACE_COLUMN_BASE_WIDTH) as usize
+}
+
+/// The workspace layout's column constraints for a row of `total` cells.
+fn workspace_column_constraints(total: u16) -> Vec<Constraint> {
+    vec![
+        Constraint::Length(3),
+        Constraint::Length(workspace_column_width(total)),
+        Constraint::Min(20),
+        Constraint::Length(16),
+        Constraint::Length(14),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(12),
+        Constraint::Length(12),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(10),
+    ]
+}
+
+/// Widths the solver grants each column of the workspace layout at `total` cells.
+fn workspace_table_widths(total: u16) -> Vec<u16> {
+    Layout::horizontal(workspace_column_constraints(total))
+        .spacing(1)
+        .split(Rect::new(0, 0, total, 1))
+        .iter()
+        .map(|area| area.width)
+        .collect()
 }
 
 fn workspace_label(model: &crate::tui::data::ModelUsage) -> &str {
@@ -202,14 +247,17 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                     Cell::from(format!("{}", idx + 1)).style(Style::default().fg(theme_muted)),
                     Cell::from(truncate_to_width(
                         workspace_label(model),
-                        workspace_column_width(inner.width) as usize,
+                        workspace_column_granted_width(inner.width),
                     ))
                     .style(
                         Style::default()
                             .fg(theme_accent)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Cell::from(truncate_text(&model.model, 24)).style(
+                    // Cells, not code points: a full-width grapheme in a model id
+                    // counts as one char but occupies two cells, so a char budget
+                    // overflows the column and gets clipped with no ellipsis.
+                    Cell::from(truncate_to_width(&model.model, 24)).style(
                         Style::default()
                             .fg(model_color)
                             .add_modifier(Modifier::BOLD),
@@ -285,22 +333,10 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     } else if group_by == GroupBy::WorkspaceModel {
         // Same shape as the default layout, with a wider Workspace column once the
         // row has surplus cells to give it. Model keeps the flexible slot so the
-        // workspace column can never widen at Cost's expense.
-        vec![
-            Constraint::Length(3),
-            Constraint::Length(workspace_column_width(inner.width)),
-            Constraint::Min(20),
-            Constraint::Length(16),
-            Constraint::Length(14),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(10),
-        ]
+        // workspace column can never widen at Cost's expense. Shared with
+        // `workspace_column_granted_width` so the label is truncated to the width
+        // this very layout hands out.
+        workspace_column_constraints(inner.width)
     } else {
         vec![
             Constraint::Length(3),
@@ -348,31 +384,41 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
 mod tests {
     use super::*;
 
-    /// Column widths for the workspace layout at a given inner width, mirroring
-    /// the `widths` vector in `render`.
+    /// Column widths the solver grants the workspace layout. Calls the production
+    /// helper rather than restating the constraints, so a change to the layout
+    /// cannot leave the test asserting against a stale copy of it.
     fn workspace_layout_at(total: u16) -> Vec<u16> {
-        use ratatui::layout::Layout;
-        let widths = vec![
-            Constraint::Length(3),
-            Constraint::Length(workspace_column_width(total)),
-            Constraint::Min(20),
-            Constraint::Length(16),
-            Constraint::Length(14),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(10),
-        ];
-        Layout::horizontal(widths)
-            .spacing(1)
-            .split(Rect::new(0, 0, total, 1))
-            .iter()
-            .map(|r| r.width)
-            .collect()
+        workspace_table_widths(total)
+    }
+
+    /// The label is truncated to the width the table hands out, never to the width
+    /// it merely asked for.
+    ///
+    /// A `Length` is a request: between 174 and 192 cells the row could not satisfy
+    /// a 44-cell Workspace while Model held its `Min(20)`, so the solver granted
+    /// 25..43 while the formatter still cut to 44 — leaving the overflow to be
+    /// clipped with no ellipsis, which is exactly the silent truncation this change
+    /// exists to remove. Sweeps every width so no threshold can drift back into
+    /// that gap.
+    #[test]
+    fn workspace_column_request_matches_what_it_is_granted() {
+        for total in 78u16..=400 {
+            assert_eq!(
+                workspace_column_granted_width(total),
+                workspace_layout_at(total)[1] as usize,
+                "at {total} cols the truncation width disagrees with the allocated column"
+            );
+        }
+
+        // And the wide request is genuinely satisfiable at its threshold, so the
+        // extra width is real rather than immediately clawed back.
+        let widths = workspace_layout_at(WORKSPACE_SURPLUS_MIN_WIDTH);
+        assert_eq!(widths[1], WORKSPACE_COLUMN_WIDE_WIDTH);
+        assert!(
+            widths[2] >= 20,
+            "Model fell to {} cells at the switch width",
+            widths[2]
+        );
     }
 
     /// The workspace layout as it stood before this change: Workspace pinned to 18
@@ -479,6 +525,7 @@ mod tests {
                 until: None,
                 year: None,
                 initial_tab: None,
+                ..Default::default()
             },
             None,
         )

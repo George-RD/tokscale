@@ -306,7 +306,7 @@ TUI에서 `g`를 누르거나 `--light`/`--json` 모드에서 `--group-by`를 �
 | **모델** | `--group-by model` | ✅ | 모델당 한 행 — 모든 클라이언트와 프로바이더 병합 |
 | **클라이언트 + 모델** | `--group-by client,model` | | 클라이언트-모델 쌍당 한 행 |
 | **클라이언트 + 프로바이더 + 모델** | `--group-by client,provider,model` | | 가장 세분화 — 병합 없음 |
-| **워크스페이스 + 모델** | `--group-by workspace,model` | | 로컬 사용량을 워크스페이스 키별로, 그 다음 모델별로 그룹화 |
+| **워크스페이스 + 모델** | `--group-by workspace,model` | | 로컬 사용량을 워크스페이스 키별로, 그 다음 모델별로 그룹화. [`--merge-worktrees`](README.md#per-workspace-cost)를 추가하면 리포지터리 내부의 워크트리를 상위 리포지터리로 병합합니다 |
 | **세션 + 모델** | `--group-by session,model` | | `session_id`와 모델당 한 행 — 특정 에이전트-CLI 세션에 비용 귀속 |
 | **클라이언트 + 세션 + 모델** | `--group-by client,session,model` | | 클라이언트, 세션, 모델당 한 행 — `session_id`로 조인하는 멀티 에이전트 러너에 유용 |
 

@@ -95,7 +95,7 @@ struct Cli {
 
     #[arg(
         long = "merge-worktrees",
-        help = "With --group-by workspace,model: fold git worktrees into their parent repository so each repo is one row"
+        help = "With --group-by workspace,model: fold worktrees kept inside the repo (.claude/worktrees/, .git/worktrees/) into their parent repository so each repo is one row"
     )]
     merge_worktrees: bool,
 
@@ -126,7 +126,7 @@ enum Commands {
         group_by: String,
         #[arg(
             long = "merge-worktrees",
-            help = "With --group-by workspace,model: fold git worktrees into their parent repository so each repo is one row"
+            help = "With --group-by workspace,model: fold worktrees kept inside the repo (.claude/worktrees/, .git/worktrees/) into their parent repository so each repo is one row"
         )]
         merge_worktrees: bool,
         #[arg(
@@ -657,17 +657,6 @@ fn main() -> Result<()> {
                 let year = normalize_year_filter(&date);
                 ensure_home_supported_for_tui(&cli.home)?;
                 auto_sync_cursor_before_tui(&cli.home, &clients)?;
-                // The TUI owns its own grouping state (`g` and `w`), so neither
-                // --group-by nor --merge-worktrees carries into it. Say so rather
-                // than dropping the flag silently.
-                if merge_worktrees {
-                    use colored::Colorize;
-                    eprintln!(
-                        "{}",
-                        "  Warning: --merge-worktrees applies to --light/--json output; in the TUI press 'w' to toggle worktree rollup"
-                            .yellow()
-                    );
-                }
                 tui::run(
                     cli.theme.as_deref().unwrap_or(""),
                     cli.refresh,
@@ -677,6 +666,9 @@ fn main() -> Result<()> {
                     until,
                     year,
                     Some(Tab::Models),
+                    // Carry the flag in as the initial rollup rather than dropping
+                    // it; `w` toggles from there.
+                    worktree_rollup_from_flag(merge_worktrees),
                 )
             }
         }
@@ -714,6 +706,7 @@ fn main() -> Result<()> {
                     until,
                     year,
                     Some(Tab::Monthly),
+                    tokscale_core::WorktreeRollup::default(),
                 )
             }
         }
@@ -751,6 +744,7 @@ fn main() -> Result<()> {
                     until,
                     year,
                     Some(Tab::Hourly),
+                    tokscale_core::WorktreeRollup::default(),
                 )
             }
         }
@@ -821,6 +815,7 @@ fn main() -> Result<()> {
                 until,
                 year,
                 None,
+                tokscale_core::WorktreeRollup::default(),
             )
         }
         Some(Commands::Submit {
@@ -1019,6 +1014,7 @@ fn main() -> Result<()> {
                     until,
                     year,
                     None,
+                    worktree_rollup,
                 )
             }
         }

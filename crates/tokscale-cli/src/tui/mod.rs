@@ -84,6 +84,7 @@ pub fn run(
     until: Option<String>,
     year: Option<String>,
     initial_tab: Option<Tab>,
+    worktree_rollup: tokscale_core::WorktreeRollup,
 ) -> Result<()> {
     if debug {
         let _ = tracing_subscriber::fmt()
@@ -100,6 +101,7 @@ pub fn run(
         until: until.clone(),
         year: year.clone(),
         initial_tab,
+        worktree_rollup,
     };
 
     // Build the unified filter set used by the cache key, the App
