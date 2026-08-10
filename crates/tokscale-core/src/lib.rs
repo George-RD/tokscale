@@ -552,6 +552,7 @@ pub struct MonthlyUsage {
     pub output: i64,
     pub cache_read: i64,
     pub cache_write: i64,
+    pub reasoning: i64,
     pub message_count: i32,
     pub cost: f64,
 }
@@ -2966,8 +2967,59 @@ struct MonthAggregator {
     output: i64,
     cache_read: i64,
     cache_write: i64,
+    reasoning: i64,
     message_count: i32,
     cost: f64,
+}
+
+fn aggregate_monthly_usage_entries(
+    messages: impl IntoIterator<Item = UnifiedMessage>,
+) -> Vec<MonthlyUsage> {
+    let mut month_map: HashMap<String, MonthAggregator> = HashMap::new();
+
+    for msg in messages {
+        let month = if msg.date.len() >= 7 {
+            msg.date[..7].to_string()
+        } else {
+            continue;
+        };
+
+        let entry = month_map.entry(month).or_default();
+
+        entry.models.insert(model_name_for_grouping(
+            &msg.client,
+            &msg.provider_id,
+            &msg.model_id,
+        ));
+        // Saturating arithmetic matches the model/hourly aggregators: parser
+        // clamps can legitimately produce i64::MAX, and a corrupt source must
+        // not make report generation overflow.
+        entry.input = entry.input.saturating_add(msg.tokens.input);
+        entry.output = entry.output.saturating_add(msg.tokens.output);
+        entry.cache_read = entry.cache_read.saturating_add(msg.tokens.cache_read);
+        entry.cache_write = entry.cache_write.saturating_add(msg.tokens.cache_write);
+        entry.reasoning = entry.reasoning.saturating_add(msg.tokens.reasoning);
+        entry.message_count = entry.message_count.saturating_add(msg.message_count.max(0));
+        entry.cost += msg.cost;
+    }
+
+    let mut entries: Vec<MonthlyUsage> = month_map
+        .into_iter()
+        .map(|(month, agg)| MonthlyUsage {
+            month,
+            models: agg.models.into_iter().collect(),
+            input: agg.input,
+            output: agg.output,
+            cache_read: agg.cache_read,
+            cache_write: agg.cache_write,
+            reasoning: agg.reasoning,
+            message_count: agg.message_count,
+            cost: agg.cost,
+        })
+        .collect();
+
+    entries.sort_by(|a, b| a.month.cmp(&b.month));
+    entries
 }
 
 pub async fn get_monthly_report(options: ReportOptions) -> Result<MonthlyReport, String> {
@@ -2994,48 +3046,7 @@ pub async fn get_monthly_report(options: ReportOptions) -> Result<MonthlyReport,
     );
 
     let filtered = filter_messages_for_report(all_messages, &options);
-
-    let mut month_map: HashMap<String, MonthAggregator> = HashMap::new();
-
-    for msg in filtered {
-        let month = if msg.date.len() >= 7 {
-            msg.date[..7].to_string()
-        } else {
-            continue;
-        };
-
-        let entry = month_map.entry(month).or_default();
-
-        entry.models.insert(model_name_for_grouping(
-            &msg.client,
-            &msg.provider_id,
-            &msg.model_id,
-        ));
-        // saturating_add so clamped (i64::MAX) buckets from a corrupt source
-        // can't overflow the fold.
-        entry.input = entry.input.saturating_add(msg.tokens.input);
-        entry.output = entry.output.saturating_add(msg.tokens.output);
-        entry.cache_read = entry.cache_read.saturating_add(msg.tokens.cache_read);
-        entry.cache_write = entry.cache_write.saturating_add(msg.tokens.cache_write);
-        entry.message_count += msg.message_count.max(0);
-        entry.cost += msg.cost;
-    }
-
-    let mut entries: Vec<MonthlyUsage> = month_map
-        .into_iter()
-        .map(|(month, agg)| MonthlyUsage {
-            month,
-            models: agg.models.into_iter().collect(),
-            input: agg.input,
-            output: agg.output,
-            cache_read: agg.cache_read,
-            cache_write: agg.cache_write,
-            message_count: agg.message_count,
-            cost: agg.cost,
-        })
-        .collect();
-
-    entries.sort_by(|a, b| a.month.cmp(&b.month));
+    let entries = aggregate_monthly_usage_entries(filtered);
 
     // f64's Sum identity is -0.0, so an empty report would serialize as
     // "totalCost": -0.0; adding +0.0 normalizes the sign without changing
@@ -3061,6 +3072,69 @@ struct HourAggregator {
     message_count: i32,
     turn_count: i32,
     cost: f64,
+}
+
+fn aggregate_hourly_usage_entries(
+    messages: impl IntoIterator<Item = UnifiedMessage>,
+    bucket_timezone: bucket_tz::BucketTimezone,
+) -> Vec<HourlyUsage> {
+    let mut hour_map: HashMap<String, HourAggregator> = HashMap::new();
+
+    for msg in messages {
+        let hour_key = if msg.timestamp > 0 {
+            bucket_timezone
+                .hour_key(msg.timestamp)
+                .unwrap_or_else(|| format!("{} 00:00", msg.date))
+        } else {
+            format!("{} 00:00", msg.date)
+        };
+
+        let entry = hour_map.entry(hour_key).or_default();
+        entry.clients.insert(msg.client.clone());
+        entry.models.insert(model_name_for_grouping(
+            &msg.client,
+            &msg.provider_id,
+            &msg.model_id,
+        ));
+        entry.input = entry.input.saturating_add(msg.tokens.input);
+        entry.output = entry.output.saturating_add(msg.tokens.output);
+        entry.cache_read = entry.cache_read.saturating_add(msg.tokens.cache_read);
+        entry.cache_write = entry.cache_write.saturating_add(msg.tokens.cache_write);
+        entry.reasoning = entry.reasoning.saturating_add(msg.tokens.reasoning);
+        entry.message_count += msg.message_count.max(0);
+        if msg.is_turn_start {
+            entry.turn_count += 1;
+        }
+        entry.cost += msg.cost;
+    }
+
+    let mut entries: Vec<HourlyUsage> = hour_map
+        .into_iter()
+        .map(|(hour, agg)| HourlyUsage {
+            hour,
+            clients: {
+                let mut clients: Vec<String> = agg.clients.into_iter().collect();
+                clients.sort();
+                clients
+            },
+            models: {
+                let mut models: Vec<String> = agg.models.into_iter().collect();
+                models.sort();
+                models
+            },
+            input: agg.input,
+            output: agg.output,
+            cache_read: agg.cache_read,
+            cache_write: agg.cache_write,
+            message_count: agg.message_count,
+            turn_count: agg.turn_count,
+            reasoning: agg.reasoning,
+            cost: agg.cost,
+        })
+        .collect();
+
+    entries.sort_by(|a, b| a.hour.cmp(&b.hour));
+    entries
 }
 
 /// Generate hourly usage report, keyed by "YYYY-MM-DD HH:00".
@@ -3092,72 +3166,13 @@ pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, S
 
     let filtered = filter_messages_for_report(all_messages, &options);
 
-    let mut hour_map: HashMap<String, HourAggregator> = HashMap::new();
-
-    // The hour key embeds a date, and the timestamp-less fallback below builds
-    // one out of `msg.date` — which the rebucket pass has already moved to the
-    // pinned zone. Deriving the primary key from the host instead would let a
-    // single report disagree with itself about which day an hour belongs to.
+    // The hour key embeds a date, and the timestamp-less fallback builds one
+    // out of `msg.date`, which the rebucket pass already moved to the pinned
+    // zone. Deriving it from the host would let one report disagree with
+    // itself about which day an hour belongs to.
     let bucket_timezone =
         bucket_tz::BucketTimezone::from_scanner_settings(&options.scanner_settings);
-
-    for msg in filtered {
-        let hour_key = if msg.timestamp > 0 {
-            bucket_timezone
-                .hour_key(msg.timestamp)
-                .unwrap_or_else(|| format!("{} 00:00", msg.date))
-        } else {
-            format!("{} 00:00", msg.date)
-        };
-
-        let entry = hour_map.entry(hour_key).or_default();
-
-        entry.clients.insert(msg.client.clone());
-        entry.models.insert(model_name_for_grouping(
-            &msg.client,
-            &msg.provider_id,
-            &msg.model_id,
-        ));
-        // saturating_add so clamped (i64::MAX) buckets from a corrupt source
-        // can't overflow the fold.
-        entry.input = entry.input.saturating_add(msg.tokens.input);
-        entry.output = entry.output.saturating_add(msg.tokens.output);
-        entry.cache_read = entry.cache_read.saturating_add(msg.tokens.cache_read);
-        entry.cache_write = entry.cache_write.saturating_add(msg.tokens.cache_write);
-        entry.reasoning = entry.reasoning.saturating_add(msg.tokens.reasoning);
-        entry.message_count += msg.message_count.max(0);
-        if msg.is_turn_start {
-            entry.turn_count += 1;
-        }
-        entry.cost += msg.cost;
-    }
-
-    let mut entries: Vec<HourlyUsage> = hour_map
-        .into_iter()
-        .map(|(hour, agg)| HourlyUsage {
-            hour,
-            clients: {
-                let mut v: Vec<String> = agg.clients.into_iter().collect();
-                v.sort();
-                v
-            },
-            models: {
-                let mut v: Vec<String> = agg.models.into_iter().collect();
-                v.sort();
-                v
-            },
-            input: agg.input,
-            output: agg.output,
-            cache_read: agg.cache_read,
-            cache_write: agg.cache_write,
-            message_count: agg.message_count,
-            turn_count: agg.turn_count,
-            reasoning: agg.reasoning,
-            cost: agg.cost,
-        })
-        .collect();
-
-    entries.sort_by(|a, b| a.hour.cmp(&b.hour));
+    let entries = aggregate_hourly_usage_entries(filtered, bucket_timezone);
 
     // f64's Sum identity is -0.0, so an empty report would serialize as
     // "totalCost": -0.0; adding +0.0 normalizes the sign without changing
@@ -4692,7 +4707,8 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_model_usage_entries, apply_pricing_if_available, build_graph_from_messages,
+        aggregate_hourly_usage_entries, aggregate_model_usage_entries,
+        aggregate_monthly_usage_entries, apply_pricing_if_available, build_graph_from_messages,
         dedupe_latest_trae_messages, filter_messages_for_report,
         generate_graph_with_loaded_pricing, get_home_dir_string, is_generic_routing_label,
         message_cache, normalize_model_for_grouping,
@@ -4706,6 +4722,87 @@ mod tests {
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
+
+    #[test]
+    fn monthly_reasoning_matches_model_and_hourly_aggregation() {
+        let messages = vec![
+            UnifiedMessage::new(
+                "opencode",
+                "reasoning-model",
+                "openai",
+                "session-a",
+                1_767_225_600_000,
+                TokenBreakdown {
+                    input: 10,
+                    output: 5,
+                    cache_read: 2,
+                    cache_write: 1,
+                    reasoning: 7,
+                },
+                0.1,
+            ),
+            UnifiedMessage::new(
+                "codex",
+                "reasoning-model",
+                "openai",
+                "session-b",
+                1_767_229_200_000,
+                TokenBreakdown {
+                    input: 20,
+                    output: 8,
+                    cache_read: 3,
+                    cache_write: 2,
+                    reasoning: 11,
+                },
+                0.2,
+            ),
+        ];
+
+        let monthly = aggregate_monthly_usage_entries(messages.clone());
+        let models = aggregate_model_usage_entries(messages.clone(), &GroupBy::Model);
+        let hourly = aggregate_hourly_usage_entries(
+            messages,
+            super::bucket_tz::BucketTimezone::from_pinned_name(Some("UTC")),
+        );
+
+        assert_eq!(monthly.len(), 1);
+        let monthly_reasoning = monthly[0].reasoning;
+        let model_reasoning = models
+            .iter()
+            .fold(0_i64, |total, entry| total.saturating_add(entry.reasoning));
+        let hourly_reasoning = hourly
+            .iter()
+            .fold(0_i64, |total, entry| total.saturating_add(entry.reasoning));
+        assert_eq!(monthly_reasoning, 18);
+        assert_eq!(monthly_reasoning, model_reasoning);
+        assert_eq!(monthly_reasoning, hourly_reasoning);
+    }
+
+    #[test]
+    fn monthly_message_count_saturates() {
+        let mut first = UnifiedMessage::new(
+            "codex",
+            "model",
+            "openai",
+            "session-a",
+            1_767_225_600_000,
+            TokenBreakdown::default(),
+            0.0,
+        );
+        first.message_count = i32::MAX;
+        let second = UnifiedMessage::new(
+            "codex",
+            "model",
+            "openai",
+            "session-b",
+            1_767_225_601_000,
+            TokenBreakdown::default(),
+            0.0,
+        );
+
+        let monthly = aggregate_monthly_usage_entries([first, second]);
+        assert_eq!(monthly[0].message_count, i32::MAX);
+    }
     use std::str::FromStr;
     use std::sync::Arc;
 

@@ -2852,6 +2852,7 @@ fn run_monthly_report(
                 || e.output != 0
                 || e.cache_read != 0
                 || e.cache_write != 0
+                || e.reasoning != 0
                 || e.cost != 0.0
         });
     }
@@ -2878,6 +2879,7 @@ fn run_monthly_report(
             output: i64,
             cache_read: i64,
             cache_write: i64,
+            reasoning: i64,
             message_count: i32,
             cost: f64,
         }
@@ -2903,6 +2905,7 @@ fn run_monthly_report(
                     output: e.output,
                     cache_read: e.cache_read,
                     cache_write: e.cache_write,
+                    reasoning: e.reasoning,
                     message_count: e.message_count,
                     cost: e.cost,
                 })
@@ -2964,7 +2967,8 @@ fn run_monthly_report(
                     entry.output,
                     entry.cache_read,
                     entry.cache_write,
-                );
+                )
+                .saturating_add(entry.reasoning);
 
                 table.add_row(vec![
                     Cell::new(entry.month.clone()),
@@ -2979,14 +2983,15 @@ fn run_monthly_report(
                 ]);
             }
 
-            let (total_input, total_output, total_cache_read, total_cache_write) =
+            let (total_input, total_output, total_cache_read, total_cache_write, total_reasoning) =
                 monthly_token_field_totals(&report.entries);
             let total_tokens = saturating_token_total(
                 total_input,
                 total_output,
                 total_cache_read,
                 total_cache_write,
-            );
+            )
+            .saturating_add(total_reasoning);
             table.add_row(vec![
                 Cell::new("Total")
                     .fg(Color::Yellow)
@@ -3013,6 +3018,7 @@ fn run_monthly_report(
                 Cell::new("Output").fg(Color::Cyan),
                 Cell::new("Cache Write").fg(Color::Cyan),
                 Cell::new("Cache Read").fg(Color::Cyan),
+                Cell::new("Reasoning").fg(Color::Cyan),
                 Cell::new("Total").fg(Color::Cyan),
                 Cell::new("Cost").fg(Color::Cyan),
                 Cell::new("Cost/1M").fg(Color::Cyan),
@@ -3041,7 +3047,8 @@ fn run_monthly_report(
                     entry.output,
                     entry.cache_read,
                     entry.cache_write,
-                );
+                )
+                .saturating_add(entry.reasoning);
 
                 table.add_row(vec![
                     Cell::new(entry.month.clone()),
@@ -3054,6 +3061,8 @@ fn run_monthly_report(
                         .set_alignment(CellAlignment::Right),
                     Cell::new(format_tokens_with_commas(entry.cache_read))
                         .set_alignment(CellAlignment::Right),
+                    Cell::new(format_tokens_with_commas(entry.reasoning))
+                        .set_alignment(CellAlignment::Right),
                     Cell::new(format_tokens_with_commas(total)).set_alignment(CellAlignment::Right),
                     Cell::new(format_currency(entry.cost)).set_alignment(CellAlignment::Right),
                     Cell::new(format_cost_per_million(entry.cost, total))
@@ -3061,14 +3070,15 @@ fn run_monthly_report(
                 ]);
             }
 
-            let (total_input, total_output, total_cache_read, total_cache_write) =
+            let (total_input, total_output, total_cache_read, total_cache_write, total_reasoning) =
                 monthly_token_field_totals(&report.entries);
             let total_all = saturating_token_total(
                 total_input,
                 total_output,
                 total_cache_read,
                 total_cache_write,
-            );
+            )
+            .saturating_add(total_reasoning);
 
             table.add_row(vec![
                 Cell::new("Total")
@@ -3085,6 +3095,9 @@ fn run_monthly_report(
                     .fg(Color::Yellow)
                     .set_alignment(CellAlignment::Right),
                 Cell::new(format_tokens_with_commas(total_cache_read))
+                    .fg(Color::Yellow)
+                    .set_alignment(CellAlignment::Right),
+                Cell::new(format_tokens_with_commas(total_reasoning))
                     .fg(Color::Yellow)
                     .set_alignment(CellAlignment::Right),
                 Cell::new(format_tokens_with_commas(total_all))
@@ -3792,15 +3805,18 @@ fn saturating_token_total(input: i64, output: i64, cache_read: i64, cache_write:
 /// `ModelReport`) doesn't carry precomputed grand totals, so the display
 /// layer aggregates `report.entries` itself; a saturating fold keeps that
 /// aggregation safe against clamped (i64::MAX) entry buckets.
-fn monthly_token_field_totals(entries: &[tokscale_core::MonthlyUsage]) -> (i64, i64, i64, i64) {
+fn monthly_token_field_totals(
+    entries: &[tokscale_core::MonthlyUsage],
+) -> (i64, i64, i64, i64, i64) {
     entries.iter().fold(
-        (0, 0, 0, 0),
-        |(input, output, cache_read, cache_write), entry| {
+        (0, 0, 0, 0, 0),
+        |(input, output, cache_read, cache_write, reasoning), entry| {
             (
                 input.saturating_add(entry.input),
                 output.saturating_add(entry.output),
                 cache_read.saturating_add(entry.cache_read),
                 cache_write.saturating_add(entry.cache_write),
+                reasoning.saturating_add(entry.reasoning),
             )
         },
     )
@@ -6547,16 +6563,18 @@ mod tests {
             output: 0,
             cache_read: 0,
             cache_write: 0,
+            reasoning: 0,
             message_count: 1,
             cost: 0.0,
         };
         let entries = vec![make(i64::MAX), make(i64::MAX)];
-        let (total_input, total_output, total_cache_read, total_cache_write) =
+        let (total_input, total_output, total_cache_read, total_cache_write, total_reasoning) =
             monthly_token_field_totals(&entries);
         assert_eq!(total_input, i64::MAX);
         assert_eq!(total_output, 0);
         assert_eq!(total_cache_read, 0);
         assert_eq!(total_cache_write, 0);
+        assert_eq!(total_reasoning, 0);
     }
 
     #[test]
