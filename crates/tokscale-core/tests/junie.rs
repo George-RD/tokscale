@@ -8,7 +8,8 @@ use tokscale_core::pricing::{litellm::ModelPricing, PricingService};
 use tokscale_core::scanner::ScannerSettings;
 use tokscale_core::sessions::junie::parse_junie_file;
 use tokscale_core::{
-    parse_local_clients, parse_local_unified_messages_with_pricing, ClientId, LocalParseOptions,
+    parse_local_clients, parse_local_unified_messages_with_pricing_uncached, ClientId,
+    LocalParseOptions,
 };
 
 fn write_junie_session(home: &Path, session_id: &str, events: &str) -> PathBuf {
@@ -140,9 +141,10 @@ async fn test_junie_end_to_end_preserves_embedded_cost_and_prices_missing_cost()
     );
 
     let pricing = make_pricing_service();
-    let messages = parse_local_unified_messages_with_pricing(junie_options(home), Some(&pricing))
-        .await
-        .unwrap();
+    let messages =
+        parse_local_unified_messages_with_pricing_uncached(junie_options(home), Some(&pricing))
+            .await
+            .unwrap();
 
     assert_eq!(messages.len(), 2);
     let embedded = messages

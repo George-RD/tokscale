@@ -729,12 +729,36 @@ fn parse_all_messages_with_pricing(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceCachePolicy {
+    Persistent,
+    InMemory,
+}
+
 fn parse_all_messages_with_pricing_with_env_strategy(
     home_dir: &str,
     clients: &[String],
     pricing: Option<&pricing::PricingService>,
     use_env_roots: bool,
     scanner_settings: &scanner::ScannerSettings,
+) -> Vec<UnifiedMessage> {
+    parse_all_messages_with_pricing_with_cache_policy(
+        home_dir,
+        clients,
+        pricing,
+        use_env_roots,
+        scanner_settings,
+        SourceCachePolicy::Persistent,
+    )
+}
+
+fn parse_all_messages_with_pricing_with_cache_policy(
+    home_dir: &str,
+    clients: &[String],
+    pricing: Option<&pricing::PricingService>,
+    use_env_roots: bool,
+    scanner_settings: &scanner::ScannerSettings,
+    cache_policy: SourceCachePolicy,
 ) -> Vec<UnifiedMessage> {
     #[derive(Debug)]
     struct CachedParseOutcome {
@@ -1433,8 +1457,14 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         scanner_settings,
     );
     let headless_roots = scanner::headless_roots_with_env_strategy(home_dir, use_env_roots);
-    let mut source_cache = message_cache::SourceMessageCache::load();
-    source_cache.prune_missing_files();
+    let mut source_cache = match cache_policy {
+        SourceCachePolicy::Persistent => {
+            let mut cache = message_cache::SourceMessageCache::load();
+            cache.prune_missing_files();
+            cache
+        }
+        SourceCachePolicy::InMemory => message_cache::SourceMessageCache::default(),
+    };
     let mut all_messages: Vec<UnifiedMessage> = Vec::new();
     let include_all = clients.is_empty();
     let include_synthetic = include_all || clients.iter().any(|c| c == "synthetic");
@@ -2708,7 +2738,9 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
-    source_cache.save_if_dirty();
+    if cache_policy == SourceCachePolicy::Persistent {
+        source_cache.save_if_dirty();
+    }
 
     rebucket_days(&mut all_messages, scanner_settings);
 
@@ -3768,13 +3800,15 @@ fn parse_local_unified_messages_resolved(
     home_dir: &str,
     clients: &[String],
     pricing: Option<&pricing::PricingService>,
+    cache_policy: SourceCachePolicy,
 ) -> Result<Vec<UnifiedMessage>, String> {
-    let messages = parse_all_messages_with_pricing_with_env_strategy(
+    let messages = parse_all_messages_with_pricing_with_cache_policy(
         home_dir,
         clients,
         pricing,
         options.use_env_roots,
         &options.scanner_settings,
+        cache_policy,
     );
     Ok(filter_unified_messages(messages, &options))
 }
@@ -4702,7 +4736,33 @@ pub async fn parse_local_unified_messages_with_pricing(
     pricing: Option<&pricing::PricingService>,
 ) -> Result<Vec<UnifiedMessage>, String> {
     let (home_dir, clients) = resolve_local_parse_request(&options)?;
-    parse_local_unified_messages_resolved(options, &home_dir, &clients, pricing)
+    parse_local_unified_messages_resolved(
+        options,
+        &home_dir,
+        &clients,
+        pricing,
+        SourceCachePolicy::Persistent,
+    )
+}
+
+/// Parse local messages without reading or writing the persistent source cache.
+///
+/// A fresh in-memory cache is still shared by every source parsed during this
+/// call, preserving normal within-call reuse and deduplication. This entry point
+/// is intended for isolated callers such as integration tests.
+#[doc(hidden)]
+pub async fn parse_local_unified_messages_with_pricing_uncached(
+    options: LocalParseOptions,
+    pricing: Option<&pricing::PricingService>,
+) -> Result<Vec<UnifiedMessage>, String> {
+    let (home_dir, clients) = resolve_local_parse_request(&options)?;
+    parse_local_unified_messages_resolved(
+        options,
+        &home_dir,
+        &clients,
+        pricing,
+        SourceCachePolicy::InMemory,
+    )
 }
 
 pub async fn parse_local_unified_messages(
@@ -4710,7 +4770,13 @@ pub async fn parse_local_unified_messages(
 ) -> Result<Vec<UnifiedMessage>, String> {
     let (home_dir, clients) = resolve_local_parse_request(&options)?;
     let pricing = load_pricing_for_local_parse().await;
-    parse_local_unified_messages_resolved(options, &home_dir, &clients, pricing.as_deref())
+    parse_local_unified_messages_resolved(
+        options,
+        &home_dir,
+        &clients,
+        pricing.as_deref(),
+        SourceCachePolicy::Persistent,
+    )
 }
 
 fn unified_to_parsed(msg: &UnifiedMessage) -> ParsedMessage {

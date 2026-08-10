@@ -5,7 +5,7 @@ use std::fs;
 
 use tokscale_core::pricing::{litellm::ModelPricing, PricingService};
 use tokscale_core::scanner::ScannerSettings;
-use tokscale_core::{parse_local_unified_messages_with_pricing, LocalParseOptions};
+use tokscale_core::{parse_local_unified_messages_with_pricing_uncached, LocalParseOptions};
 
 fn make_pricing_service() -> PricingService {
     let mut litellm_data = HashMap::new();
@@ -51,7 +51,7 @@ async fn test_jcode_end_to_end_parsing_and_pricing() {
     );
 
     let pricing = make_pricing_service();
-    let messages = parse_local_unified_messages_with_pricing(
+    let messages = parse_local_unified_messages_with_pricing_uncached(
         LocalParseOptions {
             home_dir: Some(home.to_str().unwrap().to_string()),
             use_env_roots: false,
@@ -101,7 +101,7 @@ async fn test_jcode_deduplicates_replayed_message_ids() {
 }"#;
     write_jcode_session(home, "session_a.json", session_body);
 
-    let messages = parse_local_unified_messages_with_pricing(
+    let messages = parse_local_unified_messages_with_pricing_uncached(
         LocalParseOptions {
             home_dir: Some(home.to_str().unwrap().to_string()),
             use_env_roots: false,
@@ -153,7 +153,7 @@ async fn test_jcode_journal_corrects_replayed_snapshot_duplicate() {
     )
     .unwrap();
 
-    let messages = parse_local_unified_messages_with_pricing(
+    let messages = parse_local_unified_messages_with_pricing_uncached(
         LocalParseOptions {
             home_dir: Some(home.to_str().unwrap().to_string()),
             use_env_roots: false,
