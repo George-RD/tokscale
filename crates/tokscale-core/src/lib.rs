@@ -3097,11 +3097,10 @@ fn aggregate_monthly_usage_v2_entries(
     let mut month_map: HashMap<String, MonthAggregator> = HashMap::new();
 
     for msg in messages {
-        let month = if msg.date.len() >= 7 {
-            msg.date[..7].to_string()
-        } else {
+        let Ok(date) = chrono::NaiveDate::parse_from_str(&msg.date, "%Y-%m-%d") else {
             continue;
         };
+        let month = date.format("%Y-%m").to_string();
 
         let entry = month_map.entry(month).or_default();
 
@@ -5070,6 +5069,54 @@ mod tests {
         assert_eq!(monthly_reasoning, 18);
         assert_eq!(monthly_reasoning, model_reasoning);
         assert_eq!(monthly_reasoning, hourly_reasoning);
+    }
+
+    #[test]
+    fn monthly_aggregation_rejects_malformed_calendar_dates() {
+        let message_with_date = |date: &str, input: i64| {
+            let mut message = UnifiedMessage::new(
+                "codex",
+                "model",
+                "openai",
+                format!("session-{input}"),
+                1_767_225_600_000,
+                TokenBreakdown {
+                    input,
+                    ..TokenBreakdown::default()
+                },
+                0.0,
+            );
+            message.date = date.to_string();
+            message
+        };
+
+        let monthly = aggregate_monthly_usage_v2_entries([
+            message_with_date("2024-02-29", 1),
+            message_with_date("2023-02-29", 2),
+            message_with_date("2026-00-01", 4),
+            message_with_date("2026-13-01", 8),
+            message_with_date("2026-04-31", 16),
+            message_with_date("2026-💥", 32),
+            message_with_date("2026-01-31", 64),
+        ]);
+
+        assert_eq!(monthly.len(), 2);
+        assert_eq!(
+            monthly
+                .iter()
+                .find(|entry| entry.month == "2024-02")
+                .unwrap()
+                .input,
+            1
+        );
+        assert_eq!(
+            monthly
+                .iter()
+                .find(|entry| entry.month == "2026-01")
+                .unwrap()
+                .input,
+            64
+        );
     }
 
     #[test]
