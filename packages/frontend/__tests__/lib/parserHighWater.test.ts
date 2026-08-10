@@ -349,6 +349,63 @@ describe("non-destructive parser generation high-water", () => {
     });
   });
 
+  it("does not fund a cache composition shift with unrelated bucket growth", () => {
+    const first = baseline(
+      {},
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 20, output: 0, cacheRead: 80, cacheWrite: 0, reasoning: 0 },
+          1,
+          1
+        )
+      )
+    );
+    const plan = next(
+      first.nextState!,
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 0, output: 0, cacheRead: 90, cacheWrite: 20, reasoning: 0 },
+          2,
+          2
+        )
+      )
+    );
+    const increment = plan.increments["2026-07-01"].models["model-a"];
+
+    expect(increment.cacheRead).toBe(0);
+    expect(increment.cacheWrite).toBe(10);
+    expect(increment.tokens).toBe(10);
+  });
+
+  it("allows genuine fully-cached inclusive-input growth", () => {
+    const first = baseline(
+      {},
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 0, output: 0, cacheRead: 100, cacheWrite: 0, reasoning: 0 },
+          1,
+          1
+        )
+      )
+    );
+    const plan = next(
+      first.nextState!,
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 0, output: 0, cacheRead: 150, cacheWrite: 0, reasoning: 0 },
+          2,
+          2
+        )
+      )
+    );
+
+    expect(plan.increments["2026-07-01"].models["model-a"].cacheRead).toBe(50);
+  });
+
   it("does not treat repricing without token growth as new spend", () => {
     const first = baseline(
       legacy(contribution("2026-07-01", 100, "model-a", 5)),

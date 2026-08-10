@@ -285,9 +285,27 @@ function allocateIncrements(
       const model = incoming.models[modelId];
       const prior = ownValue(previous?.models, modelId);
       const increment = emptyModel();
+      const candidates = Object.fromEntries(
+        TOKEN_FIELDS.map((field) => [
+          field,
+          positive(model[field] - (prior?.[field] ?? 0)),
+        ])
+      ) as Record<TokenField, number>;
+      // Submitted `input` is already exclusive of cache reads. Reconstruct the
+      // producer's inclusive input counter before bounding cache growth, so a
+      // cache-only composition shift cannot mint tokens while a genuinely
+      // fully-cached request (exclusive input 0) can still advance.
+      const inclusiveInputCandidate = positive(
+        model.input + model.cacheRead -
+          ((prior?.input ?? 0) + (prior?.cacheRead ?? 0))
+      );
+      candidates.cacheRead = Math.min(
+        candidates.cacheRead,
+        inclusiveInputCandidate
+      );
       let candidateTokens = 0;
       for (const field of TOKEN_FIELDS) {
-        const candidate = positive(model[field] - (prior?.[field] ?? 0));
+        const candidate = candidates[field];
         candidateTokens += candidate;
         const accepted = Math.min(candidate, bucketBudgets[field], tokenBudget);
         increment[field] = accepted;
