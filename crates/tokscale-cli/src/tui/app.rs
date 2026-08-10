@@ -304,6 +304,9 @@ pub struct App {
     /// at the boundary via `App::scan_clients` and `App::include_synthetic`.
     pub enabled_clients: Rc<RefCell<HashSet<ClientFilter>>>,
     pub group_by: Rc<RefCell<tokscale_core::GroupBy>>,
+    /// Whether workspace rows fold git worktrees into their parent repo. Toggled
+    /// with `w`; only observable under `GroupBy::WorkspaceModel`.
+    pub worktree_rollup: tokscale_core::WorktreeRollup,
     pub sort_field: SortField,
     pub sort_direction: SortDirection,
     tab_sort_state: HashMap<Tab, (SortField, SortDirection)>,
@@ -457,6 +460,7 @@ impl App {
             data_loader,
             enabled_clients: Rc::new(RefCell::new(enabled_clients)),
             group_by: Rc::new(RefCell::new(super::cache::TUI_DEFAULT_GROUP_BY)),
+            worktree_rollup: tokscale_core::WorktreeRollup::default(),
             sort_field,
             sort_direction,
             tab_sort_state: HashMap::new(),
@@ -903,6 +907,23 @@ impl App {
             }
             KeyCode::Char('g') => {
                 self.open_group_by_picker();
+            }
+            // Only meaningful while workspace rows are on screen; leaving `w`
+            // inert elsewhere keeps it free for other tabs later.
+            KeyCode::Char('w')
+                if *self.group_by.borrow() == tokscale_core::GroupBy::WorkspaceModel =>
+            {
+                self.worktree_rollup = match self.worktree_rollup {
+                    tokscale_core::WorktreeRollup::Separate => {
+                        tokscale_core::WorktreeRollup::MergeIntoRepo
+                    }
+                    tokscale_core::WorktreeRollup::MergeIntoRepo => {
+                        tokscale_core::WorktreeRollup::Separate
+                    }
+                };
+                // Rollup changes the grouping key, so rows must be rebuilt.
+                self.needs_reload = true;
+                self.reset_selection();
             }
             KeyCode::Char('a') if self.current_tab == Tab::Usage => {
                 self.start_codex_login();

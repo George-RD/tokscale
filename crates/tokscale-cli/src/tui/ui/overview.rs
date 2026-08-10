@@ -269,7 +269,18 @@ fn render_top_models(frame: &mut Frame, app: &mut App, area: Rect, items_per_pag
     let models_len = models_data.len();
     let start = scroll_offset.min(models_len);
     let end = (start + items_per_page).min(models_len);
-    let max_name_width = if is_narrow { 20 } else { 35 };
+    // `workspace / model` is roughly twice the text of a bare model name, and
+    // the label's distinguishing part (repo, worktree) sits at the far end, so a
+    // 35-cell cap truncated every row down to the same shared path prefix. The
+    // panel is full-width here, so spend it rather than clipping to a constant.
+    let max_name_width = if is_narrow {
+        20
+    } else if group_by == GroupBy::WorkspaceModel {
+        // Leave room for the "● " marker and the trailing " (12.3%)".
+        inner.width.saturating_sub(12).max(35) as usize
+    } else {
+        35
+    };
 
     if start >= models_len {
         return;

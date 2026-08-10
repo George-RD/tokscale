@@ -8,7 +8,7 @@ use tokio::runtime::{Handle, Runtime};
 use tokscale_core::sessions::UnifiedMessage;
 use tokscale_core::{
     model_name_for_grouping, normalize_model_for_grouping, parse_local_unified_messages, sessions,
-    ClientId, GroupBy, LocalParseOptions, ModelPerformance,
+    ClientId, GroupBy, LocalParseOptions, ModelPerformance, WorktreeRollup,
 };
 
 /// Returns the scanner settings that `DataLoader` should use when building
@@ -214,27 +214,15 @@ pub struct DataLoader {
     pub until: Option<String>,
     pub year: Option<String>,
     pub minutely_enabled: bool,
+    pub worktree_rollup: WorktreeRollup,
 }
 
+#[cfg(test)]
 const UNKNOWN_WORKSPACE_LABEL: &str = "Unknown workspace";
-const UNKNOWN_WORKSPACE_GROUP_KEY: &str = "\0unknown-workspace";
 
-fn workspace_bucket(msg: &UnifiedMessage) -> (String, Option<String>, String) {
-    match (&msg.workspace_key, &msg.workspace_label) {
-        (Some(key), Some(label)) => (key.clone(), Some(key.clone()), label.clone()),
-        (Some(key), None) => (
-            key.clone(),
-            Some(key.clone()),
-            tokscale_core::sessions::workspace_label_from_key(key)
-                .unwrap_or_else(|| UNKNOWN_WORKSPACE_LABEL.to_string()),
-        ),
-        _ => (
-            UNKNOWN_WORKSPACE_GROUP_KEY.to_string(),
-            None,
-            UNKNOWN_WORKSPACE_LABEL.to_string(),
-        ),
-    }
-}
+// Workspace bucketing lives in tokscale_core::workspace_bucket so this
+// aggregation and the CLI report agree on worktree rollup and on labeling
+// Claude Code's dash-mangled keys.
 
 fn positive_unified_token_total(tokens: &tokscale_core::TokenBreakdown) -> i64 {
     // saturating_add (mirrors tokscale_core::TokenBreakdown::total) so a
@@ -331,6 +319,7 @@ impl DataLoader {
             until: None,
             year: None,
             minutely_enabled: false,
+            worktree_rollup: WorktreeRollup::default(),
         }
     }
 
@@ -346,11 +335,17 @@ impl DataLoader {
             until,
             year,
             minutely_enabled: false,
+            worktree_rollup: WorktreeRollup::default(),
         }
     }
 
     pub fn with_minutely_enabled(mut self, enabled: bool) -> Self {
         self.minutely_enabled = enabled;
+        self
+    }
+
+    pub fn with_worktree_rollup(mut self, rollup: WorktreeRollup) -> Self {
+        self.worktree_rollup = rollup;
         self
     }
 
@@ -468,12 +463,15 @@ impl DataLoader {
         let mut minutely_map: HashMap<NaiveDateTime, MinutelyUsage> = HashMap::new();
         let mut model_session_ids: HashMap<String, HashSet<String>> = HashMap::new();
         let mut session_map: HashMap<String, SessionUsage> = HashMap::new();
+        // Memoizes the filesystem probes that resolve a workspace key to a label.
+        let mut workspace_labeler = tokscale_core::WorkspaceLabeler::default();
 
         for msg in &messages {
             let normalized_model =
                 model_name_for_grouping(&msg.client, &msg.provider_id, &msg.model_id);
             let model_key = normalize_model_for_grouping(&msg.model_id);
-            let (workspace_group_key, workspace_key, workspace_label) = workspace_bucket(msg);
+            let (workspace_group_key, workspace_key, workspace_label) =
+                tokscale_core::workspace_bucket(msg, self.worktree_rollup, &mut workspace_labeler);
             let key = match group_by {
                 GroupBy::Model => normalized_model.clone(),
                 GroupBy::ClientModel => format!("{}:{}", msg.client, normalized_model),

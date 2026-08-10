@@ -545,6 +545,9 @@ pub struct ReportOptions {
     pub until: Option<String>,
     pub year: Option<String>,
     pub group_by: GroupBy,
+    /// Whether `workspace,model` rows fold git worktrees into their parent repo.
+    /// Only consulted for [`GroupBy::WorkspaceModel`].
+    pub worktree_rollup: WorktreeRollup,
     /// Persistent scanner config loaded from `~/.config/tokscale/settings.json`.
     /// Defaults to empty when callers don't care about user-configured paths.
     pub scanner_settings: scanner::ScannerSettings,
@@ -2868,32 +2871,125 @@ fn filter_unified_messages(
     filtered
 }
 
-fn workspace_bucket(msg: &UnifiedMessage) -> (String, Option<String>, String) {
-    match (&msg.workspace_key, &msg.workspace_label) {
-        (Some(key), Some(label)) => (key.clone(), Some(key.clone()), label.clone()),
-        (Some(key), None) => (
-            key.clone(),
-            Some(key.clone()),
-            sessions::workspace_label_from_key(key)
-                .unwrap_or_else(|| UNKNOWN_WORKSPACE_LABEL.to_string()),
-        ),
-        _ => (
-            UNKNOWN_WORKSPACE_GROUP_KEY.to_string(),
-            None,
-            UNKNOWN_WORKSPACE_LABEL.to_string(),
-        ),
+/// How workspace rows treat git worktrees.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub enum WorktreeRollup {
+    /// One row per worktree — a task-isolating agent CLI produces many rows per repo.
+    #[default]
+    Separate,
+    /// Fold every worktree into its parent repository.
+    MergeIntoRepo,
+}
+
+/// Resolving a workspace key to a display label reads the filesystem (see
+/// [`sessions::decode_claude_project_slug`]). Reports iterate hundreds of
+/// thousands of messages over a handful of distinct workspaces, so memoize per
+/// key and keep the syscalls proportional to workspaces, not messages.
+#[derive(Default)]
+pub struct WorkspaceLabeler {
+    labels: HashMap<String, String>,
+    roots: HashMap<String, Option<String>>,
+}
+
+impl WorkspaceLabeler {
+    pub fn label(&mut self, key: &str) -> String {
+        if let Some(cached) = self.labels.get(key) {
+            return cached.clone();
+        }
+        let label = sessions::workspace_display_label(key)
+            .unwrap_or_else(|| UNKNOWN_WORKSPACE_LABEL.to_string());
+        self.labels.insert(key.to_string(), label.clone());
+        label
+    }
+
+    /// The canonical repo identity for `key`: the real filesystem path, with any
+    /// worktree suffix stripped. `None` when the key cannot be resolved to a path
+    /// (an opaque client id, or a directory no longer on disk), leaving the
+    /// original key as its own identity.
+    ///
+    /// Decoding is what makes the rollup actually merge. Claude Code writes a
+    /// dash-mangled slug and Codex/OpenCode write real paths, so without this the
+    /// same repo keeps two identities and the "one row per repo" promise fails.
+    pub fn repo_root(&mut self, key: &str) -> Option<String> {
+        if let Some(cached) = self.roots.get(key) {
+            return cached.clone();
+        }
+        // Decode first: Claude's slug encodes `.claude/worktrees/` as dashes, so
+        // the marker is only visible once the real path is recovered.
+        let decoded = sessions::decode_claude_project_slug(key);
+        let path = decoded.as_deref().unwrap_or(key);
+        let root = sessions::workspace_repo_root(path)
+            // Not a worktree: the decoded path is already the repo identity.
+            .or_else(|| decoded.clone())
+            // Undecodable slug (deleted worktree): fall back to the repo prefix
+            // recovered from the slug string so it still merges with its repo.
+            .or_else(|| sessions::workspace_repo_root_from_slug(key));
+        self.roots.insert(key.to_string(), root.clone());
+        root
     }
 }
 
+/// Grouping key, stored key and display label for a message's workspace.
+///
+/// Shared with the TUI, which runs its own aggregation over the same messages —
+/// duplicating this would let the two drift on how worktrees roll up and how
+/// Claude Code's dash-mangled keys are labeled.
+pub fn workspace_bucket(
+    msg: &UnifiedMessage,
+    rollup: WorktreeRollup,
+    labeler: &mut WorkspaceLabeler,
+) -> (String, Option<String>, String) {
+    let Some(key) = msg.workspace_key.as_deref() else {
+        return (
+            UNKNOWN_WORKSPACE_GROUP_KEY.to_string(),
+            None,
+            UNKNOWN_WORKSPACE_LABEL.to_string(),
+        );
+    };
+
+    // Under MergeIntoRepo the repo root becomes the grouping identity, so every
+    // worktree of a repo lands in one row and the row reports the repo's path.
+    if rollup == WorktreeRollup::MergeIntoRepo {
+        if let Some(root) = labeler.repo_root(key) {
+            let label = labeler.label(&root);
+            return (root.clone(), Some(root), label);
+        }
+    }
+
+    // A parser-supplied label is authoritative — it is the only thing that can
+    // name a workspace whose key is not a path (Warp's workspace UUID). Keys
+    // that fell back to `workspace_label_from_key` are relabeled, because that
+    // helper returns the whole dash-mangled slug for Claude Code.
+    let label = match msg.workspace_label.as_deref() {
+        Some(label) if Some(label.to_string()) != sessions::workspace_label_from_key(key) => {
+            label.to_string()
+        }
+        _ => labeler.label(key),
+    };
+
+    (key.to_string(), Some(key.to_string()), label)
+}
+
+#[cfg(test)]
 fn aggregate_model_usage_entries(
     messages: Vec<UnifiedMessage>,
     group_by: &GroupBy,
 ) -> Vec<ModelUsage> {
+    aggregate_model_usage_entries_with_rollup(messages, group_by, WorktreeRollup::default())
+}
+
+fn aggregate_model_usage_entries_with_rollup(
+    messages: Vec<UnifiedMessage>,
+    group_by: &GroupBy,
+    rollup: WorktreeRollup,
+) -> Vec<ModelUsage> {
     let mut model_map: HashMap<String, ModelUsage> = HashMap::new();
+    let mut labeler = WorkspaceLabeler::default();
 
     for msg in messages {
         let normalized = model_name_for_grouping(&msg.client, &msg.provider_id, &msg.model_id);
-        let (workspace_group_key, workspace_key, workspace_label) = workspace_bucket(&msg);
+        let (workspace_group_key, workspace_key, workspace_label) =
+            workspace_bucket(&msg, rollup, &mut labeler);
         let key = match group_by {
             GroupBy::Model => normalized.clone(),
             GroupBy::ClientModel => format!("{}:{}", msg.client, normalized),
@@ -3058,7 +3154,11 @@ pub async fn get_model_report(options: ReportOptions) -> Result<ModelReport, Str
     );
 
     let filtered = filter_messages_for_report(all_messages, &options);
-    let entries = aggregate_model_usage_entries(filtered, &options.group_by);
+    let entries = aggregate_model_usage_entries_with_rollup(
+        filtered,
+        &options.group_by,
+        options.worktree_rollup,
+    );
 
     let (total_input, total_output, total_cache_read, total_cache_write) =
         model_report_token_totals(&entries);
@@ -4930,6 +5030,10 @@ mod tests {
         MISSING_MODEL_PRICING_REASON, ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL,
         UNVERIFIED_MODEL_IDENTITY_REASON, UNVERIFIED_PROVIDER_IDENTITY_REASON,
     };
+    // Kept as its own statement rather than folded into the list above: that list
+    // is edited by nearly every PR that touches this file, and sharing it made
+    // this branch conflict on every single upstream merge.
+    use super::{aggregate_model_usage_entries_with_rollup, WorktreeRollup};
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
@@ -6089,6 +6193,163 @@ mod tests {
         assert_eq!(entries[0].output, 10);
         assert_eq!(entries[0].cost, 4.0);
         assert_eq!(entries[0].message_count, 2);
+    }
+
+    #[test]
+    fn worktree_rollup_merges_worktrees_of_one_repo_into_a_single_row() {
+        let messages = vec![
+            make_workspace_message(
+                "claude",
+                "claude-sonnet-4-5-20250929",
+                "anthropic",
+                "session-1",
+                1.0,
+                Some("/repo-a/.claude/worktrees/feature-x"),
+                None,
+            ),
+            make_workspace_message(
+                "claude",
+                "claude-sonnet-4-5-20250929",
+                "anthropic",
+                "session-2",
+                2.0,
+                Some("/repo-a/.claude/worktrees/feature-y"),
+                None,
+            ),
+            make_workspace_message(
+                "claude",
+                "claude-sonnet-4-5-20250929",
+                "anthropic",
+                "session-3",
+                4.0,
+                Some("/repo-a"),
+                None,
+            ),
+        ];
+
+        let separate = aggregate_model_usage_entries_with_rollup(
+            messages.clone(),
+            &GroupBy::WorkspaceModel,
+            WorktreeRollup::Separate,
+        );
+        assert_eq!(separate.len(), 3, "each worktree stays its own row");
+
+        let merged = aggregate_model_usage_entries_with_rollup(
+            messages,
+            &GroupBy::WorkspaceModel,
+            WorktreeRollup::MergeIntoRepo,
+        );
+        assert_eq!(merged.len(), 1, "every worktree folds into the repo row");
+        assert_eq!(merged[0].workspace_key.as_deref(), Some("/repo-a"));
+        assert_eq!(merged[0].workspace_label.as_deref(), Some("repo-a"));
+        // No usage may be lost or double counted by the rollup.
+        assert_eq!(merged[0].cost, 7.0);
+        assert_eq!(merged[0].message_count, 3);
+    }
+
+    #[test]
+    fn worktree_rollup_labels_name_the_repo_and_the_worktree() {
+        let entries = aggregate_model_usage_entries_with_rollup(
+            vec![make_workspace_message(
+                "claude",
+                "claude-sonnet-4-5-20250929",
+                "anthropic",
+                "session-1",
+                1.0,
+                Some("/repo-a/.claude/worktrees/feature-x"),
+                None,
+            )],
+            &GroupBy::WorkspaceModel,
+            WorktreeRollup::Separate,
+        );
+
+        // Without rollup the row must still say WHICH worktree it is -- the bug
+        // was a label that truncated to a shared, indistinguishable prefix.
+        assert_eq!(
+            entries[0].workspace_label.as_deref(),
+            Some("repo-a ⑃ feature-x")
+        );
+    }
+
+    #[test]
+    fn worktree_rollup_merges_a_slug_key_with_the_same_repos_real_path() {
+        // Claude Code writes a dash-mangled slug and Codex/OpenCode write real
+        // paths for the SAME directory. Under rollup both must resolve to one
+        // identity, or "one row per repo" silently still yields two.
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("devpro/ing/claude-witness");
+        std::fs::create_dir_all(repo.join(".claude/worktrees/feature-x")).unwrap();
+
+        let real_path = std::fs::canonicalize(&repo)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let worktree_path = std::fs::canonicalize(repo.join(".claude/worktrees/feature-x"))
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        // How Claude Code would name that worktree's project directory.
+        let slug: String = worktree_path
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+
+        let entries = aggregate_model_usage_entries_with_rollup(
+            vec![
+                make_workspace_message(
+                    "claude",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-1",
+                    1.0,
+                    Some(&slug),
+                    None,
+                ),
+                make_workspace_message(
+                    "opencode",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-2",
+                    2.0,
+                    Some(&real_path),
+                    None,
+                ),
+            ],
+            &GroupBy::WorkspaceModel,
+            WorktreeRollup::MergeIntoRepo,
+        );
+
+        assert_eq!(entries.len(), 1, "slug and real path must share one row");
+        assert_eq!(entries[0].cost, 3.0);
+        assert_eq!(
+            entries[0].workspace_label.as_deref(),
+            Some("claude-witness")
+        );
+    }
+
+    #[test]
+    fn workspace_rows_keep_parser_supplied_labels_for_non_path_keys() {
+        // Warp keys a workspace by opaque UUID; only the parser can name it, so
+        // relabeling must not clobber that.
+        let entries = aggregate_model_usage_entries_with_rollup(
+            vec![make_workspace_message(
+                "warp",
+                "claude-sonnet-4-5-20250929",
+                "anthropic",
+                "session-1",
+                1.0,
+                Some("9f2c1a04-1e4b-4c3f-a0d1-77b2e5c9aa10"),
+                Some("Ing's Team"),
+            )],
+            &GroupBy::WorkspaceModel,
+            WorktreeRollup::MergeIntoRepo,
+        );
+
+        assert_eq!(entries[0].workspace_label.as_deref(), Some("Ing's Team"));
+        assert_eq!(
+            entries[0].workspace_key.as_deref(),
+            Some("9f2c1a04-1e4b-4c3f-a0d1-77b2e5c9aa10")
+        );
     }
 
     #[test]
@@ -12161,6 +12422,7 @@ mod tests {
                     until: None,
                     year: None,
                     group_by: GroupBy::default(),
+                    worktree_rollup: WorktreeRollup::default(),
                     scanner_settings: scanner::ScannerSettings::default(),
                 },
                 None,

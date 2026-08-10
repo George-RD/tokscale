@@ -6,10 +6,31 @@ use ratatui::widgets::{
 use super::widgets::{
     format_cache_hit_rate, format_cost, format_cost_per_million, format_ms_per_1k, format_tokens,
     get_client_display_name, get_provider_display_name, total_tokens_cell, truncate_text,
-    viewport_scrollbar_state,
+    truncate_to_width, viewport_scrollbar_state,
 };
 use crate::tui::app::{App, SortDirection, SortField};
 use tokscale_core::GroupBy;
+
+/// Floor for the Workspace column. A `repo ⑃ worktree` label needs far more than
+/// the model column's share, so it takes `Min` and the rest of the row is fixed.
+const WORKSPACE_COLUMN_MIN_WIDTH: u16 = 28;
+
+/// Every fixed-width column in the workspace layout, in render order. Kept as
+/// data so [`workspace_column_width`] derives the leftover width from the same
+/// numbers the `widths` vector below uses — a hand-summed constant silently
+/// drifts the moment a column is added or resized.
+const WORKSPACE_LAYOUT_FIXED_COLUMNS: [u16; 12] = [3, 24, 16, 14, 10, 10, 12, 12, 10, 10, 10, 10];
+
+/// Width available to the flexible Workspace column in a table of `total` cells.
+fn workspace_column_width(total: u16) -> usize {
+    let fixed: u16 = WORKSPACE_LAYOUT_FIXED_COLUMNS.iter().sum();
+    // ratatui puts one cell of spacing between adjacent columns: one gap per
+    // fixed column, since the Workspace column sits beside each of them.
+    let gaps = WORKSPACE_LAYOUT_FIXED_COLUMNS.len() as u16;
+    total
+        .saturating_sub(fixed + gaps)
+        .max(WORKSPACE_COLUMN_MIN_WIDTH) as usize
+}
 
 fn workspace_label(model: &crate::tui::data::ModelUsage) -> &str {
     model
@@ -168,7 +189,11 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             } else if group_by == GroupBy::WorkspaceModel {
                 vec![
                     Cell::from(format!("{}", idx + 1)).style(Style::default().fg(theme_muted)),
-                    Cell::from(truncate_text(workspace_label(model), 18)).style(
+                    Cell::from(truncate_to_width(
+                        workspace_label(model),
+                        workspace_column_width(inner.width),
+                    ))
+                    .style(
                         Style::default()
                             .fg(theme_accent)
                             .add_modifier(Modifier::BOLD),
@@ -247,21 +272,18 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Percentage(25),
         ]
     } else if group_by == GroupBy::WorkspaceModel {
-        vec![
-            Constraint::Length(3),
-            Constraint::Length(18),
-            Constraint::Min(20),
-            Constraint::Length(16),
-            Constraint::Length(14),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(10),
-        ]
+        // Workspace is the row's identity under this grouping, so it gets the
+        // flexible column and the model name a fixed one -- the reverse of every
+        // other layout. `repo ⑃ worktree` labels are long, and a fixed 18 cells
+        // clipped them back to an indistinguishable shared prefix.
+        let mut widths = vec![Constraint::Length(WORKSPACE_LAYOUT_FIXED_COLUMNS[0])];
+        widths.push(Constraint::Min(WORKSPACE_COLUMN_MIN_WIDTH));
+        widths.extend(
+            WORKSPACE_LAYOUT_FIXED_COLUMNS[1..]
+                .iter()
+                .map(|w| Constraint::Length(*w)),
+        );
+        widths
     } else {
         vec![
             Constraint::Length(3),
@@ -301,6 +323,31 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                 vertical: 1,
             }),
             &mut scrollbar_state,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_column_takes_the_width_the_fixed_columns_leave_behind() {
+        let fixed: u16 = WORKSPACE_LAYOUT_FIXED_COLUMNS.iter().sum::<u16>()
+            + WORKSPACE_LAYOUT_FIXED_COLUMNS.len() as u16;
+
+        // Everything past the fixed columns belongs to Workspace.
+        assert_eq!(workspace_column_width(fixed + 40), 40);
+
+        // Narrow terminals fall back to the floor rather than 0 (which would
+        // render an empty cell) or a negative wrap.
+        assert_eq!(
+            workspace_column_width(fixed),
+            WORKSPACE_COLUMN_MIN_WIDTH as usize
+        );
+        assert_eq!(
+            workspace_column_width(0),
+            WORKSPACE_COLUMN_MIN_WIDTH as usize
         );
     }
 }

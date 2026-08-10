@@ -248,6 +248,7 @@ async fn load_wrapped_data(options: &WrappedOptions) -> Result<WrappedData> {
         until: Some(until),
         year: Some(year.clone()),
         group_by: GroupBy::default(),
+        worktree_rollup: tokscale_core::WorktreeRollup::default(),
         scanner_settings: crate::tui::settings::load_scanner_settings(),
     })
     .await
