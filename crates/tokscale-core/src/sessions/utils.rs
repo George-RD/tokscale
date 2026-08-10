@@ -191,6 +191,7 @@ pub(crate) fn back_anchor_timestamp(end: i64, duration: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::ErrorCode;
 
     #[test]
     fn lossy_lines_survives_undecodable_bytes_and_strips_a_bom() {
@@ -256,8 +257,6 @@ mod tests {
 
     #[test]
     fn open_readonly_sqlite_rejects_writes_but_reads_existing_data() {
-        use rusqlite::ffi::ErrorCode;
-
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("state.db");
         let conn = Connection::open(&db_path).unwrap();
@@ -273,23 +272,29 @@ mod tests {
         let error = conn
             .execute("INSERT INTO sessions (id) VALUES ('session')", [])
             .unwrap_err();
-        assert!(matches!(
-            error,
-            rusqlite::Error::SqliteFailure(error, _) if error.code == ErrorCode::ReadOnly
-        ));
+        assert!(
+            matches!(
+                &error,
+                rusqlite::Error::SqliteFailure(sqlite_error, _)
+                    if sqlite_error.code == ErrorCode::ReadOnly
+            ),
+            "expected SQLITE_READONLY, got {error:?}"
+        );
     }
 
     #[test]
     fn open_readonly_sqlite_preserves_cannot_open_error() {
-        use rusqlite::ffi::ErrorCode;
-
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("missing.db");
         let error = open_readonly_sqlite(&db_path).unwrap_err();
 
-        assert!(matches!(
-            error,
-            rusqlite::Error::SqliteFailure(error, _) if error.code == ErrorCode::CannotOpen
-        ));
+        assert!(
+            matches!(
+                &error,
+                rusqlite::Error::SqliteFailure(sqlite_error, _)
+                    if sqlite_error.code == ErrorCode::CannotOpen
+            ),
+            "expected SQLITE_CANTOPEN, got {error:?}"
+        );
     }
 }

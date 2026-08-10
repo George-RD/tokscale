@@ -663,6 +663,13 @@ fn parse_iso8601_timestamp_ms(value: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_copilot_desktop_db_returns_empty_for_missing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.db");
+        assert!(parse_copilot_desktop_db(&missing).is_empty());
+    }
     use rusqlite::{params, Connection};
     use std::fs::{self, File};
     use std::io::Write;
