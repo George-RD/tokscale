@@ -293,18 +293,18 @@ function allocateIncrements(
   let messageBudget = positive(
     incomingAggregate.messages - previousAggregate.messages
   );
-  const aggregateInclusiveInputBudget = positive(
+  let inclusiveInputBudget = positive(
     incomingAggregate.inputIncludingCacheRead -
       previousAggregate.inputIncludingCacheRead
   );
-  const aggregateCacheReadBudget = Math.min(
-    positive(incomingAggregate.cacheRead - previousAggregate.cacheRead),
-    aggregateInclusiveInputBudget
-  );
   const bucketBudgets: Record<TokenField, number> = {
-    input: aggregateInclusiveInputBudget - aggregateCacheReadBudget,
+    // Normalized input/cache share the one observed inclusive-input budget.
+    // Their per-cell candidates partition that budget below; pre-partitioning
+    // it from aggregate bucket maxima lets an unsupported cache composition
+    // move starve genuine input growth in another cell.
+    input: 0,
     output: positive(incomingAggregate.output - previousAggregate.output),
-    cacheRead: aggregateCacheReadBudget,
+    cacheRead: 0,
     cacheWrite: positive(incomingAggregate.cacheWrite - previousAggregate.cacheWrite),
     reasoning: positive(incomingAggregate.reasoning - previousAggregate.reasoning),
   };
@@ -351,9 +351,21 @@ function allocateIncrements(
       for (const field of TOKEN_FIELDS) {
         const candidate = candidates[field];
         candidateTokens += candidate;
-        const accepted = Math.min(candidate, bucketBudgets[field], tokenBudget);
+        const isInclusiveInputComponent =
+          field === "input" || field === "cacheRead";
+        const accepted = Math.min(
+          candidate,
+          isInclusiveInputComponent
+            ? inclusiveInputBudget
+            : bucketBudgets[field],
+          tokenBudget
+        );
         increment[field] = accepted;
-        bucketBudgets[field] -= accepted;
+        if (isInclusiveInputComponent) {
+          inclusiveInputBudget -= accepted;
+        } else {
+          bucketBudgets[field] -= accepted;
+        }
         tokenBudget -= accepted;
       }
       increment.tokens = TOKEN_FIELDS.reduce(

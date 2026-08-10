@@ -484,6 +484,74 @@ describe("non-destructive parser generation high-water", () => {
     expect(replay.increments).toEqual({});
   });
 
+  it("does not reserve cross-cell inclusive growth for an unsupported cache shift", () => {
+    const first = baseline(
+      {},
+      snapshot(
+        contribution("2026-07-01", 100, "model-a", 1),
+        contribution("2026-07-01", 100, "model-b", 1)
+      )
+    );
+    const plan = next(
+      first.nextState!,
+      snapshot(
+        contribution("2026-07-01", 150, "model-a", 2),
+        bucketContribution(
+          "2026-07-01",
+          { input: 50, output: 0, cacheRead: 50, cacheWrite: 0, reasoning: 0 },
+          1,
+          1,
+          "model-b"
+        )
+      )
+    );
+
+    expect(plan.increments["2026-07-01"].models["model-a"].input).toBe(50);
+    expect(plan.increments["2026-07-01"].models["model-b"]).toBeUndefined();
+  });
+
+  it("spends a partial shared inclusive budget deterministically and once", () => {
+    const first = baseline(
+      {},
+      snapshot(
+        contribution("2026-07-01", 100, "z-growing", 1),
+        contribution("2026-07-01", 100, "a-cache-shift", 1),
+        contribution("2026-07-01", 50, "deleted-model", 1)
+      )
+    );
+    const grown = next(
+      first.nextState!,
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 50, output: 0, cacheRead: 50, cacheWrite: 0, reasoning: 0 },
+          1,
+          1,
+          "a-cache-shift"
+        ),
+        contribution("2026-07-01", 200, "z-growing", 2)
+      )
+    );
+    const replay = next(
+      grown.nextState!,
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 50, output: 0, cacheRead: 50, cacheWrite: 0, reasoning: 0 },
+          1,
+          1,
+          "a-cache-shift"
+        ),
+        contribution("2026-07-01", 200, "z-growing", 2)
+      )
+    );
+
+    expect(grown.increments["2026-07-01"].models["a-cache-shift"]).toBeUndefined();
+    expect(grown.increments["2026-07-01"].models["z-growing"].input).toBe(50);
+    expect(grown.increments["2026-07-01"].tokens).toBe(50);
+    expect(replay.increments).toEqual({});
+  });
+
   it("allows genuine fully-cached inclusive-input growth", () => {
     const first = baseline(
       {},
