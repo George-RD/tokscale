@@ -1735,7 +1735,7 @@ fn current_bucket_date(home_dir: &Option<String>) -> chrono::NaiveDate {
     .today()
 }
 
-fn build_date_filter_for_date(
+pub(crate) fn build_date_filter_for_date(
     date: &DateRangeFlags,
     current_date: chrono::NaiveDate,
 ) -> (Option<String>, Option<String>) {
@@ -1772,7 +1772,7 @@ fn build_date_filter_for_date(
     (date.since.clone(), date.until.clone())
 }
 
-fn normalize_year_filter(date: &DateRangeFlags) -> Option<String> {
+pub(crate) fn normalize_year_filter(date: &DateRangeFlags) -> Option<String> {
     if date.today || date.yesterday || date.week || date.month {
         None
     } else {
