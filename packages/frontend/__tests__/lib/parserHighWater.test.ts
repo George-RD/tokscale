@@ -421,6 +421,69 @@ describe("non-destructive parser generation high-water", () => {
     expect(grown.increments["2026-07-01"].models["model-a"].cacheRead).toBe(50);
   });
 
+  it("derives exclusive-input growth from the inclusive delta after a cache shift", () => {
+    const first = baseline(
+      {},
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 100, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+          1,
+          1
+        )
+      )
+    );
+    const shifted = next(
+      first.nextState!,
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 0, output: 0, cacheRead: 100, cacheWrite: 0, reasoning: 0 },
+          1,
+          1
+        )
+      )
+    );
+    const grown = next(
+      shifted.nextState!,
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 50, output: 0, cacheRead: 100, cacheWrite: 0, reasoning: 0 },
+          2,
+          2
+        )
+      )
+    );
+
+    const increment = grown.increments["2026-07-01"].models["model-a"];
+    expect(increment.input).toBe(50);
+    expect(increment.cacheRead).toBe(0);
+    expect(increment.tokens).toBe(50);
+  });
+
+  it("applies a partial lifetime budget to inclusive growth exactly once", () => {
+    const first = baseline(
+      {},
+      snapshot(
+        contribution("2026-07-02", 100, "model-a", 1),
+        contribution("2026-07-01", 100, "deleted-model", 1)
+      )
+    );
+    const grown = next(
+      first.nextState!,
+      snapshot(contribution("2026-07-02", 250, "model-a", 3))
+    );
+    const replay = next(
+      grown.nextState!,
+      snapshot(contribution("2026-07-02", 250, "model-a", 3))
+    );
+
+    expect(grown.increments["2026-07-02"].models["model-a"].input).toBe(50);
+    expect(grown.increments["2026-07-02"].tokens).toBe(50);
+    expect(replay.increments).toEqual({});
+  });
+
   it("allows genuine fully-cached inclusive-input growth", () => {
     const first = baseline(
       {},

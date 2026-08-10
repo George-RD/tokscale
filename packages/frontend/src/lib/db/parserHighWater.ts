@@ -26,6 +26,8 @@ export interface ParserAggregateHighWater {
   cacheWrite: number;
   reasoning: number;
   messages: number;
+  /** Device/client input before cache-read normalization. */
+  inputIncludingCacheRead: number;
 }
 
 export interface ParserClientHighWaterState {
@@ -92,6 +94,7 @@ function emptyAggregate(): ParserAggregateHighWater {
     cacheWrite: 0,
     reasoning: 0,
     messages: 0,
+    inputIncludingCacheRead: 0,
   };
 }
 
@@ -190,6 +193,8 @@ function aggregateSnapshot(
     for (const field of TOKEN_FIELDS) aggregate[field] += day[field] || 0;
     aggregate.tokens += day.tokens || 0;
     aggregate.messages += day.messages || 0;
+    aggregate.inputIncludingCacheRead +=
+      (day.input || 0) + (day.cacheRead || 0);
   }
   return aggregate;
 }
@@ -261,6 +266,10 @@ function advanceAggregate(
     cacheWrite: Math.max(previous.cacheWrite, incoming.cacheWrite),
     reasoning: Math.max(previous.reasoning, incoming.reasoning),
     messages: Math.max(previous.messages, incoming.messages),
+    inputIncludingCacheRead: Math.max(
+      previous.inputIncludingCacheRead,
+      incoming.inputIncludingCacheRead
+    ),
   };
 }
 
@@ -284,10 +293,18 @@ function allocateIncrements(
   let messageBudget = positive(
     incomingAggregate.messages - previousAggregate.messages
   );
+  const aggregateInclusiveInputBudget = positive(
+    incomingAggregate.inputIncludingCacheRead -
+      previousAggregate.inputIncludingCacheRead
+  );
+  const aggregateCacheReadBudget = Math.min(
+    positive(incomingAggregate.cacheRead - previousAggregate.cacheRead),
+    aggregateInclusiveInputBudget
+  );
   const bucketBudgets: Record<TokenField, number> = {
-    input: positive(incomingAggregate.input - previousAggregate.input),
+    input: aggregateInclusiveInputBudget - aggregateCacheReadBudget,
     output: positive(incomingAggregate.output - previousAggregate.output),
-    cacheRead: positive(incomingAggregate.cacheRead - previousAggregate.cacheRead),
+    cacheRead: aggregateCacheReadBudget,
     cacheWrite: positive(incomingAggregate.cacheWrite - previousAggregate.cacheWrite),
     reasoning: positive(incomingAggregate.reasoning - previousAggregate.reasoning),
   };
@@ -320,10 +337,16 @@ function allocateIncrements(
               (prior?.input ?? 0) + (prior?.cacheRead ?? 0)
           )
       );
-      candidates.cacheRead = Math.min(
+      const cacheReadCandidate = Math.min(
         candidates.cacheRead,
         inclusiveInputCandidate
       );
+      // Inclusive input is the conserved producer counter. Allocate its growth
+      // between cache and exclusive input from the current observed snapshot;
+      // comparing exclusive input against its independent maximum would lose
+      // real growth after a cache-composition shift.
+      candidates.cacheRead = cacheReadCandidate;
+      candidates.input = inclusiveInputCandidate - cacheReadCandidate;
       let candidateTokens = 0;
       for (const field of TOKEN_FIELDS) {
         const candidate = candidates[field];
@@ -388,18 +411,21 @@ function validState(
           state.aggregate[field] >= 0
       ) &&
       Number.isFinite(state.aggregate.messages) &&
-      state.aggregate.messages >= 0
+      state.aggregate.messages >= 0 &&
+      Number.isFinite(state.aggregate.inputIncludingCacheRead) &&
+      state.aggregate.inputIncludingCacheRead >= 0
   );
 }
 
 /**
  * Build a non-destructive parser rollout plan.
  *
- * The first supported full snapshot becomes a baseline. If legacy rows exist,
- * that snapshot is deliberately not added. Later full snapshots may add only
- * growth bounded BOTH by positive per-cell deltas and by device/client-wide
- * cumulative high-water growth. Date/model reshuffles and deleted local
- * history therefore add nothing and can never erase or duplicate stored rows.
+ * The first supported full snapshot becomes a baseline. Legacy rows are always
+ * preserved; only positive lifetime growth beyond their aggregate may be added
+ * at transition. Later full snapshots may add only growth bounded BOTH by
+ * positive per-cell deltas and by device/client-wide cumulative high-water
+ * growth. Date/model reshuffles and deleted local history therefore add
+ * nothing and can never erase or duplicate stored rows.
  */
 export function planParserHighWaterSubmission(args: {
   client: string;
