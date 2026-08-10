@@ -562,6 +562,11 @@ pub struct ModelUsage {
     pub performance: ModelPerformance,
 }
 
+/// Original monthly usage shape returned by [`get_monthly_report`].
+///
+/// This type intentionally remains unchanged so downstream struct literals stay
+/// source-compatible. Use [`MonthlyUsageV2`] and [`get_monthly_report_v2`] when
+/// reasoning tokens are required.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MonthlyUsage {
     pub month: String,
@@ -574,12 +579,11 @@ pub struct MonthlyUsage {
     pub cost: f64,
 }
 
-/// Complete monthly usage including token buckets added after the original
-/// [`MonthlyUsage`] API was established.
+/// Complete monthly usage including reasoning tokens.
 ///
-/// This versioned type keeps downstream `MonthlyUsage` struct literals source
-/// compatible while allowing CLI and API consumers to opt into reasoning
-/// tokens without silently omitting them.
+/// This versioned type keeps downstream [`MonthlyUsage`] struct literals
+/// source-compatible while allowing CLI and API consumers to opt into the
+/// complete token breakdown.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MonthlyUsageV2 {
     pub month: String,
@@ -615,12 +619,51 @@ pub struct MonthlyReport {
     pub processing_time_ms: u32,
 }
 
-/// Versioned monthly report whose entries retain every token bucket.
+/// Complete monthly report whose entries retain reasoning tokens.
+///
+/// Use [`get_monthly_report_v2`] to generate this shape. The original
+/// [`MonthlyReport`] and [`get_monthly_report`] remain available for source
+/// compatibility.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MonthlyReportV2 {
     pub entries: Vec<MonthlyUsageV2>,
     pub total_cost: f64,
     pub processing_time_ms: u32,
+}
+
+impl MonthlyUsageV2 {
+    /// Convert to the original public shape, intentionally discarding the
+    /// `reasoning` bucket that [`MonthlyUsage`] predates.
+    pub fn into_legacy(self) -> MonthlyUsage {
+        MonthlyUsage {
+            month: self.month,
+            models: self.models,
+            input: self.input,
+            output: self.output,
+            cache_read: self.cache_read,
+            cache_write: self.cache_write,
+            message_count: self.message_count,
+            cost: self.cost,
+        }
+    }
+}
+
+impl MonthlyReportV2 {
+    /// Convert to the original public report shape.
+    ///
+    /// Each entry's `reasoning` bucket is intentionally discarded because
+    /// [`MonthlyUsage`] predates that field.
+    pub fn into_legacy(self) -> MonthlyReport {
+        MonthlyReport {
+            entries: self
+                .entries
+                .into_iter()
+                .map(MonthlyUsageV2::into_legacy)
+                .collect(),
+            total_cost: self.total_cost,
+            processing_time_ms: self.processing_time_ms,
+        }
+    }
 }
 
 /// Hourly usage entry for a single hour slot (e.g. "2026-03-23 14:00")
@@ -3016,7 +3059,7 @@ struct MonthAggregator {
     cost: f64,
 }
 
-fn aggregate_monthly_usage_entries(
+fn aggregate_monthly_usage_v2_entries(
     messages: impl IntoIterator<Item = UnifiedMessage>,
 ) -> Vec<MonthlyUsageV2> {
     let mut month_map: HashMap<String, MonthAggregator> = HashMap::new();
@@ -3090,7 +3133,7 @@ pub async fn get_monthly_report_v2(options: ReportOptions) -> Result<MonthlyRepo
     );
 
     let filtered = filter_messages_for_report(all_messages, &options);
-    let entries = aggregate_monthly_usage_entries(filtered);
+    let entries = aggregate_monthly_usage_v2_entries(filtered);
 
     // f64's Sum identity is -0.0, so an empty report would serialize as
     // "totalCost": -0.0; adding +0.0 normalizes the sign without changing
@@ -3108,25 +3151,7 @@ pub async fn get_monthly_report_v2(options: ReportOptions) -> Result<MonthlyRepo
 ///
 /// New callers that need reasoning tokens should use [`get_monthly_report_v2`].
 pub async fn get_monthly_report(options: ReportOptions) -> Result<MonthlyReport, String> {
-    let report = get_monthly_report_v2(options).await?;
-    Ok(MonthlyReport {
-        entries: report
-            .entries
-            .into_iter()
-            .map(|entry| MonthlyUsage {
-                month: entry.month,
-                models: entry.models,
-                input: entry.input,
-                output: entry.output,
-                cache_read: entry.cache_read,
-                cache_write: entry.cache_write,
-                message_count: entry.message_count,
-                cost: entry.cost,
-            })
-            .collect(),
-        total_cost: report.total_cost,
-        processing_time_ms: report.processing_time_ms,
-    })
+    Ok(get_monthly_report_v2(options).await?.into_legacy())
 }
 
 #[derive(Default)]
@@ -4777,16 +4802,17 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
 mod tests {
     use super::{
         aggregate_hourly_usage_entries, aggregate_model_usage_entries,
-        aggregate_monthly_usage_entries, apply_pricing_if_available, build_graph_from_messages,
+        aggregate_monthly_usage_v2_entries, apply_pricing_if_available, build_graph_from_messages,
         dedupe_latest_trae_messages, filter_messages_for_report,
         generate_graph_with_loaded_pricing, get_home_dir_string, is_generic_routing_label,
         message_cache, normalize_model_for_grouping,
         parse_all_messages_with_pricing_with_env_strategy, parse_local_clients, parsed_to_unified,
         paths, pricing, retain_for_requested_clients, scanner, select_local_parse_pricing,
         sessions, unified_to_parsed, validate_priced_messages, ClientId, GraphPricingRequirement,
-        GroupBy, LocalParseOptions, MonthlyUsage, MonthlyUsageV2, ReportOptions, TokenBreakdown,
-        UnifiedMessage, UnpricedSubmissionExclusion, INCOMPLETE_MODEL_PRICING_REASON,
-        MISSING_MODEL_PRICING_REASON, ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL,
+        GroupBy, LocalParseOptions, MonthlyReportV2, MonthlyUsage, MonthlyUsageV2, ReportOptions,
+        TokenBreakdown, UnifiedMessage, UnpricedSubmissionExclusion,
+        INCOMPLETE_MODEL_PRICING_REASON, MISSING_MODEL_PRICING_REASON,
+        ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL,
     };
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
@@ -4876,8 +4902,53 @@ mod tests {
             cost: 0.5,
         };
 
-        let serialized = serde_json::to_value(usage).unwrap();
+        let serialized = serde_json::to_value(&usage).unwrap();
         assert_eq!(serialized["reasoning"], 6);
+
+        let legacy = usage.into_legacy();
+        assert_eq!(legacy.month, "2026-01");
+        assert_eq!(legacy.models, ["model"]);
+        assert_eq!(legacy.input, 1);
+        assert_eq!(legacy.output, 2);
+        assert_eq!(legacy.cache_read, 3);
+        assert_eq!(legacy.cache_write, 4);
+        assert_eq!(legacy.message_count, 5);
+        assert_eq!(legacy.cost, 0.5);
+        assert!(serde_json::to_value(legacy)
+            .unwrap()
+            .get("reasoning")
+            .is_none());
+    }
+
+    #[test]
+    fn monthly_report_v2_legacy_conversion_preserves_report_metadata() {
+        let report = MonthlyReportV2 {
+            entries: vec![MonthlyUsageV2 {
+                month: "2026-02".to_string(),
+                models: vec![],
+                input: 1,
+                output: 2,
+                cache_read: 3,
+                cache_write: 4,
+                reasoning: 5,
+                message_count: 6,
+                cost: 0.75,
+            }],
+            total_cost: 0.75,
+            processing_time_ms: 42,
+        };
+
+        let legacy = report.into_legacy();
+        assert_eq!(legacy.entries.len(), 1);
+        assert_eq!(legacy.entries[0].month, "2026-02");
+        assert_eq!(legacy.entries[0].input, 1);
+        assert_eq!(legacy.entries[0].output, 2);
+        assert_eq!(legacy.entries[0].cache_read, 3);
+        assert_eq!(legacy.entries[0].cache_write, 4);
+        assert_eq!(legacy.entries[0].message_count, 6);
+        assert_eq!(legacy.entries[0].cost, 0.75);
+        assert_eq!(legacy.total_cost, 0.75);
+        assert_eq!(legacy.processing_time_ms, 42);
     }
 
     #[test]
@@ -4915,7 +4986,7 @@ mod tests {
             ),
         ];
 
-        let monthly = aggregate_monthly_usage_entries(messages.clone());
+        let monthly = aggregate_monthly_usage_v2_entries(messages.clone());
         let models = aggregate_model_usage_entries(messages.clone(), &GroupBy::Model);
         let hourly = aggregate_hourly_usage_entries(
             messages,
@@ -4957,7 +5028,7 @@ mod tests {
             0.0,
         );
 
-        let monthly = aggregate_monthly_usage_entries([first, second]);
+        let monthly = aggregate_monthly_usage_v2_entries([first, second]);
         assert_eq!(monthly[0].message_count, i32::MAX);
     }
     use std::str::FromStr;

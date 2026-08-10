@@ -3801,8 +3801,8 @@ fn saturating_token_total(input: i64, output: i64, cache_read: i64, cache_write:
 }
 
 /// Sum every monthly token field (input, output, cache read, cache write, and
-/// reasoning) across usage entries with saturating_add. `MonthlyReport` (unlike
-/// `ModelReport`) doesn't carry precomputed grand totals, so the display
+/// reasoning) across usage entries with saturating_add. `MonthlyReportV2`
+/// (unlike `ModelReport`) doesn't carry precomputed grand totals, so the display
 /// layer aggregates `report.entries` itself; a saturating fold keeps that
 /// aggregation safe against clamped (i64::MAX) entry buckets.
 fn monthly_token_field_totals(
@@ -6529,28 +6529,28 @@ mod tests {
 
     #[test]
     fn monthly_token_field_totals_saturate_across_entries() {
-        // MonthlyReport has no precomputed grand totals, so the display layer
+        // MonthlyReportV2 has no precomputed grand totals, so the display layer
         // aggregates report.entries itself. Two entries each carrying a
         // clamped (i64::MAX) input bucket must not overflow that aggregation.
-        let make = |input: i64| tokscale_core::MonthlyUsageV2 {
+        let make = |input: i64, reasoning: i64| tokscale_core::MonthlyUsageV2 {
             month: "2026-07".to_string(),
             models: vec![],
             input,
             output: 0,
             cache_read: 0,
             cache_write: 0,
-            reasoning: 0,
+            reasoning,
             message_count: 1,
             cost: 0.0,
         };
-        let entries = vec![make(i64::MAX), make(i64::MAX)];
+        let entries = vec![make(i64::MAX, 100), make(i64::MAX, 23)];
         let (total_input, total_output, total_cache_read, total_cache_write, total_reasoning) =
             monthly_token_field_totals(&entries);
         assert_eq!(total_input, i64::MAX);
         assert_eq!(total_output, 0);
         assert_eq!(total_cache_read, 0);
         assert_eq!(total_cache_write, 0);
-        assert_eq!(total_reasoning, 0);
+        assert_eq!(total_reasoning, 123);
     }
 
     #[test]
