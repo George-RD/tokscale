@@ -1620,6 +1620,62 @@ mod tests {
     }
 
     #[test]
+    fn test_client_display_names_match_canonical_registry() {
+        let expected = [
+            "OpenCode",
+            "Claude Code",
+            "Codex CLI",
+            "Cursor IDE",
+            "Gemini CLI",
+            "Amp",
+            "Droid",
+            "OpenClaw",
+            "Pi",
+            "Kimi CLI",
+            "Qwen CLI",
+            "Roo Code",
+            "Kilo Code",
+            "Mux",
+            "Kilo CLI",
+            "Crush",
+            "Hermes Agent",
+            "Copilot CLI",
+            "Goose",
+            "Codebuff",
+            "Antigravity",
+            "Zed Agent",
+            "Kiro",
+            "Trae",
+            "Warp",
+            "Cline",
+            "Gajae-Code",
+            "Grok Build",
+            "Jcode",
+            "Command Code",
+            "MiMo Code",
+            "Antigravity CLI",
+            "Junie",
+            "ZCode",
+            "OpenCodeReview",
+            "CodeBuddy",
+            "WorkBuddy",
+            "Devin CLI",
+            "Devin Desktop",
+            "Senpi (OmO Native)",
+            "Augment Code",
+            "Kimchi",
+            "Reasonix",
+            "Prime Agent",
+            "Freebuff",
+        ];
+
+        assert_eq!(expected.len(), ClientId::COUNT);
+        for (client, expected_name) in ClientId::iter().zip(expected) {
+            assert_eq!(crate::tui::client_ui::display_name(client), expected_name);
+        }
+    }
+
+    #[test]
     fn test_client_key() {
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::OpenCode), '1');
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::Claude), '2');

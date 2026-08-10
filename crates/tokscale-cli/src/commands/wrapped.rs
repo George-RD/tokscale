@@ -1443,6 +1443,7 @@ fn format_number_with_commas_i64(value: i64) -> String {
 fn client_display_name(client: &str) -> Option<&'static str> {
     ClientId::from_str(client)
         .map(|client| client.display_name())
+        .or_else(|| (client == "9router").then_some("9Router"))
         .or_else(|| (client == "synthetic").then_some("Synthetic"))
 }
 
@@ -2424,6 +2425,11 @@ mod tests {
                 Some(client.display_name())
             );
         }
+    }
+
+    #[test]
+    fn test_client_display_name_9router_alias() {
+        assert_eq!(client_display_name("9router"), Some("9Router"));
     }
 
     #[test]
