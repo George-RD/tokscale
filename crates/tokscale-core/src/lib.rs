@@ -1154,6 +1154,40 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         )
     }
 
+    /// Parse one direct cached lane and merge it before the next lane starts.
+    ///
+    /// Outcomes are collected in parallel before either destination is mutated;
+    /// this preserves the existing per-lane collection and post-collection cache
+    /// insertion lifecycle. Callers invoke this helper in source order, so the
+    /// call order also preserves the sequential lane order of the parser.
+    ///
+    /// The scan key and cache identity are intentionally derived from the same
+    /// `ClientId`, making a same-client mapping impossible to mismatch. An
+    /// asymmetric lane should use a separately named helper with its own contract.
+    fn parse_cached_lane<F>(
+        scan_result: &scanner::ScanResult,
+        source_cache: &mut message_cache::SourceMessageCache,
+        pricing: Option<&pricing::PricingService>,
+        all_messages: &mut Vec<UnifiedMessage>,
+        scan_client: ClientId,
+        parse: F,
+    ) where
+        F: Fn(&Path) -> Vec<UnifiedMessage> + Sync,
+    {
+        let cache_identity = message_cache::CacheIdentity::for_client(scan_client);
+        let outcomes: Vec<CachedParseOutcome> = scan_result
+            .get(scan_client)
+            .par_iter()
+            .map(|path| load_or_parse_source(cache_identity, path, source_cache, pricing, &parse))
+            .collect();
+        for outcome in outcomes {
+            all_messages.extend(outcome.messages);
+            if let Some(entry) = outcome.cache_entry {
+                source_cache.insert(entry);
+            }
+        }
+    }
+
     fn uncached_prime_outcome(
         mut messages: Vec<UnifiedMessage>,
         accounting: sessions::prime_agent::PrimeFileAccounting,
@@ -1664,25 +1698,14 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         }
     }
 
-    let copilot_outcomes: Vec<CachedParseOutcome> = scan_result
-        .get(ClientId::Copilot)
-        .par_iter()
-        .map(|path| {
-            load_or_parse_source(
-                message_cache::CacheIdentity::for_client(ClientId::Copilot),
-                path,
-                &source_cache,
-                pricing,
-                sessions::copilot::parse_copilot_file,
-            )
-        })
-        .collect();
-    for outcome in copilot_outcomes {
-        all_messages.extend(outcome.messages);
-        if let Some(entry) = outcome.cache_entry {
-            source_cache.insert(entry);
-        }
-    }
+    parse_cached_lane(
+        &scan_result,
+        &mut source_cache,
+        pricing,
+        &mut all_messages,
+        ClientId::Copilot,
+        sessions::copilot::parse_copilot_file,
+    );
     if let Some(db_path) = &scan_result.copilot_desktop_db {
         let otel_sessions: HashSet<String> = all_messages
             .iter()
@@ -1765,45 +1788,23 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         }
     }
 
-    let cursor_outcomes: Vec<CachedParseOutcome> = scan_result
-        .get(ClientId::Cursor)
-        .par_iter()
-        .map(|path| {
-            load_or_parse_source(
-                message_cache::CacheIdentity::for_client(ClientId::Cursor),
-                path,
-                &source_cache,
-                pricing,
-                sessions::cursor::parse_cursor_file,
-            )
-        })
-        .collect();
-    for outcome in cursor_outcomes {
-        all_messages.extend(outcome.messages);
-        if let Some(entry) = outcome.cache_entry {
-            source_cache.insert(entry);
-        }
-    }
+    parse_cached_lane(
+        &scan_result,
+        &mut source_cache,
+        pricing,
+        &mut all_messages,
+        ClientId::Cursor,
+        sessions::cursor::parse_cursor_file,
+    );
 
-    let warp_outcomes: Vec<CachedParseOutcome> = scan_result
-        .get(ClientId::Warp)
-        .par_iter()
-        .map(|path| {
-            load_or_parse_source(
-                message_cache::CacheIdentity::for_client(ClientId::Warp),
-                path,
-                &source_cache,
-                pricing,
-                sessions::warp::parse_warp_file,
-            )
-        })
-        .collect();
-    for outcome in warp_outcomes {
-        all_messages.extend(outcome.messages);
-        if let Some(entry) = outcome.cache_entry {
-            source_cache.insert(entry);
-        }
-    }
+    parse_cached_lane(
+        &scan_result,
+        &mut source_cache,
+        pricing,
+        &mut all_messages,
+        ClientId::Warp,
+        sessions::warp::parse_warp_file,
+    );
 
     let grok_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Grok)
@@ -1860,25 +1861,14 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         }
     }
 
-    let amp_outcomes: Vec<CachedParseOutcome> = scan_result
-        .get(ClientId::Amp)
-        .par_iter()
-        .map(|path| {
-            load_or_parse_source(
-                message_cache::CacheIdentity::for_client(ClientId::Amp),
-                path,
-                &source_cache,
-                pricing,
-                sessions::amp::parse_amp_file,
-            )
-        })
-        .collect();
-    for outcome in amp_outcomes {
-        all_messages.extend(outcome.messages);
-        if let Some(entry) = outcome.cache_entry {
-            source_cache.insert(entry);
-        }
-    }
+    parse_cached_lane(
+        &scan_result,
+        &mut source_cache,
+        pricing,
+        &mut all_messages,
+        ClientId::Amp,
+        sessions::amp::parse_amp_file,
+    );
 
     let codebuff_outcomes: Vec<CachedParseOutcome> = if include_codebuff {
         scan_result
@@ -1954,45 +1944,23 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         }
     }
 
-    let openclaw_outcomes: Vec<CachedParseOutcome> = scan_result
-        .get(ClientId::OpenClaw)
-        .par_iter()
-        .map(|path| {
-            load_or_parse_source(
-                message_cache::CacheIdentity::for_client(ClientId::OpenClaw),
-                path,
-                &source_cache,
-                pricing,
-                sessions::openclaw::parse_openclaw_transcript,
-            )
-        })
-        .collect();
-    for outcome in openclaw_outcomes {
-        all_messages.extend(outcome.messages);
-        if let Some(entry) = outcome.cache_entry {
-            source_cache.insert(entry);
-        }
-    }
+    parse_cached_lane(
+        &scan_result,
+        &mut source_cache,
+        pricing,
+        &mut all_messages,
+        ClientId::OpenClaw,
+        sessions::openclaw::parse_openclaw_transcript,
+    );
 
-    let pi_outcomes: Vec<CachedParseOutcome> = scan_result
-        .get(ClientId::Pi)
-        .par_iter()
-        .map(|path| {
-            load_or_parse_source(
-                message_cache::CacheIdentity::for_client(ClientId::Pi),
-                path,
-                &source_cache,
-                pricing,
-                sessions::pi::parse_pi_file,
-            )
-        })
-        .collect();
-    for outcome in pi_outcomes {
-        all_messages.extend(outcome.messages);
-        if let Some(entry) = outcome.cache_entry {
-            source_cache.insert(entry);
-        }
-    }
+    parse_cached_lane(
+        &scan_result,
+        &mut source_cache,
+        pricing,
+        &mut all_messages,
+        ClientId::Pi,
+        sessions::pi::parse_pi_file,
+    );
 
     let prime_agent_outcomes: Vec<(
         CachedParseOutcome,
@@ -2065,25 +2033,14 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         }
     }
 
-    let senpi_outcomes: Vec<CachedParseOutcome> = scan_result
-        .get(ClientId::Senpi)
-        .par_iter()
-        .map(|path| {
-            load_or_parse_source(
-                message_cache::CacheIdentity::for_client(ClientId::Senpi),
-                path,
-                &source_cache,
-                pricing,
-                sessions::senpi::parse_senpi_file,
-            )
-        })
-        .collect();
-    for outcome in senpi_outcomes {
-        all_messages.extend(outcome.messages);
-        if let Some(entry) = outcome.cache_entry {
-            source_cache.insert(entry);
-        }
-    }
+    parse_cached_lane(
+        &scan_result,
+        &mut source_cache,
+        pricing,
+        &mut all_messages,
+        ClientId::Senpi,
+        sessions::senpi::parse_senpi_file,
+    );
 
     let augment_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Augment)
@@ -2230,25 +2187,14 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     // above, there is no authoritative embedded cost for cached_messages()'s
     // unconditional reprice to overwrite. The parser also dedups within a file
     // on its own, so no cross-file `should_keep_deduped_message` pass is needed.
-    let opencodereview_outcomes: Vec<CachedParseOutcome> = scan_result
-        .get(ClientId::OpenCodeReview)
-        .par_iter()
-        .map(|path| {
-            load_or_parse_source(
-                message_cache::CacheIdentity::for_client(ClientId::OpenCodeReview),
-                path,
-                &source_cache,
-                pricing,
-                sessions::opencodereview::parse_opencodereview_file,
-            )
-        })
-        .collect();
-    for outcome in opencodereview_outcomes {
-        all_messages.extend(outcome.messages);
-        if let Some(entry) = outcome.cache_entry {
-            source_cache.insert(entry);
-        }
-    }
+    parse_cached_lane(
+        &scan_result,
+        &mut source_cache,
+        pricing,
+        &mut all_messages,
+        ClientId::OpenCodeReview,
+        sessions::opencodereview::parse_opencodereview_file,
+    );
 
     let kimi_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Kimi)
@@ -2278,25 +2224,14 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     }
 
     // Parse Qwen files
-    let qwen_outcomes: Vec<CachedParseOutcome> = scan_result
-        .get(ClientId::Qwen)
-        .par_iter()
-        .map(|path| {
-            load_or_parse_source(
-                message_cache::CacheIdentity::for_client(ClientId::Qwen),
-                path,
-                &source_cache,
-                pricing,
-                sessions::qwen::parse_qwen_file,
-            )
-        })
-        .collect();
-    for outcome in qwen_outcomes {
-        all_messages.extend(outcome.messages);
-        if let Some(entry) = outcome.cache_entry {
-            source_cache.insert(entry);
-        }
-    }
+    parse_cached_lane(
+        &scan_result,
+        &mut source_cache,
+        pricing,
+        &mut all_messages,
+        ClientId::Qwen,
+        sessions::qwen::parse_qwen_file,
+    );
 
     let roocode_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::RooCode)
@@ -2367,25 +2302,14 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         }
     }
 
-    let mux_outcomes: Vec<CachedParseOutcome> = scan_result
-        .get(ClientId::Mux)
-        .par_iter()
-        .map(|path| {
-            load_or_parse_source(
-                message_cache::CacheIdentity::for_client(ClientId::Mux),
-                path,
-                &source_cache,
-                pricing,
-                sessions::mux::parse_mux_file,
-            )
-        })
-        .collect();
-    for outcome in mux_outcomes {
-        all_messages.extend(outcome.messages);
-        if let Some(entry) = outcome.cache_entry {
-            source_cache.insert(entry);
-        }
-    }
+    parse_cached_lane(
+        &scan_result,
+        &mut source_cache,
+        pricing,
+        &mut all_messages,
+        ClientId::Mux,
+        sessions::mux::parse_mux_file,
+    );
 
     // Kilo CLI: SQLite database
     if let Some(db_path) = &scan_result.kilo_db {
@@ -6382,7 +6306,10 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_cursor_parse_path_reprices_zero_cost_composer_1_5_rows() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
         let temp_dir = tempfile::TempDir::new().unwrap();
         let cursor_cache_dir = temp_dir.path().join(".config/tokscale/cursor-cache");
         std::fs::create_dir_all(&cursor_cache_dir).unwrap();
@@ -6402,6 +6329,71 @@ mod tests {
         assert_eq!(messages[0].client, "cursor");
         assert_eq!(messages[0].model_id, "Composer 1.5");
         assert!(messages[0].cost > 0.0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_cursor_cached_lane_matches_cold_parse_on_warm_hit() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let cursor_cache_dir = source_home.path().join(".config/tokscale/cursor-cache");
+        std::fs::create_dir_all(&cursor_cache_dir).unwrap();
+        let usage_path = cursor_cache_dir.join("usage.csv");
+
+        let csv = r#"Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost
+"2026-03-04T12:00:00.000Z","Included","Composer 1.5","No","1200","1000","5000","2000","8000","0""#;
+        std::fs::write(&usage_path, csv).unwrap();
+
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "composer-1.5".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.002),
+                cache_read_input_token_cost: Some(0.0001),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let _parse_counter =
+            sessions::cursor::register_parse_cursor_file_counter(source_home.path());
+
+        let cold = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &["cursor".to_string()],
+            Some(&pricing),
+        );
+        assert_eq!(cold.len(), 1);
+        assert!(cold[0].cost > 0.0);
+        assert_eq!(
+            sessions::cursor::parse_cursor_file_call_count(source_home.path()),
+            1,
+            "cold parse should invoke the Cursor parser once"
+        );
+
+        let persisted = message_cache::SourceMessageCache::load();
+        let cached = persisted
+            .get(
+                message_cache::CacheIdentity::for_client(ClientId::Cursor),
+                &usage_path,
+            )
+            .expect("cold parse should persist the Cursor source entry");
+        assert_eq!(cached.messages.len(), 1);
+
+        let warm = parse_all_messages_with_pricing(
+            source_home.path().to_str().unwrap(),
+            &["cursor".to_string()],
+            Some(&pricing),
+        );
+        assert_eq!(warm.len(), 1);
+        assert!(warm[0].cost > 0.0);
+        assert_eq!(warm, cold);
+        assert_eq!(
+            sessions::cursor::parse_cursor_file_call_count(source_home.path()),
+            1,
+            "warm cache hit must not invoke the Cursor parser again"
+        );
     }
 
     /// MiMo Code records carry an authoritative per-message cost. The micode
