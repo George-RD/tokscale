@@ -499,6 +499,10 @@ pub fn get_client_color(client: &str) -> Color {
 }
 
 fn registered_client_display_name(client: &str) -> Option<&'static str> {
+    ClientId::from_str(&client.to_lowercase()).map(|client_id| client_id.display_name())
+}
+
+fn registered_compact_client_display_name(client: &str) -> Option<&'static str> {
     ClientId::from_str(&client.to_lowercase()).map(client_ui::compact_display_name)
 }
 
@@ -507,10 +511,19 @@ pub fn get_client_display_name(client: &str) -> String {
     if let Some(name) = config.get_client_display_name(client) {
         return name.to_string();
     }
-    if let Some(name) = registered_client_display_name(client) {
+    registered_client_display_name(client)
+        .unwrap_or(client)
+        .to_string()
+}
+
+pub fn get_compact_client_display_name(client: &str) -> String {
+    let config = TokscaleConfig::load();
+    if let Some(name) = config.get_client_display_name(client) {
         return name.to_string();
     }
-    client.to_string()
+    registered_compact_client_display_name(client)
+        .unwrap_or(client)
+        .to_string()
 }
 
 pub fn get_provider_display_name(provider: &str) -> String {
@@ -622,6 +635,10 @@ mod tests {
         for client in ClientId::iter() {
             assert_eq!(
                 registered_client_display_name(client.as_str()),
+                Some(client.display_name())
+            );
+            assert_eq!(
+                registered_compact_client_display_name(client.as_str()),
                 Some(client_ui::compact_display_name(client))
             );
         }
