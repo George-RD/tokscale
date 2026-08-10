@@ -2811,7 +2811,7 @@ fn run_monthly_report(
 ) -> Result<()> {
     use std::time::Instant;
     use tokio::runtime::Runtime;
-    use tokscale_core::{get_monthly_report, GroupBy, ReportOptions};
+    use tokscale_core::{get_monthly_report_v2, GroupBy, ReportOptions};
 
     let (since, until) = build_date_filter(date, &home_dir);
     let year = normalize_year_filter(date);
@@ -2831,7 +2831,7 @@ fn run_monthly_report(
     let rt = Runtime::new()?;
     let report = rt
         .block_on(async {
-            get_monthly_report(ReportOptions {
+            get_monthly_report_v2(ReportOptions {
                 home_dir: home_dir.clone(),
                 use_env_roots,
                 clients,
@@ -3806,7 +3806,7 @@ fn saturating_token_total(input: i64, output: i64, cache_read: i64, cache_write:
 /// layer aggregates `report.entries` itself; a saturating fold keeps that
 /// aggregation safe against clamped (i64::MAX) entry buckets.
 fn monthly_token_field_totals(
-    entries: &[tokscale_core::MonthlyUsage],
+    entries: &[tokscale_core::MonthlyUsageV2],
 ) -> (i64, i64, i64, i64, i64) {
     entries.iter().fold(
         (0, 0, 0, 0, 0),
@@ -6532,7 +6532,7 @@ mod tests {
         // MonthlyReport has no precomputed grand totals, so the display layer
         // aggregates report.entries itself. Two entries each carrying a
         // clamped (i64::MAX) input bucket must not overflow that aggregation.
-        let make = |input: i64| tokscale_core::MonthlyUsage {
+        let make = |input: i64| tokscale_core::MonthlyUsageV2 {
             month: "2026-07".to_string(),
             models: vec![],
             input,

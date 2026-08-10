@@ -570,6 +570,24 @@ pub struct MonthlyUsage {
     pub output: i64,
     pub cache_read: i64,
     pub cache_write: i64,
+    pub message_count: i32,
+    pub cost: f64,
+}
+
+/// Complete monthly usage including token buckets added after the original
+/// [`MonthlyUsage`] API was established.
+///
+/// This versioned type keeps downstream `MonthlyUsage` struct literals source
+/// compatible while allowing CLI and API consumers to opt into reasoning
+/// tokens without silently omitting them.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MonthlyUsageV2 {
+    pub month: String,
+    pub models: Vec<String>,
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
     pub reasoning: i64,
     pub message_count: i32,
     pub cost: f64,
@@ -593,6 +611,14 @@ const UNKNOWN_WORKSPACE_GROUP_KEY: &str = "\0unknown-workspace";
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MonthlyReport {
     pub entries: Vec<MonthlyUsage>,
+    pub total_cost: f64,
+    pub processing_time_ms: u32,
+}
+
+/// Versioned monthly report whose entries retain every token bucket.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MonthlyReportV2 {
+    pub entries: Vec<MonthlyUsageV2>,
     pub total_cost: f64,
     pub processing_time_ms: u32,
 }
@@ -2992,7 +3018,7 @@ struct MonthAggregator {
 
 fn aggregate_monthly_usage_entries(
     messages: impl IntoIterator<Item = UnifiedMessage>,
-) -> Vec<MonthlyUsage> {
+) -> Vec<MonthlyUsageV2> {
     let mut month_map: HashMap<String, MonthAggregator> = HashMap::new();
 
     for msg in messages {
@@ -3021,9 +3047,9 @@ fn aggregate_monthly_usage_entries(
         entry.cost += msg.cost;
     }
 
-    let mut entries: Vec<MonthlyUsage> = month_map
+    let mut entries: Vec<MonthlyUsageV2> = month_map
         .into_iter()
-        .map(|(month, agg)| MonthlyUsage {
+        .map(|(month, agg)| MonthlyUsageV2 {
             month,
             models: agg.models.into_iter().collect(),
             input: agg.input,
@@ -3040,7 +3066,7 @@ fn aggregate_monthly_usage_entries(
     entries
 }
 
-pub async fn get_monthly_report(options: ReportOptions) -> Result<MonthlyReport, String> {
+pub async fn get_monthly_report_v2(options: ReportOptions) -> Result<MonthlyReportV2, String> {
     let start = Instant::now();
 
     let home_dir = get_home_dir_string(&options.home_dir)?;
@@ -3071,10 +3097,35 @@ pub async fn get_monthly_report(options: ReportOptions) -> Result<MonthlyReport,
     // any non-zero total.
     let total_cost: f64 = entries.iter().map(|e| e.cost).sum::<f64>() + 0.0;
 
-    Ok(MonthlyReport {
+    Ok(MonthlyReportV2 {
         entries,
         total_cost,
         processing_time_ms: start.elapsed().as_millis() as u32,
+    })
+}
+
+/// Generate the original monthly report shape.
+///
+/// New callers that need reasoning tokens should use [`get_monthly_report_v2`].
+pub async fn get_monthly_report(options: ReportOptions) -> Result<MonthlyReport, String> {
+    let report = get_monthly_report_v2(options).await?;
+    Ok(MonthlyReport {
+        entries: report
+            .entries
+            .into_iter()
+            .map(|entry| MonthlyUsage {
+                month: entry.month,
+                models: entry.models,
+                input: entry.input,
+                output: entry.output,
+                cache_read: entry.cache_read,
+                cache_write: entry.cache_write,
+                message_count: entry.message_count,
+                cost: entry.cost,
+            })
+            .collect(),
+        total_cost: report.total_cost,
+        processing_time_ms: report.processing_time_ms,
     })
 }
 
@@ -4733,9 +4784,9 @@ mod tests {
         parse_all_messages_with_pricing_with_env_strategy, parse_local_clients, parsed_to_unified,
         paths, pricing, retain_for_requested_clients, scanner, select_local_parse_pricing,
         sessions, unified_to_parsed, validate_priced_messages, ClientId, GraphPricingRequirement,
-        GroupBy, LocalParseOptions, ReportOptions, TokenBreakdown, UnifiedMessage,
-        UnpricedSubmissionExclusion, INCOMPLETE_MODEL_PRICING_REASON, MISSING_MODEL_PRICING_REASON,
-        ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL,
+        GroupBy, LocalParseOptions, MonthlyUsage, MonthlyUsageV2, ReportOptions, TokenBreakdown,
+        UnifiedMessage, UnpricedSubmissionExclusion, INCOMPLETE_MODEL_PRICING_REASON,
+        MISSING_MODEL_PRICING_REASON, ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL,
     };
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
@@ -4792,6 +4843,41 @@ mod tests {
         assert_eq!(total.cache_read, i64::MAX);
         assert_eq!(total.cache_write, i64::MIN);
         assert_eq!(total.reasoning, 123);
+    }
+
+    #[test]
+    fn legacy_monthly_usage_struct_literal_remains_source_compatible() {
+        let usage = MonthlyUsage {
+            month: "2026-01".to_string(),
+            models: vec!["model".to_string()],
+            input: 1,
+            output: 2,
+            cache_read: 3,
+            cache_write: 4,
+            message_count: 5,
+            cost: 0.5,
+        };
+
+        let serialized = serde_json::to_value(usage).unwrap();
+        assert!(serialized.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn monthly_usage_v2_serializes_reasoning_additively() {
+        let usage = MonthlyUsageV2 {
+            month: "2026-01".to_string(),
+            models: vec!["model".to_string()],
+            input: 1,
+            output: 2,
+            cache_read: 3,
+            cache_write: 4,
+            reasoning: 6,
+            message_count: 5,
+            cost: 0.5,
+        };
+
+        let serialized = serde_json::to_value(usage).unwrap();
+        assert_eq!(serialized["reasoning"], 6);
     }
 
     #[test]
