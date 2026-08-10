@@ -4,7 +4,6 @@ use tokscale_core::ClientId;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::tui::client_ui;
 use crate::tui::config::TokscaleConfig;
 use crate::tui::themes::Theme;
 
@@ -498,17 +497,17 @@ pub fn get_client_color(client: &str) -> Color {
     }
 }
 
+fn registered_client_display_name(client: &str) -> Option<&'static str> {
+    ClientId::from_str(&client.to_lowercase()).map(|client_id| client_id.display_name())
+}
+
 pub fn get_client_display_name(client: &str) -> String {
     let config = TokscaleConfig::load();
     if let Some(name) = config.get_client_display_name(client) {
         return name.to_string();
     }
-    let client_lower = client.to_lowercase();
-    if client_lower == ClientId::OpenClaw.as_str() {
-        return "🦞 OpenClaw".to_string();
-    }
-    if let Some(client_id) = ClientId::from_str(&client_lower) {
-        return client_ui::display_name(client_id).to_string();
+    if let Some(name) = registered_client_display_name(client) {
+        return name.to_string();
     }
     client.to_string()
 }
@@ -616,6 +615,16 @@ fn capitalize_first(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registered_client_display_names_cover_the_core_registry() {
+        for client in ClientId::iter() {
+            assert_eq!(
+                registered_client_display_name(client.as_str()),
+                Some(client.display_name())
+            );
+        }
+    }
 
     #[test]
     fn truncate_to_width_never_exceeds_its_budget() {

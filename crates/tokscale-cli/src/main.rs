@@ -3911,39 +3911,15 @@ fn format_model_name(model: &str) -> String {
 }
 
 fn capitalize_client(client: &str) -> String {
-    match client {
-        "opencode" => "OpenCode".to_string(),
-        "claude" => "Claude".to_string(),
-        "codex" => "Codex".to_string(),
-        "cursor" => "Cursor".to_string(),
-        "gemini" => "Gemini".to_string(),
-        "amp" => "Amp".to_string(),
-        "codebuff" => "Codebuff".to_string(),
-        "freebuff" => "Freebuff".to_string(),
-        "droid" => "Droid".to_string(),
-        "crush" => "Crush".to_string(),
-        "openclaw" => "openclaw".to_string(),
-        "hermes" => "Hermes Agent".to_string(),
-        "goose" => "Goose".to_string(),
-        "warp" => "Warp".to_string(),
-        "grok" => "Grok Build".to_string(),
-        "9router" => "9Router".to_string(),
-        "pi" => "Pi".to_string(),
-        "gjc" => "Gajae-Code".to_string(),
-        "jcode" => "Jcode".to_string(),
-        "commandcode" => "Command Code".to_string(),
-        "junie" => "Junie".to_string(),
-        "zcode" => "ZCode".to_string(),
-        "codebuddy" => "CodeBuddy".to_string(),
-        "workbuddy" => "WorkBuddy".to_string(),
-        "devin-cli" => "Devin CLI".to_string(),
-        "devin-desktop" => "Devin Desktop".to_string(),
-        "senpi" => "Senpi (OmO Native)".to_string(),
-        "augment" => "Augment Code".to_string(),
-        "kimchi" => "Kimchi".to_string(),
-        "prime-agent" => "Prime Agent".to_string(),
-        other => other.to_string(),
-    }
+    tokscale_core::ClientId::from_str(client)
+        .map(|client_id| client_id.display_name().to_string())
+        .unwrap_or_else(|| match client {
+            // 9Router is a gjc-compatible source alias, not a separately
+            // scannable client, so it intentionally remains outside ClientDef.
+            "9router" => "9Router".to_string(),
+            "synthetic" => "Synthetic".to_string(),
+            other => other.to_string(),
+        })
 }
 
 fn run_clients_command(json: bool, home_dir: Option<String>) -> Result<()> {
@@ -7676,22 +7652,22 @@ mod tests {
 
     #[test]
     fn test_capitalize_client_claude() {
-        assert_eq!(capitalize_client("claude"), "Claude");
+        assert_eq!(capitalize_client("claude"), "Claude Code");
     }
 
     #[test]
     fn test_capitalize_client_codex() {
-        assert_eq!(capitalize_client("codex"), "Codex");
+        assert_eq!(capitalize_client("codex"), "Codex CLI");
     }
 
     #[test]
     fn test_capitalize_client_cursor() {
-        assert_eq!(capitalize_client("cursor"), "Cursor");
+        assert_eq!(capitalize_client("cursor"), "Cursor IDE");
     }
 
     #[test]
     fn test_capitalize_client_gemini() {
-        assert_eq!(capitalize_client("gemini"), "Gemini");
+        assert_eq!(capitalize_client("gemini"), "Gemini CLI");
     }
 
     #[test]
@@ -7711,7 +7687,7 @@ mod tests {
 
     #[test]
     fn test_capitalize_client_openclaw() {
-        assert_eq!(capitalize_client("openclaw"), "openclaw");
+        assert_eq!(capitalize_client("openclaw"), "OpenClaw");
     }
 
     #[test]
@@ -7732,6 +7708,13 @@ mod tests {
     #[test]
     fn test_capitalize_client_jcode() {
         assert_eq!(capitalize_client("jcode"), "Jcode");
+    }
+
+    #[test]
+    fn test_capitalize_client_covers_every_registered_client() {
+        for client in tokscale_core::ClientId::iter() {
+            assert_eq!(capitalize_client(client.as_str()), client.display_name());
+        }
     }
 
     #[test]

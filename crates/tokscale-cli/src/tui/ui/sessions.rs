@@ -1508,11 +1508,9 @@ mod tests {
         }
     }
 
-    /// The concrete failure the budget above prevents: at 12 cells these two
-    /// rows were byte-identical at every width, which is a misattribution and
-    /// not a cosmetic clip. `🦞 OpenClaw` is here because its emoji is one char
-    /// and two cells, so a code-point budget gets it wrong in the other
-    /// direction.
+    /// The concrete failure the budget above prevents: at 12 cells these rows
+    /// could become byte-identical at every width, which is a misattribution
+    /// and not a cosmetic clip.
     #[test]
     fn clients_sharing_a_prefix_render_distinguishably() {
         let width = 200;
