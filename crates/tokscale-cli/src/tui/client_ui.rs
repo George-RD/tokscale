@@ -56,6 +56,15 @@ pub fn display_name(client: ClientId) -> &'static str {
     client.display_name()
 }
 
+/// Compact label for constrained TUI columns. Product-facing surfaces should
+/// use [`display_name`] so the canonical registry label is preserved.
+pub fn compact_display_name(client: ClientId) -> &'static str {
+    match client {
+        ClientId::Senpi => "Senpi",
+        _ => display_name(client),
+    }
+}
+
 pub fn hotkey(client: ClientId) -> char {
     CLIENT_UI[client as usize].hotkey
 }

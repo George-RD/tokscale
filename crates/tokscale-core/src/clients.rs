@@ -188,10 +188,6 @@ fn expand_reasonix_env_vars(value: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct ClientDef {
     pub id: &'static str,
-    /// Canonical human-readable label shared by CLI, Wrapped, and TUI views.
-    pub display_name: &'static str,
-    /// Optional client logo used by presentation layers such as Wrapped.
-    pub logo_url: Option<&'static str>,
     pub root: PathRoot,
     pub relative_path: &'static str,
     pub pattern: &'static str,
@@ -246,11 +242,11 @@ macro_rules! define_clients {
             }
 
             pub fn display_name(&self) -> &'static str {
-                self.data().display_name
+                CLIENT_DISPLAY_NAMES[*self as usize]
             }
 
             pub fn logo_url(&self) -> Option<&'static str> {
-                self.data().logo_url
+                CLIENT_LOGO_URLS[*self as usize]
             }
 
             pub fn file_pattern(&self) -> &'static str {
@@ -282,8 +278,6 @@ macro_rules! define_clients {
         pub const CLIENTS: [ClientDef; ClientId::COUNT] = [
             $( ClientDef {
                 id: $id,
-                display_name: $display,
-                logo_url: $logo,
                 root: $root,
                 relative_path: $rel,
                 pattern: $pat,
@@ -292,6 +286,12 @@ macro_rules! define_clients {
                 submit_default: $sd,
             } ),+
         ];
+
+        // Display metadata is generated from the same exhaustive registry but
+        // kept out of public ClientDef so downstream struct literals remain
+        // source-compatible.
+        const CLIENT_DISPLAY_NAMES: [&str; ClientId::COUNT] = [ $( $display ),+ ];
+        const CLIENT_LOGO_URLS: [Option<&str>; ClientId::COUNT] = [ $( $logo ),+ ];
 
         const _: () = {
             let mut i = 0;
@@ -731,7 +731,7 @@ define_clients!(
     // mirroring the `gjc` layout.
     Senpi = 39 => {
         id: "senpi",
-        display: "Senpi",
+        display: "Senpi (OmO Native)",
         logo: None,root: PathRoot::EnvVar {
             var: "SENPI_CODING_AGENT_DIR",
             fallback_relative: ".senpi/agent",
@@ -912,8 +912,6 @@ mod tests {
                 "{} falls back to its raw lowercase id",
                 client.as_str()
             );
-            assert_eq!(display_name, client.data().display_name);
-            assert_eq!(client.logo_url(), client.data().logo_url);
         }
     }
 
@@ -924,6 +922,7 @@ mod tests {
         assert_eq!(ClientId::Cursor.display_name(), "Cursor IDE");
         assert_eq!(ClientId::KiloCode.display_name(), "Kilo Code");
         assert_eq!(ClientId::Kilo.display_name(), "Kilo CLI");
+        assert_eq!(ClientId::Senpi.display_name(), "Senpi (OmO Native)");
         assert_eq!(
             ClientId::OpenCode.logo_url(),
             Some("https://tokscale.ai/assets/logos/opencode.png")
@@ -971,8 +970,6 @@ mod tests {
         // a single `Path::join` (which only normalizes the junction).
         let client = ClientDef {
             id: "codex",
-            display_name: "Codex CLI",
-            logo_url: None,
             root: PathRoot::Home,
             relative_path: ".codex/sessions",
             pattern: "*.jsonl",
@@ -1562,8 +1559,6 @@ mod tests {
     fn test_client_def_resolve_path_combines_root_and_relative() {
         let client = ClientDef {
             id: "test",
-            display_name: "Test",
-            logo_url: None,
             root: PathRoot::Home,
             relative_path: ".test/sessions",
             pattern: "*.jsonl",

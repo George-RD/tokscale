@@ -4,6 +4,7 @@ use tokscale_core::ClientId;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::tui::client_ui;
 use crate::tui::config::TokscaleConfig;
 use crate::tui::themes::Theme;
 
@@ -498,7 +499,7 @@ pub fn get_client_color(client: &str) -> Color {
 }
 
 fn registered_client_display_name(client: &str) -> Option<&'static str> {
-    ClientId::from_str(&client.to_lowercase()).map(|client_id| client_id.display_name())
+    ClientId::from_str(&client.to_lowercase()).map(client_ui::compact_display_name)
 }
 
 pub fn get_client_display_name(client: &str) -> String {
@@ -621,9 +622,11 @@ mod tests {
         for client in ClientId::iter() {
             assert_eq!(
                 registered_client_display_name(client.as_str()),
-                Some(client.display_name())
+                Some(client_ui::compact_display_name(client))
             );
         }
+        assert_eq!(ClientId::Senpi.display_name(), "Senpi (OmO Native)");
+        assert_eq!(client_ui::compact_display_name(ClientId::Senpi), "Senpi");
     }
 
     #[test]
