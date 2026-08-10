@@ -379,6 +379,48 @@ describe("non-destructive parser generation high-water", () => {
     expect(increment.tokens).toBe(10);
   });
 
+  it("tracks observed inclusive input separately from independent bucket maxima", () => {
+    const first = baseline(
+      {},
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 100, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+          1,
+          1
+        )
+      )
+    );
+    const shifted = next(
+      first.nextState!,
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 0, output: 0, cacheRead: 100, cacheWrite: 0, reasoning: 0 },
+          1,
+          1
+        )
+      )
+    );
+    const grown = next(
+      shifted.nextState!,
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 0, output: 0, cacheRead: 150, cacheWrite: 0, reasoning: 0 },
+          2,
+          2
+        )
+      )
+    );
+
+    const priorModel = shifted.nextState?.days["2026-07-01"].models["model-a"];
+    expect(priorModel?.input).toBe(100);
+    expect(priorModel?.cacheRead).toBe(100);
+    expect(priorModel?.inputIncludingCacheRead).toBe(100);
+    expect(grown.increments["2026-07-01"].models["model-a"].cacheRead).toBe(50);
+  });
+
   it("allows genuine fully-cached inclusive-input growth", () => {
     const first = baseline(
       {},

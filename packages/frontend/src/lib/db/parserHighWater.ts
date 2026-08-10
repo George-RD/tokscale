@@ -125,6 +125,7 @@ function modelFromContribution(
     cacheWrite,
     reasoning,
     messages: contribution.messages,
+    inputIncludingCacheRead: input + cacheRead,
   };
 }
 
@@ -163,6 +164,9 @@ export function foldParserClientSnapshot(
       const incoming = modelFromContribution(contribution);
       const model = ownValue(models, contribution.modelId) ?? emptyModel();
       for (const field of TOKEN_FIELDS) model[field] += incoming[field];
+      model.inputIncludingCacheRead =
+        positive(model.inputIncludingCacheRead ?? 0) +
+        positive(incoming.inputIncludingCacheRead ?? incoming.input + incoming.cacheRead);
       model.tokens = TOKEN_FIELDS.reduce((sum, field) => sum + model[field], 0);
       model.cost += incoming.cost;
       model.messages += incoming.messages;
@@ -202,6 +206,18 @@ function maxModel(
     result[field] = Math.max(prior, next);
     tokenHighWaterAdvanced ||= next > prior;
   }
+  const priorInclusiveInput = positive(
+    previous?.inputIncludingCacheRead ??
+      (previous?.input ?? 0) + (previous?.cacheRead ?? 0)
+  );
+  const incomingInclusiveInput = positive(
+    incoming.inputIncludingCacheRead ?? incoming.input + incoming.cacheRead
+  );
+  result.inputIncludingCacheRead = Math.max(
+    priorInclusiveInput,
+    incomingInclusiveInput
+  );
+  tokenHighWaterAdvanced ||= incomingInclusiveInput > priorInclusiveInput;
   result.tokens = TOKEN_FIELDS.reduce((sum, field) => sum + result[field], 0);
   // Cost is contextual data for the token high-water snapshot, never its own
   // monotonic signal: repricing alone must not authorize spend.
@@ -296,8 +312,13 @@ function allocateIncrements(
       // cache-only composition shift cannot mint tokens while a genuinely
       // fully-cached request (exclusive input 0) can still advance.
       const inclusiveInputCandidate = positive(
-        model.input + model.cacheRead -
-          ((prior?.input ?? 0) + (prior?.cacheRead ?? 0))
+        positive(
+          model.inputIncludingCacheRead ?? model.input + model.cacheRead
+        ) -
+          positive(
+            prior?.inputIncludingCacheRead ??
+              (prior?.input ?? 0) + (prior?.cacheRead ?? 0)
+          )
       );
       candidates.cacheRead = Math.min(
         candidates.cacheRead,

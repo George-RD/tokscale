@@ -13,6 +13,8 @@ export interface ModelBreakdownData {
   cacheWrite: number;
   reasoning: number;
   messages: number;
+  /** Internal parser-state high-water for input before cache-read normalization. */
+  inputIncludingCacheRead?: number;
 }
 
 export interface ClientBreakdownProvenanceData {
