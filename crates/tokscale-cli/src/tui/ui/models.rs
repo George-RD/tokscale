@@ -48,17 +48,20 @@ fn workspace_column_width(total: u16) -> u16 {
 const WORKSPACE_COL_WORKSPACE: usize = 1;
 const WORKSPACE_COL_MODEL: usize = 2;
 
-/// Cells column `index` is actually *granted* in a row of `total` cells, which is
-/// what text in that cell has to be truncated to.
+/// Cells column `index` is granted out of already-solved `widths`, which is what
+/// text in that cell has to be truncated to.
 ///
 /// A `Length` is a request, not a guarantee, and `Min` floats: the solver resizes
 /// both to make the row fit. Truncating to the requested width leaves the overflow
 /// to be clipped by the renderer with no ellipsis — the same silent truncation this
-/// change exists to remove. Asking the layout closes that gap at every width for
-/// every column, instead of each cell carrying a constant that is right only for
-/// the widths someone happened to check.
-fn workspace_granted_width(total: u16, index: usize) -> usize {
-    workspace_table_widths(total)
+/// change exists to remove. Reading the solved width closes that gap at every width
+/// for every column, instead of each cell carrying a constant that is right only
+/// for the sizes someone happened to check.
+///
+/// Takes the solved widths rather than an inner width so `render` can solve once
+/// per frame instead of once per cell.
+fn workspace_granted_width(widths: &[u16], index: usize) -> usize {
+    widths
         .get(index)
         .copied()
         .unwrap_or(WORKSPACE_COLUMN_BASE_WIDTH) as usize
@@ -223,6 +226,16 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    // Solve the workspace layout once per render, not once per cell: the widths
+    // depend only on `inner.width`, so running the solver inside the row loop
+    // repeated the same work (and its allocation) twice for every visible row.
+    let workspace_widths = if group_by == GroupBy::WorkspaceModel {
+        workspace_table_widths(inner.width)
+    } else {
+        Vec::new()
+    };
+    let granted = |index: usize| workspace_granted_width(&workspace_widths, index);
+
     let rows: Vec<Row> = models[start..end]
         .iter()
         .enumerate()
@@ -252,7 +265,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                     Cell::from(format!("{}", idx + 1)).style(Style::default().fg(theme_muted)),
                     Cell::from(truncate_to_width(
                         workspace_label(model),
-                        workspace_granted_width(inner.width, WORKSPACE_COL_WORKSPACE),
+                        granted(WORKSPACE_COL_WORKSPACE),
                     ))
                     .style(
                         Style::default()
@@ -266,7 +279,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                     // the rest.
                     Cell::from(truncate_to_width(
                         &model.model,
-                        workspace_granted_width(inner.width, WORKSPACE_COL_MODEL),
+                        granted(WORKSPACE_COL_MODEL),
                     ))
                     .style(
                         Style::default()
@@ -419,9 +432,10 @@ mod tests {
                 (WORKSPACE_COL_WORKSPACE, "Workspace"),
                 (WORKSPACE_COL_MODEL, "Model"),
             ] {
+                let solved = workspace_layout_at(total);
                 assert_eq!(
-                    workspace_granted_width(total, index),
-                    workspace_layout_at(total)[index] as usize,
+                    workspace_granted_width(&solved, index),
+                    solved[index] as usize,
                     "at {total} cols the {name} truncation width disagrees with its allocation"
                 );
             }

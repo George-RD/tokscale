@@ -2109,10 +2109,8 @@ fn run_models_report(
     let rt = Runtime::new()?;
     let report = rt
         .block_on(async {
-            get_model_report(
-                context.report_options_with_rollup(group_by.clone(), worktree_rollup),
-            )
-            .await
+            get_model_report(context.report_options_with_rollup(group_by.clone(), worktree_rollup))
+                .await
         })
         .map_err(|e| anyhow::anyhow!(e))?;
     let mut report = report;
