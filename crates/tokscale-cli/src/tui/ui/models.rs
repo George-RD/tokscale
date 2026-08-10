@@ -350,4 +350,71 @@ mod tests {
             WORKSPACE_COLUMN_MIN_WIDTH as usize
         );
     }
+
+    /// Pins the painted screen, not the helpers behind it. The reported symptom
+    /// was purely visual -- readable labels that still rendered as a truncated
+    /// shared prefix -- so only the rendered buffer can prove it is fixed.
+    #[test]
+    fn workspace_grouping_paints_full_repo_and_worktree_labels() {
+        use crate::tui::app::{Tab, TuiConfig};
+        use crate::tui::data::ModelUsage;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = App::new_with_cached_data(
+            TuiConfig {
+                theme: "blue".to_string(),
+                refresh: 0,
+                sessions_path: None,
+                clients: None,
+                since: None,
+                until: None,
+                year: None,
+                initial_tab: None,
+            },
+            None,
+        )
+        .unwrap();
+
+        let width = 200u16;
+        app.terminal_width = width;
+        app.current_tab = Tab::Models;
+        *app.group_by.borrow_mut() = GroupBy::WorkspaceModel;
+        app.data.models = vec![ModelUsage {
+            model: "claude-opus-5".to_string(),
+            color_key: "claude-opus-5".to_string(),
+            provider: "anthropic".to_string(),
+            client: "claude".to_string(),
+            workspace_key: Some("/Users/z/devpro/ea/ea-world-service".to_string()),
+            // The label the aggregator now produces for a worktree row.
+            workspace_label: Some("ea-world-service ⑃ nicole-25-20".to_string()),
+            tokens: Default::default(),
+            cost: 5367.48,
+            performance: Default::default(),
+            session_count: 1,
+        }];
+
+        let backend = TestBackend::new(width, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut app, Rect::new(0, 0, width, 8)))
+            .unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            screen.contains("ea-world-service ⑃ nicole-25-20"),
+            "workspace label must be painted in full, got:\n{screen}"
+        );
+        // The old behavior: a right-truncated label ending in an ellipsis.
+        assert!(
+            !screen.contains("ea-world-s…") && !screen.contains("ea-world-s..."),
+            "label must not be truncated at this width, got:\n{screen}"
+        );
+    }
 }

@@ -52,7 +52,7 @@ pub mod workbuddy;
 pub mod zcode;
 pub mod zed;
 
-use std::path::Path;
+use std::path::{Path, PathBuf, MAIN_SEPARATOR_STR};
 
 use crate::TokenBreakdown;
 
@@ -587,13 +587,43 @@ fn last_slug_segment(slug: &str) -> Option<String> {
 /// Returns `None` for keys that are already real paths, or when no directory on
 /// disk matches (a project whose folder has since been deleted or renamed).
 pub fn decode_claude_project_slug(key: &str) -> Option<String> {
-    // Real paths and Windows keys are already usable; only the slug form starts
-    // with the separator-turned-dash and contains no separator of its own.
-    if !key.starts_with('-') || key.contains('/') {
+    // A real path (already usable) keeps its separators; `normalize_workspace_key`
+    // rewrites Windows backslashes to `/`, so one check covers both platforms.
+    if key.contains('/') {
         return None;
     }
 
-    resolve_slug_under(Path::new("/"), key)
+    let (root, remaining) = slug_root_and_remainder(key)?;
+    resolve_slug_under(&root, remaining)
+}
+
+/// Split a slug into the filesystem root it was anchored at and the rest.
+///
+/// A POSIX slug begins at `/`, so it opens with the separator-turned-dash. A
+/// Windows slug encodes the drive instead (`C:\Users\me` becomes `C--Users-me`:
+/// one dash for the colon, one for the separator), so the root has to be
+/// reconstructed from the drive letter rather than assumed to be `/`.
+fn slug_root_and_remainder(key: &str) -> Option<(PathBuf, &str)> {
+    if key.starts_with('-') {
+        // Pass the whole key through: `slug_matches_prefix` expects every segment
+        // to arrive separator-first, including the first one.
+        return Some((PathBuf::from(MAIN_SEPARATOR_STR), key));
+    }
+
+    let mut chars = key.chars();
+    let drive = chars.next()?;
+    if !drive.is_ascii_alphabetic() {
+        return None;
+    }
+    // The encoded colon, leaving the separator dash to start the first segment.
+    let remaining = key[1..].strip_prefix('-')?;
+    if !remaining.starts_with('-') {
+        return None;
+    }
+    Some((
+        PathBuf::from(format!("{drive}:{MAIN_SEPARATOR_STR}")),
+        remaining,
+    ))
 }
 
 /// Walk `remaining` against the real directories under `dir`.
@@ -714,14 +744,22 @@ mod tests {
         // "claude-witness" is ONE directory, not "claude" then "witness".
         std::fs::create_dir_all(root.join("devpro/ing/claude-witness")).unwrap();
 
-        let slug =
-            super::slugify_path_segment(&root.join("devpro/ing/claude-witness").to_string_lossy());
-        let decoded = super::resolve_slug_under(Path::new("/"), &slug).unwrap();
+        let decoded =
+            decode_claude_project_slug(&slug_for(&root.join("devpro/ing/claude-witness")))
+                .expect("slug should resolve to the directory it was built from");
 
         assert_eq!(
             std::fs::canonicalize(decoded).unwrap(),
             std::fs::canonicalize(root.join("devpro/ing/claude-witness")).unwrap()
         );
+    }
+
+    /// Encode a real path the way Claude Code names its project directory, going
+    /// through `normalize_workspace_key` first so Windows backslashes become `/`
+    /// exactly as they do in production before the slug is formed.
+    fn slug_for(path: &Path) -> String {
+        let normalized = normalize_workspace_key(&path.to_string_lossy()).unwrap();
+        super::slugify_path_segment(&normalized)
     }
 
     #[test]
@@ -733,13 +771,34 @@ mod tests {
         let real = root.join("ing/IngTian.github.io/.claude/worktrees/scroll-reveal");
         std::fs::create_dir_all(&real).unwrap();
 
-        let slug = super::slugify_path_segment(&real.to_string_lossy());
-        let decoded = super::resolve_slug_under(Path::new("/"), &slug).unwrap();
+        let decoded = decode_claude_project_slug(&slug_for(&real))
+            .expect("slug should resolve to the directory it was built from");
 
         assert_eq!(
             std::fs::canonicalize(decoded).unwrap(),
             std::fs::canonicalize(&real).unwrap()
         );
+    }
+
+    #[test]
+    fn slug_root_and_remainder_anchors_posix_and_windows_slugs() {
+        // POSIX: the leading dash IS the root separator, and stays in the
+        // remainder so the first segment arrives separator-first.
+        let (root, remaining) = super::slug_root_and_remainder("-Users-me-app").unwrap();
+        assert_eq!(root, PathBuf::from(MAIN_SEPARATOR_STR));
+        assert_eq!(remaining, "-Users-me-app");
+
+        // Windows: `C:\Users\me\app` encodes as `C--Users-me-app` -- one dash for
+        // the colon, one for the separator -- so the drive has to be rebuilt
+        // rather than assumed to be `/`.
+        let (root, remaining) = super::slug_root_and_remainder("C--Users-me-app").unwrap();
+        assert_eq!(root, PathBuf::from(format!("C:{MAIN_SEPARATOR_STR}")));
+        assert_eq!(remaining, "-Users-me-app");
+
+        // Neither shape: nothing to anchor against.
+        assert_eq!(super::slug_root_and_remainder("Users-me-app"), None);
+        assert_eq!(super::slug_root_and_remainder("1--Users-me"), None);
+        assert_eq!(super::slug_root_and_remainder(""), None);
     }
 
     #[test]
