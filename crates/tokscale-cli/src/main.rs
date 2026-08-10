@@ -3800,8 +3800,8 @@ fn saturating_token_total(input: i64, output: i64, cache_read: i64, cache_write:
         .saturating_add(cache_write)
 }
 
-/// Sum the (input, output, cache_read, cache_write) token fields across
-/// monthly usage entries with saturating_add. `MonthlyReport` (unlike
+/// Sum every monthly token field (input, output, cache read, cache write, and
+/// reasoning) across usage entries with saturating_add. `MonthlyReport` (unlike
 /// `ModelReport`) doesn't carry precomputed grand totals, so the display
 /// layer aggregates `report.entries` itself; a saturating fold keeps that
 /// aggregation safe against clamped (i64::MAX) entry buckets.
