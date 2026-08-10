@@ -738,19 +738,18 @@ mod tests {
 
     #[test]
     fn decode_claude_project_slug_recovers_names_containing_dashes() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
+        let (_temp, root) = canonical_tempdir();
         // A real name with a literal '-' is the case a greedy split gets wrong:
         // "claude-witness" is ONE directory, not "claude" then "witness".
-        std::fs::create_dir_all(root.join("devpro/ing/claude-witness")).unwrap();
+        let real = root.join("devpro/ing/claude-witness");
+        std::fs::create_dir_all(&real).unwrap();
 
-        let decoded =
-            decode_claude_project_slug(&slug_for(&root.join("devpro/ing/claude-witness")))
-                .expect("slug should resolve to the directory it was built from");
+        let decoded = decode_claude_project_slug(&slug_for(&real))
+            .expect("slug should resolve to the directory it was built from");
 
         assert_eq!(
             std::fs::canonicalize(decoded).unwrap(),
-            std::fs::canonicalize(root.join("devpro/ing/claude-witness")).unwrap()
+            std::fs::canonicalize(&real).unwrap()
         );
     }
 
@@ -762,10 +761,29 @@ mod tests {
         super::slugify_path_segment(&normalized)
     }
 
+    /// A temp directory whose path is spelled the way `read_dir` reports it.
+    ///
+    /// The decoder matches slugs against real directory entries, so the fixture
+    /// path has to agree with what the OS enumerates. On Windows `%TEMP%` is
+    /// often an 8.3 short name (`RUNNER~1`) while `read_dir` yields the long name
+    /// (`runneradmin`), and `canonicalize` returns a `\\?\` verbatim prefix that
+    /// is not a walkable root — so strip that and let the walk start at the
+    /// drive. Without this the slug describes a path no directory listing
+    /// contains and the decode correctly finds nothing.
+    fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(temp.path()).unwrap();
+        let spelled = canonical.to_string_lossy().to_string();
+        let stripped = spelled
+            .strip_prefix(r"\\?\")
+            .map(PathBuf::from)
+            .unwrap_or(canonical);
+        (temp, stripped)
+    }
+
     #[test]
     fn decode_claude_project_slug_recovers_dots_and_worktrees() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
+        let (_temp, root) = canonical_tempdir();
         // '.' also encodes to '-', so "IngTian.github.io" and the ".claude"
         // worktree marker both have to come back exactly.
         let real = root.join("ing/IngTian.github.io/.claude/worktrees/scroll-reveal");

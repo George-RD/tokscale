@@ -6277,17 +6277,26 @@ mod tests {
         // paths for the SAME directory. Under rollup both must resolve to one
         // identity, or "one row per repo" silently still yields two.
         let temp = tempfile::tempdir().unwrap();
-        let repo = temp.path().join("devpro/ing/claude-witness");
+        // Spell the fixture the way `read_dir` reports it: Windows `%TEMP%` can be
+        // an 8.3 short name the decoder's directory walk never sees, and
+        // `canonicalize` returns a `\\?\` verbatim prefix that is not a walkable
+        // root. Both would make the slug describe a path no listing contains.
+        let temp_root = {
+            let canonical = std::fs::canonicalize(temp.path()).unwrap();
+            let spelled = canonical.to_string_lossy().to_string();
+            spelled
+                .strip_prefix(r"\\?\")
+                .map(std::path::PathBuf::from)
+                .unwrap_or(canonical)
+        };
+        let repo = temp_root.join("devpro/ing/claude-witness");
         std::fs::create_dir_all(repo.join(".claude/worktrees/feature-x")).unwrap();
 
-        let real_path = std::fs::canonicalize(&repo)
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-        let worktree_path = std::fs::canonicalize(repo.join(".claude/worktrees/feature-x"))
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
+        let real_path = crate::sessions::normalize_workspace_key(&repo.to_string_lossy()).unwrap();
+        let worktree_path = crate::sessions::normalize_workspace_key(
+            &repo.join(".claude/worktrees/feature-x").to_string_lossy(),
+        )
+        .unwrap();
         // How Claude Code would name that worktree's project directory.
         let slug: String = worktree_path
             .chars()
