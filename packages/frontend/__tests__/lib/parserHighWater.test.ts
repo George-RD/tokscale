@@ -161,6 +161,41 @@ describe("non-destructive parser generation high-water", () => {
     expect(plan.increments).toEqual({});
   });
 
+  it.each([
+    { legacyDate: "2026-07-02", newDate: "2026-07-01" },
+    { legacyDate: "2026-07-01", newDate: "2026-07-02" },
+  ])(
+    "derives a prior model from scalar legacy rows before allocating growth ($legacyDate -> $newDate)",
+    ({ legacyDate, newDate }) => {
+      const scalarLegacy = {
+        tokens: 100,
+        cost: 10,
+        input: 100,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        reasoning: 0,
+        messages: 1,
+        modelId: "model-a",
+        models: {},
+      } satisfies ClientBreakdownData;
+      const plan = baseline(
+        { [legacyDate]: scalarLegacy },
+        snapshot(
+          contribution(legacyDate, 100, "model-a", 10),
+          contribution(newDate, 50, "model-b", 5)
+        )
+      );
+
+      expect(plan.increments[legacyDate]).toBeUndefined();
+      expect(plan.increments[newDate].models["model-b"]).toMatchObject({
+        input: 50,
+        tokens: 50,
+        cost: 5,
+      });
+    }
+  );
+
   it("is idempotent when the same v2 full snapshot is replayed", () => {
     const first = baseline({}, snapshot(contribution("2026-07-01", 100)));
     const replay = next(

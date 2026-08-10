@@ -85,6 +85,30 @@ function copyModels(
   return result;
 }
 
+function modelsForHighWater(
+  breakdown?: ClientBreakdownData
+): Record<string, ModelBreakdownData> {
+  const models = copyModels(breakdown?.models);
+  if (
+    breakdown?.modelId &&
+    Object.keys(models).length === 0
+  ) {
+    models[breakdown.modelId] = {
+      tokens: positive(breakdown.tokens || 0),
+      cost: positive(breakdown.cost || 0),
+      input: positive(breakdown.input || 0),
+      output: positive(breakdown.output || 0),
+      cacheRead: positive(breakdown.cacheRead || 0),
+      cacheWrite: positive(breakdown.cacheWrite || 0),
+      reasoning: positive(breakdown.reasoning || 0),
+      messages: positive(breakdown.messages || 0),
+      inputIncludingCacheRead:
+        positive(breakdown.input || 0) + positive(breakdown.cacheRead || 0),
+    };
+  }
+  return models;
+}
+
 function emptyAggregate(): ParserAggregateHighWater {
   return {
     tokens: 0,
@@ -245,7 +269,7 @@ function advanceDays(
   const next = copyDictionary(previous);
   for (const [date, day] of Object.entries(incoming)) {
     const prior = ownValue(previous, date);
-    const models = copyDictionary(prior?.models);
+    const models = modelsForHighWater(prior);
     for (const [modelId, model] of Object.entries(day.models)) {
       models[modelId] = maxModel(ownValue(prior?.models, modelId), model);
     }
@@ -300,8 +324,9 @@ function allocateIncrements(
   let supportedCellCacheReadGrowth = 0;
   for (const [date, incomingDay] of Object.entries(incomingDays)) {
     const previousDay = ownValue(previousDays, date);
+    const previousModels = modelsForHighWater(previousDay);
     for (const [modelId, model] of Object.entries(incomingDay.models)) {
-      const prior = ownValue(previousDay?.models, modelId);
+      const prior = ownValue(previousModels, modelId);
       const inclusiveGrowth = positive(
         positive(
           model.inputIncludingCacheRead ?? model.input + model.cacheRead
@@ -338,9 +363,10 @@ function allocateIncrements(
     const incrementModels = createSafeRecord<ModelBreakdownData>();
     const incoming = incomingDays[date];
     const previous = ownValue(previousDays, date);
+    const previousModels = modelsForHighWater(previous);
     for (const modelId of Object.keys(incoming.models).sort()) {
       const model = incoming.models[modelId];
-      const prior = ownValue(previous?.models, modelId);
+      const prior = ownValue(previousModels, modelId);
       const increment = emptyModel();
       const candidates = Object.fromEntries(
         TOKEN_FIELDS.map((field) => [
