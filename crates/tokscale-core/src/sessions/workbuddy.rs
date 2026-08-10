@@ -4,9 +4,9 @@
 //! Older installs also expose an aggregate `~/.workbuddy/workbuddy.db`; that
 //! database is kept as a fallback when detailed token sources are unavailable.
 
+use super::utils::open_readonly_sqlite_result;
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::{provider_identity, TokenBreakdown};
-use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 use tracing::warn;
 
@@ -42,10 +42,7 @@ struct WorkBuddyUsageRow {
 }
 
 pub fn parse_workbuddy_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
-    let conn = match Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) {
+    let conn = match open_readonly_sqlite_result(db_path) {
         Ok(conn) => conn,
         Err(err) => {
             warn!(

@@ -145,13 +145,17 @@ pub(crate) fn file_modified_timestamp_ms(path: &Path) -> i64 {
 }
 
 /// Open a SQLite file for read-only access with no mutex (single-threaded parser use).
-/// Returns `None` if the file cannot be opened — the caller treats that as "no sessions".
-pub(crate) fn open_readonly_sqlite(path: &Path) -> Option<Connection> {
+pub(crate) fn open_readonly_sqlite_result(path: &Path) -> rusqlite::Result<Connection> {
     Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .ok()
+}
+
+/// Open a SQLite file for read-only access with no mutex (single-threaded parser use).
+/// Returns `None` if the file cannot be opened — the caller treats that as "no sessions".
+pub(crate) fn open_readonly_sqlite(path: &Path) -> Option<Connection> {
+    open_readonly_sqlite_result(path).ok()
 }
 
 /// Read a file into bytes, returning `None` on any I/O error instead of propagating.
@@ -244,5 +248,28 @@ mod tests {
             parse_timestamp_str("2026-06-16T12:00:00Z"),
             Some(1_781_611_200_000)
         );
+    }
+
+    #[test]
+    fn open_readonly_sqlite_result_uses_read_only_flags() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("state.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("CREATE TABLE sessions (id TEXT)", []).unwrap();
+        drop(conn);
+
+        let conn = open_readonly_sqlite_result(&db_path).unwrap();
+        assert!(conn
+            .execute("INSERT INTO sessions (id) VALUES ('session')", [])
+            .is_err());
+    }
+
+    #[test]
+    fn open_readonly_sqlite_result_preserves_open_error() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("missing.db");
+        let error = open_readonly_sqlite_result(&db_path).unwrap_err();
+
+        assert!(error.to_string().contains("unable to open database file"));
     }
 }
