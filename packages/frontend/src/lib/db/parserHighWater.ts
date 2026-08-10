@@ -271,7 +271,7 @@ function advanceDays(
     const prior = ownValue(previous, date);
     const models = modelsForHighWater(prior);
     for (const [modelId, model] of Object.entries(day.models)) {
-      models[modelId] = maxModel(ownValue(prior?.models, modelId), model);
+      models[modelId] = maxModel(ownValue(models, modelId), model);
     }
     next[date] = breakdownFromModels(models);
   }

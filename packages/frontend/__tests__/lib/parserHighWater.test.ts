@@ -196,6 +196,48 @@ describe("non-destructive parser generation high-water", () => {
     }
   );
 
+  it.each([
+    { legacyDate: "2026-07-02", newDate: "2026-07-01" },
+    { legacyDate: "2026-07-01", newDate: "2026-07-02" },
+  ])(
+    "keeps synthesized scalar high-water when the first full scan is truncated ($legacyDate -> $newDate)",
+    ({ legacyDate, newDate }) => {
+      const scalarLegacy = {
+        tokens: 100,
+        cost: 10,
+        input: 100,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        reasoning: 0,
+        messages: 1,
+        modelId: "model-a",
+        models: {},
+      } satisfies ClientBreakdownData;
+      const first = baseline(
+        { [legacyDate]: scalarLegacy },
+        snapshot(
+          contribution(legacyDate, 80, "model-a", 8),
+          contribution(newDate, 50, "model-b", 5)
+        )
+      );
+      const restored = next(
+        first.nextState!,
+        snapshot(
+          contribution(legacyDate, 100, "model-a", 10),
+          contribution(newDate, 50, "model-b", 5)
+        )
+      );
+
+      expect(first.increments[newDate].tokens).toBe(30);
+      expect(
+        first.nextState?.days[legacyDate].models["model-a"].input
+      ).toBe(100);
+      expect(restored.increments[legacyDate]).toBeUndefined();
+      expect(restored.increments).toEqual({});
+    }
+  );
+
   it("is idempotent when the same v2 full snapshot is replayed", () => {
     const first = baseline({}, snapshot(contribution("2026-07-01", 100)));
     const replay = next(
