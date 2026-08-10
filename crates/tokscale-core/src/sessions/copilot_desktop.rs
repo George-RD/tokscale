@@ -441,16 +441,19 @@ fn session_row_to_messages(db_path: &Path, row: CopilotDesktopSessionRow) -> Vec
     let consumed = metadata.consumed;
     // The row's own cache-write column does not exist, so the shutdown records
     // are the only source for that bucket and there is nothing to reconcile.
+    let residual_input = (row.total_input_tokens - consumed[0]).max(0);
+    let residual_cache_read = (row.total_cached_tokens - consumed[2])
+        .max(0)
+        .min(residual_input);
     let residual = super::copilot::normalize_input_tokens(
-        (row.total_input_tokens - consumed[0]).max(0),
+        residual_input,
         (row.total_output_tokens - consumed[1]).max(0),
-        (row.total_cached_tokens - consumed[2]).max(0),
+        residual_cache_read,
         0,
         (row.total_reasoning_tokens - consumed[4]).max(0),
     );
 
-    let nothing_accounted = consumed.iter().all(|bucket| *bucket == 0);
-    if (messages.is_empty() && nothing_accounted) || residual.total() > 0 {
+    if residual.total() > 0 {
         messages.push(build(
             fallback_model,
             created_at_ms,
@@ -1334,6 +1337,41 @@ mod tests {
         assert_eq!(messages[0].tokens.output, 50);
         assert_eq!(messages[0].tokens.reasoning, 10);
         assert_eq!(messages[0].tokens.cache_write, 7);
+    }
+
+    /// Cache is a subset of inclusive input. A sidecar that accounts for all
+    /// row input but temporarily omits cache metadata cannot leave a cache-only
+    /// residual that pushes normalized usage above the row total.
+    #[test]
+    fn residual_cache_is_bounded_by_residual_inclusive_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("data.db");
+        let conn = create_copilot_desktop_db(&db_path);
+        insert_session(&conn, "session-1", "gpt-5.1-codex", 100, 0, 50, 0);
+        drop(conn);
+        write_events(
+            dir.path(),
+            "session-1",
+            &[
+                SESSION_START,
+                r#"{"type":"session.shutdown","data":{"modelMetrics":{"gpt-5.1-codex":{"usage":{"inputTokens":100,"cacheReadTokens":0}}}},"id":"9f2c6f0e-1d5a-4a7e-9b30-2c8d4e6f1a01","timestamp":"2026-07-01T20:00:00.000Z","parentId":null}"#,
+            ],
+        );
+
+        let messages = parse_copilot_desktop_db(&db_path);
+        let normalized_input: i64 = messages
+            .iter()
+            .map(|message| message.tokens.input + message.tokens.cache_read)
+            .sum();
+
+        assert_eq!(normalized_input, 100);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.tokens.cache_read)
+                .sum::<i64>(),
+            0
+        );
     }
 
     /// Inclusive input and cache reads are not independent totals. A reset or
