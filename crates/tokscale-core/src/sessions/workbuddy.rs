@@ -165,6 +165,7 @@ fn normalize_timestamp_ms(timestamp: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::{params, Connection};
 
     #[test]
     fn parse_workbuddy_sqlite_returns_empty_for_missing_database() {
@@ -172,7 +173,6 @@ mod tests {
         let missing = dir.path().join("missing.db");
         assert!(parse_workbuddy_sqlite(&missing).is_empty());
     }
-    use rusqlite::{params, Connection};
 
     fn create_workbuddy_db(path: &Path) -> Connection {
         let conn = Connection::open(path).unwrap();

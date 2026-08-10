@@ -1418,6 +1418,10 @@ struct KiroDbRequestMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
+    use std::fs;
+    use std::io::Write;
+    use tempfile::TempDir;
 
     #[test]
     fn parse_kiro_sqlite_returns_empty_for_missing_database() {
@@ -1425,10 +1429,6 @@ mod tests {
         let missing = dir.path().join("missing.db");
         assert!(parse_kiro_sqlite(&missing).is_empty());
     }
-    use rusqlite::Connection;
-    use std::fs;
-    use std::io::Write;
-    use tempfile::TempDir;
 
     fn create_session_files(
         dir: &TempDir,
