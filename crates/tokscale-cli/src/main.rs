@@ -763,16 +763,13 @@ fn main() -> Result<()> {
             benchmark,
             no_spinner,
         }) => {
-            let (since, until) = build_date_filter(&date, &cli.home);
-            let year = normalize_year_filter(&date);
+            let resolved_date = ResolvedReportDate::new(&date, &cli.home);
             let clients = build_client_filter(clients, &cli.home);
             run_graph_command(
                 output,
                 cli.home.clone(),
                 clients,
-                since,
-                until,
-                year,
+                resolved_date,
                 benchmark,
                 no_spinner,
             )
@@ -896,18 +893,9 @@ fn main() -> Result<()> {
             date,
             no_spinner,
         }) => {
-            let (since, until) = build_date_filter(&date, &cli.home);
-            let year = normalize_year_filter(&date);
+            let resolved_date = ResolvedReportDate::new(&date, &cli.home);
             let clients = build_client_filter(clients, &cli.home);
-            run_time_metrics_report(
-                json,
-                cli.home.clone(),
-                clients,
-                since,
-                until,
-                year,
-                no_spinner,
-            )
+            run_time_metrics_report(json, cli.home.clone(), clients, resolved_date, no_spinner)
         }
         Some(Commands::WarmTuiCache) => run_warm_tui_cache(),
         Some(Commands::Config { subcommand }) => {
@@ -1780,6 +1768,7 @@ pub(crate) fn normalize_year_filter(date: &DateRangeFlags) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn get_date_range_label(date: &DateRangeFlags) -> Option<String> {
     get_date_range_label_for_date(date, chrono::Local::now().date_naive())
 }
@@ -1929,11 +1918,44 @@ impl Drop for LightSpinner {
     }
 }
 
-/// Shared setup for the local, non-TUI report commands.
+/// Date bounds and scanner settings resolved from one pinned bucket date.
 ///
-/// Keeping this context separate from the renderers makes the report variants
-/// use the same date, scanner, cursor, and timing setup without changing the
-/// operation ordering that their output relies on.
+/// Loading scanner settings once is deliberate: the same settings choose both
+/// the date keys and the scanner's bucket timezone. Report options clone the
+/// settings instead of reading the profile again, so filtering and scanning
+/// cannot disagree after a settings change.
+struct ResolvedReportDate {
+    since: Option<String>,
+    until: Option<String>,
+    year: Option<String>,
+    date_range: Option<String>,
+    scanner_settings: tokscale_core::ScannerSettings,
+}
+
+impl ResolvedReportDate {
+    fn new(date: &DateRangeFlags, home_dir: &Option<String>) -> Self {
+        let scanner_settings = tui::settings::load_scanner_settings_for_home(home_dir);
+        let current_date =
+            tokscale_core::BucketTimezone::from_scanner_settings(&scanner_settings).today();
+        let (since, until) = build_date_filter_for_date(date, current_date);
+        let year = normalize_year_filter(date);
+        let date_range = get_date_range_label_for_date(date, current_date);
+
+        Self {
+            since,
+            until,
+            year,
+            date_range,
+            scanner_settings,
+        }
+    }
+}
+
+/// Shared setup for local report commands.
+///
+/// The cursor cache snapshot is intentionally taken before the best-effort
+/// sync. A failed sync must still be reported as "using cached data" when a
+/// cache existed before the sync attempt.
 struct LocalReportContext {
     home_dir: Option<String>,
     clients: Option<Vec<String>>,
@@ -1941,7 +1963,7 @@ struct LocalReportContext {
     until: Option<String>,
     year: Option<String>,
     date_range: Option<String>,
-    effective_home_dir: Option<PathBuf>,
+    scanner_settings: tokscale_core::ScannerSettings,
     had_cursor_cache: bool,
     explicit_cursor_filter: bool,
     spinner: Option<LightSpinner>,
@@ -1956,43 +1978,70 @@ impl LocalReportContext {
         home_dir: Option<String>,
         clients: Option<Vec<String>>,
         date: &DateRangeFlags,
-        no_spinner: bool,
-        resolve_effective_home: bool,
+        spinner_message: Option<&'static str>,
     ) -> Self {
-        let (since, until) = build_date_filter(date, &home_dir);
-        let year = normalize_year_filter(date);
-        let date_range = get_date_range_label(date);
-        let effective_home_dir = resolve_effective_home
-            .then(|| resolve_effective_home_dir(&home_dir))
-            .flatten();
+        let resolved_date = ResolvedReportDate::new(date, &home_dir);
+        let mut context =
+            Self::from_resolved_date(home_dir, clients, resolved_date, spinner_message);
+        context.complete_timing_setup();
+        context
+    }
 
-        let had_cursor_cache = has_cursor_usage_cache_for_report(&home_dir);
+    fn from_resolved_date(
+        home_dir: Option<String>,
+        clients: Option<Vec<String>>,
+        resolved_date: ResolvedReportDate,
+        spinner_message: Option<&'static str>,
+    ) -> Self {
         let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
-        let spinner = if no_spinner {
-            None
-        } else {
-            Some(LightSpinner::start("Scanning session data..."))
-        };
-        let cursor_sync_result = auto_sync_cursor_for_local_report(&home_dir, &clients);
+        let (had_cursor_cache, (spinner, cursor_sync_result)) = sample_cursor_cache_before_sync(
+            || has_cursor_usage_cache_for_report(&home_dir),
+            || {
+                let spinner = spinner_message.map(LightSpinner::start);
+                let cursor_sync_result = auto_sync_cursor_for_local_report(&home_dir, &clients);
+                (spinner, cursor_sync_result)
+            },
+        );
         let cursor_setup_warnings = setup_warnings_for_report(&home_dir, &clients);
-        let use_env_roots = use_env_roots(&home_dir);
-        let start = std::time::Instant::now();
 
         Self {
             home_dir,
             clients,
-            since,
-            until,
-            year,
-            date_range,
-            effective_home_dir,
+            since: resolved_date.since,
+            until: resolved_date.until,
+            year: resolved_date.year,
+            date_range: resolved_date.date_range,
+            scanner_settings: resolved_date.scanner_settings,
             had_cursor_cache,
             explicit_cursor_filter,
             spinner,
             cursor_sync_result,
             cursor_setup_warnings,
-            use_env_roots,
-            start,
+            use_env_roots: false,
+            start: std::time::Instant::now(),
+        }
+    }
+
+    fn complete_timing_setup(&mut self) {
+        self.resolve_env_roots();
+        self.start_timing();
+    }
+
+    fn resolve_env_roots(&mut self) {
+        self.use_env_roots = use_env_roots(&self.home_dir);
+    }
+
+    fn start_timing(&mut self) {
+        self.start = std::time::Instant::now();
+    }
+
+    fn effective_home_dir(&self) -> Option<PathBuf> {
+        resolve_effective_home_dir(&self.home_dir)
+    }
+
+    fn stop_spinner(&mut self) {
+        if let Some(spinner) = self.spinner.take() {
+            spinner.stop();
         }
     }
 
@@ -2005,9 +2054,19 @@ impl LocalReportContext {
             until: self.until.clone(),
             year: self.year.clone(),
             group_by,
-            scanner_settings: tui::settings::load_scanner_settings_for_home(&self.home_dir),
+            scanner_settings: self.scanner_settings.clone(),
         }
     }
+}
+
+fn sample_cursor_cache_before_sync<FCache, FSync, T>(sample_cache: FCache, sync: FSync) -> (bool, T)
+where
+    FCache: FnOnce() -> bool,
+    FSync: FnOnce() -> T,
+{
+    let had_cursor_cache = sample_cache();
+    let sync_result = sync();
+    (had_cursor_cache, sync_result)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2026,7 +2085,12 @@ fn run_models_report(
     use tokio::runtime::Runtime;
     use tokscale_core::{get_model_report, GroupBy};
 
-    let mut context = LocalReportContext::new(home_dir, clients, date, no_spinner, true);
+    let mut context = LocalReportContext::new(
+        home_dir,
+        clients,
+        date,
+        (!no_spinner).then_some("Scanning session data..."),
+    );
     let rt = Runtime::new()?;
     let report = rt
         .block_on(async { get_model_report(context.report_options(group_by.clone())).await })
@@ -2047,9 +2111,7 @@ fn run_models_report(
     }
     let report = report;
 
-    if let Some(spinner) = context.spinner.take() {
-        spinner.stop();
-    }
+    context.stop_spinner();
     emit_cursor_sync_warning(
         context.cursor_sync_result.as_ref(),
         context.had_cursor_cache,
@@ -2063,7 +2125,7 @@ fn run_models_report(
         .map(|entry| entry.message_count)
         .sum();
     let diagnostics = context
-        .effective_home_dir
+        .effective_home_dir()
         .as_deref()
         .map(|home| {
             claude_diagnostics::diagnostics_for_empty_explicit_report(
@@ -2874,7 +2936,12 @@ fn run_monthly_report(
     use tokio::runtime::Runtime;
     use tokscale_core::{get_monthly_report_v2, GroupBy};
 
-    let mut context = LocalReportContext::new(home_dir, clients, date, no_spinner, false);
+    let mut context = LocalReportContext::new(
+        home_dir,
+        clients,
+        date,
+        (!no_spinner).then_some("Scanning session data..."),
+    );
     let rt = Runtime::new()?;
     let report = rt
         .block_on(async { get_monthly_report_v2(context.report_options(GroupBy::default())).await })
@@ -2893,9 +2960,7 @@ fn run_monthly_report(
     }
     let report = report;
 
-    if let Some(spinner) = context.spinner.take() {
-        spinner.stop();
-    }
+    context.stop_spinner();
     emit_cursor_sync_warning(
         context.cursor_sync_result.as_ref(),
         context.had_cursor_cache,
@@ -3183,7 +3248,12 @@ fn run_hourly_report(
     use tokio::runtime::Runtime;
     use tokscale_core::{get_hourly_report, GroupBy};
 
-    let mut context = LocalReportContext::new(home_dir, clients, date, no_spinner, false);
+    let mut context = LocalReportContext::new(
+        home_dir,
+        clients,
+        date,
+        (!no_spinner).then_some("Scanning session data..."),
+    );
     let rt = Runtime::new()?;
     let report = rt
         .block_on(async { get_hourly_report(context.report_options(GroupBy::default())).await })
@@ -3202,9 +3272,7 @@ fn run_hourly_report(
     }
     let report = report;
 
-    if let Some(spinner) = context.spinner.take() {
-        spinner.stop();
-    }
+    context.stop_spinner();
     emit_cursor_sync_warning(
         context.cursor_sync_result.as_ref(),
         context.had_cursor_cache,
@@ -4995,48 +5063,31 @@ fn run_time_metrics_report(
     json: bool,
     home_dir: Option<String>,
     clients: Option<Vec<String>>,
-    since: Option<String>,
-    until: Option<String>,
-    year: Option<String>,
+    resolved_date: ResolvedReportDate,
     no_spinner: bool,
 ) -> Result<()> {
     use tokio::runtime::Runtime;
-    use tokscale_core::{get_time_metrics_report, GroupBy, ReportOptions};
+    use tokscale_core::{get_time_metrics_report, GroupBy};
 
-    let had_cursor_cache = has_cursor_usage_cache_for_report(&home_dir);
-    let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
-    let spinner = if no_spinner {
-        None
-    } else {
-        Some(LightSpinner::start("Computing time metrics..."))
-    };
-    let cursor_sync_result = auto_sync_cursor_for_local_report(&home_dir, &clients);
-    let cursor_setup_warnings = setup_warnings_for_report(&home_dir, &clients);
-    let use_env_roots = use_env_roots(&home_dir);
+    let mut context = LocalReportContext::from_resolved_date(
+        home_dir,
+        clients,
+        resolved_date,
+        (!no_spinner).then_some("Computing time metrics..."),
+    );
+    context.complete_timing_setup();
     let rt = Runtime::new()?;
     let report = rt
         .block_on(async {
-            get_time_metrics_report(ReportOptions {
-                home_dir: home_dir.clone(),
-                use_env_roots,
-                clients,
-                since,
-                until,
-                year,
-                group_by: GroupBy::default(),
-                scanner_settings: tui::settings::load_scanner_settings_for_home(&home_dir),
-            })
-            .await
+            get_time_metrics_report(context.report_options(GroupBy::default())).await
         })
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    if let Some(spinner) = spinner {
-        spinner.stop();
-    }
+    context.stop_spinner();
     emit_cursor_sync_warning(
-        cursor_sync_result.as_ref(),
-        had_cursor_cache,
-        explicit_cursor_filter,
+        context.cursor_sync_result.as_ref(),
+        context.had_cursor_cache,
+        context.explicit_cursor_filter,
     );
 
     let m = &report.metrics;
@@ -5054,11 +5105,11 @@ fn run_time_metrics_report(
         let output = TimeMetricsReportJson {
             metrics: &report.metrics,
             processing_time_ms: report.processing_time_ms,
-            warnings: cursor_setup_warnings,
+            warnings: context.cursor_setup_warnings,
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        emit_cursor_setup_warnings(&cursor_setup_warnings);
+        emit_cursor_setup_warnings(&context.cursor_setup_warnings);
         println!("Session Time Metrics");
         println!("====================");
         println!(
@@ -5104,55 +5155,40 @@ fn run_graph_command(
     output: Option<String>,
     home_dir: Option<String>,
     clients: Option<Vec<String>>,
-    since: Option<String>,
-    until: Option<String>,
-    year: Option<String>,
+    resolved_date: ResolvedReportDate,
     benchmark: bool,
     no_spinner: bool,
 ) -> Result<()> {
     use colored::Colorize;
-    use std::time::Instant;
-    use tokscale_core::{generate_local_graph_report, GroupBy, ReportOptions};
+    use tokscale_core::{generate_local_graph_report, GroupBy};
 
     let show_progress = output.is_some() && !no_spinner;
-    let had_cursor_cache = has_cursor_usage_cache_for_report(&home_dir);
-    let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
-    let cursor_sync_result = auto_sync_cursor_for_local_report(&home_dir, &clients);
-    let cursor_setup_warnings = setup_warnings_for_report(&home_dir, &clients);
+    let mut context =
+        LocalReportContext::from_resolved_date(home_dir, clients, resolved_date, None);
 
     if show_progress {
         eprintln!("  Scanning session data...");
     }
-    let start = Instant::now();
+    context.start_timing();
 
     if show_progress {
         eprintln!("  Generating graph data...");
     }
-    let use_env_roots = use_env_roots(&home_dir);
+    context.resolve_env_roots();
     let rt = tokio::runtime::Runtime::new()?;
     let graph_result = rt
         .block_on(async {
-            generate_local_graph_report(ReportOptions {
-                home_dir: home_dir.clone(),
-                use_env_roots,
-                clients,
-                since,
-                until,
-                year,
-                group_by: GroupBy::default(),
-                scanner_settings: tui::settings::load_scanner_settings_for_home(&home_dir),
-            })
-            .await
+            generate_local_graph_report(context.report_options(GroupBy::default())).await
         })
         .map_err(|e| anyhow::anyhow!(e))?;
     emit_cursor_sync_warning(
-        cursor_sync_result.as_ref(),
-        had_cursor_cache,
-        explicit_cursor_filter,
+        context.cursor_sync_result.as_ref(),
+        context.had_cursor_cache,
+        context.explicit_cursor_filter,
     );
-    emit_cursor_setup_warnings(&cursor_setup_warnings);
+    emit_cursor_setup_warnings(&context.cursor_setup_warnings);
 
-    let processing_time_ms = start.elapsed().as_millis() as u32;
+    let processing_time_ms = context.start.elapsed().as_millis() as u32;
     let output_data = to_ts_token_contribution_data(&graph_result, None, None);
     let json_output = serde_json::to_string_pretty(&output_data)?;
 
@@ -5187,7 +5223,7 @@ fn run_graph_command(
                 "{}",
                 format!("  Processing time: {}ms (Rust native)", processing_time_ms).bright_black()
             );
-            if let Some(sync) = cursor_sync_result {
+            if let Some(sync) = context.cursor_sync_result.as_ref() {
                 if sync.synced {
                     eprintln!(
                         "{}",
@@ -5197,8 +5233,8 @@ fn run_graph_command(
                         )
                         .bright_black()
                     );
-                } else if let Some(err) = sync.error {
-                    if had_cursor_cache {
+                } else if let Some(err) = sync.error.as_ref() {
+                    if context.had_cursor_cache {
                         eprintln!("{}", format!("  Cursor: sync failed - {}", err).yellow());
                     }
                 }
@@ -7456,6 +7492,40 @@ mod tests {
             Some("Pacific/Kiritimati"),
             "report must rebucket sessions with the --home profile's timezone"
         );
+    }
+
+    #[test]
+    fn test_resolved_month_filter_and_label_share_bucket_boundary() {
+        let date = DateRangeFlags {
+            month: true,
+            ..DateRangeFlags::default()
+        };
+        let current_date = chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
+        let (since, until) = build_date_filter_for_date(&date, current_date);
+        let label = get_date_range_label_for_date(&date, current_date);
+
+        assert_eq!(since.as_deref(), Some("2026-03-01"));
+        assert_eq!(until.as_deref(), Some("2026-03-01"));
+        assert_eq!(label.as_deref(), Some("March 2026"));
+    }
+
+    #[test]
+    fn test_cursor_cache_is_sampled_before_sync() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let (had_cache, sync_result) = sample_cursor_cache_before_sync(
+            || {
+                events.borrow_mut().push("sample");
+                true
+            },
+            || {
+                events.borrow_mut().push("sync");
+                42
+            },
+        );
+
+        assert!(had_cache);
+        assert_eq!(sync_result, 42);
+        assert_eq!(*events.borrow(), ["sample", "sync"]);
     }
 
     #[test]
