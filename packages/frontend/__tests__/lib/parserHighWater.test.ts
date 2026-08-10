@@ -552,6 +552,54 @@ describe("non-destructive parser generation high-water", () => {
     expect(replay.increments).toEqual({});
   });
 
+  it("caps cell-supported cache moves by aggregate cache growth", () => {
+    const first = baseline(
+      {},
+      snapshot(
+        contribution("2026-07-01", 100, "a-cache-move", 1),
+        contribution("2026-07-01", 100, "z-input-growth", 1),
+        bucketContribution(
+          "2026-07-01",
+          { input: 0, output: 0, cacheRead: 50, cacheWrite: 0, reasoning: 0 },
+          1,
+          1,
+          "gone-cache"
+        )
+      )
+    );
+    const grown = next(
+      first.nextState!,
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 100, output: 0, cacheRead: 50, cacheWrite: 0, reasoning: 0 },
+          2,
+          2,
+          "a-cache-move"
+        ),
+        contribution("2026-07-01", 150, "z-input-growth", 2)
+      )
+    );
+    const replay = next(
+      grown.nextState!,
+      snapshot(
+        bucketContribution(
+          "2026-07-01",
+          { input: 100, output: 0, cacheRead: 50, cacheWrite: 0, reasoning: 0 },
+          2,
+          2,
+          "a-cache-move"
+        ),
+        contribution("2026-07-01", 150, "z-input-growth", 2)
+      )
+    );
+
+    expect(grown.increments["2026-07-01"].models["a-cache-move"]).toBeUndefined();
+    expect(grown.increments["2026-07-01"].models["z-input-growth"].input).toBe(50);
+    expect(grown.increments["2026-07-01"].tokens).toBe(50);
+    expect(replay.increments).toEqual({});
+  });
+
   it("allows genuine fully-cached inclusive-input growth", () => {
     const first = baseline(
       {},

@@ -293,18 +293,42 @@ function allocateIncrements(
   let messageBudget = positive(
     incomingAggregate.messages - previousAggregate.messages
   );
-  let inclusiveInputBudget = positive(
+  const inclusiveInputBudget = positive(
     incomingAggregate.inputIncludingCacheRead -
       previousAggregate.inputIncludingCacheRead
   );
+  let supportedCellCacheReadGrowth = 0;
+  for (const [date, incomingDay] of Object.entries(incomingDays)) {
+    const previousDay = ownValue(previousDays, date);
+    for (const [modelId, model] of Object.entries(incomingDay.models)) {
+      const prior = ownValue(previousDay?.models, modelId);
+      const inclusiveGrowth = positive(
+        positive(
+          model.inputIncludingCacheRead ?? model.input + model.cacheRead
+        ) -
+          positive(
+            prior?.inputIncludingCacheRead ??
+              (prior?.input ?? 0) + (prior?.cacheRead ?? 0)
+          )
+      );
+      supportedCellCacheReadGrowth += Math.min(
+        positive(model.cacheRead - (prior?.cacheRead ?? 0)),
+        inclusiveGrowth
+      );
+    }
+  }
+  const cacheReadBudget = Math.min(
+    positive(incomingAggregate.cacheRead - previousAggregate.cacheRead),
+    supportedCellCacheReadGrowth,
+    inclusiveInputBudget
+  );
   const bucketBudgets: Record<TokenField, number> = {
-    // Normalized input/cache share the one observed inclusive-input budget.
-    // Their per-cell candidates partition that budget below; pre-partitioning
-    // it from aggregate bucket maxima lets an unsupported cache composition
-    // move starve genuine input growth in another cell.
-    input: 0,
+    // Reserve inclusive growth for cache only when BOTH the aggregate cache
+    // high-water and at least one cell's observed inclusive growth support it.
+    // Unsupported cache moves reserve nothing, so the remainder flows to input.
+    input: inclusiveInputBudget - cacheReadBudget,
     output: positive(incomingAggregate.output - previousAggregate.output),
-    cacheRead: 0,
+    cacheRead: cacheReadBudget,
     cacheWrite: positive(incomingAggregate.cacheWrite - previousAggregate.cacheWrite),
     reasoning: positive(incomingAggregate.reasoning - previousAggregate.reasoning),
   };
@@ -351,21 +375,9 @@ function allocateIncrements(
       for (const field of TOKEN_FIELDS) {
         const candidate = candidates[field];
         candidateTokens += candidate;
-        const isInclusiveInputComponent =
-          field === "input" || field === "cacheRead";
-        const accepted = Math.min(
-          candidate,
-          isInclusiveInputComponent
-            ? inclusiveInputBudget
-            : bucketBudgets[field],
-          tokenBudget
-        );
+        const accepted = Math.min(candidate, bucketBudgets[field], tokenBudget);
         increment[field] = accepted;
-        if (isInclusiveInputComponent) {
-          inclusiveInputBudget -= accepted;
-        } else {
-          bucketBudgets[field] -= accepted;
-        }
+        bucketBudgets[field] -= accepted;
         tokenBudget -= accepted;
       }
       increment.tokens = TOKEN_FIELDS.reduce(
