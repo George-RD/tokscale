@@ -7462,6 +7462,12 @@ mod tests {
         let niue_report_date =
             ResolvedReportDate::from_current_date(&month, niue_settings, niue_fixed_date);
         let report_settings = tui::settings::load_scanner_settings_for_home(&kiritimati_home_path);
+        let today = DateRangeFlags {
+            today: true,
+            ..DateRangeFlags::default()
+        };
+        let kiritimati_today = ResolvedReportDate::new(&today, &kiritimati_home_path);
+        let niue_today = ResolvedReportDate::new(&today, &niue_home_path);
 
         assert_eq!(
             kiritimati,
@@ -7478,6 +7484,22 @@ mod tests {
             Some("Pacific/Kiritimati"),
             "report must rebucket sessions with the --home profile's timezone"
         );
+        let expected_kiritimati_today = kiritimati.to_string();
+        let expected_niue_today = niue.to_string();
+        assert_eq!(
+            kiritimati_today.until.as_deref(),
+            Some(expected_kiritimati_today.as_str()),
+            "production date resolution must use the --home profile's pinned zone"
+        );
+        assert_eq!(
+            niue_today.until.as_deref(),
+            Some(expected_niue_today.as_str()),
+            "production date resolution must use the --home profile's pinned zone"
+        );
+        assert_ne!(
+            kiritimati_today.until, niue_today.until,
+            "profiles 25 hours apart must resolve today to different dates"
+        );
         let expected_kiritimati = kiritimati_fixed_date.to_string();
         let expected_niue = niue_fixed_date.to_string();
         let expected_kiritimati_start = kiritimati_fixed_date.with_day(1).unwrap().to_string();
@@ -7487,22 +7509,22 @@ mod tests {
         assert_eq!(
             kiritimati_report_date.since.as_deref(),
             Some(expected_kiritimati_start.as_str()),
-            "resolved month filters must use the pinned --home timezone"
+            "fixed-date month bounds must use the injected date"
         );
         assert_eq!(
             kiritimati_report_date.until.as_deref(),
             Some(expected_kiritimati.as_str()),
-            "resolved month filters must use the pinned --home timezone"
+            "fixed-date month bounds must use the injected date"
         );
         assert_eq!(
             niue_report_date.since.as_deref(),
             Some(expected_niue_start.as_str()),
-            "resolved month filters must use the pinned --home timezone"
+            "fixed-date month bounds must use the injected date"
         );
         assert_eq!(
             niue_report_date.until.as_deref(),
             Some(expected_niue.as_str()),
-            "resolved month filters must use the pinned --home timezone"
+            "fixed-date month bounds must use the injected date"
         );
         assert_eq!(
             kiritimati_report_date.date_range.as_deref(),
@@ -7512,21 +7534,6 @@ mod tests {
             niue_report_date.date_range.as_deref(),
             Some(expected_niue_label.as_str())
         );
-    }
-
-    #[test]
-    fn test_resolved_month_filter_and_label_share_bucket_boundary() {
-        let date = DateRangeFlags {
-            month: true,
-            ..DateRangeFlags::default()
-        };
-        let current_date = chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
-        let (since, until) = build_date_filter_for_date(&date, current_date);
-        let label = get_date_range_label_for_date(&date, current_date);
-
-        assert_eq!(since.as_deref(), Some("2026-03-01"));
-        assert_eq!(until.as_deref(), Some("2026-03-01"));
-        assert_eq!(label.as_deref(), Some("March 2026"));
     }
 
     #[test]
