@@ -38,7 +38,7 @@ fn provider_for_model(model: &str) -> &'static str {
         || lower.contains("o1")
         || lower.contains("o3")
         || lower.contains("o4")
-        || lower.contains("sol")
+        || lower.ends_with("sol")
     {
         "openai"
     } else {
@@ -113,9 +113,6 @@ pub fn parse_cherrystudio_file(path: &Path) -> Vec<UnifiedMessage> {
             .and_then(Value::as_i64)
             .unwrap_or(0)
             .max(0);
-        if input == 0 && output == 0 {
-            continue;
-        }
 
         let model = message
             .get("model")
@@ -137,7 +134,10 @@ pub fn parse_cherrystudio_file(path: &Path) -> Vec<UnifiedMessage> {
             .and_then(Value::as_i64)
             .unwrap_or(0)
             .max(0);
-        let total = input + output + cache_read + cache_creation;
+        let total = input
+            .saturating_add(output)
+            .saturating_add(cache_read)
+            .saturating_add(cache_creation);
         if total <= 0 {
             continue;
         }
