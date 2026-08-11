@@ -4,6 +4,12 @@ pub enum PathRoot {
     ReasonixHome,
     XdgData,
     Config,
+    /// The per-user application data directory, resolved via the `dirs` crate:
+    /// `%APPDATA%` on Windows, `~/Library/Application Support` on macOS, and
+    /// the XDG config home on Linux. Cherry Studio (an Electron app) stores its
+    /// Claude Code transcripts under `<config_dir>/CherryStudio/.claude/projects`,
+    /// so this root matches where its data actually lives on every platform.
+    AppData,
     EnvVar {
         var: &'static str,
         fallback_relative: &'static str,
@@ -43,12 +49,12 @@ impl PathRoot {
                             return config_dir.join("reasonix").to_string_lossy().into_owned();
                         }
                     }
-                    return std::path::Path::new(home_dir)
+                    std::path::Path::new(home_dir)
                         .join("AppData")
                         .join("Roaming")
                         .join("reasonix")
                         .to_string_lossy()
-                        .into_owned();
+                        .into_owned()
                 }
                 #[cfg(not(target_os = "windows"))]
                 {
@@ -93,6 +99,22 @@ impl PathRoot {
                 }
 
                 join_home(home_dir, ".config/tokscale")
+            }
+            PathRoot::AppData => {
+                if use_env_roots {
+                    if let Some(dir) = dirs::config_dir() {
+                        return dir.to_string_lossy().into_owned();
+                    }
+                }
+                // Without env roots (tests, explicit `--home`) the other roots
+                // resolve under the given home; follow the same convention so
+                // an AppData-rooted client cannot leak the machine's real
+                // per-user data into a hermetic scan.
+                if cfg!(windows) {
+                    join_home(home_dir, "AppData/Roaming")
+                } else {
+                    join_home(home_dir, ".config")
+                }
             }
             PathRoot::EnvVar {
                 var,
@@ -816,6 +838,24 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // Cherry Studio (Electron desktop client) writes standard Claude Code
+    // transcripts under its per-user app-data directory
+    // (`%APPDATA%\CherryStudio\.claude\projects` on Windows). The transcript
+    // format is identical to Claude Code's, but parsing uses the dedicated
+    // `sessions::cherrystudio` parser, which dedupes the same API call
+    // appended 3-4 times per streaming response via the usage signature;
+    // naively summing every assistant row would ~3x the true figure.
+    CherryStudio = 45 => {
+        id: "cherrystudio",
+        display: "Cherry Studio",
+        logo: None,
+        root: PathRoot::AppData,
+        relative: "CherryStudio/.claude/projects",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -931,7 +971,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 45);
+        assert_eq!(ClientId::COUNT, 46);
     }
 
     #[test]

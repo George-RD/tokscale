@@ -1667,6 +1667,7 @@ mod tests {
             "Reasonix",
             "Prime Agent",
             "Freebuff",
+            "Cherry Studio",
         ];
 
         assert_eq!(expected.len(), ClientId::COUNT);

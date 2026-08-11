@@ -2279,6 +2279,29 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         }
     }
 
+    // Cherry Studio (Electron desktop) writes standard Claude Code transcripts
+    // under its app-data `.claude/projects`; parse them with the shared
+    // claudecode logic re-tagged as `cherrystudio`.
+    let cherrystudio_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::CherryStudio)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(
+                message_cache::CacheIdentity::for_client(ClientId::CherryStudio),
+                path,
+                &source_cache,
+                pricing,
+                sessions::cherrystudio::parse_cherrystudio_file,
+            )
+        })
+        .collect();
+    for outcome in cherrystudio_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     // ZCode (Z.ai GLM-5.2 ADE) JSONL sessions. Token usage may be embedded
     // from the API response; otherwise estimated from content.
     let zcode_messages: Vec<UnifiedMessage> = scan_result
@@ -4363,6 +4386,21 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let zcode_count = summed_parsed_message_count(&zcode_msgs);
     counts.set(ClientId::Zcode, zcode_count);
     messages.extend(zcode_msgs);
+
+    // Cherry Studio agent-session transcripts (Claude Code format).
+    let cherrystudio_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::CherryStudio)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::cherrystudio::parse_cherrystudio_file(path)
+                .into_iter()
+                .map(|message| unified_to_parsed(&message))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let cherrystudio_count = summed_parsed_message_count(&cherrystudio_msgs);
+    counts.set(ClientId::CherryStudio, cherrystudio_count);
+    messages.extend(cherrystudio_msgs);
 
     let opencodereview_msgs: Vec<ParsedMessage> = scan_result
         .get(ClientId::OpenCodeReview)

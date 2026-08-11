@@ -1080,6 +1080,7 @@ pub enum ClientFilter {
     #[value(name = "prime-agent")]
     PrimeAgent,
     Freebuff,
+    CherryStudio,
     Synthetic,
 }
 
@@ -1135,6 +1136,7 @@ impl ClientFilter {
             Self::Reasonix => "reasonix",
             Self::PrimeAgent => "prime-agent",
             Self::Freebuff => "freebuff",
+            Self::CherryStudio => "cherrystudio",
             Self::Synthetic => "synthetic",
         }
     }
@@ -1193,6 +1195,7 @@ impl ClientFilter {
             Self::Reasonix => Some(ClientId::Reasonix),
             Self::PrimeAgent => Some(ClientId::PrimeAgent),
             Self::Freebuff => Some(ClientId::Freebuff),
+            Self::CherryStudio => Some(ClientId::CherryStudio),
             Self::Synthetic => None,
         }
     }
@@ -1247,6 +1250,7 @@ impl ClientFilter {
             ClientId::Reasonix => Self::Reasonix,
             ClientId::PrimeAgent => Self::PrimeAgent,
             ClientId::Freebuff => Self::Freebuff,
+            ClientId::CherryStudio => Self::CherryStudio,
         }
     }
 
