@@ -38,6 +38,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
+/// Counts Claude cache entries rebuilt because they predate retention
+/// provenance. Tests assert the rebuild is a one-time upgrade cost: the count
+/// must stop growing once every entry carries the marker.
+#[cfg(test)]
+static RETENTION_PROVENANCE_REBUILDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Strip a CLIProxyAPI-style `(level)` reasoning-effort suffix from a model id.
 ///
 /// Mirrors <https://help.router-for.me/configuration/thinking>: the proxy
@@ -763,6 +770,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     #[derive(Debug)]
     struct CachedParseOutcome {
         messages: Vec<UnifiedMessage>,
+        retained_message_keys: HashSet<String>,
         cache_entry: Option<message_cache::CachedSourceEntry>,
         invalidate_cache: bool,
     }
@@ -807,6 +815,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         if !parsed.parse_succeeded {
             return CachedParseOutcome {
                 messages,
+                retained_message_keys: HashSet::new(),
                 cache_entry: None,
                 invalidate_cache: false,
             };
@@ -815,6 +824,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         if parsed.unresolved_model_events {
             return CachedParseOutcome {
                 messages,
+                retained_message_keys: HashSet::new(),
                 cache_entry: None,
                 invalidate_cache: false,
             };
@@ -830,6 +840,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
 
         CachedParseOutcome {
             messages,
+            retained_message_keys: HashSet::new(),
             cache_entry,
             invalidate_cache: false,
         }
@@ -911,9 +922,9 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     /// still contains: a key present on both sides keeps the freshly parsed
     /// message, so a corrected re-parse still wins and nothing is frozen at a
     /// stale value. Only keys the file no longer carries are carried forward.
-    /// (Across entries the Claude lane is first-wins on lexical path order, so
-    /// a retained copy in an earlier-sorting file still beats a live copy of
-    /// the same key in a later one.)
+    /// Across entries the Claude lane separately carries the returned key set,
+    /// so cross-file dedup can merge a retained partial with a completed live
+    /// replay instead of depending on lexical path order.
     ///
     /// Messages without a dedup key are never retained. The key is what lets a
     /// later scan recognise the message as already-seen; re-emitting an
@@ -924,12 +935,13 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         parsed: &mut Vec<UnifiedMessage>,
         cached: &[UnifiedMessage],
         key_is_globally_stable: fn(&str) -> bool,
-    ) {
+    ) -> HashSet<String> {
         let mut seen: HashSet<String> = parsed
             .iter()
             .filter_map(|message| message.dedup_key.clone())
             .collect();
 
+        let mut retained = HashSet::new();
         for message in cached {
             let Some(key) = message.dedup_key.as_ref() else {
                 continue;
@@ -939,8 +951,10 @@ fn parse_all_messages_with_pricing_with_cache_policy(
             }
             if seen.insert(key.clone()) {
                 parsed.push(message.clone());
+                retained.insert(key.clone());
             }
         }
+        retained
     }
 
     fn load_or_parse_source_with_fingerprint_and_policy<F, FingerprintFn>(
@@ -960,6 +974,21 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         ) -> Option<message_cache::FingerprintStatus>,
     {
         let cached = source_cache.get(identity, path);
+        // An entry written before retention provenance existed cannot say
+        // which of its rows the live transcript already dropped, so serving it
+        // warm presents a retained copy of a response as a live one — and the
+        // live copy of that same response in a forked transcript then loses
+        // the merge, freezing the stale model attribution and the cost priced
+        // from it. Rebuild those entries by taking the ordinary re-parse path
+        // once: it re-derives the retained set from the live bytes and writes
+        // the entry back with the provenance marker, so the next scan is a
+        // plain warm hit.
+        let rebuild_retention_provenance = cached
+            .is_some_and(message_cache::CachedSourceEntry::needs_retention_provenance_migration);
+        #[cfg(test)]
+        if rebuild_retention_provenance {
+            RETENTION_PROVENANCE_REBUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let Some(fingerprint_status) =
             fingerprint_from_path(path, cached.map(|entry| &entry.fingerprint))
         else {
@@ -967,6 +996,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
             apply_pricing_to_messages(&mut messages, pricing);
             return CachedParseOutcome {
                 messages,
+                retained_message_keys: HashSet::new(),
                 cache_entry: None,
                 invalidate_cache: false,
             };
@@ -977,9 +1007,10 @@ fn parse_all_messages_with_pricing_with_cache_policy(
                 let Some(cached) = cached else {
                     unreachable!("an uncached source always builds a complete fingerprint")
                 };
-                if !cached.messages.is_empty() {
+                if !rebuild_retention_provenance && !cached.messages.is_empty() {
                     return CachedParseOutcome {
                         messages: cached_messages(cached, pricing),
+                        retained_message_keys: cached.retained_message_keys(),
                         cache_entry: None,
                         invalidate_cache: false,
                     };
@@ -990,9 +1021,13 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         };
 
         if let Some(cached) = cached {
-            if cached.fingerprint == fingerprint && !cached.messages.is_empty() {
+            if !rebuild_retention_provenance
+                && cached.fingerprint == fingerprint
+                && !cached.messages.is_empty()
+            {
                 return CachedParseOutcome {
                     messages: cached_messages(cached, pricing),
+                    retained_message_keys: cached.retained_message_keys(),
                     cache_entry: None,
                     invalidate_cache: false,
                 };
@@ -1007,13 +1042,14 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         // would retire them from history (#994). Only merge when the parse is
         // cacheable: an untrustworthy parse must not be used to synthesise an
         // entry, and the caller invalidates on that path anyway.
+        let mut retained_message_keys = HashSet::new();
         if let HistoryRetention::RetainObserved {
             key_is_globally_stable,
         } = history
         {
             if cacheable {
                 if let Some(cached) = cached {
-                    retain_observed_messages(
+                    retained_message_keys = retain_observed_messages(
                         &mut messages,
                         &cached.messages,
                         key_is_globally_stable,
@@ -1024,19 +1060,31 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         let cache_entry = if messages.is_empty() || !cacheable {
             None
         } else {
-            Some(message_cache::CachedSourceEntry::new(
-                identity,
-                path,
-                fingerprint,
-                messages.clone(),
-                Vec::new(),
-                None,
-            ))
+            Some(match history {
+                HistoryRetention::LiveFileOnly => message_cache::CachedSourceEntry::new(
+                    identity,
+                    path,
+                    fingerprint,
+                    messages.clone(),
+                    Vec::new(),
+                    None,
+                ),
+                HistoryRetention::RetainObserved { .. } => {
+                    message_cache::CachedSourceEntry::new_with_retained_message_keys(
+                        identity,
+                        path,
+                        fingerprint,
+                        messages.clone(),
+                        &retained_message_keys,
+                    )
+                }
+            })
         };
         apply_pricing_to_messages(&mut messages, pricing);
 
         CachedParseOutcome {
             messages,
+            retained_message_keys,
             cache_entry,
             invalidate_cache: !cacheable,
         }
@@ -1166,6 +1214,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         (
             CachedParseOutcome {
                 messages,
+                retained_message_keys: HashSet::new(),
                 cache_entry: None,
                 invalidate_cache: false,
             },
@@ -1213,6 +1262,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
                 return (
                     CachedParseOutcome {
                         messages,
+                        retained_message_keys: HashSet::new(),
                         cache_entry,
                         invalidate_cache: false,
                     },
@@ -1269,6 +1319,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
                             return (
                                 CachedParseOutcome {
                                     messages: cached_messages(cached, pricing),
+                                    retained_message_keys: HashSet::new(),
                                     cache_entry: None,
                                     invalidate_cache: false,
                                 },
@@ -1300,6 +1351,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
                             return (
                                 CachedParseOutcome {
                                     messages: cached_messages(cached, pricing),
+                                    retained_message_keys: HashSet::new(),
                                     cache_entry: Some(
                                         cached.clone().with_prime_accounting(accounting.clone()),
                                     ),
@@ -1389,6 +1441,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
                             &cached.fallback_timestamp_indices,
                             fallback_timestamp,
                         ),
+                        retained_message_keys: HashSet::new(),
                         cache_entry: None,
                         invalidate_cache: false,
                     };
@@ -1436,6 +1489,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
 
                             return CachedParseOutcome {
                                 messages,
+                                retained_message_keys: HashSet::new(),
                                 cache_entry: Some(cache_entry),
                                 invalidate_cache: false,
                             };
@@ -1617,24 +1671,42 @@ fn parse_all_messages_with_pricing_with_cache_policy(
             )
         })
         .collect();
-    let mut claude_messages_raw: Vec<(String, UnifiedMessage)> = Vec::new();
+    let mut claude_messages: Vec<(bool, UnifiedMessage)> = Vec::new();
+    let mut claude_keyed_indices: HashMap<String, usize> = HashMap::new();
     for outcome in claude_outcomes {
-        claude_messages_raw.extend(outcome.messages.into_iter().map(|msg| {
-            let dedup_key = msg.dedup_key.clone().unwrap_or_default();
-            (dedup_key, msg)
-        }));
+        for message in outcome.messages {
+            let Some(key) = message.dedup_key.clone().filter(|key| !key.is_empty()) else {
+                claude_messages.push((false, message));
+                continue;
+            };
+            let is_retained = outcome.retained_message_keys.contains(&key);
+            let Some(index) = claude_keyed_indices.get(&key).copied() else {
+                claude_keyed_indices.insert(key, claude_messages.len());
+                claude_messages.push((is_retained, message));
+                continue;
+            };
+
+            let (existing_is_retained, existing) = &mut claude_messages[index];
+            if *existing_is_retained && !is_retained {
+                // Keep live metadata authoritative while still taking token and
+                // duration maxima from the retained observation.
+                let mut live = message;
+                sessions::claudecode::merge_message_completeness(&mut live, existing);
+                *existing = live;
+            } else {
+                sessions::claudecode::merge_message_completeness(existing, &message);
+            }
+            *existing_is_retained &= is_retained;
+            // Both inputs were priced before reaching this merge. Token maxima
+            // can change the estimate, so refresh it after combining.
+            existing.refresh_derived_fields();
+            apply_pricing_if_available(existing, pricing);
+        }
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         }
     }
-
-    let mut seen_keys: HashSet<String> = HashSet::new();
-    let claude_messages: Vec<UnifiedMessage> = claude_messages_raw
-        .into_iter()
-        .filter(|(key, _)| key.is_empty() || seen_keys.insert(key.clone()))
-        .map(|(_, msg)| msg)
-        .collect();
-    all_messages.extend(claude_messages);
+    all_messages.extend(claude_messages.into_iter().map(|(_, message)| message));
 
     let codex_outcomes: Vec<(PathBuf, CachedParseOutcome)> = scan_result
         .get(ClientId::Codex)
@@ -6666,14 +6738,14 @@ mod tests {
     /// session into a new transcript that replays earlier turns, so the same
     /// `messageId:requestId` legitimately appears in two files at once.
     ///
-    /// The transcripts are named so the retaining file sorts first: the lane
-    /// walks paths in lexical order and keeps the first copy of a key, so this
-    /// is the ordering where a retained copy wins over the live one. Both
-    /// copies come from the same API response, so either winner reports the
-    /// same tokens — what must not happen is both being counted.
+    /// The transcripts are named so the retaining file sorts first. A scan may
+    /// have cached that copy while the response was still streaming, while the
+    /// fork contains the completed replay. Cross-file dedup must keep one turn,
+    /// merge per-field maxima, and preserve the live copy's provenance across
+    /// the next warm-cache scan.
     #[test]
     #[serial_test::serial]
-    fn test_claude_retained_message_collapses_against_a_forked_transcript() {
+    fn test_claude_retained_partial_merges_completed_fork_replay() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
         let _cache_env = redirect_cache_home(cache_home.path());
@@ -6684,10 +6756,15 @@ mod tests {
             let original = claude_dir.join("aaa-original.jsonl");
 
             let turn_one = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
-            let turn_two = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_002","message":{"id":"msg_002","model":"claude-3-5-sonnet","usage":{"input_tokens":200,"output_tokens":60}}}"#;
+            let turn_two_partial = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_002","message":{"id":"msg_002","model":"claude-3-5-sonnet","usage":{"input_tokens":200,"output_tokens":60}}}"#;
+            let turn_two_complete = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_002","message":{"id":"msg_002","model":"claude-3-5-sonnet","usage":{"input_tokens":2000,"output_tokens":999}}}"#;
             let turn_three = r#"{"type":"assistant","timestamp":"2024-12-01T10:10:00.000Z","requestId":"req_003","message":{"id":"msg_003","model":"claude-3-5-sonnet","usage":{"input_tokens":300,"output_tokens":70}}}"#;
 
-            std::fs::write(&original, format!("{turn_one}\n{turn_two}\n{turn_three}\n")).unwrap();
+            std::fs::write(
+                &original,
+                format!("{turn_one}\n{turn_two_partial}\n{turn_three}\n"),
+            )
+            .unwrap();
             let before = parse_all_messages_with_pricing_with_env_strategy(
                 source_home.path().to_str().unwrap(),
                 &["claude".to_string()],
@@ -6702,7 +6779,11 @@ mod tests {
             // only as a retained copy — it is what makes the count here
             // differ from a run with no retention at all.
             std::fs::write(&original, format!("{turn_one}\n")).unwrap();
-            std::fs::write(claude_dir.join("zzz-fork.jsonl"), format!("{turn_two}\n")).unwrap();
+            std::fs::write(
+                claude_dir.join("zzz-fork.jsonl"),
+                format!("{turn_two_complete}\n"),
+            )
+            .unwrap();
 
             let after = parse_all_messages_with_pricing_with_env_strategy(
                 source_home.path().to_str().unwrap(),
@@ -6714,7 +6795,7 @@ mod tests {
             assert_eq!(
                 after.len(),
                 3,
-                "retention must keep turn three and must not double count turn two"
+                "retention must keep turn three and count the replayed turn once"
             );
             let keys: HashSet<String> = after
                 .iter()
@@ -6723,10 +6804,210 @@ mod tests {
             assert_eq!(keys.len(), 3, "every surviving message must be distinct");
             assert_eq!(
                 after.iter().map(|m| m.tokens.output).sum::<i64>(),
-                180,
-                "turn two contributes its 60 once, not twice"
+                50 + 999 + 70,
+                "the completed replay must outrank the retained streaming partial"
             );
-            assert_eq!(after.iter().map(|m| m.tokens.input).sum::<i64>(), 600);
+            assert_eq!(
+                after.iter().map(|m| m.tokens.input).sum::<i64>(),
+                100 + 2000 + 300
+            );
+
+            let warm = parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &["claude".to_string()],
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+            );
+            assert_eq!(warm.len(), 3);
+            assert_eq!(
+                warm.iter().map(|m| m.tokens.output).sum::<i64>(),
+                50 + 999 + 70,
+                "retained/live provenance must survive the cache round trip"
+            );
+            assert_eq!(
+                warm.iter().map(|m| m.tokens.input).sum::<i64>(),
+                100 + 2000 + 300
+            );
+        }
+    }
+
+    /// A cache entry written before retention provenance existed carries the
+    /// retained turns but no record of *which* rows they are. Reading such an
+    /// entry as if every row were live lets the stale, path-first copy of a
+    /// response outrank the completed live replay of the same response — and
+    /// the model attribution rides along with it, so the priced cost goes
+    /// stale too. Every existing user upgrades with a populated cache, so the
+    /// first warm scan after the upgrade has to rebuild that provenance.
+    ///
+    /// The strongest statement of "not stale" is that the warm scan agrees
+    /// with a cold scan of the same bytes, cost included.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_legacy_cache_entry_rebuilds_retention_provenance() {
+        use crate::RETENTION_PROVENANCE_REBUILDS;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let cold_cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let mut env = redirect_cache_home(cache_home.path());
+
+        {
+            let claude_dir =
+                client_scan_root(source_home.path(), ClientId::Claude).join("myproject");
+            std::fs::create_dir_all(&claude_dir).unwrap();
+            let original = claude_dir.join("aaa-original.jsonl");
+
+            let turn_one = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
+            // The partial was observed mid-stream, before the transcript
+            // recorded the model the turn actually billed against.
+            let turn_two_partial = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_002","message":{"id":"msg_002","model":"claude-3-5-haiku","usage":{"input_tokens":200,"output_tokens":60}}}"#;
+            let turn_two_complete = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_002","message":{"id":"msg_002","model":"claude-3-5-sonnet","usage":{"input_tokens":2000,"output_tokens":999}}}"#;
+
+            let mut litellm = HashMap::new();
+            litellm.insert(
+                "claude-3-5-sonnet".to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.000_003),
+                    output_cost_per_token: Some(0.000_015),
+                    ..Default::default()
+                },
+            );
+            litellm.insert(
+                "claude-3-5-haiku".to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.000_000_8),
+                    output_cost_per_token: Some(0.000_004),
+                    ..Default::default()
+                },
+            );
+            let pricing = pricing::PricingService::new(litellm, HashMap::new());
+
+            let scan = |pricing: &pricing::PricingService| {
+                let mut messages = parse_all_messages_with_pricing_with_env_strategy(
+                    source_home.path().to_str().unwrap(),
+                    &["claude".to_string()],
+                    Some(pricing),
+                    false,
+                    &scanner::ScannerSettings::default(),
+                );
+                messages.sort_by(|left, right| left.dedup_key.cmp(&right.dedup_key));
+                messages
+            };
+            let summary = |messages: &[UnifiedMessage]| {
+                messages
+                    .iter()
+                    .map(|message| {
+                        (
+                            message.dedup_key.clone(),
+                            message.model_id.clone(),
+                            message.tokens.input,
+                            message.tokens.output,
+                            format!("{:.10}", message.cost),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            std::fs::write(&original, format!("{turn_one}\n{turn_two_partial}\n")).unwrap();
+            assert_eq!(scan(&pricing).len(), 2, "seed scan");
+
+            // The session forks: the original transcript keeps only turn one,
+            // and the fork replays turn two with the completed response.
+            std::fs::write(&original, format!("{turn_one}\n")).unwrap();
+            std::fs::write(
+                claude_dir.join("zzz-fork.jsonl"),
+                format!("{turn_two_complete}\n"),
+            )
+            .unwrap();
+            assert_eq!(scan(&pricing).len(), 2, "fork scan");
+
+            // Rewrite every Claude entry in the pre-provenance shape a release
+            // before this one would have left on disk.
+            let mut cache = message_cache::SourceMessageCache::load();
+            let legacy: Vec<message_cache::CachedSourceEntry> = cache
+                .entries
+                .values()
+                .filter(|entry| entry.is_claude_namespace())
+                .cloned()
+                .collect();
+            assert_eq!(legacy.len(), 2, "both transcripts must be cached");
+            assert!(
+                legacy
+                    .iter()
+                    .any(|entry| !entry.fallback_timestamp_indices.is_empty()),
+                "the retaining entry must have recorded provenance before it is stripped"
+            );
+            for mut entry in legacy {
+                entry.fallback_timestamp_indices.clear();
+                cache.insert(entry);
+            }
+            cache.save_if_dirty();
+            drop(cache);
+
+            let rebuilds_before = RETENTION_PROVENANCE_REBUILDS.load(Relaxed);
+            let warm = scan(&pricing);
+            let rebuilds_after_first = RETENTION_PROVENANCE_REBUILDS.load(Relaxed);
+
+            point_cache_home(&mut env, cold_cache_home.path());
+            let cold = scan(&pricing);
+            point_cache_home(&mut env, cache_home.path());
+
+            assert_eq!(cold.len(), 2, "cold scan sees turn one and the replay");
+            assert_eq!(
+                summary(&warm),
+                summary(&cold),
+                "the first warm scan over a pre-provenance cache must agree with a cold parse"
+            );
+            let warm_two = warm
+                .iter()
+                .find(|message| message.dedup_key.as_deref() == Some("msg_002:req_002"))
+                .expect("the replayed turn must survive");
+            assert_eq!(warm_two.model_id, "claude-3-5-sonnet");
+            assert!(warm_two.cost > 0.0, "the replayed turn must be priced");
+
+            // The rebuild is an upgrade cost, not a per-scan one. Both entries
+            // are rebuilt on the first warm scan and none on the second.
+            assert_eq!(
+                rebuilds_after_first - rebuilds_before,
+                2,
+                "both pre-provenance entries are rebuilt on the first warm scan"
+            );
+            let warm_again = scan(&pricing);
+            assert_eq!(
+                RETENTION_PROVENANCE_REBUILDS.load(Relaxed),
+                rebuilds_after_first,
+                "a second warm scan must not re-parse the transcripts again"
+            );
+            assert_eq!(
+                summary(&warm_again),
+                summary(&cold),
+                "and it must keep reporting the rebuilt result"
+            );
+
+            let migrated = message_cache::SourceMessageCache::load();
+            let claude_entries: Vec<&message_cache::CachedSourceEntry> = migrated
+                .entries
+                .values()
+                .filter(|entry| entry.is_claude_namespace())
+                .collect();
+            assert_eq!(claude_entries.len(), 2);
+            assert!(
+                claude_entries
+                    .iter()
+                    .all(|entry| !entry.needs_retention_provenance_migration()),
+                "the rebuild has to be persisted, or every scan pays for it again"
+            );
+            let retained: HashSet<String> = claude_entries
+                .iter()
+                .flat_map(|entry| entry.retained_message_keys())
+                .collect();
+            assert_eq!(
+                retained,
+                HashSet::from(["msg_002:req_002".to_string()]),
+                "only the turn the original transcript no longer carries is retained"
+            );
         }
     }
 
@@ -7480,14 +7761,20 @@ mod tests {
                 Some("claude:tool_result:session:tool_result:toolu_1".to_string()),
             );
             let mut cache = message_cache::SourceMessageCache::default();
-            cache.insert(message_cache::CachedSourceEntry::new(
-                identity,
-                &transcript,
-                fingerprint,
-                vec![retained, poisoned],
-                Vec::new(),
-                None,
-            ));
+            // Seeded the way a scan writes it: `old:req_old` is history the
+            // live transcript no longer carries, and the entry records that.
+            // An entry without the provenance is a pre-upgrade one and gets
+            // rebuilt from the live bytes instead of served warm, which is a
+            // different path than this test is about.
+            cache.insert(
+                message_cache::CachedSourceEntry::new_with_retained_message_keys(
+                    identity,
+                    &transcript,
+                    fingerprint,
+                    vec![retained, poisoned],
+                    &HashSet::from(["old:req_old".to_string()]),
+                ),
+            );
             cache.save_if_dirty();
 
             let messages = parse_all_messages_with_pricing(
