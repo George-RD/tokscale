@@ -1758,6 +1758,104 @@ mod tests {
     }
 
     #[test]
+    fn cross_provider_model_part_price_remains_an_estimate_only() {
+        let service = PricingService::new(
+            HashMap::new(),
+            HashMap::from([(
+                "vendor/atlas-chat".to_string(),
+                model_pricing(0.000001, 0.000002),
+            )]),
+        );
+        let usage = TokenBreakdown {
+            input: 100,
+            output: 50,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        };
+
+        let resolution = service
+            .lookup_with_source("atlas-chat", None)
+            .expect("lenient reporting keeps the model-part estimate visible");
+        assert_eq!(resolution.matched_key, "vendor/atlas-chat");
+        assert_eq!(resolution.evidence.kind, ResolutionKind::ModelPart);
+        assert!(!resolution.evidence.is_submission_safe());
+        assert!(service.calculate_cost_with_provider("atlas-chat", None, &usage) > 0.0);
+        assert!(!service.covers_usage_with_provider("atlas-chat", None, &usage));
+    }
+
+    #[test]
+    fn provider_prefix_and_cross_endpoint_aliases_remain_estimates_only() {
+        let service = PricingService::new(
+            HashMap::from([
+                (
+                    "anthropic/atlas-chat".to_string(),
+                    model_pricing(0.000001, 0.000002),
+                ),
+                (
+                    "vertex_ai/vertex-chat".to_string(),
+                    model_pricing(0.000003, 0.000006),
+                ),
+                (
+                    "vertex_ai/accounts/anthropic/models/vertex-chat".to_string(),
+                    model_pricing(0.000003, 0.000006),
+                ),
+            ]),
+            HashMap::from([(
+                "vertex_ai/accounts/anthropic/models/vertex-chat".to_string(),
+                model_pricing(0.000003, 0.000006),
+            )]),
+        );
+        let usage = TokenBreakdown {
+            input: 100,
+            output: 50,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        };
+
+        let prefixed = service
+            .lookup_with_source_and_provider("atlas-chat", None, Some("synthetic"))
+            .expect("the provider-prefix estimate remains visible");
+        assert_eq!(prefixed.evidence.kind, ResolutionKind::ProviderPrefix);
+        assert!(!prefixed.evidence.is_submission_safe());
+        assert!(!service.covers_usage_with_provider("atlas-chat", Some("synthetic"), &usage));
+
+        let aliased = service
+            .lookup_with_source_and_provider("vertex-chat", None, Some("anthropic"))
+            .expect("the cross-endpoint alias estimate remains visible");
+        assert_eq!(aliased.evidence.kind, ResolutionKind::ModelPart);
+        assert!(!aliased.evidence.is_submission_safe());
+        assert!(!service.covers_usage_with_provider("vertex-chat", Some("anthropic"), &usage));
+
+        assert!(
+            service.calculate_cost_with_provider("atlas-chat", Some("synthetic"), &usage) > 0.0
+        );
+        assert!(
+            service.calculate_cost_with_provider("vertex-chat", Some("anthropic"), &usage) > 0.0
+        );
+
+        for source in [None, Some("litellm"), Some("openrouter")] {
+            let scoped = service
+                .lookup_with_source_and_provider(
+                    "accounts/anthropic/models/vertex-chat",
+                    source,
+                    Some("anthropic"),
+                )
+                .unwrap_or_else(|| {
+                    panic!("the {source:?} scoped cross-endpoint alias remains visible")
+                });
+            assert_eq!(scoped.evidence.kind, ResolutionKind::ModelPart);
+            assert!(!scoped.evidence.is_submission_safe());
+        }
+        assert!(!service.covers_usage_with_provider(
+            "accounts/anthropic/models/vertex-chat",
+            Some("anthropic"),
+            &usage,
+        ));
+    }
+
+    #[test]
     fn ambiguous_fuzzy_price_remains_visible_but_does_not_cover_submission() {
         let litellm = HashMap::from([
             (
