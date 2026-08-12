@@ -146,6 +146,8 @@ pub enum ResolutionKind {
     Exact,
     ModelPart,
     ProviderPrefix,
+    /// The provider was established by an explicit scoped path or a provider
+    /// hint matched against the qualified catalog candidates.
     ProviderScoped,
     BuiltIn,
     Fuzzy,
@@ -205,8 +207,15 @@ impl ResolutionEvidence {
     /// that decides safety is what keeps a diagnostic from claiming candidates
     /// disagreed when the lookup only ever saw one.
     pub fn submission_safety_gap(&self) -> Option<SubmissionSafetyGap> {
-        if self.kind != ResolutionKind::Fuzzy {
-            return None;
+        match self.kind {
+            // A model-part fallback starts from a bare id and borrows a
+            // provider-qualified row. Matching the terminal model spelling
+            // does not establish that the request used that provider's price.
+            ResolutionKind::ModelPart => {
+                return Some(SubmissionSafetyGap::UnverifiedProviderIdentity);
+            }
+            ResolutionKind::Fuzzy | ResolutionKind::ProviderScoped => {}
+            _ => return None,
         }
         if !self.price_consensus {
             return Some(SubmissionSafetyGap::PriceDisagreement);
@@ -259,6 +268,9 @@ pub enum SubmissionSafetyGap {
     /// No candidate names the requested model exactly, so the price belongs to
     /// a model that merely resembles the one that was used.
     UnverifiedModelIdentity,
+    /// A bare model id resolved through another provider's qualified catalog
+    /// key, without evidence that the request used that provider's price.
+    UnverifiedProviderIdentity,
 }
 
 #[derive(Debug, Clone)]
@@ -2934,6 +2946,9 @@ fn choose_best_source_result_with_models_dev(
     }
 }
 
+/// Resolve an exact model part only among keys matched by the explicit
+/// provider hint. This is provider-scoped evidence, unlike the unhinted
+/// cross-provider model-part indexes.
 fn exact_match_with_provider_prefixes(
     model_id: &str,
     provider_id: Option<&str>,
@@ -2962,7 +2977,7 @@ fn exact_match_with_provider_prefixes(
         dataset,
         source,
         Some(provider_id),
-        ResolutionKind::ModelPart,
+        ResolutionKind::ProviderScoped,
         model_id,
     )
 }
@@ -4167,6 +4182,35 @@ mod tests {
         assert_eq!(result.source, "OpenRouter");
     }
 
+    /// A bare model id only proves the terminal model spelling. Resolving it to
+    /// another provider's qualified catalog row remains useful as an estimate,
+    /// but must not authorize publishing that provider's price.
+    #[test]
+    fn cross_provider_model_part_remains_visible_but_is_not_submission_safe() {
+        let openrouter = HashMap::from([(
+            "vendor/atlas-chat".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(1e-6),
+                output_cost_per_token: Some(2e-6),
+                ..Default::default()
+            },
+        )]);
+        let lookup = PricingLookup::new(HashMap::new(), openrouter, HashMap::new());
+
+        let result = lookup
+            .lookup("atlas-chat")
+            .expect("reporting should retain the model-part estimate");
+
+        assert_eq!(result.matched_key, "vendor/atlas-chat");
+        assert_eq!(result.evidence.kind, ResolutionKind::ModelPart);
+        assert!(result.evidence.exact_model_identity);
+        assert_eq!(
+            result.evidence.submission_safety_gap(),
+            Some(SubmissionSafetyGap::UnverifiedProviderIdentity)
+        );
+        assert!(!result.evidence.is_submission_safe());
+    }
+
     #[test]
     fn test_tier_suffix_low() {
         let lookup = create_lookup();
@@ -5140,6 +5184,8 @@ mod tests {
             .unwrap();
         assert_eq!(hinted.matched_key, "venice/claude-opus-4.6-fast");
         assert_eq!(hinted.pricing.input_cost_per_token, Some(36e-6));
+        assert_eq!(hinted.evidence.kind, ResolutionKind::ProviderScoped);
+        assert!(hinted.evidence.is_submission_safe());
 
         // Unhinted dotted lookup keeps the canonical OpenRouter resolution.
         let unhinted = lookup.lookup("claude-opus-4.6-fast").unwrap();

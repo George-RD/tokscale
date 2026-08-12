@@ -1758,6 +1758,33 @@ mod tests {
     }
 
     #[test]
+    fn cross_provider_model_part_price_remains_an_estimate_only() {
+        let service = PricingService::new(
+            HashMap::new(),
+            HashMap::from([(
+                "vendor/atlas-chat".to_string(),
+                model_pricing(0.000001, 0.000002),
+            )]),
+        );
+        let usage = TokenBreakdown {
+            input: 100,
+            output: 50,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        };
+
+        let resolution = service
+            .lookup_with_source("atlas-chat", None)
+            .expect("lenient reporting keeps the model-part estimate visible");
+        assert_eq!(resolution.matched_key, "vendor/atlas-chat");
+        assert_eq!(resolution.evidence.kind, ResolutionKind::ModelPart);
+        assert!(!resolution.evidence.is_submission_safe());
+        assert!(service.calculate_cost_with_provider("atlas-chat", None, &usage) > 0.0);
+        assert!(!service.covers_usage_with_provider("atlas-chat", None, &usage));
+    }
+
+    #[test]
     fn ambiguous_fuzzy_price_remains_visible_but_does_not_cover_submission() {
         let litellm = HashMap::from([
             (

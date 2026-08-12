@@ -3478,6 +3478,8 @@ const AMBIGUOUS_MODEL_PRICING_REASON: &str =
     "model price lookup is ambiguous across non-equivalent candidates";
 const UNVERIFIED_MODEL_IDENTITY_REASON: &str =
     "model price match does not exactly name the requested model";
+const UNVERIFIED_PROVIDER_IDENTITY_REASON: &str =
+    "model price match does not establish the requested provider";
 
 /// Routing labels name the router that served the request, never the model
 /// that answered it, so they have no authoritative model-to-price mapping.
@@ -3555,6 +3557,9 @@ fn exclude_unpriced_submission_messages(
                     SubmissionSafetyGap::PriceDisagreement => AMBIGUOUS_MODEL_PRICING_REASON,
                     SubmissionSafetyGap::UnverifiedModelIdentity => {
                         UNVERIFIED_MODEL_IDENTITY_REASON
+                    }
+                    SubmissionSafetyGap::UnverifiedProviderIdentity => {
+                        UNVERIFIED_PROVIDER_IDENTITY_REASON
                     }
                 }
             } else if resolution.is_some() {
@@ -4969,7 +4974,7 @@ mod tests {
         TokenBreakdown, UnifiedMessage, UnpricedSubmissionExclusion,
         AMBIGUOUS_MODEL_PRICING_REASON, INCOMPLETE_MODEL_PRICING_REASON,
         MISSING_MODEL_PRICING_REASON, ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL,
-        UNVERIFIED_MODEL_IDENTITY_REASON,
+        UNVERIFIED_MODEL_IDENTITY_REASON, UNVERIFIED_PROVIDER_IDENTITY_REASON,
     };
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
@@ -9796,6 +9801,60 @@ mod tests {
                 total_tokens: 1,
                 reason: MISSING_MODEL_PRICING_REASON,
             }]
+        );
+    }
+
+    /// An unscoped model-part fallback proves only the model spelling, not
+    /// which provider served it. The estimate remains available locally, while
+    /// submission excludes it with the provider-specific evidence gap.
+    #[test]
+    fn submission_excludes_cross_provider_model_part_estimate() {
+        let openrouter = HashMap::from([(
+            "vendor/atlas-chat".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(1e-6),
+                output_cost_per_token: Some(2e-6),
+                ..Default::default()
+            },
+        )]);
+        let pricing = pricing::PricingService::new(HashMap::new(), openrouter);
+        let message = UnifiedMessage::new(
+            "synthetic",
+            "atlas-chat",
+            "unknown",
+            "cross-provider-model-part",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 100,
+                output: 50,
+                ..Default::default()
+            },
+            0.0,
+        );
+
+        let estimate = pricing
+            .lookup_with_source("atlas-chat", None)
+            .expect("the model-part estimate remains available for reporting");
+        assert_eq!(estimate.matched_key, "vendor/atlas-chat");
+        assert_eq!(
+            estimate.evidence.kind,
+            pricing::lookup::ResolutionKind::ModelPart
+        );
+
+        let graph = build_graph_from_messages(
+            vec![message],
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("the unsafe estimate must be excluded, not abort the graph");
+
+        assert!(graph.contributions.is_empty());
+        assert_eq!(graph.unpriced_submission_exclusions.len(), 1);
+        assert_eq!(
+            graph.unpriced_submission_exclusions[0].reason,
+            UNVERIFIED_PROVIDER_IDENTITY_REASON
         );
     }
 
