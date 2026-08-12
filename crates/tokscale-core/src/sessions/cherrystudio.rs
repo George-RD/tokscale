@@ -11,9 +11,10 @@
 //! streaming response progresses. Naively summing every assistant row
 //! triple-counts each call (verified ~3x over the true figure). The canonical
 //! fix — validated against DeepSeek's platform per-hour billing, <1% error —
-//! is to dedupe **consecutive rows within a session whose usage signature
-//! (model + the four token buckets) is identical**, keeping one record per API
-//! call. This parser implements exactly that; all reads are strictly read-only.
+//! is to dedupe records by their stable request, message, or event UUID identity.
+//! Usage signatures are not identities: two distinct requests may legitimately
+//! have identical token counts. Records without an identity are retained
+//! conservatively. All reads are strictly read-only.
 //!
 //! The usage fields come from the assistant event's `message.usage`:
 //! `input_tokens` (cache miss), `cache_read_input_tokens` (cache hit),
@@ -64,9 +65,8 @@ fn workspace_from_path(path: &Path) -> (Option<String>, Option<String>) {
     (None, None)
 }
 
-/// Parse a Cherry Studio Claude Code transcript into unified messages, applying
-/// the per-session consecutive usage-signature dedup that matches the canonical
-/// platform-validated figures.
+/// Parse a Cherry Studio Claude Code transcript into unified messages, collapsing
+/// only repeated records with a stable per-request, message, or event identity.
 pub fn parse_cherrystudio_file(path: &Path) -> Vec<UnifiedMessage> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -77,7 +77,7 @@ pub fn parse_cherrystudio_file(path: &Path) -> Vec<UnifiedMessage> {
 
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
-    let mut last_signature: Option<String> = None;
+    let mut seen_identities = std::collections::HashSet::new();
     let session_id = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -142,15 +142,41 @@ pub fn parse_cherrystudio_file(path: &Path) -> Vec<UnifiedMessage> {
             continue;
         }
 
-        // Canonical dedup: Cherry Studio writes the same API call 3-4 times with
-        // identical usage. Skip a row whose usage signature matches the previous
-        // one in this file (one session = one file).
-        let signature =
-            format!("{model}\u{1f}{input}\u{1f}{cache_read}\u{1f}{cache_creation}\u{1f}{output}");
-        if last_signature.as_deref() == Some(&signature) {
+        // Cherry Studio can append a streaming record several times. Only an
+        // explicit identity proves two rows represent the same call: matching
+        // usage is not sufficient because separate calls can cost the same.
+        // Keep every stable ID in the key. In particular, a changed UUID is a
+        // distinct event even when its request/message IDs and usage match.
+        // Rows without IDs are retained conservatively.
+        let request_id = record
+            .get("requestId")
+            .or_else(|| message.get("requestId"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
+        let message_id = message
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
+        let uuid = record
+            .get("uuid")
+            .or_else(|| message.get("uuid"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
+        let identity =
+            (request_id.is_some() || message_id.is_some() || uuid.is_some()).then(|| {
+                format!(
+                    "request:{}\u{1f}message:{}\u{1f}uuid:{}",
+                    request_id.unwrap_or(""),
+                    message_id.unwrap_or(""),
+                    uuid.unwrap_or("")
+                )
+            });
+        if identity.is_some_and(|identity| !seen_identities.insert(identity)) {
             continue;
         }
-        last_signature = Some(signature);
 
         let timestamp = record
             .get("timestamp")
@@ -211,23 +237,63 @@ mod tests {
             dir.path(),
             "session.jsonl",
             &[
-                // The same API call appended 3 times with identical usage.
-                r#"{"type":"assistant","sessionId":"s1","uuid":"a","timestamp":"2026-04-27T13:59:02.828Z","message":{"model":"deepseek-v4-pro","usage":{"input_tokens":100,"cache_read_input_tokens":200,"cache_creation_input_tokens":50,"output_tokens":30}}}"#,
-                r#"{"type":"assistant","sessionId":"s1","uuid":"b","timestamp":"2026-04-27T13:59:02.900Z","message":{"model":"deepseek-v4-pro","usage":{"input_tokens":100,"cache_read_input_tokens":200,"cache_creation_input_tokens":50,"output_tokens":30}}}"#,
-                r#"{"type":"assistant","sessionId":"s1","uuid":"c","timestamp":"2026-04-27T13:59:03.000Z","message":{"model":"deepseek-v4-pro","usage":{"input_tokens":100,"cache_read_input_tokens":200,"cache_creation_input_tokens":50,"output_tokens":30}}}"#,
+                // The same API call appended three times while streaming.
+                r#"{"type":"assistant","sessionId":"s1","uuid":"a","requestId":"request-1","timestamp":"2026-04-27T13:59:02.828Z","message":{"id":"message-1","model":"deepseek-v4-pro","usage":{"input_tokens":100,"cache_read_input_tokens":200,"cache_creation_input_tokens":50,"output_tokens":30}}}"#,
+                r#"{"type":"assistant","sessionId":"s1","uuid":"a","requestId":"request-1","timestamp":"2026-04-27T13:59:02.900Z","message":{"id":"message-1","model":"deepseek-v4-pro","usage":{"input_tokens":100,"cache_read_input_tokens":200,"cache_creation_input_tokens":50,"output_tokens":30}}}"#,
+                r#"{"type":"assistant","sessionId":"s1","uuid":"a","requestId":"request-1","timestamp":"2026-04-27T13:59:03.000Z","message":{"id":"message-1","model":"deepseek-v4-pro","usage":{"input_tokens":100,"cache_read_input_tokens":200,"cache_creation_input_tokens":50,"output_tokens":30}}}"#,
                 // A genuinely different call.
-                r#"{"type":"assistant","sessionId":"s1","uuid":"d","timestamp":"2026-04-27T14:00:00.000Z","message":{"model":"deepseek-v4-pro","usage":{"input_tokens":40,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":10}}}"#,
+                r#"{"type":"assistant","sessionId":"s1","uuid":"d","requestId":"request-2","timestamp":"2026-04-27T14:00:00.000Z","message":{"id":"message-2","model":"deepseek-v4-pro","usage":{"input_tokens":40,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":10}}}"#,
             ],
         );
         let messages = parse_cherrystudio_file(&path);
         assert_eq!(
             messages.len(),
             2,
-            "three identical signatures collapse to one"
+            "three rows for one request/message identity collapse to one"
         );
         assert_eq!(messages[0].tokens.total(), 380);
         assert_eq!(messages[1].tokens.total(), 50);
         assert_eq!(messages[0].workspace_key.as_deref(), Some("D--repo"));
+    }
+
+    #[test]
+    fn keeps_consecutive_distinct_identities_with_identical_usage() {
+        let dir = tempdir().unwrap();
+        let path = write_transcript(
+            dir.path(),
+            "session.jsonl",
+            &[
+                r#"{"type":"assistant","uuid":"event-1","requestId":"request-1","message":{"id":"message-1","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+                r#"{"type":"assistant","uuid":"event-2","requestId":"request-1","message":{"id":"message-1","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+            ],
+        );
+
+        let messages = parse_cherrystudio_file(&path);
+        assert_eq!(
+            messages.len(),
+            2,
+            "distinct calls with equal usage must count"
+        );
+    }
+
+    #[test]
+    fn keeps_consecutive_no_id_rows_with_identical_usage() {
+        let dir = tempdir().unwrap();
+        let path = write_transcript(
+            dir.path(),
+            "session.jsonl",
+            &[
+                r#"{"type":"assistant","message":{"model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+                r#"{"type":"assistant","message":{"model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+            ],
+        );
+
+        let messages = parse_cherrystudio_file(&path);
+        assert_eq!(
+            messages.len(),
+            2,
+            "rows without an identity are retained conservatively"
+        );
     }
 
     #[test]

@@ -6,9 +6,8 @@ pub enum PathRoot {
     Config,
     /// The per-user application data directory, resolved via the `dirs` crate:
     /// `%APPDATA%` on Windows, `~/Library/Application Support` on macOS, and
-    /// the XDG config home on Linux. Cherry Studio (an Electron app) stores its
-    /// Claude Code transcripts under `<config_dir>/CherryStudio/.claude/projects`,
-    /// so this root matches where its data actually lives on every platform.
+    /// the XDG config home on Linux. When an explicit home is supplied, this
+    /// root is derived from that home using the matching platform convention.
     AppData,
     EnvVar {
         var: &'static str,
@@ -110,9 +109,16 @@ impl PathRoot {
                 // resolve under the given home; follow the same convention so
                 // an AppData-rooted client cannot leak the machine's real
                 // per-user data into a hermetic scan.
-                if cfg!(windows) {
+                #[cfg(target_os = "windows")]
+                {
                     join_home(home_dir, "AppData/Roaming")
-                } else {
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    join_home(home_dir, "Library/Application Support")
+                }
+                #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+                {
                     join_home(home_dir, ".config")
                 }
             }
@@ -1033,6 +1039,30 @@ mod tests {
         assert!(
             !joined.contains('/'),
             "mixed separators in resolved path: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn test_explicit_home_app_data_root_uses_platform_layout() {
+        let home = absolute_test_path("explicit-home");
+        let expected = {
+            #[cfg(target_os = "windows")]
+            {
+                home.join("AppData").join("Roaming")
+            }
+            #[cfg(target_os = "macos")]
+            {
+                home.join("Library").join("Application Support")
+            }
+            #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+            {
+                home.join(".config")
+            }
+        };
+
+        assert_eq!(
+            PathRoot::AppData.resolve_with_env_strategy(home.to_str().unwrap(), false),
+            expected.to_string_lossy()
         );
     }
 
