@@ -1733,20 +1733,13 @@ fn parse_all_messages_with_pricing_with_cache_policy(
             };
 
             let (existing_is_retained, existing) = &mut claude_messages[index];
-            if *existing_is_retained && !is_retained {
-                // Keep live metadata authoritative while still taking token and
-                // duration maxima from the retained observation.
-                let mut live = message;
-                sessions::claudecode::merge_message_completeness(&mut live, existing);
-                *existing = live;
-            } else {
-                sessions::claudecode::merge_message_completeness(existing, &message);
-            }
-            *existing_is_retained &= is_retained;
-            // Both inputs were priced before reaching this merge. Token maxima
-            // can change the estimate, so refresh it after combining.
-            existing.refresh_derived_fields();
-            apply_pricing_if_available(existing, pricing);
+            merge_claude_cross_file_duplicate(
+                existing,
+                existing_is_retained,
+                message,
+                is_retained,
+                pricing,
+            );
         }
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
@@ -3764,6 +3757,30 @@ fn apply_pricing_if_available(
     }
 }
 
+/// Merge two cross-file Claude observations without letting retained
+/// provenance replace live metadata. Completeness is monotonic for usage
+/// fields, while model/provider/session/workspace stay sourced from the live
+/// observation. Estimated cost is then derived from that authoritative metadata
+/// and the merged tokens; provider-reported cost remains immune to repricing
+/// through `apply_pricing_if_available`'s authority guard.
+fn merge_claude_cross_file_duplicate(
+    existing: &mut UnifiedMessage,
+    existing_is_retained: &mut bool,
+    mut candidate: UnifiedMessage,
+    candidate_is_retained: bool,
+    pricing: Option<&pricing::PricingService>,
+) {
+    if *existing_is_retained && !candidate_is_retained {
+        sessions::claudecode::merge_message_completeness(&mut candidate, existing);
+        *existing = candidate;
+    } else {
+        sessions::claudecode::merge_message_completeness(existing, &candidate);
+    }
+    *existing_is_retained &= candidate_is_retained;
+    existing.refresh_derived_fields();
+    apply_pricing_if_available(existing, pricing);
+}
+
 fn parse_hermes_sqlite_with_pricing(
     db_path: &Path,
     pricing: Option<&pricing::PricingService>,
@@ -4897,7 +4914,7 @@ mod tests {
         aggregate_monthly_usage_v2_entries, apply_pricing_if_available, build_graph_from_messages,
         dedupe_latest_trae_messages, filter_messages_for_report,
         generate_graph_with_loaded_pricing, get_home_dir_string, is_generic_routing_label,
-        message_cache, normalize_model_for_grouping,
+        merge_claude_cross_file_duplicate, message_cache, normalize_model_for_grouping,
         parse_all_messages_with_pricing_with_env_strategy, parse_local_clients, parsed_to_unified,
         paths, pricing, retain_for_requested_clients, scanner, select_local_parse_pricing,
         sessions, unified_to_parsed, validate_priced_messages, ClientId, GraphPricingRequirement,
@@ -6737,103 +6754,177 @@ mod tests {
         }
     }
 
-    /// Retention is only sound because a retained message still collapses
-    /// against a live copy of itself somewhere else. Claude Code forks a
-    /// session into a new transcript that replays earlier turns, so the same
-    /// `messageId:requestId` legitimately appears in two files at once.
-    ///
-    /// The transcripts are named so the retaining file sorts first. A scan may
-    /// have cached that copy while the response was still streaming, while the
-    /// fork contains the completed replay. Cross-file dedup must keep one turn,
-    /// merge per-field maxima, and preserve the live copy's provenance across
-    /// the next warm-cache scan.
     #[test]
-    #[serial_test::serial]
-    fn test_claude_retained_partial_merges_completed_fork_replay() {
+    fn test_claude_cross_file_merge_preserves_provider_reported_cost() {
+        let mut retained = UnifiedMessage::new_with_dedup(
+            "claude",
+            "claude-3-5-haiku",
+            "bedrock",
+            "retained-session",
+            1_733_050_000_000,
+            TokenBreakdown {
+                input: 500,
+                output: 60,
+                ..Default::default()
+            },
+            9.0,
+            Some("msg_shared:req_shared".to_string()),
+        );
+        retained.mark_provider_reported_cost();
+        let live = UnifiedMessage::new_with_dedup(
+            "claude",
+            "claude-3-5-sonnet",
+            "anthropic",
+            "live-session",
+            1_733_050_001_000,
+            TokenBreakdown {
+                input: 200,
+                output: 999,
+                ..Default::default()
+            },
+            0.0,
+            Some("msg_shared:req_shared".to_string()),
+        );
+        let mut retained_flag = true;
+
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-3-5-sonnet".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.002),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+
+        merge_claude_cross_file_duplicate(
+            &mut retained,
+            &mut retained_flag,
+            live,
+            false,
+            Some(&pricing),
+        );
+
+        assert!(!retained_flag);
+        assert_eq!(retained.model_id, "claude-3-5-sonnet");
+        assert_eq!(retained.provider_id, "anthropic");
+        assert_eq!(retained.session_id, "live-session");
+        assert_eq!(retained.tokens.input, 500);
+        assert_eq!(retained.tokens.output, 999);
+        assert_eq!(retained.cost, 9.0);
+        assert_eq!(retained.cost_source, sessions::CostSource::ProviderReported);
+    }
+
+    /// Drive the retained/live collision through cold parse, compaction,
+    /// cross-file replay, and a warm cache hit. The retained copy is a stale
+    /// Haiku partial; the live copy is the completed Sonnet observation. The
+    /// caller controls file order so provenance authority cannot accidentally
+    /// depend on lexical discovery order.
+    fn assert_claude_retained_partial_merges_completed_live(second_file_name: &str) {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
         let _cache_env = redirect_cache_home(cache_home.path());
 
-        {
-            let claude_dir = source_home.path().join(".claude/projects/myproject");
-            std::fs::create_dir_all(&claude_dir).unwrap();
-            let original = claude_dir.join("aaa-original.jsonl");
+        let claude_dir = client_scan_root(source_home.path(), ClientId::Claude).join("myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let retained_path = claude_dir.join("mmm-retained.jsonl");
 
-            let turn_one = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}"#;
-            let turn_two_partial = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_002","message":{"id":"msg_002","model":"claude-3-5-sonnet","usage":{"input_tokens":200,"output_tokens":60}}}"#;
-            let turn_two_complete = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_002","message":{"id":"msg_002","model":"claude-3-5-sonnet","usage":{"input_tokens":2000,"output_tokens":999}}}"#;
-            let turn_three = r#"{"type":"assistant","timestamp":"2024-12-01T10:10:00.000Z","requestId":"req_003","message":{"id":"msg_003","model":"claude-3-5-sonnet","usage":{"input_tokens":300,"output_tokens":70}}}"#;
+        let retained_partial = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_shared","provider":"bedrock","message":{"id":"msg_shared","model":"claude-3-5-haiku","provider":"bedrock","usage":{"input_tokens":500,"output_tokens":60}}}"#;
+        let live_completed = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:01.000Z","requestId":"req_shared","provider":"anthropic","message":{"id":"msg_shared","model":"claude-3-5-sonnet","provider":"anthropic","usage":{"input_tokens":200,"output_tokens":999}}}"#;
 
-            std::fs::write(
-                &original,
-                format!("{turn_one}\n{turn_two_partial}\n{turn_three}\n"),
-            )
-            .unwrap();
-            let before = parse_all_messages_with_pricing_with_env_strategy(
-                source_home.path().to_str().unwrap(),
-                &["claude".to_string()],
-                None,
-                false,
-                &scanner::ScannerSettings::default(),
-            );
-            assert_eq!(before.len(), 3);
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-3-5-sonnet".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.002),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "claude-3-5-haiku".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.0001),
+                output_cost_per_token: Some(0.0002),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
 
-            // The compaction keeps turn one. Turn two is replayed into the
-            // fork, so it exists both retained and live. Turn three exists
-            // only as a retained copy — it is what makes the count here
-            // differ from a run with no retention at all.
-            std::fs::write(&original, format!("{turn_one}\n")).unwrap();
-            std::fs::write(
-                claude_dir.join("zzz-fork.jsonl"),
-                format!("{turn_two_complete}\n"),
-            )
-            .unwrap();
+        std::fs::write(&retained_path, format!("{retained_partial}\n")).unwrap();
+        let seeded = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &["claude".to_string()],
+            Some(&pricing),
+            false,
+            &scanner::ScannerSettings::default(),
+        );
+        assert_eq!(seeded.len(), 1, "cold scan must seed retained history");
 
-            let after = parse_all_messages_with_pricing_with_env_strategy(
-                source_home.path().to_str().unwrap(),
-                &["claude".to_string()],
-                None,
-                false,
-                &scanner::ScannerSettings::default(),
-            );
-            assert_eq!(
-                after.len(),
-                3,
-                "retention must keep turn three and count the replayed turn once"
-            );
-            let keys: HashSet<String> = after
-                .iter()
-                .filter_map(|message| message.dedup_key.clone())
-                .collect();
-            assert_eq!(keys.len(), 3, "every surviving message must be distinct");
-            assert_eq!(
-                after.iter().map(|m| m.tokens.output).sum::<i64>(),
-                50 + 999 + 70,
-                "the completed replay must outrank the retained streaming partial"
-            );
-            assert_eq!(
-                after.iter().map(|m| m.tokens.input).sum::<i64>(),
-                100 + 2000 + 300
-            );
+        // Claude rewrites the first transcript and the same response completes
+        // live in a fork/resume transcript.
+        std::fs::write(&retained_path, "").unwrap();
+        std::fs::write(
+            claude_dir.join(second_file_name),
+            format!("{live_completed}\n"),
+        )
+        .unwrap();
 
-            let warm = parse_all_messages_with_pricing_with_env_strategy(
-                source_home.path().to_str().unwrap(),
-                &["claude".to_string()],
-                None,
-                false,
-                &scanner::ScannerSettings::default(),
-            );
-            assert_eq!(warm.len(), 3);
+        let assert_merged = |messages: &[UnifiedMessage]| {
             assert_eq!(
-                warm.iter().map(|m| m.tokens.output).sum::<i64>(),
-                50 + 999 + 70,
-                "retained/live provenance must survive the cache round trip"
+                messages.len(),
+                1,
+                "the shared response must be counted once"
             );
+            let merged = &messages[0];
+            assert_eq!(merged.tokens.input, 500, "retain the larger partial input");
+            assert_eq!(merged.tokens.output, 999, "take the completed live output");
+            assert_eq!(merged.model_id, "claude-3-5-sonnet");
+            assert_eq!(merged.provider_id, "anthropic");
             assert_eq!(
-                warm.iter().map(|m| m.tokens.input).sum::<i64>(),
-                100 + 2000 + 300
+                merged.session_id,
+                second_file_name.trim_end_matches(".jsonl")
             );
-        }
+            assert_eq!(merged.workspace_key.as_deref(), Some("myproject"));
+            assert_eq!(merged.workspace_label.as_deref(), Some("myproject"));
+            assert_eq!(merged.cost_source, sessions::CostSource::Estimated);
+            assert!(
+                (merged.cost - 2.498).abs() < 1e-9,
+                "Sonnet price must be recomputed from merged tokens; got {}",
+                merged.cost
+            );
+        };
+
+        let merged = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &["claude".to_string()],
+            Some(&pricing),
+            false,
+            &scanner::ScannerSettings::default(),
+        );
+        assert_merged(&merged);
+
+        let warm = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &["claude".to_string()],
+            Some(&pricing),
+            false,
+            &scanner::ScannerSettings::default(),
+        );
+        assert_merged(&warm);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_retained_partial_merges_completed_live_that_sorts_later() {
+        assert_claude_retained_partial_merges_completed_live("zzz-live.jsonl");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_retained_partial_merges_completed_live_that_sorts_earlier() {
+        assert_claude_retained_partial_merges_completed_live("aaa-live.jsonl");
     }
 
     /// A cache entry written before retention provenance existed carries the
