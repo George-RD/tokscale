@@ -849,12 +849,11 @@ define_clients!(
         submit_default: true
     },
     // Cherry Studio (Electron desktop client) writes standard Claude Code
-    // transcripts under its per-user app-data directory
-    // (`%APPDATA%\CherryStudio\.claude\projects` on Windows). The transcript
-    // format is identical to Claude Code's, but parsing uses the dedicated
-    // `sessions::cherrystudio` parser, which dedupes the same API call
-    // appended 3-4 times per streaming response via the usage signature;
-    // naively summing every assistant row would ~3x the true figure.
+    // transcripts under its per-user app-data directory. V2 uses
+    // `%APPDATA%\CherryStudio\Data\Agents\.claude\projects` on Windows;
+    // V1 uses the root below. The transcript format is identical to Claude
+    // Code's, but parsing uses the dedicated `sessions::cherrystudio` parser,
+    // which dedupes replayed records by stable request/message IDs.
     CherryStudio = 45 => {
         id: "cherrystudio",
         display: "Cherry Studio",

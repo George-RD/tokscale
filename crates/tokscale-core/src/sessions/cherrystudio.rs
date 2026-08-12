@@ -2,16 +2,19 @@
 //!
 //! Cherry Studio's Agent / Claude Code sessions write **standard Claude Code
 //! transcripts** under its per-user app-data directory:
-//! `%APPDATA%\CherryStudio\.claude\projects\<workspace>\<session>.jsonl`
-//! (macOS: `~/Library/Application Support/CherryStudio/.claude/projects/...`,
-//! Linux: `$XDG_CONFIG_HOME/CherryStudio/.claude/projects/...`).
+//! `%APPDATA%\CherryStudio\Data\Agents\.claude\projects\<workspace>\<session>.jsonl`
+//! (macOS: `~/Library/Application Support/CherryStudio/Data/Agents/.claude/projects/...`,
+//! Linux: `$XDG_CONFIG_HOME/CherryStudio/Data/Agents/.claude/projects/...`).
+//! The V1 root omits `Data/Agents`; both roots are scanned so pre-upgrade
+//! history remains available.
 //!
 //! Unlike a stock Claude Code transcript, Cherry Studio appends the **same API
-//! call to the file 3-4 times** (different `uuid`, identical `usage`) as the
-//! streaming response progresses. Naively summing every assistant row
-//! triple-counts each call (verified ~3x over the true figure). The canonical
-//! fix — validated against DeepSeek's platform per-hour billing, <1% error —
-//! is to dedupe records by their stable request, message, or event UUID identity.
+//! call to the file 3-4 times** (different `uuid`, identical `requestId`,
+//! `message.id`, and `usage`) as the streaming response progresses. Naively
+//! summing every assistant row triple-counts each call (verified ~3x over the
+//! true figure). The canonical fix — validated against DeepSeek's platform
+//! per-hour billing, <1% error — is to dedupe by the stable request and/or
+//! message identity; `uuid` is only a fallback when neither primary ID exists.
 //! Usage signatures are not identities: two distinct requests may legitimately
 //! have identical token counts. Records without an identity are retained
 //! conservatively. All reads are strictly read-only.
@@ -145,8 +148,8 @@ pub fn parse_cherrystudio_file(path: &Path) -> Vec<UnifiedMessage> {
         // Cherry Studio can append a streaming record several times. Only an
         // explicit identity proves two rows represent the same call: matching
         // usage is not sufficient because separate calls can cost the same.
-        // Keep every stable ID in the key. In particular, a changed UUID is a
-        // distinct event even when its request/message IDs and usage match.
+        // requestId and message.id survive replay UUID changes, so they take
+        // precedence. UUID is only an identity fallback when both are absent.
         // Rows without IDs are retained conservatively.
         let request_id = record
             .get("requestId")
@@ -165,15 +168,15 @@ pub fn parse_cherrystudio_file(path: &Path) -> Vec<UnifiedMessage> {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|id| !id.is_empty());
-        let identity =
-            (request_id.is_some() || message_id.is_some() || uuid.is_some()).then(|| {
-                format!(
-                    "request:{}\u{1f}message:{}\u{1f}uuid:{}",
-                    request_id.unwrap_or(""),
-                    message_id.unwrap_or(""),
-                    uuid.unwrap_or("")
-                )
-            });
+        let identity = if request_id.is_some() || message_id.is_some() {
+            Some(format!(
+                "request:{}\u{1f}message:{}",
+                request_id.unwrap_or(""),
+                message_id.unwrap_or("")
+            ))
+        } else {
+            uuid.map(|id| format!("uuid:{id}"))
+        };
         if identity.is_some_and(|identity| !seen_identities.insert(identity)) {
             continue;
         }
@@ -257,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_consecutive_distinct_identities_with_identical_usage() {
+    fn dedupes_replays_with_changed_uuids_and_same_primary_ids() {
         let dir = tempdir().unwrap();
         let path = write_transcript(
             dir.path(),
@@ -265,6 +268,28 @@ mod tests {
             &[
                 r#"{"type":"assistant","uuid":"event-1","requestId":"request-1","message":{"id":"message-1","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
                 r#"{"type":"assistant","uuid":"event-2","requestId":"request-1","message":{"id":"message-1","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+                r#"{"type":"assistant","uuid":"event-3","requestId":"request-1","message":{"id":"message-1","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+            ],
+        );
+
+        let messages = parse_cherrystudio_file(&path);
+        assert_eq!(
+            messages.len(),
+            1,
+            "replays must collapse even when each record has a different UUID"
+        );
+        assert_eq!(messages[0].tokens.total(), 110);
+    }
+
+    #[test]
+    fn keeps_distinct_primary_ids_with_identical_usage() {
+        let dir = tempdir().unwrap();
+        let path = write_transcript(
+            dir.path(),
+            "session.jsonl",
+            &[
+                r#"{"type":"assistant","uuid":"event-1","requestId":"request-1","message":{"id":"message-1","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+                r#"{"type":"assistant","uuid":"event-1","requestId":"request-2","message":{"id":"message-2","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
             ],
         );
 
@@ -272,7 +297,14 @@ mod tests {
         assert_eq!(
             messages.len(),
             2,
-            "distinct calls with equal usage must count"
+            "distinct primary IDs must count even when UUID and usage match"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.tokens.total())
+                .sum::<i64>(),
+            220
         );
     }
 

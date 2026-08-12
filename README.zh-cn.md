@@ -1446,7 +1446,7 @@ AI 编程工具将会话数据存储在跨平台位置。大多数工具在所�
 | Jcode | `~/.jcode/sessions/` | `%USERPROFILE%\.jcode\sessions\` | 可通过 `JCODE_HOME` 环境变量配置；解析 `session_*.json` 快照以及 `session_*.journal.jsonl` sidecar |
 | MiMo Code | `~/.local/share/mimocode/` | `%USERPROFILE%\.local\share\mimocode\` | 使用 XDG 数据目录；SQLite 数据库 `mimocode.db` |
 | Gajae-Code | `~/.gjc/agent/sessions/` | `%USERPROFILE%\.gjc\agent\sessions\` | 可通过 `GJC_CODING_AGENT_DIR`（也可用 `GJC_CONFIG_DIR`/`PI_CONFIG_DIR`；Linux/macOS 上 `$XDG_DATA_HOME/gjc/sessions/` 亦支持）配置 |
-| Cherry Studio | `$XDG_CONFIG_HOME/CherryStudio/.claude/projects/`（默认 `~/.config/CherryStudio/.claude/projects/`；macOS: `~/Library/Application Support/CherryStudio/.claude/projects/`） | `%APPDATA%\CherryStudio\.claude\projects\` | Agent/Claude Code 模式转录 |
+| Cherry Studio | V2：`$XDG_CONFIG_HOME/CherryStudio/Data/Agents/.claude/projects/`（默认 `~/.config/CherryStudio/Data/Agents/.claude/projects/`；macOS: `~/Library/Application Support/CherryStudio/Data/Agents/.claude/projects/`）；V1：`$XDG_CONFIG_HOME/CherryStudio/.claude/projects/`（默认 `~/.config/CherryStudio/.claude/projects/`；macOS: `~/Library/Application Support/CherryStudio/.claude/projects/`） | V2：`%APPDATA%\CherryStudio\Data\Agents\.claude\projects\`；V1：`%APPDATA%\CherryStudio\.claude\projects\` | Agent/Claude Code 模式转录；同名会话优先使用 V2，V1 保留未迁移的历史记录 |
 | Junie | `~/.junie/sessions/` | `%USERPROFILE%\.junie\sessions\` | 所有平台使用相同的 home 相对路径；解析 `events.jsonl` 使用事件 |
 | ZCode | `~/.zcode/cli/db/db.sqlite` 和 `~/.zcode/projects/` | `%USERPROFILE%\.zcode\cli\db\db.sqlite` 和 `%USERPROFILE%\.zcode\projects\` | 解析 v2 SQLite 模型用量和旧版 `*.jsonl` 会话记录；Z.ai 的 GLM 模型专用 ADE |
 | OpenCodeReview | `~/.opencodereview/sessions/` | `%USERPROFILE%\.opencodereview\sessions\` | 解析 `*.jsonl` 会话记录；阿里巴巴的 AI 代码审查工具 |
