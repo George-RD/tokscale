@@ -3652,7 +3652,10 @@ fn test_clients_json_finds_stats_cache_under_claude_config_dir() {
 #[test]
 fn test_clients_home_override_ignores_claude_config_dir_for_stats_cache() {
     let explicit_home = create_empty_fixture_dir();
-    let expected_cache = explicit_home.path().join(".claude/stats-cache.json");
+    let expected_cache = explicit_home
+        .path()
+        .join(".claude")
+        .join("stats-cache.json");
     fs::create_dir_all(expected_cache.parent().unwrap()).unwrap();
     fs::write(&expected_cache, "{}").unwrap();
 
