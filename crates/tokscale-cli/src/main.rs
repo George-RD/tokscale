@@ -2014,6 +2014,7 @@ fn run_models_report(
         .map(|home| {
             claude_diagnostics::diagnostics_for_empty_explicit_report(
                 home,
+                use_env_roots,
                 &clients,
                 claude_message_count,
             )
@@ -4061,7 +4062,8 @@ fn run_clients_command(json: bool, home_dir: Option<String>) -> Result<()> {
     } else {
         Vec::new()
     };
-    let built_in_extra_paths = built_in_extra_scan_paths_for(&home_dir_str, &all_clients);
+    let built_in_extra_paths =
+        built_in_extra_scan_paths_for(&home_dir_str, &all_clients, use_env_roots);
     let settings_extra_dirs = extra_scan_paths_for(&scanner_settings, &all_clients);
     let copilot_exporter_path =
         tokscale_core::copilot_exporter_path_with_env_strategy(use_env_roots);
@@ -4196,7 +4198,7 @@ fn run_clients_command(json: bool, home_dir: Option<String>) -> Result<()> {
                 ));
 
                 let diagnostics = if client == ClientId::Claude {
-                    claude_diagnostics::diagnostics_for_clients_row(&home_dir)
+                    claude_diagnostics::diagnostics_for_clients_row(&home_dir, use_env_roots)
                 } else {
                     Vec::new()
                 };
