@@ -3608,6 +3608,98 @@ fn test_clients_json_includes_claude_desktop_diagnostic() {
 }
 
 #[test]
+fn test_clients_json_finds_stats_cache_under_claude_config_dir() {
+    let home = create_empty_fixture_dir();
+    let default_cache = home.path().join(".claude/stats-cache.json");
+    fs::create_dir_all(default_cache.parent().unwrap()).unwrap();
+    fs::write(&default_cache, "{}").unwrap();
+
+    let claude_config_dir = TempDir::new().expect("failed to create Claude config dir");
+    let configured_cache = claude_config_dir.path().join("stats-cache.json");
+    fs::write(&configured_cache, "{}").unwrap();
+
+    let output = cmd_with_home(home.path())
+        .env("CLAUDE_CONFIG_DIR", claude_config_dir.path())
+        .args(["clients", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let claude = json["clients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["client"] == "claude")
+        .unwrap();
+    let stats_cache = claude["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["code"] == "claude_stats_cache_not_imported")
+        .expect("configured stats-cache.json should produce a diagnostic");
+
+    assert_eq!(
+        stats_cache["paths"][0]["path"],
+        configured_cache.to_string_lossy().as_ref()
+    );
+}
+
+#[test]
+fn test_clients_home_override_ignores_claude_config_dir_for_stats_cache() {
+    let explicit_home = create_empty_fixture_dir();
+    let expected_cache = explicit_home
+        .path()
+        .join(".claude")
+        .join("stats-cache.json");
+    fs::create_dir_all(expected_cache.parent().unwrap()).unwrap();
+    fs::write(&expected_cache, "{}").unwrap();
+
+    let process_home = TempDir::new().expect("failed to create process home");
+    let conflicting_claude_dir = TempDir::new().expect("failed to create Claude config dir");
+    fs::write(conflicting_claude_dir.path().join("stats-cache.json"), "{}").unwrap();
+
+    let output = cmd_with_conflicting_env(process_home.path())
+        .env("CLAUDE_CONFIG_DIR", conflicting_claude_dir.path())
+        .args([
+            "clients",
+            "--json",
+            "--home",
+            explicit_home.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let claude = json["clients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["client"] == "claude")
+        .unwrap();
+    let stats_cache = claude["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["code"] == "claude_stats_cache_not_imported")
+        .expect("the --home stats-cache.json should produce a diagnostic");
+
+    assert_eq!(
+        stats_cache["paths"][0]["path"],
+        expected_cache.to_string_lossy().as_ref()
+    );
+}
+
+#[test]
 fn test_clients_home_override_ignores_conflicting_claude_config_dir_env() {
     let real_home = create_empty_fixture_dir();
     fs::create_dir_all(real_home.path().join("Library/Application Support/Claude")).unwrap();

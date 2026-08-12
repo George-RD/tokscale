@@ -53,6 +53,7 @@ fn claude_diagnostics(
     include_info: bool,
 ) -> Vec<ClientDiagnostic> {
     let mut diagnostics = Vec::new();
+    let claude_root = resolved_claude_root(home_dir, use_env_roots);
 
     let desktop_paths: Vec<PathBuf> = claude_desktop_storage_paths(home_dir)
         .into_iter()
@@ -65,11 +66,11 @@ fn claude_diagnostics(
             severity: "warning",
             message: CLAUDE_DESKTOP_MESSAGE,
             help: CLAUDE_DESKTOP_HELP,
-            paths: diagnostic_paths(home_dir, use_env_roots, desktop_paths),
+            paths: diagnostic_paths(&claude_root, desktop_paths),
         });
     }
 
-    let stats_cache = home_dir.join(".claude").join("stats-cache.json");
+    let stats_cache = claude_root.join("stats-cache.json");
     if include_info && stats_cache.exists() {
         diagnostics.push(ClientDiagnostic {
             code: "claude_stats_cache_not_imported",
@@ -98,11 +99,16 @@ fn claude_desktop_storage_paths(home_dir: &Path) -> Vec<PathBuf> {
     ]
 }
 
-fn diagnostic_paths(
-    home_dir: &Path,
-    use_env_roots: bool,
-    desktop_paths: Vec<PathBuf>,
-) -> Vec<DiagnosticPath> {
+fn resolved_claude_root(home_dir: &Path, use_env_roots: bool) -> PathBuf {
+    PathBuf::from(
+        tokscale_core::ClientId::Claude
+            .data()
+            .root
+            .resolve_with_env_strategy(&home_dir.to_string_lossy(), use_env_roots),
+    )
+}
+
+fn diagnostic_paths(claude_root: &Path, desktop_paths: Vec<PathBuf>) -> Vec<DiagnosticPath> {
     let mut paths: Vec<DiagnosticPath> = desktop_paths
         .into_iter()
         .map(|path| DiagnosticPath {
@@ -112,17 +118,6 @@ fn diagnostic_paths(
         })
         .collect();
 
-    // Resolve through the client registry (CLAUDE_CONFIG_DIR-aware) instead of
-    // a fixed `.claude` offset from home, so this diagnostic reports the same
-    // paths the scanner actually reads — and respect `use_env_roots` so a
-    // `--home` override keeps its documented ignore-conflicting-env-vars
-    // semantics instead of always following CLAUDE_CONFIG_DIR.
-    let claude_root = PathBuf::from(
-        tokscale_core::ClientId::Claude
-            .data()
-            .root
-            .resolve_with_env_strategy(&home_dir.to_string_lossy(), use_env_roots),
-    );
     for (label, path) in [
         ("claudeCodeProjects", claude_root.join("projects")),
         ("claudeCodeTranscripts", claude_root.join("transcripts")),
