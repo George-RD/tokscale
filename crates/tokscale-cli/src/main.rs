@@ -763,16 +763,12 @@ fn main() -> Result<()> {
             benchmark,
             no_spinner,
         }) => {
-            let (since, until) = build_date_filter(&date, &cli.home);
-            let year = normalize_year_filter(&date);
             let clients = build_client_filter(clients, &cli.home);
             run_graph_command(
                 output,
                 cli.home.clone(),
                 clients,
-                since,
-                until,
-                year,
+                &date,
                 benchmark,
                 no_spinner,
             )
@@ -896,18 +892,8 @@ fn main() -> Result<()> {
             date,
             no_spinner,
         }) => {
-            let (since, until) = build_date_filter(&date, &cli.home);
-            let year = normalize_year_filter(&date);
             let clients = build_client_filter(clients, &cli.home);
-            run_time_metrics_report(
-                json,
-                cli.home.clone(),
-                clients,
-                since,
-                until,
-                year,
-                no_spinner,
-            )
+            run_time_metrics_report(json, cli.home.clone(), clients, &date, no_spinner)
         }
         Some(Commands::WarmTuiCache) => run_warm_tui_cache(),
         Some(Commands::Config { subcommand }) => {
@@ -1739,7 +1725,7 @@ fn current_bucket_date(home_dir: &Option<String>) -> chrono::NaiveDate {
     .today()
 }
 
-fn build_date_filter_for_date(
+pub(crate) fn build_date_filter_for_date(
     date: &DateRangeFlags,
     current_date: chrono::NaiveDate,
 ) -> (Option<String>, Option<String>) {
@@ -1776,16 +1762,12 @@ fn build_date_filter_for_date(
     (date.since.clone(), date.until.clone())
 }
 
-fn normalize_year_filter(date: &DateRangeFlags) -> Option<String> {
+pub(crate) fn normalize_year_filter(date: &DateRangeFlags) -> Option<String> {
     if date.today || date.yesterday || date.week || date.month {
         None
     } else {
         date.year.clone()
     }
-}
-
-fn get_date_range_label(date: &DateRangeFlags) -> Option<String> {
-    get_date_range_label_for_date(date, chrono::Local::now().date_naive())
 }
 
 fn get_date_range_label_for_date(
@@ -1933,6 +1915,135 @@ impl Drop for LightSpinner {
     }
 }
 
+/// Date bounds and scanner settings resolved from one pinned bucket date.
+///
+/// Loading scanner settings once is deliberate: the same settings choose both
+/// the date keys and the scanner's bucket timezone. Report options clone the
+/// settings instead of reading the profile again, so filtering and scanning
+/// cannot disagree after a settings change.
+struct ResolvedReportDate {
+    since: Option<String>,
+    until: Option<String>,
+    year: Option<String>,
+    // Text report renderers use this label; graph and time-metrics intentionally
+    // share the context without rendering a date-range title.
+    date_range: Option<String>,
+    scanner_settings: tokscale_core::ScannerSettings,
+}
+
+impl ResolvedReportDate {
+    fn new(date: &DateRangeFlags, home_dir: &Option<String>) -> Self {
+        let scanner_settings = tui::settings::load_scanner_settings_for_home(home_dir);
+        let current_date =
+            tokscale_core::BucketTimezone::from_scanner_settings(&scanner_settings).today();
+        Self::from_current_date(date, scanner_settings, current_date)
+    }
+
+    fn from_current_date(
+        date: &DateRangeFlags,
+        scanner_settings: tokscale_core::ScannerSettings,
+        current_date: chrono::NaiveDate,
+    ) -> Self {
+        let (since, until) = build_date_filter_for_date(date, current_date);
+        let year = normalize_year_filter(date);
+        let date_range = get_date_range_label_for_date(date, current_date);
+
+        Self {
+            since,
+            until,
+            year,
+            date_range,
+            scanner_settings,
+        }
+    }
+}
+
+/// Shared setup for local report commands.
+///
+/// The cursor cache snapshot is intentionally taken before the best-effort
+/// sync. A failed sync must still be reported as "using cached data" when a
+/// cache existed before the sync attempt.
+struct LocalReportContext {
+    home_dir: Option<String>,
+    clients: Option<Vec<String>>,
+    since: Option<String>,
+    until: Option<String>,
+    year: Option<String>,
+    date_range: Option<String>,
+    scanner_settings: tokscale_core::ScannerSettings,
+    had_cursor_cache: bool,
+    explicit_cursor_filter: bool,
+    spinner: Option<LightSpinner>,
+    cursor_sync_result: Option<cursor::SyncCursorResult>,
+    cursor_setup_warnings: Vec<String>,
+    use_env_roots: bool,
+    start: std::time::Instant,
+}
+
+impl LocalReportContext {
+    fn new(
+        home_dir: Option<String>,
+        clients: Option<Vec<String>>,
+        date: &DateRangeFlags,
+        spinner_message: Option<&'static str>,
+    ) -> Self {
+        let resolved_date = ResolvedReportDate::new(date, &home_dir);
+        let had_cursor_cache = has_cursor_usage_cache_for_report(&home_dir);
+        let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
+        let spinner = spinner_message.map(LightSpinner::start);
+        let cursor_sync_result = auto_sync_cursor_for_local_report(&home_dir, &clients);
+        let cursor_setup_warnings = setup_warnings_for_report(&home_dir, &clients);
+        let use_env_roots = use_env_roots(&home_dir);
+
+        Self {
+            home_dir,
+            clients,
+            since: resolved_date.since,
+            until: resolved_date.until,
+            year: resolved_date.year,
+            date_range: resolved_date.date_range,
+            scanner_settings: resolved_date.scanner_settings,
+            had_cursor_cache,
+            explicit_cursor_filter,
+            spinner,
+            cursor_sync_result,
+            cursor_setup_warnings,
+            use_env_roots,
+            start: std::time::Instant::now(),
+        }
+    }
+
+    /// Graph emits progress before scanning, so restart its benchmark clock
+    /// after the progress prelude while retaining the constructor's complete
+    /// environment setup.
+    fn restart_timing(&mut self) {
+        self.start = std::time::Instant::now();
+    }
+
+    fn effective_home_dir(&self) -> Option<PathBuf> {
+        resolve_effective_home_dir(&self.home_dir)
+    }
+
+    fn stop_spinner(&mut self) {
+        if let Some(spinner) = self.spinner.take() {
+            spinner.stop();
+        }
+    }
+
+    fn report_options(&self, group_by: tokscale_core::GroupBy) -> tokscale_core::ReportOptions {
+        tokscale_core::ReportOptions {
+            home_dir: self.home_dir.clone(),
+            use_env_roots: self.use_env_roots,
+            clients: self.clients.clone(),
+            since: self.since.clone(),
+            until: self.until.clone(),
+            year: self.year.clone(),
+            group_by,
+            scanner_settings: self.scanner_settings.clone(),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_models_report(
     json: bool,
@@ -1946,41 +2057,18 @@ fn run_models_report(
     cli_no_write_cache: bool,
     hide_zero: bool,
 ) -> Result<()> {
-    use std::time::Instant;
     use tokio::runtime::Runtime;
-    use tokscale_core::{get_model_report, GroupBy, ReportOptions};
+    use tokscale_core::{get_model_report, GroupBy};
 
-    let (since, until) = build_date_filter(date, &home_dir);
-    let year = normalize_year_filter(date);
-    let date_range = get_date_range_label(date);
-    let effective_home_dir = resolve_effective_home_dir(&home_dir);
-
-    let had_cursor_cache = has_cursor_usage_cache_for_report(&home_dir);
-    let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
-    let spinner = if no_spinner {
-        None
-    } else {
-        Some(LightSpinner::start("Scanning session data..."))
-    };
-    let cursor_sync_result = auto_sync_cursor_for_local_report(&home_dir, &clients);
-    let cursor_setup_warnings = setup_warnings_for_report(&home_dir, &clients);
-    let use_env_roots = use_env_roots(&home_dir);
-    let start = Instant::now();
+    let mut context = LocalReportContext::new(
+        home_dir,
+        clients,
+        date,
+        (!no_spinner).then_some("Scanning session data..."),
+    );
     let rt = Runtime::new()?;
     let report = rt
-        .block_on(async {
-            get_model_report(ReportOptions {
-                home_dir: home_dir.clone(),
-                use_env_roots,
-                clients: clients.clone(),
-                since: since.clone(),
-                until: until.clone(),
-                year: year.clone(),
-                group_by: group_by.clone(),
-                scanner_settings: tui::settings::load_scanner_settings_for_home(&home_dir),
-            })
-            .await
-        })
+        .block_on(async { get_model_report(context.report_options(group_by.clone())).await })
         .map_err(|e| anyhow::anyhow!(e))?;
     let mut report = report;
     if hide_zero {
@@ -1998,27 +2086,27 @@ fn run_models_report(
     }
     let report = report;
 
-    if let Some(spinner) = spinner {
-        spinner.stop();
-    }
+    context.stop_spinner();
     emit_cursor_sync_warning(
-        cursor_sync_result.as_ref(),
-        had_cursor_cache,
-        explicit_cursor_filter,
+        context.cursor_sync_result.as_ref(),
+        context.had_cursor_cache,
+        context.explicit_cursor_filter,
     );
-    let processing_time_ms = start.elapsed().as_millis();
+    let processing_time_ms = context.start.elapsed().as_millis();
     let claude_message_count = report
         .entries
         .iter()
         .filter(|entry| model_usage_includes_client(entry, "claude"))
         .map(|entry| entry.message_count)
         .sum();
-    let diagnostics = effective_home_dir
+    let diagnostics = context
+        .effective_home_dir()
         .as_deref()
         .map(|home| {
             claude_diagnostics::diagnostics_for_empty_explicit_report(
                 home,
-                &clients,
+                context.use_env_roots,
+                &context.clients,
                 claude_message_count,
             )
         })
@@ -2112,7 +2200,7 @@ fn run_models_report(
             total_messages: report.total_messages,
             total_cost: report.total_cost,
             processing_time_ms: report.processing_time_ms,
-            warnings: cursor_setup_warnings,
+            warnings: context.cursor_setup_warnings,
             diagnostics,
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -2120,7 +2208,7 @@ fn run_models_report(
         use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table};
         emit_client_diagnostics(&diagnostics);
 
-        emit_cursor_setup_warnings(&cursor_setup_warnings);
+        emit_cursor_setup_warnings(&context.cursor_setup_warnings);
         let total_performance = aggregate_model_report_performance(&report.entries);
         let term_width = crossterm::terminal::size()
             .map(|(w, _)| w as usize)
@@ -2765,7 +2853,7 @@ fn run_models_report(
             }
         }
 
-        let title = match &date_range {
+        let title = match &context.date_range {
             Some(range) => format!("Token Usage Report by Model ({})", range),
             None => "Token Usage Report by Model".to_string(),
         };
@@ -2797,7 +2885,14 @@ fn run_models_report(
 
         let settings = tui::settings::Settings::load();
         if resolve_should_write_cache(cli_write_cache, cli_no_write_cache, &settings) {
-            write_light_cache(&home_dir, &clients, &since, &until, &year, &group_by);
+            write_light_cache(
+                &context.home_dir,
+                &context.clients,
+                &context.since,
+                &context.until,
+                &context.year,
+                &group_by,
+            );
         }
     }
 
@@ -2813,40 +2908,18 @@ fn run_monthly_report(
     no_spinner: bool,
     hide_zero: bool,
 ) -> Result<()> {
-    use std::time::Instant;
     use tokio::runtime::Runtime;
-    use tokscale_core::{get_monthly_report_v2, GroupBy, ReportOptions};
+    use tokscale_core::{get_monthly_report_v2, GroupBy};
 
-    let (since, until) = build_date_filter(date, &home_dir);
-    let year = normalize_year_filter(date);
-    let date_range = get_date_range_label(date);
-
-    let had_cursor_cache = has_cursor_usage_cache_for_report(&home_dir);
-    let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
-    let spinner = if no_spinner {
-        None
-    } else {
-        Some(LightSpinner::start("Scanning session data..."))
-    };
-    let cursor_sync_result = auto_sync_cursor_for_local_report(&home_dir, &clients);
-    let cursor_setup_warnings = setup_warnings_for_report(&home_dir, &clients);
-    let use_env_roots = use_env_roots(&home_dir);
-    let start = Instant::now();
+    let mut context = LocalReportContext::new(
+        home_dir,
+        clients,
+        date,
+        (!no_spinner).then_some("Scanning session data..."),
+    );
     let rt = Runtime::new()?;
     let report = rt
-        .block_on(async {
-            get_monthly_report_v2(ReportOptions {
-                home_dir: home_dir.clone(),
-                use_env_roots,
-                clients,
-                since,
-                until,
-                year,
-                group_by: GroupBy::default(),
-                scanner_settings: tui::settings::load_scanner_settings_for_home(&home_dir),
-            })
-            .await
-        })
+        .block_on(async { get_monthly_report_v2(context.report_options(GroupBy::default())).await })
         .map_err(|e| anyhow::anyhow!(e))?;
     let mut report = report;
     if hide_zero {
@@ -2862,16 +2935,14 @@ fn run_monthly_report(
     }
     let report = report;
 
-    if let Some(spinner) = spinner {
-        spinner.stop();
-    }
+    context.stop_spinner();
     emit_cursor_sync_warning(
-        cursor_sync_result.as_ref(),
-        had_cursor_cache,
-        explicit_cursor_filter,
+        context.cursor_sync_result.as_ref(),
+        context.had_cursor_cache,
+        context.explicit_cursor_filter,
     );
 
-    let processing_time_ms = start.elapsed().as_millis();
+    let processing_time_ms = context.start.elapsed().as_millis();
 
     if json {
         #[derive(serde::Serialize)]
@@ -2916,14 +2987,14 @@ fn run_monthly_report(
                 .collect(),
             total_cost: report.total_cost,
             processing_time_ms: report.processing_time_ms,
-            warnings: cursor_setup_warnings,
+            warnings: context.cursor_setup_warnings,
         };
 
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table};
 
-        emit_cursor_setup_warnings(&cursor_setup_warnings);
+        emit_cursor_setup_warnings(&context.cursor_setup_warnings);
         let term_width = crossterm::terminal::size()
             .map(|(w, _)| w as usize)
             .unwrap_or(120);
@@ -3116,7 +3187,7 @@ fn run_monthly_report(
             ]);
         }
 
-        let title = match &date_range {
+        let title = match &context.date_range {
             Some(range) => format!("Monthly Token Usage Report ({})", range),
             None => "Monthly Token Usage Report".to_string(),
         };
@@ -3149,40 +3220,18 @@ fn run_hourly_report(
     no_spinner: bool,
     hide_zero: bool,
 ) -> Result<()> {
-    use std::time::Instant;
     use tokio::runtime::Runtime;
-    use tokscale_core::{get_hourly_report, GroupBy, ReportOptions};
+    use tokscale_core::{get_hourly_report, GroupBy};
 
-    let (since, until) = build_date_filter(date, &home_dir);
-    let year = normalize_year_filter(date);
-    let date_range = get_date_range_label(date);
-
-    let had_cursor_cache = has_cursor_usage_cache_for_report(&home_dir);
-    let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
-    let spinner = if no_spinner {
-        None
-    } else {
-        Some(LightSpinner::start("Scanning session data..."))
-    };
-    let cursor_sync_result = auto_sync_cursor_for_local_report(&home_dir, &clients);
-    let cursor_setup_warnings = setup_warnings_for_report(&home_dir, &clients);
-    let use_env_roots = use_env_roots(&home_dir);
-    let start = Instant::now();
+    let mut context = LocalReportContext::new(
+        home_dir,
+        clients,
+        date,
+        (!no_spinner).then_some("Scanning session data..."),
+    );
     let rt = Runtime::new()?;
     let report = rt
-        .block_on(async {
-            get_hourly_report(ReportOptions {
-                home_dir: home_dir.clone(),
-                use_env_roots,
-                clients,
-                since,
-                until,
-                year,
-                group_by: GroupBy::default(),
-                scanner_settings: tui::settings::load_scanner_settings_for_home(&home_dir),
-            })
-            .await
-        })
+        .block_on(async { get_hourly_report(context.report_options(GroupBy::default())).await })
         .map_err(|e| anyhow::anyhow!(e))?;
     let mut report = report;
     if hide_zero {
@@ -3198,16 +3247,14 @@ fn run_hourly_report(
     }
     let report = report;
 
-    if let Some(spinner) = spinner {
-        spinner.stop();
-    }
+    context.stop_spinner();
     emit_cursor_sync_warning(
-        cursor_sync_result.as_ref(),
-        had_cursor_cache,
-        explicit_cursor_filter,
+        context.cursor_sync_result.as_ref(),
+        context.had_cursor_cache,
+        context.explicit_cursor_filter,
     );
 
-    let processing_time_ms = start.elapsed().as_millis();
+    let processing_time_ms = context.start.elapsed().as_millis();
 
     if json {
         #[derive(serde::Serialize)]
@@ -3254,14 +3301,14 @@ fn run_hourly_report(
                 .collect(),
             total_cost: report.total_cost,
             processing_time_ms: report.processing_time_ms,
-            warnings: cursor_setup_warnings,
+            warnings: context.cursor_setup_warnings,
         };
 
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         use comfy_table::{Cell, CellAlignment, Color, ContentArrangement, Table};
 
-        emit_cursor_setup_warnings(&cursor_setup_warnings);
+        emit_cursor_setup_warnings(&context.cursor_setup_warnings);
         let term_width = crossterm::terminal::size()
             .map(|(w, _)| w as usize)
             .unwrap_or(120);
@@ -3414,7 +3461,7 @@ fn run_hourly_report(
 
         // Title
         use colored::Colorize;
-        let title = if let Some(ref range) = date_range {
+        let title = if let Some(ref range) = context.date_range {
             format!("Hourly Usage ({})", range)
         } else {
             "Hourly Usage".to_string()
@@ -4065,7 +4112,8 @@ fn run_clients_command(json: bool, home_dir: Option<String>) -> Result<()> {
     } else {
         Vec::new()
     };
-    let built_in_extra_paths = built_in_extra_scan_paths_for(&home_dir_str, &all_clients);
+    let built_in_extra_paths =
+        built_in_extra_scan_paths_for(&home_dir_str, &all_clients, use_env_roots);
     let settings_extra_dirs = extra_scan_paths_for(&scanner_settings, &all_clients);
     let copilot_exporter_path =
         tokscale_core::copilot_exporter_path_with_env_strategy(use_env_roots);
@@ -4200,7 +4248,7 @@ fn run_clients_command(json: bool, home_dir: Option<String>) -> Result<()> {
                 ));
 
                 let diagnostics = if client == ClientId::Claude {
-                    claude_diagnostics::diagnostics_for_clients_row(&home_dir)
+                    claude_diagnostics::diagnostics_for_clients_row(&home_dir, use_env_roots)
                 } else {
                     Vec::new()
                 };
@@ -4990,48 +5038,30 @@ fn run_time_metrics_report(
     json: bool,
     home_dir: Option<String>,
     clients: Option<Vec<String>>,
-    since: Option<String>,
-    until: Option<String>,
-    year: Option<String>,
+    date: &DateRangeFlags,
     no_spinner: bool,
 ) -> Result<()> {
     use tokio::runtime::Runtime;
-    use tokscale_core::{get_time_metrics_report, GroupBy, ReportOptions};
+    use tokscale_core::{get_time_metrics_report, GroupBy};
 
-    let had_cursor_cache = has_cursor_usage_cache_for_report(&home_dir);
-    let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
-    let spinner = if no_spinner {
-        None
-    } else {
-        Some(LightSpinner::start("Computing time metrics..."))
-    };
-    let cursor_sync_result = auto_sync_cursor_for_local_report(&home_dir, &clients);
-    let cursor_setup_warnings = setup_warnings_for_report(&home_dir, &clients);
-    let use_env_roots = use_env_roots(&home_dir);
+    let mut context = LocalReportContext::new(
+        home_dir,
+        clients,
+        date,
+        (!no_spinner).then_some("Computing time metrics..."),
+    );
     let rt = Runtime::new()?;
     let report = rt
         .block_on(async {
-            get_time_metrics_report(ReportOptions {
-                home_dir: home_dir.clone(),
-                use_env_roots,
-                clients,
-                since,
-                until,
-                year,
-                group_by: GroupBy::default(),
-                scanner_settings: tui::settings::load_scanner_settings_for_home(&home_dir),
-            })
-            .await
+            get_time_metrics_report(context.report_options(GroupBy::default())).await
         })
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    if let Some(spinner) = spinner {
-        spinner.stop();
-    }
+    context.stop_spinner();
     emit_cursor_sync_warning(
-        cursor_sync_result.as_ref(),
-        had_cursor_cache,
-        explicit_cursor_filter,
+        context.cursor_sync_result.as_ref(),
+        context.had_cursor_cache,
+        context.explicit_cursor_filter,
     );
 
     let m = &report.metrics;
@@ -5049,11 +5079,11 @@ fn run_time_metrics_report(
         let output = TimeMetricsReportJson {
             metrics: &report.metrics,
             processing_time_ms: report.processing_time_ms,
-            warnings: cursor_setup_warnings,
+            warnings: context.cursor_setup_warnings,
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        emit_cursor_setup_warnings(&cursor_setup_warnings);
+        emit_cursor_setup_warnings(&context.cursor_setup_warnings);
         println!("Session Time Metrics");
         println!("====================");
         println!(
@@ -5099,55 +5129,38 @@ fn run_graph_command(
     output: Option<String>,
     home_dir: Option<String>,
     clients: Option<Vec<String>>,
-    since: Option<String>,
-    until: Option<String>,
-    year: Option<String>,
+    date: &DateRangeFlags,
     benchmark: bool,
     no_spinner: bool,
 ) -> Result<()> {
     use colored::Colorize;
-    use std::time::Instant;
-    use tokscale_core::{generate_local_graph_report, GroupBy, ReportOptions};
+    use tokscale_core::{generate_local_graph_report, GroupBy};
 
     let show_progress = output.is_some() && !no_spinner;
-    let had_cursor_cache = has_cursor_usage_cache_for_report(&home_dir);
-    let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
-    let cursor_sync_result = auto_sync_cursor_for_local_report(&home_dir, &clients);
-    let cursor_setup_warnings = setup_warnings_for_report(&home_dir, &clients);
+    let mut context = LocalReportContext::new(home_dir, clients, date, None);
 
     if show_progress {
         eprintln!("  Scanning session data...");
     }
-    let start = Instant::now();
+    context.restart_timing();
 
     if show_progress {
         eprintln!("  Generating graph data...");
     }
-    let use_env_roots = use_env_roots(&home_dir);
     let rt = tokio::runtime::Runtime::new()?;
     let graph_result = rt
         .block_on(async {
-            generate_local_graph_report(ReportOptions {
-                home_dir: home_dir.clone(),
-                use_env_roots,
-                clients,
-                since,
-                until,
-                year,
-                group_by: GroupBy::default(),
-                scanner_settings: tui::settings::load_scanner_settings_for_home(&home_dir),
-            })
-            .await
+            generate_local_graph_report(context.report_options(GroupBy::default())).await
         })
         .map_err(|e| anyhow::anyhow!(e))?;
     emit_cursor_sync_warning(
-        cursor_sync_result.as_ref(),
-        had_cursor_cache,
-        explicit_cursor_filter,
+        context.cursor_sync_result.as_ref(),
+        context.had_cursor_cache,
+        context.explicit_cursor_filter,
     );
-    emit_cursor_setup_warnings(&cursor_setup_warnings);
+    emit_cursor_setup_warnings(&context.cursor_setup_warnings);
 
-    let processing_time_ms = start.elapsed().as_millis() as u32;
+    let processing_time_ms = context.start.elapsed().as_millis() as u32;
     let output_data = to_ts_token_contribution_data(&graph_result, None, None);
     let json_output = serde_json::to_string_pretty(&output_data)?;
 
@@ -5182,7 +5195,7 @@ fn run_graph_command(
                 "{}",
                 format!("  Processing time: {}ms (Rust native)", processing_time_ms).bright_black()
             );
-            if let Some(sync) = cursor_sync_result {
+            if let Some(sync) = context.cursor_sync_result.as_ref() {
                 if sync.synced {
                     eprintln!(
                         "{}",
@@ -5192,8 +5205,8 @@ fn run_graph_command(
                         )
                         .bright_black()
                     );
-                } else if let Some(err) = sync.error {
-                    if had_cursor_cache {
+                } else if let Some(err) = sync.error.as_ref() {
+                    if context.had_cursor_cache {
                         eprintln!("{}", format!("  Cursor: sync failed - {}", err).yellow());
                     }
                 }
@@ -7410,6 +7423,8 @@ mod tests {
     /// ignores its argument returns the same day for both homes.
     #[test]
     fn test_current_bucket_date_follows_the_home_overrides_pinned_zone() {
+        use chrono::Datelike;
+
         fn home_pinned_to(zone: &str) -> tempfile::TempDir {
             let home = tempfile::TempDir::new().unwrap();
             let config = home.path().join(if cfg!(windows) {
@@ -7432,9 +7447,31 @@ mod tests {
         let kiritimati =
             current_bucket_date(&Some(kiritimati_home.path().to_string_lossy().into_owned()));
         let niue = current_bucket_date(&Some(niue_home.path().to_string_lossy().into_owned()));
-        let report_settings = tui::settings::load_scanner_settings_for_home(&Some(
-            kiritimati_home.path().to_string_lossy().into_owned(),
-        ));
+        let kiritimati_home_path = Some(kiritimati_home.path().to_string_lossy().into_owned());
+        let niue_home_path = Some(niue_home.path().to_string_lossy().into_owned());
+        let month = DateRangeFlags {
+            month: true,
+            ..DateRangeFlags::default()
+        };
+        let kiritimati_settings =
+            tui::settings::load_scanner_settings_for_home(&kiritimati_home_path);
+        let niue_settings = tui::settings::load_scanner_settings_for_home(&niue_home_path);
+        let kiritimati_fixed_date = chrono::NaiveDate::from_ymd_opt(2026, 1, 31).unwrap();
+        let niue_fixed_date = chrono::NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
+        let kiritimati_report_date = ResolvedReportDate::from_current_date(
+            &month,
+            kiritimati_settings,
+            kiritimati_fixed_date,
+        );
+        let niue_report_date =
+            ResolvedReportDate::from_current_date(&month, niue_settings, niue_fixed_date);
+        let report_settings = tui::settings::load_scanner_settings_for_home(&kiritimati_home_path);
+        let today = DateRangeFlags {
+            today: true,
+            ..DateRangeFlags::default()
+        };
+        let kiritimati_today = ResolvedReportDate::new(&today, &kiritimati_home_path);
+        let niue_today = ResolvedReportDate::new(&today, &niue_home_path);
 
         assert_eq!(
             kiritimati,
@@ -7450,6 +7487,56 @@ mod tests {
             report_settings.bucket_timezone.as_deref(),
             Some("Pacific/Kiritimati"),
             "report must rebucket sessions with the --home profile's timezone"
+        );
+        let expected_kiritimati_today = kiritimati.to_string();
+        let expected_niue_today = niue.to_string();
+        assert_eq!(
+            kiritimati_today.until.as_deref(),
+            Some(expected_kiritimati_today.as_str()),
+            "production date resolution must use the --home profile's pinned zone"
+        );
+        assert_eq!(
+            niue_today.until.as_deref(),
+            Some(expected_niue_today.as_str()),
+            "production date resolution must use the --home profile's pinned zone"
+        );
+        assert_ne!(
+            kiritimati_today.until, niue_today.until,
+            "profiles 25 hours apart must resolve today to different dates"
+        );
+        let expected_kiritimati = kiritimati_fixed_date.to_string();
+        let expected_niue = niue_fixed_date.to_string();
+        let expected_kiritimati_start = kiritimati_fixed_date.with_day(1).unwrap().to_string();
+        let expected_niue_start = niue_fixed_date.with_day(1).unwrap().to_string();
+        let expected_kiritimati_label = kiritimati_fixed_date.format("%B %Y").to_string();
+        let expected_niue_label = niue_fixed_date.format("%B %Y").to_string();
+        assert_eq!(
+            kiritimati_report_date.since.as_deref(),
+            Some(expected_kiritimati_start.as_str()),
+            "fixed-date month bounds must use the injected date"
+        );
+        assert_eq!(
+            kiritimati_report_date.until.as_deref(),
+            Some(expected_kiritimati.as_str()),
+            "fixed-date month bounds must use the injected date"
+        );
+        assert_eq!(
+            niue_report_date.since.as_deref(),
+            Some(expected_niue_start.as_str()),
+            "fixed-date month bounds must use the injected date"
+        );
+        assert_eq!(
+            niue_report_date.until.as_deref(),
+            Some(expected_niue.as_str()),
+            "fixed-date month bounds must use the injected date"
+        );
+        assert_eq!(
+            kiritimati_report_date.date_range.as_deref(),
+            Some(expected_kiritimati_label.as_str())
+        );
+        assert_eq!(
+            niue_report_date.date_range.as_deref(),
+            Some(expected_niue_label.as_str())
         );
     }
 
@@ -7768,84 +7855,107 @@ mod tests {
 
     #[test]
     fn test_get_date_range_label_today() {
-        let label = get_date_range_label(&DateRangeFlags {
-            today: true,
-            ..DateRangeFlags::default()
-        });
+        let label = get_date_range_label_for_date(
+            &DateRangeFlags {
+                today: true,
+                ..DateRangeFlags::default()
+            },
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(),
+        );
         assert_eq!(label, Some("Today".to_string()));
     }
 
     #[test]
     fn test_get_date_range_label_yesterday() {
-        let label = get_date_range_label(&DateRangeFlags {
-            yesterday: true,
-            ..DateRangeFlags::default()
-        });
+        let label = get_date_range_label_for_date(
+            &DateRangeFlags {
+                yesterday: true,
+                ..DateRangeFlags::default()
+            },
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(),
+        );
         assert_eq!(label, Some("Yesterday".to_string()));
     }
 
     #[test]
     fn test_get_date_range_label_week() {
-        let label = get_date_range_label(&DateRangeFlags {
-            week: true,
-            ..DateRangeFlags::default()
-        });
+        let label = get_date_range_label_for_date(
+            &DateRangeFlags {
+                week: true,
+                ..DateRangeFlags::default()
+            },
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(),
+        );
         assert_eq!(label, Some("Last 7 days".to_string()));
     }
 
     #[test]
     fn test_get_date_range_label_month_uses_provided_local_date() {
-        let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
         let label = get_date_range_label_for_date(
             &DateRangeFlags {
                 month: true,
                 ..DateRangeFlags::default()
             },
-            today,
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(),
         );
         assert_eq!(label, Some("March 2026".to_string()));
     }
 
     #[test]
     fn test_get_date_range_label_year() {
-        let label = get_date_range_label(&DateRangeFlags {
-            year: Some("2024".to_string()),
-            ..DateRangeFlags::default()
-        });
+        let label = get_date_range_label_for_date(
+            &DateRangeFlags {
+                year: Some("2024".to_string()),
+                ..DateRangeFlags::default()
+            },
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(),
+        );
         assert_eq!(label, Some("2024".to_string()));
     }
 
     #[test]
     fn test_get_date_range_label_custom_since() {
-        let label = get_date_range_label(&DateRangeFlags {
-            since: Some("2024-01-01".to_string()),
-            ..DateRangeFlags::default()
-        });
+        let label = get_date_range_label_for_date(
+            &DateRangeFlags {
+                since: Some("2024-01-01".to_string()),
+                ..DateRangeFlags::default()
+            },
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(),
+        );
         assert_eq!(label, Some("from 2024-01-01".to_string()));
     }
 
     #[test]
     fn test_get_date_range_label_custom_until() {
-        let label = get_date_range_label(&DateRangeFlags {
-            until: Some("2024-12-31".to_string()),
-            ..DateRangeFlags::default()
-        });
+        let label = get_date_range_label_for_date(
+            &DateRangeFlags {
+                until: Some("2024-12-31".to_string()),
+                ..DateRangeFlags::default()
+            },
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(),
+        );
         assert_eq!(label, Some("to 2024-12-31".to_string()));
     }
 
     #[test]
     fn test_get_date_range_label_custom_range() {
-        let label = get_date_range_label(&DateRangeFlags {
-            since: Some("2024-01-01".to_string()),
-            until: Some("2024-12-31".to_string()),
-            ..DateRangeFlags::default()
-        });
+        let label = get_date_range_label_for_date(
+            &DateRangeFlags {
+                since: Some("2024-01-01".to_string()),
+                until: Some("2024-12-31".to_string()),
+                ..DateRangeFlags::default()
+            },
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(),
+        );
         assert_eq!(label, Some("from 2024-01-01 to 2024-12-31".to_string()));
     }
 
     #[test]
     fn test_get_date_range_label_none() {
-        let label = get_date_range_label(&DateRangeFlags::default());
+        let label = get_date_range_label_for_date(
+            &DateRangeFlags::default(),
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(),
+        );
         assert_eq!(label, None);
     }
 

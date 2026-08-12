@@ -598,19 +598,45 @@ fn join_native(root: &str, relative: &str) -> String {
 pub fn built_in_extra_scan_paths_for(
     home_dir: &str,
     enabled: &HashSet<ClientId>,
+    use_env_roots: bool,
 ) -> Vec<(ClientId, PathBuf)> {
     let mut paths = Vec::new();
 
     if enabled.contains(&ClientId::Claude) {
+        // `transcripts` is a sibling of the registered `projects` root, not a
+        // fixed offset from `home_dir` — resolving through the client's own
+        // `root` keeps this in sync with CLAUDE_CONFIG_DIR (#1048-adjacent:
+        // this dir moves whenever the primary root does), and respecting
+        // `use_env_roots` keeps parity with the `Grok` root resolved just
+        // above this function's only caller.
+        let claude_root = ClientId::Claude
+            .data()
+            .root
+            .resolve_with_env_strategy(home_dir, use_env_roots);
         paths.push((
             ClientId::Claude,
-            PathBuf::from(join_native(home_dir, ".claude/transcripts")),
+            PathBuf::from(join_native(&claude_root, "transcripts")),
         ));
         paths.extend(
             crate::cc_mirror::discover_claude_project_roots(Path::new(home_dir))
                 .into_iter()
                 .map(|path| (ClientId::Claude, path)),
         );
+    }
+
+    if enabled.contains(&ClientId::Senpi) && use_env_roots {
+        if let Some(path) =
+            std::env::var_os("SENPI_CODING_AGENT_SESSION_DIR").filter(|path| !path.is_empty())
+        {
+            paths.push((ClientId::Senpi, PathBuf::from(path)));
+        }
+
+        if let Ok(current_dir) = std::env::current_dir() {
+            paths.push((
+                ClientId::Senpi,
+                current_dir.join(".omo/senpi-task/children"),
+            ));
+        }
     }
 
     paths
@@ -1429,7 +1455,7 @@ fn scan_all_clients_with_env_strategy_inner(
         }
     }
 
-    for (client_id, path) in built_in_extra_scan_paths_for(home_dir, &enabled) {
+    for (client_id, path) in built_in_extra_scan_paths_for(home_dir, &enabled, use_env_roots) {
         push_unique_scan_task(&mut tasks, &mut seen_scan_roots, client_id, path);
     }
 
@@ -4527,6 +4553,62 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn test_scan_all_clients_claude_honors_claude_config_dir() {
+        let mut env = EnvGuard::capture(&["CLAUDE_CONFIG_DIR"]);
+
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        // A stray ~/.claude/projects entry must be ignored once
+        // CLAUDE_CONFIG_DIR redirects the client elsewhere.
+        setup_mock_claude_dir(home);
+
+        let custom_root = home.join("custom-claude-config");
+        let custom_projects = custom_root.join("projects").join("myproject");
+        fs::create_dir_all(&custom_projects).unwrap();
+        let custom_conversation = custom_projects.join("conversation.jsonl");
+        File::create(&custom_conversation)
+            .unwrap()
+            .write_all(b"")
+            .unwrap();
+        let custom_transcripts = custom_root.join("transcripts");
+        fs::create_dir_all(&custom_transcripts).unwrap();
+        let custom_transcript = custom_transcripts.join("ses_123456789012345678901234567.jsonl");
+        File::create(&custom_transcript)
+            .unwrap()
+            .write_all(b"")
+            .unwrap();
+
+        env.set("CLAUDE_CONFIG_DIR", custom_root);
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["claude".to_string()],
+            true,
+        );
+
+        assert_eq!(result.get(ClientId::Claude).len(), 2);
+        assert!(
+            result
+                .get(ClientId::Claude)
+                .iter()
+                .any(|p| p == &custom_conversation),
+            "expected {} in {:?}",
+            custom_conversation.display(),
+            result.get(ClientId::Claude)
+        );
+        assert!(
+            result
+                .get(ClientId::Claude)
+                .iter()
+                .any(|p| p == &custom_transcript),
+            "expected {} in {:?}",
+            custom_transcript.display(),
+            result.get(ClientId::Claude)
+        );
+    }
+
+    #[test]
     fn test_scan_all_clients_claude_discovers_cc_mirror_variant_projects() {
         let dir = TempDir::new().unwrap();
         let home = dir.path();
@@ -6394,5 +6476,51 @@ mod tests {
     fn test_cherrystudio_dual_root_dedup_empty_input() {
         let out = dedupe_cherrystudio_transcripts(Vec::new());
         assert!(out.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_senpi_discovers_omo_task_children_in_current_project() {
+        let home_dir = TempDir::new().unwrap();
+        let project_dir = TempDir::new().unwrap();
+        let child_sessions = project_dir
+            .path()
+            .join(".omo/senpi-task/children/task-123/sessions/encoded-cwd");
+        fs::create_dir_all(&child_sessions).unwrap();
+        let child_session = child_sessions.join("child.jsonl");
+        File::create(&child_session).unwrap();
+        let _current_dir = CurrentDirGuard::set(project_dir.path());
+
+        let result =
+            scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
+
+        let canonical_child_session = std::fs::canonicalize(&child_session).unwrap();
+        assert!(
+            result
+                .get(ClientId::Senpi)
+                .iter()
+                .any(|path| std::fs::canonicalize(path).ok()
+                    == Some(canonical_child_session.clone())),
+            "current-project OmO child sessions must be auto-discovered"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_senpi_honors_coding_agent_session_dir() {
+        let home_dir = TempDir::new().unwrap();
+        let redirected_sessions = TempDir::new().unwrap();
+        let redirected_session = redirected_sessions.path().join("redirected.jsonl");
+        File::create(&redirected_session).unwrap();
+        let mut env = EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR"]);
+        env.set("SENPI_CODING_AGENT_SESSION_DIR", redirected_sessions.path());
+
+        let result =
+            scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
+
+        assert!(
+            result.get(ClientId::Senpi).contains(&redirected_session),
+            "SENPI_CODING_AGENT_SESSION_DIR must be scanned"
+        );
     }
 }
