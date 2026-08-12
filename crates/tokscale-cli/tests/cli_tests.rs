@@ -3923,6 +3923,35 @@ fn test_monthly_light_output() {
 }
 
 #[test]
+fn test_monthly_light_title_uses_pinned_bucket_month() {
+    let tmp = create_temp_fixture_dir();
+    write_settings_json(
+        tmp.path(),
+        r#"{"scanner":{"bucketTimezone":"Pacific/Kiritimati"}}"#,
+    );
+    let expected_month =
+        tokscale_core::BucketTimezone::from_pinned_name(Some("Pacific/Kiritimati"))
+            .today()
+            .format("%B %Y")
+            .to_string();
+
+    cmd_with_home(tmp.path())
+        .args([
+            "monthly",
+            "--light",
+            "--client",
+            "opencode",
+            "--no-spinner",
+            "--month",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "Monthly Token Usage Report ({expected_month})"
+        )));
+}
+
+#[test]
 fn test_models_light_with_client_filter() {
     let tmp = create_temp_fixture_dir();
     cmd_with_home(tmp.path())
