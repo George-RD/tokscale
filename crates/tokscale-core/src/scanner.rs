@@ -1340,6 +1340,14 @@ pub fn scan_all_clients_with_env_strategy(
 /// Studio migrated the active transcripts to `Data/Agents/.claude/projects`
 /// (V2) while the legacy `CherryStudio/.claude/projects` (V1) root keeps the
 /// untransferred history. V2 receives new writes, so it wins on a conflict.
+fn is_cherrystudio_v2_root(root: &Path) -> bool {
+    root.components()
+        .rev()
+        .zip(["projects", ".claude", "Agents", "Data"])
+        .all(|(component, expected)| component.as_os_str().eq_ignore_ascii_case(expected))
+        && root.components().count() >= 4
+}
+
 fn dedupe_cherrystudio_transcripts(files: Vec<(bool, String, PathBuf)>) -> Vec<PathBuf> {
     let v2_keys: HashSet<&String> = files
         .iter()
@@ -2233,8 +2241,7 @@ fn scan_all_clients_with_env_strategy_inner(
     for (client_id, root, files) in scan_results {
         for file in files {
             if client_id == ClientId::CherryStudio {
-                let is_v2 =
-                    root.to_lowercase().contains("data") && root.to_lowercase().contains("agents");
+                let is_v2 = is_cherrystudio_v2_root(Path::new(&root));
                 let rel = file
                     .strip_prefix(&root)
                     .unwrap_or(&file)
@@ -6427,6 +6434,35 @@ mod tests {
         restore_env("GJC_CONFIG_DIR", prev_config);
         restore_env("PI_CONFIG_DIR", prev_pi);
         restore_env("XDG_DATA_HOME", prev_xdg);
+    }
+
+    #[test]
+    fn test_cherrystudio_dual_root_dedup_ignores_hostile_home_ancestor_names() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("data-and-agents-ancestor/home");
+        let v1_root = home.join(".config/CherryStudio/.claude/projects");
+        let v2_root = home.join(".config/CherryStudio/Data/Agents/.claude/projects");
+        let relative_session = Path::new("workspace/session.jsonl");
+        let v1_session = v1_root.join(relative_session);
+        let v2_session = v2_root.join(relative_session);
+        let transcript = "{\"type\":\"assistant\"}\n";
+
+        fs::create_dir_all(v1_session.parent().unwrap()).unwrap();
+        fs::create_dir_all(v2_session.parent().unwrap()).unwrap();
+        fs::write(&v1_session, transcript).unwrap();
+        fs::write(&v2_session, transcript).unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["cherrystudio".to_string()],
+            false,
+        );
+
+        assert_eq!(
+            result.get(ClientId::CherryStudio),
+            &vec![v2_session],
+            "the V2 copy must win and the V1 copy must not be counted when the --home path has arbitrary data/agents substrings"
+        );
     }
 
     #[test]
