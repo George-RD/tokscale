@@ -785,11 +785,15 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         }
     }
 
+    /// Takes the entry's messages by value: the cache handed this entry to
+    /// its one consumer (see `SourceMessageCache::take`), so cloning here
+    /// would put a second copy of the transcript alongside the first for no
+    /// reason.
     fn cached_messages(
-        cached: &message_cache::CachedSourceEntry,
+        cached: message_cache::CachedSourceEntry,
         pricing: Option<&pricing::PricingService>,
     ) -> Vec<UnifiedMessage> {
-        let mut messages = cached.messages.clone();
+        let mut messages = cached.messages;
         apply_pricing_to_messages(&mut messages, pricing);
         messages
     }
@@ -973,7 +977,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
             Option<&message_cache::SourceFingerprint>,
         ) -> Option<message_cache::FingerprintStatus>,
     {
-        let cached = source_cache.get(identity, path);
+        let mut cached = source_cache.take(identity, path);
         // An entry written before retention provenance existed cannot say
         // which of its rows the live transcript already dropped, so serving it
         // warm presents a retained copy of a response as a live one — and the
@@ -984,13 +988,14 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         // the entry back with the provenance marker, so the next scan is a
         // plain warm hit.
         let rebuild_retention_provenance = cached
+            .as_ref()
             .is_some_and(message_cache::CachedSourceEntry::needs_retention_provenance_migration);
         #[cfg(test)]
         if rebuild_retention_provenance {
             RETENTION_PROVENANCE_REBUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let Some(fingerprint_status) =
-            fingerprint_from_path(path, cached.map(|entry| &entry.fingerprint))
+            fingerprint_from_path(path, cached.as_ref().map(|entry| &entry.fingerprint))
         else {
             let (mut messages, _) = parse(path, None);
             apply_pricing_to_messages(&mut messages, pricing);
@@ -1004,34 +1009,39 @@ fn parse_all_messages_with_pricing_with_cache_policy(
 
         let fingerprint = match fingerprint_status {
             message_cache::FingerprintStatus::Unchanged => {
-                let Some(cached) = cached else {
+                let Some(entry) = cached.take() else {
                     unreachable!("an uncached source always builds a complete fingerprint")
                 };
-                if !rebuild_retention_provenance && !cached.messages.is_empty() {
+                if !rebuild_retention_provenance && !entry.messages.is_empty() {
+                    let retained_message_keys = entry.retained_message_keys();
                     return CachedParseOutcome {
-                        messages: cached_messages(cached, pricing),
-                        retained_message_keys: cached.retained_message_keys(),
+                        messages: cached_messages(entry, pricing),
+                        retained_message_keys,
                         cache_entry: None,
                         invalidate_cache: false,
                     };
                 }
-                cached.fingerprint.clone()
+                let fingerprint = entry.fingerprint.clone();
+                cached = Some(entry);
+                fingerprint
             }
             message_cache::FingerprintStatus::Changed(fingerprint) => fingerprint,
         };
 
-        if let Some(cached) = cached {
+        if let Some(entry) = cached.take() {
             if !rebuild_retention_provenance
-                && cached.fingerprint == fingerprint
-                && !cached.messages.is_empty()
+                && entry.fingerprint == fingerprint
+                && !entry.messages.is_empty()
             {
+                let retained_message_keys = entry.retained_message_keys();
                 return CachedParseOutcome {
-                    messages: cached_messages(cached, pricing),
-                    retained_message_keys: cached.retained_message_keys(),
+                    messages: cached_messages(entry, pricing),
+                    retained_message_keys,
                     cache_entry: None,
                     invalidate_cache: false,
                 };
             }
+            cached = Some(entry);
         }
 
         let (mut messages, cacheable) = parse(path, Some(&fingerprint));
@@ -1048,7 +1058,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         } = history
         {
             if cacheable {
-                if let Some(cached) = cached {
+                if let Some(cached) = cached.as_ref() {
                     retained_message_keys = retain_observed_messages(
                         &mut messages,
                         &cached.messages,
@@ -1324,10 +1334,10 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         sessions::prime_agent::PrimeFileAccounting,
     ) {
         let identity = message_cache::CacheIdentity::for_client(ClientId::PrimeAgent);
-        let cached = source_cache.get(identity, path);
+        let cached = source_cache.take(identity, path);
         let Some(fingerprint_status) = message_cache::SourceFingerprint::check_path(
             path,
-            cached.map(|entry| &entry.fingerprint),
+            cached.as_ref().map(|entry| &entry.fingerprint),
         ) else {
             let (messages, accounting) =
                 sessions::prime_agent::parse_prime_agent_file_with_accounting(path);
@@ -1336,6 +1346,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
 
         let mut fingerprint = match fingerprint_status {
             message_cache::FingerprintStatus::Unchanged => cached
+                .as_ref()
                 .expect("an uncached source always builds a complete fingerprint")
                 .fingerprint
                 .clone(),
@@ -1344,7 +1355,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
 
         if let Some(cached) = cached {
             if cached.fingerprint == fingerprint && !cached.messages.is_empty() {
-                if let Some(accounting) = cached.prime_accounting.as_ref() {
+                if let Some(accounting) = cached.prime_accounting.clone() {
                     // Prime's accounting is byte-coupled to its messages. Warm
                     // v5 scans therefore hash the complete transcript before a
                     // hit, while still avoiding JSON decode and accounting walk.
@@ -1357,7 +1368,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
                                     cache_entry: None,
                                     invalidate_cache: false,
                                 },
-                                accounting.clone(),
+                                accounting,
                             );
                         }
                         Some(refreshed) => fingerprint = refreshed,
@@ -1382,13 +1393,13 @@ fn parse_all_messages_with_pricing_with_cache_policy(
                     );
                     match message_cache::SourceFingerprint::from_path(path) {
                         Some(refreshed) if refreshed == fingerprint => {
+                            let cache_entry =
+                                cached.clone().with_prime_accounting(accounting.clone());
                             return (
                                 CachedParseOutcome {
                                     messages: cached_messages(cached, pricing),
                                     retained_message_keys: HashSet::new(),
-                                    cache_entry: Some(
-                                        cached.clone().with_prime_accounting(accounting.clone()),
-                                    ),
+                                    cache_entry: Some(cache_entry),
                                     invalidate_cache: false,
                                 },
                                 accounting,
@@ -1436,7 +1447,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     ) -> CachedParseOutcome {
         let identity = message_cache::CacheIdentity::for_client(ClientId::Codex);
         let is_headless = is_headless_path(path, headless_roots);
-        let cached = source_cache.get(identity, path);
+        let cached = source_cache.take(identity, path);
         if cached.is_none() {
             // The post-parse cache build computes the authoritative fingerprint
             // after reading the file. Avoid hashing an uncached source here
@@ -1445,12 +1456,13 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         }
         let Some(fingerprint_status) = message_cache::SourceFingerprint::check_path(
             path,
-            cached.map(|entry| &entry.fingerprint),
+            cached.as_ref().map(|entry| &entry.fingerprint),
         ) else {
             return parse_full_log_source(path, pricing, is_headless);
         };
         let fingerprint = match fingerprint_status {
             message_cache::FingerprintStatus::Unchanged => cached
+                .as_ref()
                 .expect("an uncached source always builds a complete fingerprint")
                 .fingerprint
                 .clone(),
@@ -1466,10 +1478,10 @@ fn parse_all_messages_with_pricing_with_cache_policy(
             };
 
             if cached.fingerprint == fingerprint {
-                if message_cache::codex_cache_entry_matches_fingerprint(cached, &fingerprint) {
+                if message_cache::codex_cache_entry_matches_fingerprint(&cached, &fingerprint) {
                     return CachedParseOutcome {
                         messages: finalize_codex_messages(
-                            cached.messages.clone(),
+                            cached.messages,
                             pricing,
                             is_headless,
                             &cached.fallback_timestamp_indices,
@@ -1504,7 +1516,7 @@ fn parse_all_messages_with_pricing_with_cache_policy(
                                 .iter()
                                 .map(|index| existing_len + index),
                         );
-                        raw_messages.extend(parsed.messages.clone());
+                        raw_messages.extend(parsed.messages);
                         let cache_entry = build_codex_cache_entry(
                             path,
                             raw_messages.clone(),
@@ -1545,12 +1557,12 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         scanner_settings,
     );
     let headless_roots = scanner::headless_roots_with_env_strategy(home_dir, use_env_roots);
+    // `load` reads no shard: each namespace is deserialized the first time a
+    // lane asks for one of its sources, and entries whose file is gone are
+    // pruned as that namespace loads. A scan therefore pays for the clients it
+    // actually reads instead of for every client the machine has ever cached.
     let mut source_cache = match cache_policy {
-        SourceCachePolicy::Persistent => {
-            let mut cache = message_cache::SourceMessageCache::load();
-            cache.prune_missing_files();
-            cache
-        }
+        SourceCachePolicy::Persistent => message_cache::SourceMessageCache::load(),
         SourceCachePolicy::InMemory => message_cache::SourceMessageCache::default(),
     };
     let mut all_messages: Vec<UnifiedMessage> = Vec::new();
@@ -6919,10 +6931,9 @@ mod tests {
             // before this one would have left on disk.
             let mut cache = message_cache::SourceMessageCache::load();
             let legacy: Vec<message_cache::CachedSourceEntry> = cache
-                .entries
-                .values()
-                .filter(|entry| entry.is_claude_namespace())
-                .cloned()
+                .all_entries()
+                .into_iter()
+                .filter(message_cache::CachedSourceEntry::is_claude_namespace)
                 .collect();
             assert_eq!(legacy.len(), 2, "both transcripts must be cached");
             assert!(
@@ -6979,10 +6990,10 @@ mod tests {
             );
 
             let migrated = message_cache::SourceMessageCache::load();
-            let claude_entries: Vec<&message_cache::CachedSourceEntry> = migrated
-                .entries
-                .values()
-                .filter(|entry| entry.is_claude_namespace())
+            let claude_entries: Vec<message_cache::CachedSourceEntry> = migrated
+                .all_entries()
+                .into_iter()
+                .filter(message_cache::CachedSourceEntry::is_claude_namespace)
                 .collect();
             assert_eq!(claude_entries.len(), 2);
             assert!(
@@ -8727,7 +8738,7 @@ mod tests {
                     message_cache::CacheIdentity::for_client(ClientId::Codex),
                     &path,
                 )
-                .and_then(|entry| entry.codex_incremental.as_ref())
+                .and_then(|entry| entry.codex_incremental)
                 .is_some());
 
             std::thread::sleep(std::time::Duration::from_millis(5));
