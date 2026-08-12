@@ -281,6 +281,13 @@ impl UsageOutput {
 // ── Cache ──
 
 fn cache_path() -> Option<std::path::PathBuf> {
+    // Unit tests must opt into a temporary config root before any cache
+    // helper can create, write, or remove a subscription cache.
+    #[cfg(test)]
+    if !crate::paths::is_config_dir_overridden() {
+        return None;
+    }
+
     let dir = crate::paths::get_cache_dir();
     if std::fs::create_dir_all(&dir).is_err() {
         return None;
@@ -545,6 +552,78 @@ pub fn run(json: bool, _light: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use std::ffi::{OsStr, OsString};
+    use tempfile::TempDir;
+
+    struct TestEnvGuard(Vec<(&'static str, Option<OsString>)>);
+
+    impl TestEnvGuard {
+        fn new() -> Self {
+            Self(Vec::new())
+        }
+
+        fn capture(&mut self, key: &'static str) {
+            if !self.0.iter().any(|(captured, _)| *captured == key) {
+                self.0.push((key, std::env::var_os(key)));
+            }
+        }
+
+        fn set(&mut self, key: &'static str, value: impl AsRef<OsStr>) {
+            self.capture(key);
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        fn remove(&mut self, key: &'static str) {
+            self.capture(key);
+            unsafe { std::env::remove_var(key) };
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..).rev() {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn subscription_cache_helpers_are_noop_without_explicit_override() {
+        let temp = TempDir::new().unwrap();
+        let mut env = TestEnvGuard::new();
+        env.set("HOME", temp.path());
+        env.set("XDG_CONFIG_HOME", temp.path().join(".xdg-config"));
+        env.remove("TOKSCALE_CONFIG_DIR");
+
+        assert!(cache_path().is_none());
+        save_cache(&[sample_output("Codex")]);
+        clear_cache();
+        assert!(!temp.path().join(".xdg-config/tokscale/cache").exists());
+    }
+
+    #[test]
+    #[serial]
+    fn subscription_cache_helpers_use_explicit_override_root() {
+        let temp = TempDir::new().unwrap();
+        let mut env = TestEnvGuard::new();
+        env.set("TOKSCALE_CONFIG_DIR", temp.path());
+        let data = vec![sample_output("Codex")];
+        let expected = temp.path().join("cache/subscription-usage-cache.json");
+
+        assert_eq!(cache_path(), Some(expected.clone()));
+        save_cache(&data);
+        assert_eq!(load_cache().unwrap().len(), 1);
+        assert!(expected.exists());
+        clear_cache();
+        assert!(!expected.exists());
+    }
 
     #[test]
     fn usage_output_display_name_includes_account_label() {
