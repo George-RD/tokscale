@@ -9858,6 +9858,129 @@ mod tests {
         );
     }
 
+    /// Prefix probing and provider-tag aliases are useful lookup fallbacks,
+    /// not proof that the recorded provider used the candidate's billing
+    /// endpoint. Both stay estimate-only at the submission boundary.
+    #[test]
+    fn submission_excludes_provider_prefix_and_cross_endpoint_alias_estimates() {
+        let litellm = HashMap::from([
+            (
+                "anthropic/atlas-chat".to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(1e-6),
+                    output_cost_per_token: Some(2e-6),
+                    ..Default::default()
+                },
+            ),
+            (
+                "vertex_ai/vertex-chat".to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(3e-6),
+                    output_cost_per_token: Some(6e-6),
+                    ..Default::default()
+                },
+            ),
+            (
+                "vertex_ai/accounts/anthropic/models/vertex-chat".to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(3e-6),
+                    output_cost_per_token: Some(6e-6),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let usage = TokenBreakdown {
+            input: 100,
+            output: 50,
+            ..Default::default()
+        };
+        let messages = vec![
+            UnifiedMessage::new(
+                "synthetic",
+                "atlas-chat",
+                "synthetic",
+                "provider-prefix",
+                1_736_510_400_000,
+                usage.clone(),
+                0.0,
+            ),
+            UnifiedMessage::new(
+                "synthetic",
+                "vertex-chat",
+                "anthropic",
+                "cross-endpoint-alias",
+                1_736_510_400_001,
+                usage.clone(),
+                0.0,
+            ),
+            UnifiedMessage::new(
+                "synthetic",
+                "accounts/anthropic/models/vertex-chat",
+                "anthropic",
+                "scoped-cross-endpoint-alias",
+                1_736_510_400_002,
+                usage,
+                0.0,
+            ),
+        ];
+
+        let graph = build_graph_from_messages(
+            messages,
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("unsafe estimates must be excluded, not abort the graph");
+
+        assert!(graph.contributions.is_empty());
+        assert_eq!(graph.unpriced_submission_exclusions.len(), 3);
+        for exclusion in graph.unpriced_submission_exclusions {
+            assert_eq!(exclusion.reason, UNVERIFIED_PROVIDER_IDENTITY_REASON);
+        }
+
+        // Source-constrained OpenRouter uses a separate scoped wrapper. Keep a
+        // graph-level guard with only that source loaded so it cannot regress
+        // independently from the auto/LiteLLM path above.
+        let openrouter_pricing = pricing::PricingService::new(
+            HashMap::new(),
+            HashMap::from([(
+                "vertex_ai/accounts/anthropic/models/vertex-chat".to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(3e-6),
+                    output_cost_per_token: Some(6e-6),
+                    ..Default::default()
+                },
+            )]),
+        );
+        let openrouter_graph = build_graph_from_messages(
+            vec![UnifiedMessage::new(
+                "synthetic",
+                "accounts/anthropic/models/vertex-chat",
+                "anthropic",
+                "openrouter-scoped-cross-endpoint-alias",
+                1_736_510_400_003,
+                TokenBreakdown {
+                    input: 100,
+                    output: 50,
+                    ..Default::default()
+                },
+                0.0,
+            )],
+            Some(&openrouter_pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("the OpenRouter alias estimate must be excluded");
+        assert!(openrouter_graph.contributions.is_empty());
+        assert_eq!(
+            openrouter_graph.unpriced_submission_exclusions[0].reason,
+            UNVERIFIED_PROVIDER_IDENTITY_REASON
+        );
+    }
+
     /// A fuzzy lookup with one candidate is excluded because nothing proves
     /// the priced key names the model that was used — not because candidates
     /// disagreed. There is only one candidate, so it cannot disagree with

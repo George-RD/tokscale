@@ -208,10 +208,10 @@ impl ResolutionEvidence {
     /// disagreed when the lookup only ever saw one.
     pub fn submission_safety_gap(&self) -> Option<SubmissionSafetyGap> {
         match self.kind {
-            // A model-part fallback starts from a bare id and borrows a
-            // provider-qualified row. Matching the terminal model spelling
-            // does not establish that the request used that provider's price.
-            ResolutionKind::ModelPart => {
+            // These fallbacks start from a bare id and add or borrow a
+            // provider-qualified row. Matching the model spelling alone does
+            // not establish that the request used that provider's price.
+            ResolutionKind::ModelPart | ResolutionKind::ProviderPrefix => {
                 return Some(SubmissionSafetyGap::UnverifiedProviderIdentity);
             }
             ResolutionKind::Fuzzy | ResolutionKind::ProviderScoped => {}
@@ -652,7 +652,7 @@ impl PricingLookup {
 
     fn lookup_auto(&self, model_id: &str, provider_id: Option<&str>) -> Option<LookupResult> {
         if let Some(result) = self.lookup_provider_scoped_path(model_id, provider_id) {
-            return Some(result.with_kind(ResolutionKind::ProviderScoped));
+            return Some(scope_resolution_to_provider(result, model_id));
         }
         if parse_provider_scoped_model_path(model_id).is_some() {
             return None;
@@ -976,7 +976,7 @@ impl PricingLookup {
         provider_id: Option<&str>,
     ) -> Option<LookupResult> {
         if let Some(result) = self.lookup_provider_scoped_path_litellm(model_id, provider_id) {
-            return Some(result.with_kind(ResolutionKind::ProviderScoped));
+            return Some(scope_resolution_to_provider(result, model_id));
         }
         if parse_provider_scoped_model_path(model_id).is_some() {
             return None;
@@ -1012,7 +1012,7 @@ impl PricingLookup {
         provider_id: Option<&str>,
     ) -> Option<LookupResult> {
         if let Some(result) = self.lookup_provider_scoped_path_openrouter(model_id, provider_id) {
-            return Some(result.with_kind(ResolutionKind::ProviderScoped));
+            return Some(scope_resolution_to_provider(result, model_id));
         }
         if parse_provider_scoped_model_path(model_id).is_some() {
             return None;
@@ -2794,6 +2794,22 @@ fn model_prefix_matches_provider(model_id: &str, provider_id: Option<&str>) -> b
     }
 }
 
+fn scope_resolution_to_provider(mut result: LookupResult, model_id: &str) -> LookupResult {
+    let Some(scoped) = parse_provider_scoped_model_path(model_id) else {
+        return result;
+    };
+
+    // The scoped path asserts an endpoint, but a canonical-tag alias can still
+    // make its terminal fallback land on another endpoint's root. Preserve the
+    // weaker evidence in that case instead of laundering it as provider-scoped.
+    result.evidence.kind = if key_root_matches_provider_hint(&result.matched_key, scoped.provider) {
+        ResolutionKind::ProviderScoped
+    } else {
+        ResolutionKind::ModelPart
+    };
+    result
+}
+
 fn parse_provider_scoped_model_path(model_id: &str) -> Option<ProviderScopedModelPath<'_>> {
     let rest = model_id.strip_prefix("accounts/")?;
     let (provider, rest) = rest.split_once('/')?;
@@ -2946,9 +2962,9 @@ fn choose_best_source_result_with_models_dev(
     }
 }
 
-/// Resolve an exact model part only among keys matched by the explicit
-/// provider hint. This is provider-scoped evidence, unlike the unhinted
-/// cross-provider model-part indexes.
+/// Resolve an exact model part among keys matched by the provider hint.
+/// Canonical tag aliases keep endpoint-related candidates reachable for
+/// estimates, but only a raw root match is provider-scoped evidence.
 fn exact_match_with_provider_prefixes(
     model_id: &str,
     provider_id: Option<&str>,
@@ -2972,14 +2988,25 @@ fn exact_match_with_provider_prefixes(
         return None;
     }
 
-    select_best_match(
+    let result = select_best_match(
         &matches,
         dataset,
         source,
         Some(provider_id),
-        ResolutionKind::ProviderScoped,
+        ResolutionKind::ModelPart,
         model_id,
-    )
+    )?;
+
+    // Canonical provider tags deliberately keep endpoint aliases reachable for
+    // estimates (notably `anthropic` <-> `vertex_ai`). Only a candidate whose
+    // top-level endpoint actually matches the hint proves provider identity.
+    // Otherwise this remains the same estimate-only ModelPart evidence as an
+    // unhinted cross-provider fallback.
+    if key_root_matches_provider_hint(&result.matched_key, provider_id) {
+        Some(result.with_kind(ResolutionKind::ProviderScoped))
+    } else {
+        Some(result)
+    }
 }
 
 #[cfg(test)]
@@ -4101,6 +4128,8 @@ mod tests {
             "fireworks_ai/accounts/fireworks/models/deepseek-v4-pro"
         );
         assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.evidence.kind, ResolutionKind::ProviderScoped);
+        assert!(result.evidence.is_submission_safe());
     }
 
     #[test]
@@ -4122,6 +4151,8 @@ mod tests {
 
         assert_eq!(result.matched_key, "fireworks_ai/deepseek-v4-pro");
         assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.evidence.kind, ResolutionKind::ProviderScoped);
+        assert!(result.evidence.is_submission_safe());
     }
 
     #[test]
@@ -4209,6 +4240,98 @@ mod tests {
             Some(SubmissionSafetyGap::UnverifiedProviderIdentity)
         );
         assert!(!result.evidence.is_submission_safe());
+    }
+
+    #[test]
+    fn unhinted_provider_prefix_remains_visible_but_is_not_submission_safe() {
+        let litellm = HashMap::from([(
+            "anthropic/atlas-chat".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(1e-6),
+                output_cost_per_token: Some(2e-6),
+                ..Default::default()
+            },
+        )]);
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("atlas-chat", Some("synthetic"))
+            .expect("reporting should retain the provider-prefix estimate");
+
+        assert_eq!(result.matched_key, "anthropic/atlas-chat");
+        assert_eq!(result.evidence.kind, ResolutionKind::ProviderPrefix);
+        assert_eq!(
+            result.evidence.submission_safety_gap(),
+            Some(SubmissionSafetyGap::UnverifiedProviderIdentity)
+        );
+        assert!(!result.evidence.is_submission_safe());
+    }
+
+    #[test]
+    fn provider_hint_alias_does_not_verify_another_endpoint_root() {
+        let litellm = HashMap::from([(
+            "vertex_ai/atlas-chat".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(1e-6),
+                output_cost_per_token: Some(2e-6),
+                ..Default::default()
+            },
+        )]);
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+
+        let anthropic = lookup
+            .lookup_with_provider("atlas-chat", Some("anthropic"))
+            .expect("the Vertex alias remains available as an estimate");
+        assert_eq!(anthropic.matched_key, "vertex_ai/atlas-chat");
+        assert_eq!(anthropic.evidence.kind, ResolutionKind::ModelPart);
+        assert!(!anthropic.evidence.is_submission_safe());
+
+        let vertex = lookup
+            .lookup_with_provider("atlas-chat", Some("vertex_ai"))
+            .expect("the literal Vertex endpoint should resolve");
+        assert_eq!(vertex.matched_key, "vertex_ai/atlas-chat");
+        assert_eq!(vertex.evidence.kind, ResolutionKind::ProviderScoped);
+        assert!(vertex.evidence.is_submission_safe());
+    }
+
+    #[test]
+    fn scoped_provider_path_does_not_verify_another_endpoint_root() {
+        let vertex_row = ModelPricing {
+            input_cost_per_token: Some(1e-6),
+            output_cost_per_token: Some(2e-6),
+            ..Default::default()
+        };
+        let litellm = HashMap::from([
+            ("vertex_ai/atlas-chat".to_string(), vertex_row.clone()),
+            (
+                "vertex_ai/accounts/anthropic/models/atlas-chat".to_string(),
+                vertex_row.clone(),
+            ),
+        ]);
+        let openrouter = HashMap::from([(
+            "vertex_ai/accounts/anthropic/models/atlas-chat".to_string(),
+            vertex_row,
+        )]);
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+        for source in [None, Some("litellm"), Some("openrouter")] {
+            let result = lookup
+                .lookup_with_source_and_provider(
+                    "accounts/anthropic/models/atlas-chat",
+                    source,
+                    Some("anthropic"),
+                )
+                .unwrap_or_else(|| {
+                    panic!("the {source:?} cross-endpoint row remains available as an estimate")
+                });
+
+            assert_eq!(
+                result.matched_key,
+                "vertex_ai/accounts/anthropic/models/atlas-chat"
+            );
+            assert_eq!(result.evidence.kind, ResolutionKind::ModelPart);
+            assert!(!result.evidence.is_submission_safe());
+        }
     }
 
     #[test]
