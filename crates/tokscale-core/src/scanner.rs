@@ -634,7 +634,7 @@ pub fn built_in_extra_scan_paths_for(
         if let Ok(current_dir) = std::env::current_dir() {
             paths.push((
                 ClientId::Senpi,
-                current_dir.join(".omo/senpi-task/children"),
+                current_dir.join(".omo").join("senpi-task").join("children"),
             ));
         }
     }
@@ -2230,13 +2230,11 @@ fn scan_all_clients_with_env_strategy_inner(
         })
         .collect();
 
-    // Aggregate results, deduplicating file paths across overlapping directories
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    // Cherry Studio keeps the same session files under both the V1
-    // (`CherryStudio/.claude/projects`) and V2 (`CherryStudio/Data/Agents/
-    // .claude/projects`) roots, with V2 receiving new writes. Collect its
-    // files separately and dedupe by path relative to the scanning root,
-    // preferring the V2 copy of a same-name session.
+    // Aggregate results, deduplicating canonical file paths across overlapping
+    // roots while preserving one copy per client. Cherry Studio's V1 and V2
+    // roots intentionally retain the same relative transcript names, so defer
+    // its path selection until V2 can win over a V1 counterpart.
+    let mut seen: HashSet<(ClientId, PathBuf)> = HashSet::new();
     let mut cherry_files: Vec<(bool, String, PathBuf)> = Vec::new();
     for (client_id, root, files) in scan_results {
         for file in files {
@@ -2248,14 +2246,18 @@ fn scan_all_clients_with_env_strategy_inner(
                     .to_string_lossy()
                     .to_string();
                 cherry_files.push((is_v2, rel, file));
-            } else if seen.insert(file.clone()) {
-                result.get_mut(client_id).push(file);
+            } else {
+                let key = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+                if seen.insert((client_id, key)) {
+                    result.get_mut(client_id).push(file);
+                }
             }
         }
     }
     for file in dedupe_cherrystudio_transcripts(cherry_files) {
-        if seen.insert(file.clone()) {
-            result.get_mut(ClientId::CherryStudio).push(file.clone());
+        let key = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+        if seen.insert((ClientId::CherryStudio, key)) {
+            result.get_mut(ClientId::CherryStudio).push(file);
         }
     }
 
@@ -2268,7 +2270,8 @@ fn scan_all_clients_with_env_strategy_inner(
         result.copilot_vscode_sessions = discover_copilot_vscode_sessions(home_dir, use_env_roots);
 
         if let Some(path) = copilot_exporter_path_with_env_strategy(use_env_roots) {
-            if path.is_file() && seen.insert(path.clone()) {
+            let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if path.is_file() && seen.insert((ClientId::Copilot, key)) {
                 let copilot_files = result.get_mut(ClientId::Copilot);
                 copilot_files.push(path);
                 copilot_files.sort_unstable();
@@ -2404,6 +2407,37 @@ mod tests {
         let result = ScanResult::default();
         assert_eq!(result.total_files(), 0);
         assert!(result.all_files().is_empty());
+    }
+
+    #[test]
+    fn test_overlapping_roots_do_not_suppress_independent_clients() {
+        let dir = TempDir::new().unwrap();
+        let session = dir.path().join("shared.jsonl");
+        File::create(&session).unwrap();
+        let mut settings = ScannerSettings::default();
+        settings
+            .extra_scan_paths
+            .insert("pi".to_string(), vec![dir.path().to_path_buf()]);
+        settings
+            .extra_scan_paths
+            .insert("senpi".to_string(), vec![dir.path().to_path_buf()]);
+
+        let result = scan_all_clients_with_scanner_settings(
+            dir.path().to_str().unwrap(),
+            &["pi".to_string(), "senpi".to_string()],
+            false,
+            &settings,
+        );
+
+        assert_eq!(
+            result.get(ClientId::Pi).as_slice(),
+            std::slice::from_ref(&session)
+        );
+        assert_eq!(
+            result.get(ClientId::Senpi).as_slice(),
+            std::slice::from_ref(&session)
+        );
+        assert_eq!(result.all_files().len(), 2);
     }
 
     #[test]
@@ -6436,12 +6470,68 @@ mod tests {
         restore_env("XDG_DATA_HOME", prev_xdg);
     }
 
+    fn setup_mock_senpi_omo_child(project_dir: &Path) -> PathBuf {
+        let child_session = project_dir
+            .join(".omo/senpi-task/children/task-123/sessions/task-123")
+            .join("child.jsonl");
+        fs::create_dir_all(child_session.parent().unwrap()).unwrap();
+        File::create(&child_session).unwrap();
+        child_session.canonicalize().unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[serial]
+    fn test_senpi_omo_task_children_root_uses_native_separators() {
+        let project_dir = TempDir::new().unwrap();
+        let mut env = EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR"]);
+        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
+        let _current_dir = CurrentDirGuard::set(project_dir.path());
+        let enabled = HashSet::from([ClientId::Senpi]);
+
+        let paths = built_in_extra_scan_paths_for("C:\\Users\\test", &enabled, true);
+        let omo_root = paths
+            .into_iter()
+            .find_map(|(client_id, path)| (client_id == ClientId::Senpi).then_some(path))
+            .expect("Senpi OmO child root must be registered");
+
+        assert_eq!(
+            omo_root,
+            project_dir
+                .path()
+                .join(".omo")
+                .join("senpi-task")
+                .join("children")
+        );
+        assert!(
+            !omo_root.to_string_lossy().contains('/'),
+            "Windows scan root must not contain non-native separators: {}",
+            omo_root.display()
+        );
+    }
+
+    fn explicit_home_app_data_root(home: &Path) -> PathBuf {
+        #[cfg(target_os = "windows")]
+        {
+            home.join("AppData").join("Roaming")
+        }
+        #[cfg(target_os = "macos")]
+        {
+            home.join("Library").join("Application Support")
+        }
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        {
+            home.join(".config")
+        }
+    }
+
     #[test]
     fn test_cherrystudio_dual_root_dedup_ignores_hostile_home_ancestor_names() {
         let temp = TempDir::new().unwrap();
         let home = temp.path().join("data-and-agents-ancestor/home");
-        let v1_root = home.join(".config/CherryStudio/.claude/projects");
-        let v2_root = home.join(".config/CherryStudio/Data/Agents/.claude/projects");
+        let app_data = explicit_home_app_data_root(&home);
+        let v1_root = app_data.join("CherryStudio/.claude/projects");
+        let v2_root = app_data.join("CherryStudio/Data/Agents/.claude/projects");
         let relative_session = Path::new("workspace/session.jsonl");
         let v1_session = v1_root.join(relative_session);
         let v2_session = v2_root.join(relative_session);
@@ -6519,44 +6609,106 @@ mod tests {
     fn test_senpi_discovers_omo_task_children_in_current_project() {
         let home_dir = TempDir::new().unwrap();
         let project_dir = TempDir::new().unwrap();
-        let child_sessions = project_dir
-            .path()
-            .join(".omo/senpi-task/children/task-123/sessions/encoded-cwd");
-        fs::create_dir_all(&child_sessions).unwrap();
-        let child_session = child_sessions.join("child.jsonl");
-        File::create(&child_session).unwrap();
+        let child_session = setup_mock_senpi_omo_child(project_dir.path());
+        let mut env = EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR"]);
+        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
         let _current_dir = CurrentDirGuard::set(project_dir.path());
 
         let result =
             scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
 
-        let canonical_child_session = std::fs::canonicalize(&child_session).unwrap();
-        assert!(
-            result
-                .get(ClientId::Senpi)
-                .iter()
-                .any(|path| std::fs::canonicalize(path).ok()
-                    == Some(canonical_child_session.clone())),
+        let files = result.get(ClientId::Senpi);
+        assert_eq!(
+            files.len(),
+            1,
             "current-project OmO child sessions must be auto-discovered"
         );
+        assert_eq!(files[0].canonicalize().unwrap(), child_session);
     }
 
     #[test]
     #[serial]
-    fn test_senpi_honors_coding_agent_session_dir() {
+    fn test_senpi_honors_independent_coding_agent_session_dir() {
         let home_dir = TempDir::new().unwrap();
+        let project_dir = TempDir::new().unwrap();
+        let child_session = setup_mock_senpi_omo_child(project_dir.path());
         let redirected_sessions = TempDir::new().unwrap();
         let redirected_session = redirected_sessions.path().join("redirected.jsonl");
         File::create(&redirected_session).unwrap();
         let mut env = EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR"]);
         env.set("SENPI_CODING_AGENT_SESSION_DIR", redirected_sessions.path());
+        let _current_dir = CurrentDirGuard::set(project_dir.path());
 
         let result =
             scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
 
-        assert!(
-            result.get(ClientId::Senpi).contains(&redirected_session),
-            "SENPI_CODING_AGENT_SESSION_DIR must be scanned"
-        );
+        let canonical_files: HashSet<PathBuf> = result
+            .get(ClientId::Senpi)
+            .iter()
+            .map(|path| path.canonicalize().unwrap())
+            .collect();
+        assert_eq!(canonical_files.len(), 2);
+        assert!(canonical_files.contains(&child_session));
+        assert!(canonical_files.contains(&redirected_session.canonicalize().unwrap()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_senpi_overlapping_session_roots_return_each_file_once() {
+        let home_dir = TempDir::new().unwrap();
+        let project_dir = TempDir::new().unwrap();
+        let child_session = setup_mock_senpi_omo_child(project_dir.path());
+        let children_dir = project_dir.path().join(".omo/senpi-task/children");
+        let task_dir = children_dir.join("task-123");
+        let exact_session_dir = task_dir.join("sessions/task-123");
+        let mut env = EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR"]);
+        let _current_dir = CurrentDirGuard::set(project_dir.path());
+
+        for env_root in [
+            project_dir.path(),
+            children_dir.as_path(),
+            task_dir.as_path(),
+            exact_session_dir.as_path(),
+            child_session.as_path(),
+        ] {
+            env.set("SENPI_CODING_AGENT_SESSION_DIR", env_root);
+            let result =
+                scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
+            let files = result.get(ClientId::Senpi);
+            assert_eq!(
+                files.len(),
+                1,
+                "overlapping env root {} must not duplicate the child session",
+                env_root.display()
+            );
+            assert_eq!(files[0].canonicalize().unwrap(), child_session);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn test_senpi_symlinked_overlapping_session_root_returns_each_file_once() {
+        use std::os::unix::fs::symlink;
+
+        let home_dir = TempDir::new().unwrap();
+        let project_dir = TempDir::new().unwrap();
+        let child_session = setup_mock_senpi_omo_child(project_dir.path());
+        let symlink_root = project_dir.path().join("redirected-sessions");
+        symlink(
+            project_dir.path().join(".omo/senpi-task/children"),
+            &symlink_root,
+        )
+        .unwrap();
+        let mut env = EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR"]);
+        env.set("SENPI_CODING_AGENT_SESSION_DIR", &symlink_root);
+        let _current_dir = CurrentDirGuard::set(project_dir.path());
+
+        let result =
+            scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
+
+        let files = result.get(ClientId::Senpi);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].canonicalize().unwrap(), child_session);
     }
 }
