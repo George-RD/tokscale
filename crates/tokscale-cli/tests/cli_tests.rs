@@ -8,32 +8,39 @@ use tempfile::TempDir;
 
 // ── Fixture helpers ────────────────────────────────────────────────────────
 
+fn write_canonical_pricing_cache_files(
+    base: &Path,
+    litellm_payload: &str,
+    openrouter_payload: &str,
+    models_dev_payload: &str,
+) {
+    let dir = base.join(".config/tokscale/cache");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("pricing-litellm.json"), litellm_payload).unwrap();
+    fs::write(dir.join("pricing-openrouter.json"), openrouter_payload).unwrap();
+    fs::write(dir.join("pricing-models-dev.json"), models_dev_payload).unwrap();
+}
+
 fn prime_pricing_cache(base: &Path) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
         .as_secs();
     let payload = format!(r#"{{"timestamp":{},"data":{{}}}}"#, now);
-
-    for dir in [
-        base.join("Library/Caches/tokscale"),
-        base.join(".cache/tokscale"),
-        base.join(".config/tokscale/cache"),
-    ] {
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("pricing-litellm.json"), &payload).unwrap();
-        fs::write(dir.join("pricing-openrouter.json"), &payload).unwrap();
-    }
+    let models_dev_payload = format!(
+        r#"{{"timestamp":{},"data":{{"fixture/unused-model":{{"input_cost_per_token":0.000001,"output_cost_per_token":0.000002}}}}}}"#,
+        now
+    );
+    write_canonical_pricing_cache_files(base, &payload, &payload, &models_dev_payload);
 }
 
-// @keep: the empty `data` in prime_pricing_cache is easy to mistake for real pricing.
-/// Prime the LiteLLM cache with an actual priced model.
+// @keep: the sentinel models.dev row in prime_pricing_cache marks the dataset
+// as loaded without pricing any model used by the generic report fixtures.
+/// Prime the cache with an actual priced model for submission tests.
 ///
-/// `prime_pricing_cache` writes `"data":{}`, so the pricing service loads
-/// successfully holding nothing. That is indistinguishable from a total upstream
-/// outage, and the submission path now rejects exclusions made against it. Tests
+/// The generic fixture deliberately has no matching published model, so tests
 /// that need "pricing loaded fine, it just does not cover *this* model" must
-/// prime a non-empty dataset with this.
+/// prime a non-empty dataset with this helper.
 fn prime_pricing_cache_with_a_priced_model(base: &Path) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -44,14 +51,50 @@ fn prime_pricing_cache_with_a_priced_model(base: &Path) {
         now
     );
 
-    for dir in [
-        base.join("Library/Caches/tokscale"),
-        base.join(".cache/tokscale"),
-        base.join(".config/tokscale/cache"),
+    write_canonical_pricing_cache_files(base, &payload, &payload, &payload);
+}
+
+/// Prime a deterministic canonical Sonnet catalog for offline pricing command tests.
+fn prime_canonical_sonnet_pricing_cache(base: &Path, model: &str) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs();
+    let pricing = serde_json::json!({
+        "input_cost_per_token": 0.000003,
+        "output_cost_per_token": 0.000015,
+        "cache_read_input_token_cost": 0.0000003,
+        "cache_creation_input_token_cost": 0.00000375,
+    });
+    let payload = serde_json::to_string(&serde_json::json!({
+        "timestamp": now,
+        "data": serde_json::Map::from_iter([(model.to_owned(), pricing.clone())]),
+    }))
+    .unwrap();
+    let models_dev_payload = serde_json::to_string(&serde_json::json!({
+        "timestamp": now,
+        "data": serde_json::Map::from_iter([(format!("anthropic/{model}"), pricing)]),
+    }))
+    .unwrap();
+    write_canonical_pricing_cache_files(base, &payload, &payload, &models_dev_payload);
+}
+
+#[test]
+fn prime_canonical_sonnet_pricing_cache_escapes_arbitrary_model_names() {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let model = "claude-\"quoted\\model\nnext-line";
+
+    prime_canonical_sonnet_pricing_cache(tmp.path(), model);
+
+    let cache_dir = tmp.path().join(".config/tokscale/cache");
+    for (file, expected_model) in [
+        ("pricing-litellm.json", model.to_owned()),
+        ("pricing-openrouter.json", model.to_owned()),
+        ("pricing-models-dev.json", format!("anthropic/{model}")),
     ] {
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("pricing-litellm.json"), &payload).unwrap();
-        fs::write(dir.join("pricing-openrouter.json"), &payload).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_slice(&fs::read(cache_dir.join(file)).unwrap()).unwrap();
+        assert!(payload["data"].get(&expected_model).is_some());
     }
 }
 
@@ -66,6 +109,7 @@ fn prime_override_pricing_cache(config_dir: &Path) {
     fs::create_dir_all(&cache_dir).unwrap();
     fs::write(cache_dir.join("pricing-litellm.json"), &payload).unwrap();
     fs::write(cache_dir.join("pricing-openrouter.json"), &payload).unwrap();
+    fs::write(cache_dir.join("pricing-models-dev.json"), &payload).unwrap();
 }
 
 /// Create a temporary directory with minimal OpenCode fixture data.
@@ -801,7 +845,19 @@ fn cmd_with_home(tmp: &Path) -> Command {
         .env("XDG_DATA_HOME", tmp.join(".local/share"))
         .env("XDG_CACHE_HOME", tmp.join(".cache"))
         .env("TOKSCALE_CONFIG_DIR", sandbox_config_dir(tmp))
+        // `pricing` intentionally bypasses TOKSCALE_PRICING_CACHE_ONLY; the
+        // loopback proxies below are the offline guarantee for every command.
         .env("TOKSCALE_PRICING_CACHE_ONLY", "1")
+        // Keep cache-only fixtures offline even if a future code path ignores
+        // the cache-only switch or a developer has proxy variables configured.
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "http://127.0.0.1:9")
+        .env("http_proxy", "http://127.0.0.1:9")
+        .env("https_proxy", "http://127.0.0.1:9")
+        .env("all_proxy", "http://127.0.0.1:9")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
         // Clear scan-path overrides inherited from the dev's shell, otherwise a
         // developer who exports e.g. TOKSCALE_EXTRA_DIRS=~/.codex/sessions (for
         // codefuse mirror tracking) makes the scanner read real session data
@@ -826,7 +882,8 @@ fn cmd_with_conflicting_env(tmp: &Path) -> Command {
     cmd.env("HOME", tmp)
         .env("XDG_CONFIG_HOME", tmp.join(".config"))
         .env("XDG_DATA_HOME", tmp.join(".local/share"))
-        .env("XDG_CACHE_HOME", tmp.join(".cache"));
+        .env("XDG_CACHE_HOME", tmp.join(".cache"))
+        .env("TOKSCALE_CONFIG_DIR", sandbox_config_dir(tmp));
     cmd
 }
 
@@ -845,6 +902,11 @@ fn offline_cmd_with_home(tmp: &Path) -> Command {
         .env("HTTP_PROXY", "http://127.0.0.1:9")
         .env("HTTPS_PROXY", "http://127.0.0.1:9")
         .env("ALL_PROXY", "http://127.0.0.1:9")
+        .env("http_proxy", "http://127.0.0.1:9")
+        .env("https_proxy", "http://127.0.0.1:9")
+        .env("all_proxy", "http://127.0.0.1:9")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
         // Clear scan-path overrides (mirrors cmd_with_home)
         .env_remove("TOKSCALE_EXTRA_DIRS")
         .env_remove("TOKSCALE_HEADLESS_DIR")
@@ -868,39 +930,7 @@ fn write_pricing_cache(base: &Path, timestamp: u64) {
     );
     let openrouter = format!(r#"{{"timestamp":{},"data":{{}}}}"#, timestamp);
 
-    // Only the first of these is read back. Every caller of this helper runs
-    // the child through `offline_cmd_with_home`, which sets
-    // `TOKSCALE_CONFIG_DIR`, and `paths::legacy_dirs_cache_dir` and
-    // `paths::legacy_dot_cache_tokscale_dir` both return `None` whenever that
-    // override is set — deliberately, since the override means "this root and
-    // nothing outside it". `pricing::cache::legacy_cache_paths` therefore comes
-    // back empty and the canonical `<config_dir>/cache/` seed is the only one
-    // the binary can find. Deleting it makes all four
-    // `*_offline_uses_stale_pricing_cache_when_available` tests fail; deleting
-    // the other two changes nothing.
-    //
-    // So what these fixtures no longer exercise is the post-#470 legacy
-    // fallback chain itself: no CLI test in this file reaches it, because none
-    // of them run without the override. That path is covered at the unit level
-    // by `pricing::cache::tests::load_falls_back_to_legacy_dirs_cache_path`.
-    // The macOS *settings* half of the same consequence is disclosed on
-    // `sandbox_config_dir` and worked around in
-    // `test_auto_pinning_does_not_shadow_a_legacy_settings_file_it_cannot_open`,
-    // which clears `TOKSCALE_CONFIG_DIR` precisely because the override would
-    // leave it nothing to assert.
-    //
-    // The two legacy directories are still written: they cost nothing, and a
-    // fixture that clears the override the way that test does needs them
-    // present rather than absent.
-    for dir in [
-        base.join(".config/tokscale/cache"),
-        base.join("Library/Caches/tokscale"),
-        base.join(".cache/tokscale"),
-    ] {
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("pricing-litellm.json"), &litellm).unwrap();
-        fs::write(dir.join("pricing-openrouter.json"), &openrouter).unwrap();
-    }
+    write_canonical_pricing_cache_files(base, &litellm, &openrouter, &litellm);
 }
 
 /// Add an assistant message with NO embedded cost to the OpenCode fixture.
@@ -1007,23 +1037,14 @@ fn write_fireworks_pricing_cache(base: &Path) {
         }
     });
 
-    for dir in [
-        base.join(".config/tokscale/cache"),
-        base.join("Library/Caches/tokscale"),
-        base.join(".cache/tokscale"),
-    ] {
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join("pricing-litellm.json"),
-            serde_json::to_vec(&litellm).unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            dir.join("pricing-openrouter.json"),
-            serde_json::to_vec(&openrouter).unwrap(),
-        )
-        .unwrap();
-    }
+    let litellm_payload = serde_json::to_string(&litellm).unwrap();
+    let openrouter_payload = serde_json::to_string(&openrouter).unwrap();
+    write_canonical_pricing_cache_files(
+        base,
+        &litellm_payload,
+        &openrouter_payload,
+        &litellm_payload,
+    );
 }
 
 fn write_fake_credentials(base: &Path) {
@@ -1450,22 +1471,21 @@ fn test_codex_accounts_empty_json() {
 
 #[test]
 fn test_pricing_command_missing_model() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
-    cmd.arg("pricing").assert().failure();
+    let tmp = TempDir::new().expect("failed to create temp home");
+    cmd_with_home(tmp.path()).arg("pricing").assert().failure();
 }
 
 #[test]
 fn test_headless_command_missing_client() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
-    cmd.arg("headless").assert().failure();
+    let tmp = TempDir::new().expect("failed to create temp home");
+    cmd_with_home(tmp.path()).arg("headless").assert().failure();
 }
 
 #[test]
 fn test_headless_command_invalid_client() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
-    cmd.arg("headless")
-        .arg("invalid-client")
-        .arg("test")
+    let tmp = TempDir::new().expect("failed to create temp home");
+    cmd_with_home(tmp.path())
+        .args(["headless", "invalid-client", "test"])
         .assert()
         .failure();
 }
@@ -3386,20 +3406,28 @@ fn test_models_group_by_workspace_model_surfaces_workspace_fields_for_opencode()
 
 #[test]
 fn test_pricing_command_success() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    prime_canonical_sonnet_pricing_cache(tmp.path(), "claude-sonnet-4-20250514");
+    let mut cmd = cmd_with_home(tmp.path());
     cmd.args(["pricing", "claude-sonnet-4-20250514", "--no-spinner"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Pricing for"))
+        .stdout(predicate::str::contains("Pricing for:"))
+        .stdout(predicate::str::contains(
+            "Matched key: claude-sonnet-4-20250514",
+        ))
+        .stdout(predicate::str::contains("Source: LiteLLM"))
         .stdout(predicate::str::contains("Resolution:"))
         .stdout(predicate::str::contains("submission-safe"))
-        .stdout(predicate::str::contains("Input"))
-        .stdout(predicate::str::contains("Output"));
+        .stdout(predicate::str::contains("Input:  $3.00 / 1M tokens"))
+        .stdout(predicate::str::contains("Output: $15.00 / 1M tokens"));
 }
 
 #[test]
 fn test_pricing_command_json() {
-    let output = cargo_bin_cmd!("tokscale")
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    prime_canonical_sonnet_pricing_cache(tmp.path(), "claude-sonnet-4-20250514");
+    let output = cmd_with_home(tmp.path())
         .args([
             "pricing",
             "claude-sonnet-4-20250514",
@@ -3416,19 +3444,26 @@ fn test_pricing_command_json() {
     assert!(json.get("resolution").is_some(), "Missing resolution");
     assert!(json.get("pricing").is_some(), "Missing pricing");
 
+    assert_eq!(json["modelId"], "claude-sonnet-4-20250514");
+    assert_eq!(json["matchedKey"], "claude-sonnet-4-20250514");
+    assert_eq!(json["source"], "LiteLLM");
     let resolution = &json["resolution"];
     assert!(resolution.get("kind").is_some());
     assert!(resolution.get("candidateCount").is_some());
     assert_eq!(resolution["submissionSafe"].as_bool(), Some(true));
 
     let pricing = &json["pricing"];
-    assert!(pricing.get("inputCostPerToken").is_some());
-    assert!(pricing.get("outputCostPerToken").is_some());
+    assert_eq!(pricing["inputCostPerToken"], 0.000003);
+    assert_eq!(pricing["outputCostPerToken"], 0.000015);
+    assert_eq!(pricing["cacheReadInputTokenCost"], 0.0000003);
+    assert_eq!(pricing["cacheCreationInputTokenCost"], 0.00000375);
 }
 
 #[test]
 fn test_pricing_command_with_provider() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    prime_canonical_sonnet_pricing_cache(tmp.path(), "claude-sonnet-4-20250514");
+    let mut cmd = cmd_with_home(tmp.path());
     cmd.args([
         "pricing",
         "claude-sonnet-4-20250514",
@@ -3437,21 +3472,28 @@ fn test_pricing_command_with_provider() {
         "--no-spinner",
     ])
     .assert()
-    .success();
+    .success()
+    .stdout(predicate::str::contains(
+        "Matched key: claude-sonnet-4-20250514",
+    ))
+    .stdout(predicate::str::contains("Source: LiteLLM"))
+    .stdout(predicate::str::contains("Input:  $3.00 / 1M tokens"))
+    .stdout(predicate::str::contains("Output: $15.00 / 1M tokens"));
 }
 
 #[test]
 fn test_pricing_command_invalid_provider() {
-    let mut cmd = cargo_bin_cmd!("tokscale");
-    cmd.args([
-        "pricing",
-        "claude-sonnet-4-20250514",
-        "--provider",
-        "invalid-provider",
-        "--no-spinner",
-    ])
-    .assert()
-    .failure();
+    let tmp = TempDir::new().expect("failed to create temp home");
+    cmd_with_home(tmp.path())
+        .args([
+            "pricing",
+            "claude-sonnet-4-20250514",
+            "--provider",
+            "invalid-provider",
+            "--no-spinner",
+        ])
+        .assert()
+        .failure();
 }
 
 #[test]

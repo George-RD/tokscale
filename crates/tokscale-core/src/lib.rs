@@ -4920,11 +4920,12 @@ mod tests {
         dedupe_latest_trae_messages, filter_messages_for_report,
         generate_graph_with_loaded_pricing, get_home_dir_string, is_generic_routing_label,
         merge_claude_cross_file_duplicate, message_cache, normalize_model_for_grouping,
+        parse_all_messages_with_pricing_with_cache_policy,
         parse_all_messages_with_pricing_with_env_strategy, parse_local_clients, parsed_to_unified,
         paths, pricing, retain_for_requested_clients, scanner, select_local_parse_pricing,
         sessions, unified_to_parsed, validate_priced_messages, ClientId, GraphPricingRequirement,
         GroupBy, LocalParseOptions, MonthlyReportV2, MonthlyUsage, MonthlyUsageV2, ReportOptions,
-        TokenBreakdown, UnifiedMessage, UnpricedSubmissionExclusion,
+        SourceCachePolicy, TokenBreakdown, UnifiedMessage, UnpricedSubmissionExclusion,
         AMBIGUOUS_MODEL_PRICING_REASON, INCOMPLETE_MODEL_PRICING_REASON,
         MISSING_MODEL_PRICING_REASON, ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL,
         UNVERIFIED_MODEL_IDENTITY_REASON, UNVERIFIED_PROVIDER_IDENTITY_REASON,
@@ -7443,8 +7444,7 @@ mod tests {
     fn test_parse_all_messages_keeps_conflicted_grok_scoped_model_change_unpriced_cold_and_warm() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
-        let mut env = paths::test_env::EnvGuard::capture(&["HOME"]);
-        env.set("HOME", cache_home.path());
+        let _cache_env = redirect_cache_home(cache_home.path());
 
         {
             let logs_dir = source_home.path().join(".grok/logs");
@@ -11268,10 +11268,13 @@ mod tests {
         .unwrap();
 
         let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
-        let messages = parse_all_messages_with_pricing(
+        let messages = parse_all_messages_with_pricing_with_cache_policy(
             temp_dir.path().to_str().unwrap(),
             &["synthetic".to_string()],
             Some(&pricing),
+            false,
+            &scanner::ScannerSettings::default(),
+            SourceCachePolicy::InMemory,
         );
 
         assert_eq!(messages.len(), 1);
@@ -11328,10 +11331,13 @@ mod tests {
         .unwrap();
 
         let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
-        let messages = parse_all_messages_with_pricing(
+        let messages = parse_all_messages_with_pricing_with_cache_policy(
             temp_dir.path().to_str().unwrap(),
             &["synthetic".to_string()],
             Some(&pricing),
+            false,
+            &scanner::ScannerSettings::default(),
+            SourceCachePolicy::InMemory,
         );
 
         assert_eq!(
@@ -11408,12 +11414,13 @@ mod tests {
             },
         );
         let pricing = pricing::PricingService::new(litellm, HashMap::new());
-        let messages = parse_all_messages_with_pricing_with_env_strategy(
+        let messages = parse_all_messages_with_pricing_with_cache_policy(
             temp_dir.path().to_str().unwrap(),
             &["opencode".to_string()],
             Some(&pricing),
             false,
             &scanner::ScannerSettings::default(),
+            SourceCachePolicy::InMemory,
         );
 
         let embedded = messages
@@ -11456,12 +11463,13 @@ mod tests {
             },
         );
         let pricing = pricing::PricingService::new(litellm, HashMap::new());
-        let messages = parse_all_messages_with_pricing_with_env_strategy(
+        let messages = parse_all_messages_with_pricing_with_cache_policy(
             temp_dir.path().to_str().unwrap(),
             &["gjc".to_string()],
             Some(&pricing),
             false,
             &scanner::ScannerSettings::default(),
+            SourceCachePolicy::InMemory,
         );
 
         let explicit_zero = messages
@@ -11503,12 +11511,13 @@ mod tests {
         )
         .unwrap();
 
-        let messages = parse_all_messages_with_pricing_with_env_strategy(
+        let messages = parse_all_messages_with_pricing_with_cache_policy(
             temp_dir.path().to_str().unwrap(),
             &["gjc".to_string()],
             None,
             false,
             &scanner::ScannerSettings::default(),
+            SourceCachePolicy::InMemory,
         );
 
         assert_eq!(messages.len(), 1);
