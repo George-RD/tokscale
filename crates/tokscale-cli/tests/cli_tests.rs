@@ -60,15 +60,42 @@ fn prime_canonical_sonnet_pricing_cache(base: &Path, model: &str) {
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
         .as_secs();
-    let payload = format!(
-        r#"{{"timestamp":{},"data":{{"{model}":{{"input_cost_per_token":0.000003,"output_cost_per_token":0.000015,"cache_read_input_token_cost":0.0000003,"cache_creation_input_token_cost":0.00000375}}}}}}"#,
-        now
-    );
-    let models_dev_payload = format!(
-        r#"{{"timestamp":{},"data":{{"anthropic/{model}":{{"input_cost_per_token":0.000003,"output_cost_per_token":0.000015,"cache_read_input_token_cost":0.0000003,"cache_creation_input_token_cost":0.00000375}}}}}}"#,
-        now
-    );
+    let pricing = serde_json::json!({
+        "input_cost_per_token": 0.000003,
+        "output_cost_per_token": 0.000015,
+        "cache_read_input_token_cost": 0.0000003,
+        "cache_creation_input_token_cost": 0.00000375,
+    });
+    let payload = serde_json::to_string(&serde_json::json!({
+        "timestamp": now,
+        "data": serde_json::Map::from_iter([(model.to_owned(), pricing.clone())]),
+    }))
+    .unwrap();
+    let models_dev_payload = serde_json::to_string(&serde_json::json!({
+        "timestamp": now,
+        "data": serde_json::Map::from_iter([(format!("anthropic/{model}"), pricing)]),
+    }))
+    .unwrap();
     write_canonical_pricing_cache_files(base, &payload, &payload, &models_dev_payload);
+}
+
+#[test]
+fn prime_canonical_sonnet_pricing_cache_escapes_arbitrary_model_names() {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let model = "claude-\"quoted\\model\nnext-line";
+
+    prime_canonical_sonnet_pricing_cache(tmp.path(), model);
+
+    let cache_dir = tmp.path().join(".config/tokscale/cache");
+    for (file, expected_model) in [
+        ("pricing-litellm.json", model.to_owned()),
+        ("pricing-openrouter.json", model.to_owned()),
+        ("pricing-models-dev.json", format!("anthropic/{model}")),
+    ] {
+        let payload: serde_json::Value =
+            serde_json::from_slice(&fs::read(cache_dir.join(file)).unwrap()).unwrap();
+        assert!(payload["data"].get(&expected_model).is_some());
+    }
 }
 
 fn prime_override_pricing_cache(config_dir: &Path) {
