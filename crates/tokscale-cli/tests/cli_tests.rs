@@ -3925,17 +3925,10 @@ fn test_monthly_light_output() {
 #[test]
 fn test_monthly_light_title_uses_pinned_bucket_month() {
     let tmp = create_temp_fixture_dir();
-    let config = tmp.path().join(if cfg!(windows) {
-        "AppData/Roaming/tokscale"
-    } else {
-        ".config/tokscale"
-    });
-    fs::create_dir_all(&config).unwrap();
-    fs::write(
-        config.join("settings.json"),
+    write_settings_json(
+        tmp.path(),
         r#"{"scanner":{"bucketTimezone":"Pacific/Kiritimati"}}"#,
-    )
-    .unwrap();
+    );
     let expected_month =
         tokscale_core::BucketTimezone::from_pinned_name(Some("Pacific/Kiritimati"))
             .today()
