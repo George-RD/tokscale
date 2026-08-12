@@ -1265,6 +1265,22 @@ impl CachedSourceEntry {
                 .contains(&CLAUDE_RETENTION_PROVENANCE_MARKER)
     }
 
+    /// Whether this entry is carrying rows the live file may no longer
+    /// contain — either an identified retained set, or a pre-provenance entry
+    /// that cannot say which of its rows are retained and has to be assumed to
+    /// hold some.
+    ///
+    /// Only meaningful for a namespace [`retained_history_key_filter`] covers;
+    /// elsewhere the index vector means something else entirely.
+    pub(crate) fn holds_retained_history(&self) -> bool {
+        self.is_claude_namespace()
+            && (self.needs_retention_provenance_migration()
+                || self
+                    .fallback_timestamp_indices
+                    .iter()
+                    .any(|index| *index != CLAUDE_RETENTION_PROVENANCE_MARKER))
+    }
+
     pub(crate) fn retained_message_keys(&self) -> HashSet<String> {
         if !self.is_claude_namespace() {
             return HashSet::new();
@@ -1650,11 +1666,14 @@ impl SourceMessageCache {
     ///
     /// Two cases keep their payload:
     ///
-    /// * A namespace that retains history (see [`retained_history_key_filter`])
-    ///   holds messages the live file no longer contains, and the cache is the
-    ///   only copy. A second lookup of a drained entry would look like a cold
-    ///   source and re-derive history from the live bytes alone, retiring rows
-    ///   that can never come back (#994).
+    /// * An entry that is actually carrying retained history (see
+    ///   [`CachedSourceEntry::holds_retained_history`]) holds messages the live
+    ///   file no longer contains, and the cache is the only copy. A second
+    ///   lookup of a drained entry would look like a cold source and re-derive
+    ///   history from the live bytes alone, retiring rows that can never come
+    ///   back (#994). An entry in the same namespace whose retained set is
+    ///   empty is fully reproducible from the live bytes, so it drains like any
+    ///   other.
     /// * An entry already marked dirty is written back from memory by
     ///   `save_if_dirty`, so its payload has to still be there.
     pub(crate) fn take(&self, identity: CacheIdentity, path: &Path) -> Option<CachedSourceEntry> {
@@ -1662,12 +1681,12 @@ impl SourceMessageCache {
         let mut state = self.state();
         self.ensure_namespace_loaded(&mut state, identity.namespace);
         let retains_history = retained_history_key_filter(identity.namespace).is_some();
-        let pinned = retains_history || state.dirty_keys.contains(&key);
+        let dirty = state.dirty_keys.contains(&key);
         let entry = state.entries.get_mut(&key)?;
         if !entry.matches_identity(identity) {
             return None;
         }
-        if pinned {
+        if dirty || (retains_history && entry.holds_retained_history()) {
             return Some(entry.clone());
         }
         Some(entry.take_payload())
@@ -4101,31 +4120,105 @@ mod tests {
         );
     }
 
-    /// Claude's entries hold turns the live transcript no longer contains, and
+    /// A Claude entry holds turns the live transcript no longer contains, and
     /// the cache is the only copy (#994). Draining one would make a second
-    /// lookup look like a cold source and retire that history for good, so
-    /// retention namespaces are served by clone instead.
+    /// lookup look like a cold source and retire that history for good, so an
+    /// entry that is carrying retained rows is served by clone instead.
     #[test]
     #[serial_test::serial]
-    fn take_keeps_the_payload_for_namespaces_that_retain_history() {
+    fn take_keeps_the_payload_of_an_entry_carrying_retained_history() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let source = write_temp_file(b"claude\n");
+
+        let live = keyed_message(identity.namespace, "claude-session", "live:req_live");
+        let retained = keyed_message(identity.namespace, "claude-session", "old:req_old");
+        let mut seed = SourceMessageCache::default();
+        seed.insert(CachedSourceEntry::new_with_retained_message_keys(
+            identity,
+            source.path(),
+            SourceFingerprint::from_path(source.path()).unwrap(),
+            vec![live, retained],
+            &HashSet::from(["old:req_old".to_string()]),
+        ));
+        seed.save_if_dirty();
+
+        let cache = SourceMessageCache::load();
+        let first = cache.take(identity, source.path()).expect("warm entry");
+        assert_eq!(first.messages.len(), 2);
+        assert_eq!(
+            cache
+                .take(identity, source.path())
+                .expect("a retained-history entry must survive being read")
+                .messages
+                .len(),
+            2,
+            "the only copy of a compacted turn must not leave the cache"
+        );
+    }
+
+    /// The same namespace, but nothing was retained: the live file reproduces
+    /// every row, so the entry drains like any other and Claude-heavy machines
+    /// still get the memory back.
+    #[test]
+    #[serial_test::serial]
+    fn take_drains_a_claude_entry_with_no_retained_history() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let source = write_temp_file(b"claude\n");
+
+        let live = keyed_message(identity.namespace, "claude-session", "live:req_live");
+        let mut seed = SourceMessageCache::default();
+        seed.insert(CachedSourceEntry::new_with_retained_message_keys(
+            identity,
+            source.path(),
+            SourceFingerprint::from_path(source.path()).unwrap(),
+            vec![live],
+            &HashSet::new(),
+        ));
+        seed.save_if_dirty();
+
+        let cache = SourceMessageCache::load();
+        assert_eq!(
+            cache
+                .take(identity, source.path())
+                .expect("warm entry")
+                .messages
+                .len(),
+            1
+        );
+        assert!(
+            cache.entry_messages_released(identity, source.path()),
+            "an entry with an empty retained set is reproducible from the live \
+             file, so it must not keep a second copy"
+        );
+    }
+
+    /// An entry written before retention provenance existed cannot say which of
+    /// its rows the live file already dropped, so it has to be treated as
+    /// carrying history even though its retained set reads as empty.
+    #[test]
+    #[serial_test::serial]
+    fn take_keeps_the_payload_of_a_pre_provenance_claude_entry() {
         let temp_home = TempDir::new().unwrap();
         let _cache_env = sandbox_cache_env(temp_home.path());
         let identity = CacheIdentity::for_client(ClientId::Claude);
         let source = write_temp_file(b"claude\n");
 
         let mut seed = SourceMessageCache::default();
-        seed.insert(test_entry(identity, source.path(), "claude-session"));
+        // `test_entry` builds the legacy shape: messages, no provenance marker.
+        let legacy = test_entry(identity, source.path(), "claude-session");
+        assert!(legacy.needs_retention_provenance_migration());
+        seed.insert(legacy);
         seed.save_if_dirty();
 
         let cache = SourceMessageCache::load();
         assert!(cache.take(identity, source.path()).is_some());
-        assert_eq!(
-            cache
-                .take(identity, source.path())
-                .expect("a retained-history entry must survive being read")
-                .messages[0]
-                .session_id,
-            "claude-session"
+        assert!(
+            !cache.entry_messages_released(identity, source.path()),
+            "a legacy entry may be hiding retained rows it cannot identify"
         );
     }
 
