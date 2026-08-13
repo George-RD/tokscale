@@ -6,8 +6,10 @@ pub enum PathRoot {
     Config,
     /// The per-user application data directory, resolved via the `dirs` crate:
     /// `%APPDATA%` on Windows, `~/Library/Application Support` on macOS, and
-    /// the XDG config home on Linux. When an explicit home is supplied, this
-    /// root is derived from that home using the matching platform convention.
+    /// the XDG config home on Linux. When an explicit home is supplied — or,
+    /// on Windows, when the resolved home is not the Win32 profile — this root
+    /// is derived from that home using the matching platform convention; see
+    /// [`app_data_follows_home`].
     AppData,
     EnvVar {
         var: &'static str,
@@ -24,6 +26,42 @@ fn join_home(home_dir: &str, relative: &str) -> String {
         path.push(component.as_os_str());
     }
     path.to_string_lossy().into_owned()
+}
+
+/// Whether an [`PathRoot::AppData`] scan must be derived from `home_dir`
+/// rather than from the platform's own app-data lookup, even under env roots.
+///
+/// Only Windows can disagree with `home_dir`. `dirs::config_dir()` is
+/// `SHGetKnownFolderPath(FOLDERID_RoamingAppData)` there — a Win32 known
+/// folder that no environment variable can redirect, not even `%APPDATA%`.
+/// macOS and Linux resolve it from `$HOME` / `$XDG_CONFIG_HOME`, so they
+/// already follow whatever home `paths::home_dir()` handed this call.
+///
+/// That asymmetry is the one `paths::home_dir` was written to close for
+/// `dirs::home_dir()` in #997: every home-rooted scan target obeys a
+/// redirected `HOME`, so an AppData-rooted client must not be the single
+/// target that keeps reading the machine's real profile. Cherry Studio is
+/// currently that client, and on Windows its transcripts were discovered
+/// under the live profile no matter where the caller pointed the home.
+///
+/// The known-folder answer still wins when `home_dir` *is* the Win32 profile,
+/// because folder redirection and roaming profiles can legitimately place
+/// `%APPDATA%` outside the profile directory; only a home that actually names
+/// somewhere else overrides it. A non-absolute `home_dir` (a POSIX-shaped
+/// `HOME` from Git Bash, a drive-relative `C:temp`) is never treated as a
+/// redirect, matching `paths::home_dir`, which rejects those same shapes
+/// because `Path` resolves them against ambient state.
+fn app_data_follows_home(home_dir: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let home = std::path::Path::new(home_dir);
+        home.is_absolute() && dirs::home_dir().is_none_or(|profile| profile != home)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = home_dir;
+        false
+    }
 }
 
 impl PathRoot {
@@ -100,7 +138,7 @@ impl PathRoot {
                 join_home(home_dir, ".config/tokscale")
             }
             PathRoot::AppData => {
-                if use_env_roots {
+                if use_env_roots && !app_data_follows_home(home_dir) {
                     if let Some(dir) = dirs::config_dir() {
                         return dir.to_string_lossy().into_owned();
                     }
@@ -1062,6 +1100,86 @@ mod tests {
         assert_eq!(
             PathRoot::AppData.resolve_with_env_strategy(home.to_str().unwrap(), false),
             expected.to_string_lossy()
+        );
+    }
+
+    /// Under env roots the AppData root must still land under the home it was
+    /// handed once that home is not the machine profile.
+    ///
+    /// `dirs::config_dir()` on Windows is the `FOLDERID_RoamingAppData` known
+    /// folder, which ignores every environment variable, so this root was the
+    /// one scan target that kept reading the live profile after
+    /// `paths::home_dir()` had been redirected. Cherry Studio — the only
+    /// AppData-rooted client — was therefore never discovered under a
+    /// redirected home on Windows, while macOS and Linux resolved it correctly
+    /// because their `dirs::config_dir()` is `$HOME`/`$XDG_CONFIG_HOME`-derived
+    /// and so already follows the redirect.
+    ///
+    /// The assertions read the known-folder API but no environment variable, so
+    /// this test does not need to serialize against the `EnvGuard` tests above.
+    #[test]
+    fn test_env_roots_app_data_follows_a_redirected_home() {
+        let home = absolute_test_path("redirected-home");
+
+        assert_eq!(
+            app_data_follows_home(home.to_str().unwrap()),
+            cfg!(target_os = "windows"),
+            "only Windows has an app-data lookup that a redirected home cannot reach"
+        );
+
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            PathRoot::AppData.resolve_with_env_strategy(home.to_str().unwrap(), true),
+            native_join(&home, "AppData/Roaming"),
+            "a redirected Windows home must win over the roaming-app-data known folder"
+        );
+    }
+
+    /// The known-folder answer stays authoritative when the home *is* the real
+    /// profile: folder redirection and roaming profiles can legitimately place
+    /// `%APPDATA%` outside the profile directory, and deriving it from the home
+    /// would silently relocate those users' scans.
+    #[test]
+    fn test_env_roots_app_data_keeps_the_platform_lookup_for_the_real_profile() {
+        let Some(profile) = dirs::home_dir() else {
+            return;
+        };
+
+        assert!(
+            !app_data_follows_home(&profile.to_string_lossy()),
+            "the machine profile is not a redirect and must not override the platform lookup"
+        );
+    }
+
+    /// A POSIX-shaped `HOME` (Git Bash, MSYS2, Cygwin) is not a redirect.
+    /// `paths::home_dir` rejects those because `Path` reads the leading `/` as
+    /// "root of the current drive"; the AppData root must agree rather than
+    /// relocating every Unix-shell user's scan to `C:\home\user\AppData`. The
+    /// same holds for a drive-relative `C:temp`, which Windows resolves against
+    /// the per-drive current directory.
+    #[test]
+    fn test_env_roots_app_data_ignores_non_absolute_windows_homes() {
+        for home in ["/home/user", "C:temp", ""] {
+            assert!(
+                !app_data_follows_home(home),
+                "{home:?} is not a usable native home and must not override the platform lookup"
+            );
+        }
+    }
+
+    /// The end-to-end claim the Windows CLI regression turns on: Cherry Studio
+    /// is the only AppData-rooted client, and under env roots its transcript
+    /// root must sit under a redirected home.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_cherrystudio_transcript_root_follows_a_redirected_home_under_env_roots() {
+        let home = absolute_test_path("cherry-home");
+
+        assert_eq!(
+            ClientId::CherryStudio
+                .data()
+                .resolve_path_with_env_strategy(home.to_str().unwrap(), true),
+            native_join(&home, "AppData/Roaming/CherryStudio/.claude/projects")
         );
     }
 
