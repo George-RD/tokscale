@@ -93,6 +93,12 @@ struct Cli {
     )]
     group_by: String,
 
+    #[arg(
+        long = "merge-worktrees",
+        help = "With --group-by workspace,model: fold worktrees kept inside the repo (.claude/worktrees/, .git/worktrees/) into their parent repository so each repo is one row"
+    )]
+    merge_worktrees: bool,
+
     #[arg(long, help = "Disable spinner (for AI agents and scripts)")]
     no_spinner: bool,
 }
@@ -118,6 +124,11 @@ enum Commands {
             help = "Grouping strategy for --light and --json output: model, client,model, client,provider,model, workspace,model, session,model, client,session,model"
         )]
         group_by: String,
+        #[arg(
+            long = "merge-worktrees",
+            help = "With --group-by workspace,model: fold worktrees kept inside the repo (.claude/worktrees/, .git/worktrees/) into their parent repository so each repo is one row"
+        )]
+        merge_worktrees: bool,
         #[arg(
             long = "write-cache",
             requires = "light",
@@ -614,6 +625,7 @@ fn main() -> Result<()> {
             date,
             benchmark,
             group_by,
+            merge_worktrees,
             write_cache,
             no_write_cache,
             hide_zero,
@@ -635,6 +647,7 @@ fn main() -> Result<()> {
                     benchmark,
                     no_spinner || !can_use_tui,
                     group_by,
+                    worktree_rollup_from_flag(merge_worktrees),
                     write_cache,
                     no_write_cache,
                     hide_zero,
@@ -653,6 +666,9 @@ fn main() -> Result<()> {
                     until,
                     year,
                     Some(Tab::Models),
+                    // Carry the flag in as the initial rollup rather than dropping
+                    // it; `w` toggles from there.
+                    worktree_rollup_from_flag(merge_worktrees),
                 )
             }
         }
@@ -690,6 +706,7 @@ fn main() -> Result<()> {
                     until,
                     year,
                     Some(Tab::Monthly),
+                    tokscale_core::WorktreeRollup::default(),
                 )
             }
         }
@@ -727,6 +744,7 @@ fn main() -> Result<()> {
                     until,
                     year,
                     Some(Tab::Hourly),
+                    tokscale_core::WorktreeRollup::default(),
                 )
             }
         }
@@ -797,6 +815,7 @@ fn main() -> Result<()> {
                 until,
                 year,
                 None,
+                tokscale_core::WorktreeRollup::default(),
             )
         }
         Some(Commands::Submit {
@@ -951,6 +970,8 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             });
 
+            let worktree_rollup = worktree_rollup_from_flag(cli.merge_worktrees);
+
             if cli.json {
                 run_models_report(
                     cli.json,
@@ -960,6 +981,7 @@ fn main() -> Result<()> {
                     cli.benchmark,
                     cli.no_spinner || cli.json,
                     group_by,
+                    worktree_rollup,
                     cli.write_cache,
                     cli.no_write_cache,
                     cli.hide_zero,
@@ -973,6 +995,7 @@ fn main() -> Result<()> {
                     cli.benchmark,
                     cli.no_spinner || !can_use_tui,
                     group_by,
+                    worktree_rollup,
                     cli.write_cache,
                     cli.no_write_cache,
                     cli.hide_zero,
@@ -991,6 +1014,7 @@ fn main() -> Result<()> {
                     until,
                     year,
                     None,
+                    worktree_rollup,
                 )
             }
         }
@@ -2031,6 +2055,16 @@ impl LocalReportContext {
     }
 
     fn report_options(&self, group_by: tokscale_core::GroupBy) -> tokscale_core::ReportOptions {
+        self.report_options_with_rollup(group_by, tokscale_core::WorktreeRollup::default())
+    }
+
+    /// `report_options` for the one report that can fold worktrees. Kept separate
+    /// so the other callers are not made to pass a rollup they never vary.
+    fn report_options_with_rollup(
+        &self,
+        group_by: tokscale_core::GroupBy,
+        worktree_rollup: tokscale_core::WorktreeRollup,
+    ) -> tokscale_core::ReportOptions {
         tokscale_core::ReportOptions {
             home_dir: self.home_dir.clone(),
             use_env_roots: self.use_env_roots,
@@ -2039,8 +2073,17 @@ impl LocalReportContext {
             until: self.until.clone(),
             year: self.year.clone(),
             group_by,
+            worktree_rollup,
             scanner_settings: self.scanner_settings.clone(),
         }
+    }
+}
+
+fn worktree_rollup_from_flag(merge_worktrees: bool) -> tokscale_core::WorktreeRollup {
+    if merge_worktrees {
+        tokscale_core::WorktreeRollup::MergeIntoRepo
+    } else {
+        tokscale_core::WorktreeRollup::Separate
     }
 }
 
@@ -2053,6 +2096,7 @@ fn run_models_report(
     benchmark: bool,
     no_spinner: bool,
     group_by: tokscale_core::GroupBy,
+    worktree_rollup: tokscale_core::WorktreeRollup,
     cli_write_cache: bool,
     cli_no_write_cache: bool,
     hide_zero: bool,
@@ -2068,7 +2112,10 @@ fn run_models_report(
     );
     let rt = Runtime::new()?;
     let report = rt
-        .block_on(async { get_model_report(context.report_options(group_by.clone())).await })
+        .block_on(async {
+            get_model_report(context.report_options_with_rollup(group_by.clone(), worktree_rollup))
+                .await
+        })
         .map_err(|e| anyhow::anyhow!(e))?;
     let mut report = report;
     if hide_zero {
@@ -5775,6 +5822,7 @@ fn run_submit_command(
                 until,
                 year,
                 group_by: GroupBy::default(),
+                worktree_rollup: tokscale_core::WorktreeRollup::default(),
                 scanner_settings: tui::settings::load_scanner_settings(),
             })
             .await

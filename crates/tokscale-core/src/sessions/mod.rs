@@ -53,6 +53,8 @@ pub mod workbuddy;
 pub mod zcode;
 pub mod zed;
 
+use std::path::{Path, PathBuf, MAIN_SEPARATOR_STR};
+
 use crate::TokenBreakdown;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -479,6 +481,221 @@ pub fn workspace_label_from_key(key: &str) -> Option<String> {
         .map(|segment| segment.to_string())
 }
 
+/// Marker between a repository and the worktree checked out inside it, e.g.
+/// `claude-witness ⑃ lens-backfill-findings`. Worktrees are the common case for
+/// agent CLIs that isolate each task, and a repo-only label would render a dozen
+/// identical rows.
+pub const WORKTREE_SEPARATOR: &str = " ⑃ ";
+
+/// Path segments that mean "everything below me is a worktree, not the repo".
+const WORKTREE_MARKERS: [&str; 2] = [".claude/worktrees/", ".git/worktrees/"];
+
+/// The same markers as they appear in a dash-encoded Claude Code slug. A deleted
+/// worktree cannot be resolved against the filesystem, but the marker survives
+/// verbatim in the slug, so the repo prefix is still recoverable from the string.
+const ENCODED_WORKTREE_MARKERS: [&str; 2] = ["--claude-worktrees-", "--git-worktrees-"];
+
+/// Split a dash-encoded slug at its worktree marker into (repo slug, worktree
+/// name). Lets rollup and labeling keep working for worktrees whose directories
+/// have since been deleted — otherwise those rows keep the raw slug forever.
+fn split_encoded_worktree(key: &str) -> Option<(String, String)> {
+    for marker in ENCODED_WORKTREE_MARKERS {
+        if let Some(index) = key.find(marker) {
+            let repo = &key[..index];
+            let worktree = &key[index + marker.len()..];
+            if !repo.is_empty() && !worktree.is_empty() {
+                return Some((repo.to_string(), worktree.to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// The repository root a workspace key belongs to, with any worktree suffix
+/// removed. Returns `None` when the key is not inside a worktree, so callers can
+/// tell "already a repo root" from "rolled up to one".
+///
+/// Only path-shaped keys are handled: clients that store an opaque id (Warp's
+/// workspace UUID) have nothing to roll up and are returned untouched.
+pub fn workspace_repo_root(key: &str) -> Option<String> {
+    for marker in WORKTREE_MARKERS {
+        if let Some(index) = key.find(marker) {
+            let root = key[..index].trim_end_matches('/');
+            if !root.is_empty() {
+                return Some(root.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Human-readable label for a workspace key: `repo` or `repo ⑃ worktree`.
+///
+/// The key is whatever the originating client wrote to disk, so this also has to
+/// cope with Claude Code's dash-mangled directory slug
+/// (`-Users-zetian-devpro-ing-claude-witness`), which carries no `/` to split on
+/// and therefore used to render as the entire path — the exact prefix every row
+/// shares, so truncation dropped the only distinguishing part.
+pub fn workspace_display_label(key: &str) -> Option<String> {
+    let path = decode_claude_project_slug(key).unwrap_or_else(|| key.to_string());
+
+    if let Some(root) = workspace_repo_root(&path) {
+        let repo = workspace_label_from_key(&root)?;
+        return match workspace_label_from_key(&path) {
+            Some(worktree) => Some(format!("{repo}{WORKTREE_SEPARATOR}{worktree}")),
+            None => Some(repo),
+        };
+    }
+
+    // Undecodable slug (the directory was deleted): the marker still tells us
+    // where the repo ends, so name it from the string rather than giving up and
+    // showing the whole mangled path.
+    if let Some((repo_slug, worktree)) = split_encoded_worktree(&path) {
+        let repo = decode_claude_project_slug(&repo_slug)
+            .and_then(|decoded| workspace_label_from_key(&decoded))
+            .or_else(|| last_slug_segment(&repo_slug))?;
+        return Some(format!("{repo}{WORKTREE_SEPARATOR}{worktree}"));
+    }
+
+    workspace_label_from_key(&path)
+}
+
+/// Repo identity for a dash-encoded worktree slug whose directory no longer
+/// exists, so rollup can still merge it into its repository. Prefers the repo's
+/// real path when THAT still resolves, falling back to the repo slug itself —
+/// which keeps deleted worktrees of one repo together even then.
+pub fn workspace_repo_root_from_slug(key: &str) -> Option<String> {
+    let (repo_slug, _) = split_encoded_worktree(key)?;
+    Some(decode_claude_project_slug(&repo_slug).unwrap_or(repo_slug))
+}
+
+/// Best-effort trailing name of a dash-encoded slug whose directory is gone. The
+/// original `/` boundaries are unrecoverable, so this returns the last dash
+/// segment — a hint, not an exact path.
+fn last_slug_segment(slug: &str) -> Option<String> {
+    slug.rsplit('-')
+        .find(|segment| !segment.is_empty())
+        .map(|segment| segment.to_string())
+}
+
+/// Claude Code names each project directory after the absolute path it was
+/// launched from, replacing every non-alphanumeric byte with `-`. That map is
+/// lossy — `/`, `.`, `+` and `-` all collapse to `-` — so it cannot be inverted
+/// by string surgery alone. Instead this walks the filesystem, re-applying the
+/// same map to real directory names to find which one the slug came from, which
+/// makes the recovered path exact rather than a guess.
+///
+/// Returns `None` for keys that are already real paths, or when no directory on
+/// disk matches (a project whose folder has since been deleted or renamed).
+pub fn decode_claude_project_slug(key: &str) -> Option<String> {
+    // A real path (already usable) keeps its separators; `normalize_workspace_key`
+    // rewrites Windows backslashes to `/`, so one check covers both platforms.
+    if key.contains('/') {
+        return None;
+    }
+
+    let (root, remaining) = slug_root_and_remainder(key)?;
+    resolve_slug_under(&root, remaining)
+}
+
+/// Split a slug into the filesystem root it was anchored at and the rest.
+///
+/// A POSIX slug begins at `/`, so it opens with the separator-turned-dash. A
+/// Windows slug encodes the drive instead (`C:\Users\me` becomes `C--Users-me`:
+/// one dash for the colon, one for the separator), so the root has to be
+/// reconstructed from the drive letter rather than assumed to be `/`.
+fn slug_root_and_remainder(key: &str) -> Option<(PathBuf, &str)> {
+    if key.starts_with('-') {
+        // Pass the whole key through: `slug_matches_prefix` expects every segment
+        // to arrive separator-first, including the first one.
+        return Some((PathBuf::from(MAIN_SEPARATOR_STR), key));
+    }
+
+    let mut chars = key.chars();
+    let drive = chars.next()?;
+    if !drive.is_ascii_alphabetic() {
+        return None;
+    }
+    // The encoded colon, leaving the separator dash to start the first segment.
+    let remaining = key[1..].strip_prefix('-')?;
+    if !remaining.starts_with('-') {
+        return None;
+    }
+    Some((
+        PathBuf::from(format!("{drive}:{MAIN_SEPARATOR_STR}")),
+        remaining,
+    ))
+}
+
+/// Walk `remaining` against the real directories under `dir`.
+///
+/// A dash in the slug is ambiguous — it may be a `/` boundary, or part of a
+/// directory name that genuinely contains `-`, `.` or `+` — so a single greedy
+/// pass mis-resolves paths like `claude-witness` (one directory, not two). This
+/// consumes one real directory at a time and backtracks when a branch dead-ends,
+/// which makes the result exact wherever the directory still exists on disk.
+fn resolve_slug_under(dir: &Path, remaining: &str) -> Option<String> {
+    if remaining.is_empty() {
+        // Hand back a normalized key, not a native path. Every consumer compares
+        // against forward-slash markers (`workspace_repo_root` looks for
+        // `.claude/worktrees/`), and on Windows `Path::join` produces `\`, so
+        // returning the native spelling would silently defeat worktree rollup and
+        // make a decoded key unequal to the same directory recorded by a client
+        // that stores a real path.
+        return normalize_workspace_key(&dir.to_string_lossy());
+    }
+
+    // Longest candidate first: prefer `IngTian.github.io` over a shorter
+    // `IngTian` that happens to also exist.
+    let mut candidates: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        // Name filter first: it is pure string work, and it rejects nearly every
+        // entry in a large directory. The `is_dir` check below costs a `stat` per
+        // survivor, so ordering it second keeps the syscalls proportional to
+        // matches rather than to directory size.
+        .filter(|name| slug_matches_prefix(remaining, name))
+        // `Path::is_dir` follows symlinks where `DirEntry::file_type` would not.
+        // Symlinked directories are load-bearing here: macOS reaches temp dirs
+        // through `/var -> /private/var`, and users symlink project roots.
+        .filter(|name| dir.join(name).is_dir())
+        .collect();
+    // Ties are real: `a.b` and `a-b` encode identically and nothing on disk
+    // distinguishes them, so order deterministically instead of trusting
+    // readdir order.
+    candidates.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+
+    for name in candidates {
+        let consumed = slugify_path_segment(&name).len() + 1;
+        if let Some(resolved) = resolve_slug_under(&dir.join(&name), &remaining[consumed..]) {
+            return Some(resolved);
+        }
+    }
+
+    None
+}
+
+/// Whether `remaining` starts with `-` + the encoded form of `name`, ending on a
+/// segment boundary so a directory cannot match half of a longer name.
+fn slug_matches_prefix(remaining: &str, name: &str) -> bool {
+    let encoded = slugify_path_segment(name);
+    let Some(rest) = remaining.strip_prefix('-') else {
+        return false;
+    };
+    let Some(tail) = rest.strip_prefix(encoded.as_str()) else {
+        return false;
+    };
+    tail.is_empty() || tail.starts_with('-')
+}
+
+/// Claude Code's forward map: every non-alphanumeric byte becomes `-`.
+fn slugify_path_segment(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
 /// Convert Unix milliseconds to a local YYYY-MM-DD date string.
 fn timestamp_to_date(timestamp_ms: i64) -> String {
     timestamp_to_date_with_timezone(timestamp_ms, &chrono::Local)
@@ -496,6 +713,214 @@ where
 mod tests {
     use super::*;
     use chrono::FixedOffset;
+
+    #[test]
+    fn workspace_repo_root_strips_worktree_suffixes() {
+        assert_eq!(
+            workspace_repo_root("/Users/z/devpro/witness/.claude/worktrees/lens-backfill")
+                .as_deref(),
+            Some("/Users/z/devpro/witness")
+        );
+        assert_eq!(
+            workspace_repo_root("/Users/z/devpro/witness/.git/worktrees/wt-1").as_deref(),
+            Some("/Users/z/devpro/witness")
+        );
+        // Plain repo checkouts have nothing to roll up.
+        assert_eq!(workspace_repo_root("/Users/z/devpro/witness"), None);
+        // Opaque, non-path keys (Warp's workspace UUID) must not be mangled.
+        assert_eq!(
+            workspace_repo_root("9f2c1a04-1e4b-4c3f-a0d1-77b2e5c9aa10"),
+            None
+        );
+    }
+
+    #[test]
+    fn workspace_display_label_names_repo_and_worktree() {
+        assert_eq!(
+            workspace_display_label("/Users/z/devpro/witness/.claude/worktrees/lens-backfill")
+                .as_deref(),
+            Some("witness ⑃ lens-backfill")
+        );
+        assert_eq!(
+            workspace_display_label("/Users/z/devpro/witness").as_deref(),
+            Some("witness")
+        );
+    }
+
+    #[test]
+    fn decode_claude_project_slug_recovers_names_containing_dashes() {
+        let (_temp, root) = canonical_tempdir();
+        // A real name with a literal '-' is the case a greedy split gets wrong:
+        // "claude-witness" is ONE directory, not "claude" then "witness".
+        let real = root.join("devpro/ing/claude-witness");
+        std::fs::create_dir_all(&real).unwrap();
+
+        let decoded = decode_claude_project_slug(&slug_for(&real))
+            .expect("slug should resolve to the directory it was built from");
+
+        assert_eq!(
+            std::fs::canonicalize(decoded).unwrap(),
+            std::fs::canonicalize(&real).unwrap()
+        );
+    }
+
+    /// Encode a real path the way Claude Code names its project directory, going
+    /// through `normalize_workspace_key` first so Windows backslashes become `/`
+    /// exactly as they do in production before the slug is formed.
+    fn slug_for(path: &Path) -> String {
+        let normalized = normalize_workspace_key(&path.to_string_lossy()).unwrap();
+        super::slugify_path_segment(&normalized)
+    }
+
+    /// A temp directory whose path is spelled the way `read_dir` reports it.
+    ///
+    /// The decoder matches slugs against real directory entries, so the fixture
+    /// path has to agree with what the OS enumerates. On Windows `%TEMP%` is
+    /// often an 8.3 short name (`RUNNER~1`) while `read_dir` yields the long name
+    /// (`runneradmin`), and `canonicalize` returns a `\\?\` verbatim prefix that
+    /// is not a walkable root — so strip that and let the walk start at the
+    /// drive. Without this the slug describes a path no directory listing
+    /// contains and the decode correctly finds nothing.
+    fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(temp.path()).unwrap();
+        let spelled = canonical.to_string_lossy().to_string();
+        let stripped = spelled
+            .strip_prefix(r"\\?\")
+            .map(PathBuf::from)
+            .unwrap_or(canonical);
+        (temp, stripped)
+    }
+
+    #[test]
+    fn decode_claude_project_slug_recovers_dots_and_worktrees() {
+        let (_temp, root) = canonical_tempdir();
+        // '.' also encodes to '-', so "IngTian.github.io" and the ".claude"
+        // worktree marker both have to come back exactly.
+        let real = root.join("ing/IngTian.github.io/.claude/worktrees/scroll-reveal");
+        std::fs::create_dir_all(&real).unwrap();
+
+        let decoded = decode_claude_project_slug(&slug_for(&real))
+            .expect("slug should resolve to the directory it was built from");
+
+        assert_eq!(
+            std::fs::canonicalize(decoded).unwrap(),
+            std::fs::canonicalize(&real).unwrap()
+        );
+    }
+
+    #[test]
+    fn decode_claude_project_slug_handles_non_ascii_directory_names() {
+        // `slugify_path_segment` maps each non-alphanumeric CHAR to one '-', so a
+        // multi-byte name encodes SHORTER than its byte length ("café" is 5 bytes
+        // and encodes to "caf-" at 4; "日本語" is 9 and encodes to "---" at 3).
+        // `resolve_slug_under` then advances by the ENCODED length and slices
+        // `&remaining[consumed..]`, which is a byte index — so this pins that the
+        // walk stays aligned and never slices mid-character. What keeps it safe is
+        // `slug_matches_prefix`: it only admits a candidate whose encoded form is
+        // an ASCII prefix of `remaining`, so `consumed` always lands on a char
+        // boundary. Without that guard this input would panic rather than degrade.
+        let (_temp, root) = canonical_tempdir();
+        let real = root.join("café/日本語/my-app");
+        std::fs::create_dir_all(&real).unwrap();
+
+        let decoded = decode_claude_project_slug(&slug_for(&real))
+            .expect("non-ASCII directory names must still resolve");
+
+        assert_eq!(
+            std::fs::canonicalize(decoded).unwrap(),
+            std::fs::canonicalize(&real).unwrap()
+        );
+    }
+
+    #[test]
+    fn decoded_slugs_use_normalized_separators() {
+        // The decoder builds its result with `Path::join`, which emits `\` on
+        // Windows. Every consumer compares against forward-slash markers, so a
+        // native-spelled key silently defeats worktree rollup there and never
+        // compares equal to the same directory recorded by a client that stores a
+        // real path. Asserting on the returned string keeps that platform-specific
+        // failure visible from any host.
+        let (_temp, root) = canonical_tempdir();
+        let real = root.join("repo-a/.claude/worktrees/feature-x");
+        std::fs::create_dir_all(&real).unwrap();
+
+        let decoded = decode_claude_project_slug(&slug_for(&real)).expect("slug should resolve");
+
+        assert!(
+            !decoded.contains('\\'),
+            "decoded key must not carry native separators: {decoded}"
+        );
+        // And the worktree marker must therefore be findable.
+        assert!(
+            workspace_repo_root(&decoded).is_some(),
+            "worktree marker must be visible in {decoded}"
+        );
+    }
+
+    #[test]
+    fn slug_root_and_remainder_anchors_posix_and_windows_slugs() {
+        // POSIX: the leading dash IS the root separator, and stays in the
+        // remainder so the first segment arrives separator-first.
+        let (root, remaining) = super::slug_root_and_remainder("-Users-me-app").unwrap();
+        assert_eq!(root, PathBuf::from(MAIN_SEPARATOR_STR));
+        assert_eq!(remaining, "-Users-me-app");
+
+        // Windows: `C:\Users\me\app` encodes as `C--Users-me-app` -- one dash for
+        // the colon, one for the separator -- so the drive has to be rebuilt
+        // rather than assumed to be `/`.
+        let (root, remaining) = super::slug_root_and_remainder("C--Users-me-app").unwrap();
+        assert_eq!(root, PathBuf::from(format!("C:{MAIN_SEPARATOR_STR}")));
+        assert_eq!(remaining, "-Users-me-app");
+
+        // Neither shape: nothing to anchor against.
+        assert_eq!(super::slug_root_and_remainder("Users-me-app"), None);
+        assert_eq!(super::slug_root_and_remainder("1--Users-me"), None);
+        assert_eq!(super::slug_root_and_remainder(""), None);
+    }
+
+    #[test]
+    fn decode_claude_project_slug_ignores_real_paths_and_unknown_dirs() {
+        // Already a path: nothing to decode.
+        assert_eq!(decode_claude_project_slug("/Users/z/devpro/witness"), None);
+        // Slug whose directory does not exist on disk.
+        assert_eq!(
+            decode_claude_project_slug("-nonexistent-tokscale-probe-dir-xyz"),
+            None
+        );
+    }
+
+    #[test]
+    fn deleted_worktree_slugs_still_name_and_group_by_their_repo() {
+        // A worktree deleted from disk cannot be resolved, but its slug still
+        // carries the marker, so it must not fall back to the raw mangled key.
+        let slug = "-Users-zed-devpro-ing-claude-witness--claude-worktrees-store-c1-dissolve";
+
+        assert_eq!(
+            workspace_display_label(slug).as_deref(),
+            Some("witness ⑃ store-c1-dissolve")
+        );
+        // And every deleted worktree of that repo shares one rollup identity.
+        assert_eq!(
+            workspace_repo_root_from_slug(slug).as_deref(),
+            Some("-Users-zed-devpro-ing-claude-witness")
+        );
+        assert_eq!(
+            workspace_repo_root_from_slug(
+                "-Users-zed-devpro-ing-claude-witness--claude-worktrees-proc-port-43"
+            )
+            .as_deref(),
+            Some("-Users-zed-devpro-ing-claude-witness")
+        );
+    }
+
+    #[test]
+    fn workspace_display_label_falls_back_to_raw_key_when_undecodable() {
+        // A deleted project directory cannot be resolved, so the label stays the
+        // raw slug rather than becoming empty.
+        let slug = "-nonexistent-tokscale-probe-dir-xyz";
+        assert_eq!(workspace_display_label(slug).as_deref(), Some(slug));
+    }
 
     #[test]
     fn warp_cache_parser_preserves_requests_and_spend_without_tokens() {

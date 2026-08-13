@@ -308,7 +308,7 @@ Press `g` in the TUI or use `--group-by` in `--light`/`--json` mode to control h
 | **Model** | `--group-by model` | ✅ | One row per model — merges all clients and providers |
 | **Client + Model** | `--group-by client,model` | | One row per client-model pair |
 | **Client + Provider + Model** | `--group-by client,provider,model` | | Most granular — no merging |
-| **Workspace + Model** | `--group-by workspace,model` | | Group local usage by workspace key, then model |
+| **Workspace + Model** | `--group-by workspace,model` | | Group local usage by workspace key, then model — add [`--merge-worktrees`](#per-workspace-cost) to fold git worktrees into their repo |
 | **Session + Model** | `--group-by session,model` | | One row per `session_id` and model — attribute cost to a specific agent-CLI session |
 | **Client + Session + Model** | `--group-by client,session,model` | | One row per client, session, and model — useful for multi-agent runners that join on `session_id` |
 
@@ -360,6 +360,29 @@ Press `g` in the TUI or use `--group-by` in `--light`/`--json` mode to control h
 ```
 
 Use `--group-by client,session,model` when you also need the client name on every row (one spawn across all 20+ supported CLIs at once).
+
+#### Per-workspace cost
+
+`--group-by workspace,model` attributes usage to the directory an agent ran in, so you can see what a given project cost:
+
+```bash
+# One row per (workspace, model)
+tokscale models --light --group-by workspace,model --month
+
+# Fold every git worktree into its parent repository — one row per repo
+tokscale models --light --group-by workspace,model --merge-worktrees --month
+
+# JSON carries workspaceKey (grouping identity) and workspaceLabel (display name)
+tokscale models --json --group-by workspace,model --merge-worktrees
+```
+
+In the TUI, press `g` → **Workspace + Model**, then `w` to toggle worktree rollup (the footer shows `[w:worktrees]` or `[w:repos]`).
+
+Workspace rows are labeled `repo` or `repo ⑃ worktree`. Clients disagree about how they record a workspace — Claude Code stores a dash-mangled directory slug (`-Users-me-devpro-app`) while Codex and OpenCode store real paths — so tokscale resolves slugs back to their true path against the filesystem. Three consequences worth knowing:
+
+- **Without `--merge-worktrees`, each git worktree is its own row.** Agent CLIs that isolate every task into a worktree will therefore spread one repository across many rows; `--merge-worktrees` re-unites them (and also merges a repo recorded by different clients under different key formats).
+- **`--merge-worktrees` folds worktrees by path, not by git.** It re-unites worktrees kept inside the repository — `<repo>/.claude/worktrees/<name>` (what agent CLIs create) and `<repo>/.git/worktrees/<name>` — because the repo root is a prefix of the path itself. A worktree checked out beside the repo (`git worktree add ../feature-x`) is linked to it only by a `gitdir:` pointer file, so it stays its own row; likewise a repo reached through two different path spellings (a symlink and its target) stays two rows, because a workspace identity is compared as a string. Totals are unaffected either way — usage is split across rows, never lost or double counted.
+- **Clients that never record a workspace roll up into a single `Unknown workspace` row.** Roughly half the supported clients (including gemini, cursor, amp, droid, roocode, kilocode, goose, and Copilot's OTEL path) do not write one, so their usage cannot be attributed to a directory.
 
 ### Filtering by Platform
 

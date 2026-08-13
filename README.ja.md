@@ -311,7 +311,7 @@ TUIで`g`を押すか、`--light`/`--json`モードで`--group-by`を使用し�
 | **モデル** | `--group-by model` | ✅ | モデルごとに1行 — すべてのクライアントとプロバイダーを統合 |
 | **クライアント + モデル** | `--group-by client,model` | | クライアント-モデルペアごとに1行 |
 | **クライアント + プロバイダー + モデル** | `--group-by client,provider,model` | | 最も詳細 — 統合なし |
-| **ワークスペース + モデル** | `--group-by workspace,model` | | ローカル使用量をワークスペースキー、次にモデルでグループ化 |
+| **ワークスペース + モデル** | `--group-by workspace,model` | | ローカル使用量をワークスペースキー、次にモデルでグループ化。[`--merge-worktrees`](README.md#per-workspace-cost) を追加すると、リポジトリ内のワークツリーを親リポジトリに畳み込みます |
 | **セッション + モデル** | `--group-by session,model` | | `session_id` とモデルごとに1行 — 特定のエージェント CLI セッションにコストを帰属 |
 | **クライアント + セッション + モデル** | `--group-by client,session,model` | | クライアント・セッション・モデルごとに1行 — `session_id` で結合するマルチエージェントランナーに便利 |
 

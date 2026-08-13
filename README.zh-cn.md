@@ -308,7 +308,7 @@ tokscale models --json > report.json   # 保存到文件
 | **模型** | `--group-by model` | ✅ | 每个模型一行 — 合并所有客户端和提供商 |
 | **客户端 + 模型** | `--group-by client,model` | | 每个客户端-模型对一行 |
 | **客户端 + 提供商 + 模型** | `--group-by client,provider,model` | | 最详细 — 不合并 |
-| **工作区 + 模型** | `--group-by workspace,model` | | 先按工作区键、再按模型对本地使用量分组 |
+| **工作区 + 模型** | `--group-by workspace,model` | | 先按工作区键、再按模型对本地使用量分组；添加 [`--merge-worktrees`](README.md#per-workspace-cost) 可将仓库内部的 worktree 折叠进其父仓库 |
 | **会话 + 模型** | `--group-by session,model` | | 每个 `session_id` 和模型一行 — 将成本归因到特定的 agent-CLI 会话 |
 | **客户端 + 会话 + 模型** | `--group-by client,session,model` | | 每个客户端、会话和模型一行 — 适用于按 `session_id` 关联的多代理运行器 |
 
