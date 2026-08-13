@@ -107,6 +107,8 @@ fn dedupe_usage_records(records: Vec<UsageRecord>) -> Vec<UnifiedMessage> {
             .push(index);
     }
 
+    // Keep the transcript's first-observation order, independent of HashMap
+    // iteration, while each merged message carries final-snapshot metadata.
     let mut selected = Vec::new();
     for indices in grouped.into_values() {
         let request_ids: HashSet<&str> = indices
@@ -117,39 +119,62 @@ fn dedupe_usage_records(records: Vec<UsageRecord>) -> Vec<UnifiedMessage> {
             // No stable request ID is still safely dedupable when records are
             // connected by message/UUID aliases. Rows with no aliases never
             // connect and remain separate components.
-            0 => selected.push(indices[0]),
-            // Prefer the complete snapshot over a request-only stream row, so
-            // the emitted contribution has the richest available metadata.
-            1 => selected.push(
-                indices
-                    .iter()
-                    .copied()
-                    .filter(|&index| records[index].request_id.is_some())
-                    .max_by_key(|&index| records[index].aliases.len())
-                    .unwrap_or(indices[0]),
-            ),
+            0 | 1 => selected.push((indices[0], merge_streaming_component(&records, &indices))),
             // Do not let a malformed or replayed lower-fidelity alias collapse
             // different API calls. Preserve each request and every unproven
             // partial row rather than guessing an owner.
             _ => {
-                let mut emitted_requests = HashSet::new();
-                for index in indices {
+                let mut request_components = HashMap::<&str, Vec<usize>>::new();
+                for &index in &indices {
                     match records[index].request_id.as_deref() {
-                        Some(request_id) if emitted_requests.insert(request_id) => {
-                            selected.push(index);
-                        }
-                        Some(_) => {}
-                        None => selected.push(index),
+                        Some(request_id) => request_components
+                            .entry(request_id)
+                            .or_default()
+                            .push(index),
+                        // This row could replay any request in this ambiguous
+                        // component, so retain it rather than guessing.
+                        None => selected.push((index, records[index].message.clone())),
                     }
                 }
+                selected.extend(request_components.into_values().map(|request_indices| {
+                    let first_index = request_indices[0];
+                    (
+                        first_index,
+                        merge_streaming_component(&records, &request_indices),
+                    )
+                }));
             }
         }
     }
-    selected.sort_unstable();
-    selected
-        .into_iter()
-        .map(|index| records[index].message.clone())
-        .collect()
+    selected.sort_by_key(|(first_index, _)| *first_index);
+    selected.into_iter().map(|(_, message)| message).collect()
+}
+
+/// Consolidate every replay snapshot of one logical streamed call.
+///
+/// Streaming usage counters are cumulative snapshots, not additive deltas. A
+/// final row can therefore contain a larger value in only one usage bucket.
+/// Keep the maximum independently for every bucket. Metadata comes from the
+/// final observation (latest timestamp, then transcript order), making model
+/// attribution and timestamps deterministic without allowing it to influence
+/// call identity.
+fn merge_streaming_component(records: &[UsageRecord], indices: &[usize]) -> UnifiedMessage {
+    let &final_index = indices
+        .iter()
+        .max_by_key(|&&index| (records[index].message.timestamp, index))
+        .expect("connected component contains at least one record");
+    let mut merged = records[final_index].message.clone();
+
+    for &index in indices {
+        let tokens = &records[index].message.tokens;
+        merged.tokens.input = merged.tokens.input.max(tokens.input);
+        merged.tokens.output = merged.tokens.output.max(tokens.output);
+        merged.tokens.cache_read = merged.tokens.cache_read.max(tokens.cache_read);
+        merged.tokens.cache_write = merged.tokens.cache_write.max(tokens.cache_write);
+        merged.tokens.reasoning = merged.tokens.reasoning.max(tokens.reasoning);
+    }
+
+    merged
 }
 
 fn provider_for_model(model: &str) -> &'static str {
@@ -376,6 +401,32 @@ mod tests {
         assert_eq!(messages[0].tokens.total(), 380);
         assert_eq!(messages[1].tokens.total(), 50);
         assert_eq!(messages[0].workspace_key.as_deref(), Some("D--repo"));
+    }
+
+    #[test]
+    fn merges_streaming_component_usage_by_field_maximums() {
+        let dir = tempdir().unwrap();
+        let path = write_transcript(
+            dir.path(),
+            "session.jsonl",
+            &[
+                r#"{"type":"assistant","uuid":"early","timestamp":"2026-04-27T13:59:02.000Z","message":{"id":"message-1","model":"deepseek-v4-pro","usage":{"input_tokens":100,"cache_read_input_tokens":20,"cache_creation_input_tokens":5,"output_tokens":10}}}"#,
+                r#"{"type":"assistant","uuid":"final","timestamp":"2026-04-27T13:59:03.000Z","message":{"id":"message-1","model":"deepseek-v4-pro","usage":{"input_tokens":80,"cache_read_input_tokens":30,"cache_creation_input_tokens":2,"output_tokens":300}}}"#,
+            ],
+        );
+
+        let messages = parse_cherrystudio_file(&path);
+        assert_eq!(
+            messages.len(),
+            1,
+            "snapshots of one message ID are one call"
+        );
+        let message = &messages[0];
+        assert_eq!(message.tokens.input, 100);
+        assert_eq!(message.tokens.cache_read, 30);
+        assert_eq!(message.tokens.cache_write, 5);
+        assert_eq!(message.tokens.output, 300);
+        assert_eq!(message.timestamp, 1_777_298_343_000);
     }
 
     #[test]

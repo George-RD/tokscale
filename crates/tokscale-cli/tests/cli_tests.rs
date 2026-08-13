@@ -1203,7 +1203,8 @@ fn cherrystudio_projects_root(base: &Path) -> std::path::PathBuf {
 }
 
 /// Four snapshots of one streamed Cherry Studio API call. The final snapshot
-/// connects the UUID-only, message-only, and request-only partial records.
+/// connects the UUID-only, message-only, and request-only partial records and
+/// carries the final streamed output count.
 fn write_cherrystudio_connected_alias_transcript(base: &Path) {
     let path = cherrystudio_projects_root(base).join("workspace/session.jsonl");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1216,7 +1217,7 @@ fn write_cherrystudio_connected_alias_transcript(base: &Path) {
             "\n",
             r#"{"type":"assistant","requestId":"r","message":{"model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
             "\n",
-            r#"{"type":"assistant","uuid":"u","requestId":"r","message":{"id":"m","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+            r#"{"type":"assistant","uuid":"u","requestId":"r","message":{"id":"m","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":300}}}"#,
             "\n"
         ),
     )
@@ -2007,7 +2008,7 @@ fn test_cherrystudio_connected_aliases_count_once_cold_and_warm_cache() {
         let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(json["totalMessages"].as_i64(), Some(1), "{pass} cache pass");
         assert_eq!(json["totalInput"].as_i64(), Some(100), "{pass} cache pass");
-        assert_eq!(json["totalOutput"].as_i64(), Some(10), "{pass} cache pass");
+        assert_eq!(json["totalOutput"].as_i64(), Some(300), "{pass} cache pass");
     }
 }
 
