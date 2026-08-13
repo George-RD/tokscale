@@ -15,8 +15,9 @@
 //! streaming record later gains or changes `message.id`. Naively
 //! summing every assistant row triple-counts each call (verified ~3x over the
 //! true figure). The canonical fix — validated against DeepSeek's platform
-//! per-hour billing, <1% error — is to dedupe by the stable request and/or
-//! message identity; `uuid` is only a fallback when neither primary ID exists.
+//! per-hour billing, <1% error — is to form alias-connected components across
+//! the complete transcript before choosing one contribution; `uuid` is only a
+//! fallback when neither primary ID exists.
 //! Usage signatures are not identities: two distinct requests may legitimately
 //! have identical token counts. Records without an identity are retained
 //! conservatively. All reads are strictly read-only.
@@ -35,126 +36,120 @@ use std::path::Path;
 
 const CLIENT_ID: &str = "cherrystudio";
 
-/// The strongest identity an accepted record has contributed to an alias set.
+/// A valid usage row held until every alias in the transcript has been seen.
 ///
-/// Cherry Studio's `requestId` names an API call. A `message.id` can arrive
-/// later as that call streams, while `uuid` identifies only a written event.
-/// We therefore only let a lower-fidelity alias join an existing, lower-fidelity
-/// record. In particular, two records with distinct request IDs remain distinct
-/// even if malformed/replayed data happens to reuse a message ID or UUID.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum IdentityStrength {
-    Uuid,
-    Message,
-    Request,
+/// Cherry Studio writes partial stream snapshots before it writes the complete
+/// snapshot that relates their UUID, message ID, and request ID. Deduplicating
+/// while reading therefore cannot be correct: the earlier snapshots may have
+/// already been emitted by the time the connecting row arrives.
+struct UsageRecord {
+    message: UnifiedMessage,
+    request_id: Option<String>,
+    aliases: Vec<String>,
 }
 
-/// Alias-aware deduplication for one Cherry Studio transcript.
-///
-/// A stream can begin as `uuid`, acquire `message.id`, then acquire `requestId`.
-/// Each accepted row registers every supplied alias, so either ordering of those
-/// transitions collapses. Request ID is authoritative when present: an existing
-/// message/UUID alias can only absorb a new request if that old row had not
-/// already established a request of its own.
-#[derive(Default)]
-struct IdentityAliases {
-    aliases: HashMap<String, usize>,
-    /// Lower-fidelity aliases observed under distinct API requests. They cannot
-    /// safely identify a request-only/missing-ID record any longer.
-    ambiguous_aliases: HashSet<String>,
-    strengths: Vec<IdentityStrength>,
+/// Minimal disjoint-set implementation used to form alias-connected components
+/// for a *single* transcript. Components are formed only after parsing, before
+/// any usage is returned to the caller.
+struct UnionFind {
+    parent: Vec<usize>,
 }
 
-impl IdentityAliases {
-    fn owner(&self, key: &str) -> Option<usize> {
-        (!self.ambiguous_aliases.contains(key))
-            .then(|| self.aliases.get(key).copied())
-            .flatten()
+impl UnionFind {
+    fn new(len: usize) -> Self {
+        Self {
+            parent: (0..len).collect(),
+        }
     }
 
-    fn register(&mut self, key: String, owner: usize, strength: IdentityStrength) {
-        match self.aliases.get(&key) {
-            Some(&existing) if existing != owner && strength < IdentityStrength::Request => {
-                // A reused message/UUID cannot link records once two API calls
-                // have claimed it. Preserve both requests and retain future
-                // sparse records rather than guessing which call they replay.
-                self.ambiguous_aliases.insert(key);
+    fn find(&mut self, node: usize) -> usize {
+        if self.parent[node] != node {
+            let root = self.find(self.parent[node]);
+            self.parent[node] = root;
+        }
+        self.parent[node]
+    }
+
+    fn union(&mut self, left: usize, right: usize) {
+        let left = self.find(left);
+        let right = self.find(right);
+        if left != right {
+            self.parent[right] = left;
+        }
+    }
+}
+
+/// Deduplicate only after all rows have contributed their aliases.
+///
+/// A component with zero or one authoritative request ID is one logical call.
+/// A component with several request IDs contains a reused lower-fidelity alias
+/// (message ID or UUID). It must not merge those independently authoritative
+/// calls. The ambiguous partial rows are retained conservatively because there
+/// is no evidence assigning them to either request.
+fn dedupe_usage_records(records: Vec<UsageRecord>) -> Vec<UnifiedMessage> {
+    let mut aliases = HashMap::<String, usize>::new();
+    let mut components = UnionFind::new(records.len());
+    for (index, record) in records.iter().enumerate() {
+        for alias in &record.aliases {
+            if let Some(&previous) = aliases.get(alias) {
+                components.union(index, previous);
+            } else {
+                aliases.insert(alias.clone(), index);
             }
-            Some(_) => {}
-            None => {
-                self.aliases.insert(key, owner);
+        }
+    }
+
+    let mut grouped = HashMap::<usize, Vec<usize>>::new();
+    for index in 0..records.len() {
+        grouped
+            .entry(components.find(index))
+            .or_default()
+            .push(index);
+    }
+
+    let mut selected = Vec::new();
+    for indices in grouped.into_values() {
+        let request_ids: HashSet<&str> = indices
+            .iter()
+            .filter_map(|&index| records[index].request_id.as_deref())
+            .collect();
+        match request_ids.len() {
+            // No stable request ID is still safely dedupable when records are
+            // connected by message/UUID aliases. Rows with no aliases never
+            // connect and remain separate components.
+            0 => selected.push(indices[0]),
+            // Prefer the complete snapshot over a request-only stream row, so
+            // the emitted contribution has the richest available metadata.
+            1 => selected.push(
+                indices
+                    .iter()
+                    .copied()
+                    .filter(|&index| records[index].request_id.is_some())
+                    .max_by_key(|&index| records[index].aliases.len())
+                    .unwrap_or(indices[0]),
+            ),
+            // Do not let a malformed or replayed lower-fidelity alias collapse
+            // different API calls. Preserve each request and every unproven
+            // partial row rather than guessing an owner.
+            _ => {
+                let mut emitted_requests = HashSet::new();
+                for index in indices {
+                    match records[index].request_id.as_deref() {
+                        Some(request_id) if emitted_requests.insert(request_id) => {
+                            selected.push(index);
+                        }
+                        Some(_) => {}
+                        None => selected.push(index),
+                    }
+                }
             }
         }
     }
-
-    fn is_duplicate_and_register(
-        &mut self,
-        request_id: Option<&str>,
-        message_id: Option<&str>,
-        uuid: Option<&str>,
-    ) -> bool {
-        let request_key = request_id.map(|id| format!("request:{id}"));
-        let message_key = message_id.map(|id| format!("message:{id}"));
-        let uuid_key = uuid.map(|id| format!("uuid:{id}"));
-
-        let existing = match request_key
-            .as_deref()
-            .and_then(|key| self.aliases.get(key).copied())
-        {
-            // A request ID is Cherry Studio's API-call identity, including when
-            // the associated message ID is populated or changes later.
-            Some(owner) => Some(owner),
-            None if request_key.is_some() => message_key
-                .as_deref()
-                .and_then(|key| self.owner(key))
-                .filter(|&owner| self.strengths[owner] < IdentityStrength::Request)
-                .or_else(|| {
-                    uuid_key
-                        .as_deref()
-                        .and_then(|key| self.owner(key))
-                        .filter(|&owner| self.strengths[owner] == IdentityStrength::Uuid)
-                }),
-            // A message ID is sufficient only when no request ID is available.
-            // A UUID may join it only when the earlier record was UUID-only.
-            None if message_key.is_some() => message_key
-                .as_deref()
-                .and_then(|key| self.owner(key))
-                .or_else(|| {
-                    uuid_key
-                        .as_deref()
-                        .and_then(|key| self.owner(key))
-                        .filter(|&owner| self.strengths[owner] == IdentityStrength::Uuid)
-                }),
-            // UUID is an event fallback. It is deliberately not inferred from
-            // usage, so records with no stable identity remain conservative.
-            None => uuid_key.as_deref().and_then(|key| self.owner(key)),
-        };
-
-        let strength = if request_key.is_some() {
-            IdentityStrength::Request
-        } else if message_key.is_some() {
-            IdentityStrength::Message
-        } else if uuid_key.is_some() {
-            IdentityStrength::Uuid
-        } else {
-            return false;
-        };
-        let owner = existing.unwrap_or_else(|| {
-            self.strengths.push(strength);
-            self.strengths.len() - 1
-        });
-        self.strengths[owner] = self.strengths[owner].max(strength);
-        if let Some(key) = request_key {
-            self.register(key, owner, IdentityStrength::Request);
-        }
-        if let Some(key) = message_key {
-            self.register(key, owner, IdentityStrength::Message);
-        }
-        if let Some(key) = uuid_key {
-            self.register(key, owner, IdentityStrength::Uuid);
-        }
-        existing.is_some()
-    }
+    selected.sort_unstable();
+    selected
+        .into_iter()
+        .map(|index| records[index].message.clone())
+        .collect()
 }
 
 fn provider_for_model(model: &str) -> &'static str {
@@ -204,8 +199,7 @@ pub fn parse_cherrystudio_file(path: &Path) -> Vec<UnifiedMessage> {
     let (workspace_key, workspace_label) = workspace_from_path(path);
 
     let reader = BufReader::new(file);
-    let mut messages = Vec::new();
-    let mut identities = IdentityAliases::default();
+    let mut records = Vec::new();
     let session_id = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -270,18 +264,16 @@ pub fn parse_cherrystudio_file(path: &Path) -> Vec<UnifiedMessage> {
             continue;
         }
 
-        // Cherry Studio can append a streaming record several times. Only an
-        // explicit identity proves two rows represent the same call: matching
-        // usage is not sufficient because separate calls can cost the same.
-        // requestId and message.id survive replay UUID changes, so they take
-        // precedence. UUID is only an identity fallback when both are absent.
-        // Rows without IDs are retained conservatively.
+        // Hold every valid row until the whole transcript has been read. A
+        // complete snapshot can connect UUID-only, message-only, and
+        // request-only rows that appeared earlier in any order.
         let request_id = record
             .get("requestId")
             .or_else(|| message.get("requestId"))
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|id| !id.is_empty());
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
         let message_id = message
             .get("id")
             .and_then(Value::as_str)
@@ -293,8 +285,15 @@ pub fn parse_cherrystudio_file(path: &Path) -> Vec<UnifiedMessage> {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|id| !id.is_empty());
-        if identities.is_duplicate_and_register(request_id, message_id, uuid) {
-            continue;
+        let mut aliases = Vec::new();
+        if let Some(request_id) = &request_id {
+            aliases.push(format!("request:{request_id}"));
+        }
+        if let Some(message_id) = message_id {
+            aliases.push(format!("message:{message_id}"));
+        }
+        if let Some(uuid) = uuid {
+            aliases.push(format!("uuid:{uuid}"));
         }
 
         let timestamp = record
@@ -324,9 +323,13 @@ pub fn parse_cherrystudio_file(path: &Path) -> Vec<UnifiedMessage> {
         if let (Some(key), Some(label)) = (workspace_key.clone(), workspace_label.clone()) {
             msg.set_workspace(Some(key), Some(label));
         }
-        messages.push(msg);
+        records.push(UsageRecord {
+            message: msg,
+            request_id,
+            aliases,
+        });
     }
-    messages
+    dedupe_usage_records(records)
 }
 
 #[cfg(test)]
@@ -373,6 +376,44 @@ mod tests {
         assert_eq!(messages[0].tokens.total(), 380);
         assert_eq!(messages[1].tokens.total(), 50);
         assert_eq!(messages[0].workspace_key.as_deref(), Some("D--repo"));
+    }
+
+    #[test]
+    fn dedupes_partial_aliases_connected_by_a_complete_row_in_any_order() {
+        let rows = [
+            r#"{"type":"assistant","uuid":"u","message":{"model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+            r#"{"type":"assistant","message":{"id":"m","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+            r#"{"type":"assistant","requestId":"r","message":{"model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+            r#"{"type":"assistant","uuid":"u","requestId":"r","message":{"id":"m","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+        ];
+        let mut order = [0, 1, 2, 3];
+        loop {
+            let dir = tempdir().unwrap();
+            let ordered_rows: Vec<_> = order.iter().map(|&index| rows[index]).collect();
+            let path = write_transcript(dir.path(), "session.jsonl", &ordered_rows);
+            let messages = parse_cherrystudio_file(&path);
+            assert_eq!(
+                messages.len(),
+                1,
+                "connected aliases identify one API call in order {order:?}"
+            );
+            assert_eq!(messages[0].tokens.total(), 110);
+
+            // Lexicographically enumerate all 4! stream orderings, including
+            // the P1's late-complete replay.
+            let Some(pivot) = (0..order.len() - 1)
+                .rev()
+                .find(|&index| order[index] < order[index + 1])
+            else {
+                break;
+            };
+            let swap = (pivot + 1..order.len())
+                .rev()
+                .find(|&index| order[pivot] < order[index])
+                .unwrap();
+            order.swap(pivot, swap);
+            order[pivot + 1..].reverse();
+        }
     }
 
     #[test]

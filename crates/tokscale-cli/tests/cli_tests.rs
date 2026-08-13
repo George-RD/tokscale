@@ -1187,6 +1187,42 @@ fn write_codex_token_session(dir: &Path, name: &str, model: &str, input: i64, ou
     .unwrap();
 }
 
+fn cherrystudio_projects_root(base: &Path) -> std::path::PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        base.join("AppData/Roaming/CherryStudio/.claude/projects")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        base.join("Library/Application Support/CherryStudio/.claude/projects")
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        base.join(".config/CherryStudio/.claude/projects")
+    }
+}
+
+/// Four snapshots of one streamed Cherry Studio API call. The final snapshot
+/// connects the UUID-only, message-only, and request-only partial records.
+fn write_cherrystudio_connected_alias_transcript(base: &Path) {
+    let path = cherrystudio_projects_root(base).join("workspace/session.jsonl");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        path,
+        concat!(
+            r#"{"type":"assistant","uuid":"u","message":{"model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"id":"m","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+            "\n",
+            r#"{"type":"assistant","requestId":"r","message":{"model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"u","requestId":"r","message":{"id":"m","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+}
+
 fn write_jcode_session(base: &Path) {
     let sessions_dir = base.join(".jcode/sessions");
     fs::create_dir_all(&sessions_dir).unwrap();
@@ -1942,6 +1978,37 @@ fn test_models_with_client_filter_jcode() {
     assert_eq!(entry["cacheWrite"].as_i64().unwrap(), 50);
     assert_eq!(entry["output"].as_i64().unwrap(), 250);
     assert_eq!(entry["reasoning"].as_i64().unwrap(), 25);
+}
+
+#[test]
+fn test_cherrystudio_connected_aliases_count_once_cold_and_warm_cache() {
+    let tmp = create_empty_fixture_dir();
+    write_cherrystudio_connected_alias_transcript(tmp.path());
+
+    // The first invocation parses the transcript and writes the source cache;
+    // the second reads that cache. Both must retain the parser's one-call
+    // contribution rather than reviving the three partial snapshots.
+    for pass in ["cold", "warm"] {
+        let output = cmd_with_home(tmp.path())
+            .args([
+                "models",
+                "--json",
+                "--client",
+                "cherrystudio",
+                "--no-spinner",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{pass} cache pass failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["totalMessages"].as_i64(), Some(1), "{pass} cache pass");
+        assert_eq!(json["totalInput"].as_i64(), Some(100), "{pass} cache pass");
+        assert_eq!(json["totalOutput"].as_i64(), Some(10), "{pass} cache pass");
+    }
 }
 
 fn assert_cursor_setup_warning(json: &serde_json::Value) {
