@@ -6971,6 +6971,119 @@ mod tests {
         assert_claude_retained_partial_merges_completed_live("aaa-live.jsonl");
     }
 
+    /// The mirror of the collision above: the *retained* copy is the completed
+    /// observation and the live transcript carries only the streaming partial.
+    /// Completeness has to be monotonic in this direction too — a merge that
+    /// keeps whichever copy is live, or whichever file sorts first, discards
+    /// the completed output that only the retained copy still holds.
+    ///
+    /// The two copies lead on different fields (the partial on input, the
+    /// completed one on output), so any resolution that keeps one whole message
+    /// under-reports the other field. Both copies name the same model and
+    /// provider: metadata authority is the previous pair's subject, and pinning
+    /// it again here would only restate it in a case where the live copy is the
+    /// less complete observation.
+    fn assert_claude_retained_completed_merges_live_partial(second_file_name: &str) {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+
+        let claude_dir = client_scan_root(source_home.path(), ClientId::Claude).join("myproject");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let retained_path = claude_dir.join("mmm-retained.jsonl");
+
+        let retained_completed = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:01.000Z","requestId":"req_shared","provider":"anthropic","message":{"id":"msg_shared","model":"claude-3-5-sonnet","provider":"anthropic","usage":{"input_tokens":200,"output_tokens":999}}}"#;
+        let live_partial = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_shared","provider":"anthropic","message":{"id":"msg_shared","model":"claude-3-5-sonnet","provider":"anthropic","usage":{"input_tokens":500,"output_tokens":60}}}"#;
+
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-3-5-sonnet".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.002),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+
+        std::fs::write(&retained_path, format!("{retained_completed}\n")).unwrap();
+        let seeded = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &["claude".to_string()],
+            Some(&pricing),
+            false,
+            &scanner::ScannerSettings::default(),
+        );
+        assert_eq!(seeded.len(), 1, "cold scan must seed retained history");
+
+        // Claude rewrites the first transcript; the fork/resume transcript was
+        // observed mid-stream, so the copy that is still live is the partial.
+        std::fs::write(&retained_path, "").unwrap();
+        std::fs::write(
+            claude_dir.join(second_file_name),
+            format!("{live_partial}\n"),
+        )
+        .unwrap();
+
+        let assert_merged = |messages: &[UnifiedMessage]| {
+            assert_eq!(
+                messages.len(),
+                1,
+                "the shared response must be counted once"
+            );
+            let merged = &messages[0];
+            assert_eq!(merged.tokens.input, 500, "take the larger live input");
+            assert_eq!(
+                merged.tokens.output, 999,
+                "the retained copy's completed output must not be discarded"
+            );
+            assert_eq!(merged.model_id, "claude-3-5-sonnet");
+            assert_eq!(merged.provider_id, "anthropic");
+            assert_eq!(
+                merged.session_id,
+                second_file_name.trim_end_matches(".jsonl")
+            );
+            assert_eq!(merged.workspace_key.as_deref(), Some("myproject"));
+            assert_eq!(merged.workspace_label.as_deref(), Some("myproject"));
+            assert_eq!(merged.cost_source, sessions::CostSource::Estimated);
+            assert!(
+                (merged.cost - 2.498).abs() < 1e-9,
+                "price must be recomputed from merged tokens; got {}",
+                merged.cost
+            );
+        };
+
+        let merged = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &["claude".to_string()],
+            Some(&pricing),
+            false,
+            &scanner::ScannerSettings::default(),
+        );
+        assert_merged(&merged);
+
+        let warm = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &["claude".to_string()],
+            Some(&pricing),
+            false,
+            &scanner::ScannerSettings::default(),
+        );
+        assert_merged(&warm);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_retained_completed_merges_live_partial_that_sorts_later() {
+        assert_claude_retained_completed_merges_live_partial("zzz-live.jsonl");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_retained_completed_merges_live_partial_that_sorts_earlier() {
+        assert_claude_retained_completed_merges_live_partial("aaa-live.jsonl");
+    }
+
     /// A cache entry written before retention provenance existed carries the
     /// retained turns but no record of *which* rows they are. Reading such an
     /// entry as if every row were live lets the stale, path-first copy of a
