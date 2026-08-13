@@ -1075,10 +1075,14 @@ fn parser_version(client: ClientId) -> u32 {
         // multi-day session reports against the days it actually ran.
         // v3->v4: a reply is weighted by the context standing before it rather
         // than including its own bytes, so a long answer no longer charges
-        // itself for its own output. Versions 2 and 3 only ever existed in
-        // pre-release builds of this change; the bump past them keeps anyone
-        // who ran one from holding the superseded weighting.
-        ClientId::Droid => 4,
+        // itself for its own output.
+        // v4->v5: output and reasoning follow the reply's own size instead of
+        // the context it read, a pre-epoch transcript timestamp no longer
+        // anchors a share of the session in 1969, and an oversized transcript
+        // takes the single-record path. Versions 2 through 4 only ever existed
+        // in pre-release builds of this change; the bump past them keeps anyone
+        // who ran one from holding a superseded split.
+        ClientId::Droid => 5,
         _ => 1,
     }
 }
@@ -2969,7 +2973,7 @@ mod tests {
         // A finished Droid session's settings.json is never rewritten again, so
         // its fingerprint keeps matching and only the version bump discards the
         // v1 lock-timestamp anchor.
-        assert_eq!(parser_version(ClientId::Droid), 4);
+        assert_eq!(parser_version(ClientId::Droid), 5);
     }
 
     #[test]

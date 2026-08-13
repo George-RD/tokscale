@@ -191,10 +191,36 @@ fn resolve_usage_timestamp(lock_timestamp: Option<i64>, modified: Option<i64>) -
 
 /// One assistant reply in a Droid transcript: when it was written, and how
 /// expensive it plausibly was relative to the session's other replies.
+///
+/// Two weights, because a reply's read cost and its write cost do not move
+/// together. `context_weight` is the conversation standing before the reply,
+/// which is what the call had to read; `output_weight` is the reply's own
+/// bytes, which is what the call produced.
 struct TranscriptTurn {
     timestamp: i64,
-    weight: u128,
+    context_weight: u128,
+    output_weight: u128,
 }
+
+/// Ceiling on the transcript bytes read to shape one session's spend.
+///
+/// Apportioning is a refinement, not a correctness requirement: the fallback
+/// emits one record carrying the identical total, so declining to read an
+/// oversized transcript costs attribution detail and nothing else. Cost grows
+/// linearly with transcript size and is paid again on every scan while the
+/// session is live, because the growing transcript keeps invalidating the
+/// cached parse (measured on a 104.7 MB transcript: 148 ms per parse in
+/// release, 1.28 s in debug, ~1.4 ms/MB). This ceiling bounds that per-session
+/// work at roughly 45 ms in release.
+const MAX_TRANSCRIPT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Ceiling on the records one session contributes.
+///
+/// One record per assistant reply is unbounded in the session's length, and
+/// every record is retained in the message cache. Past this many replies the
+/// turns are coalesced into runs rather than truncated, so the apportioned
+/// total is unchanged and only the resolution of the attribution drops.
+const MAX_TURNS_PER_SESSION: usize = 1024;
 
 /// Recover the shape of a session's spend from its transcript.
 ///
@@ -209,14 +235,20 @@ struct TranscriptTurn {
 ///
 /// Only assistant replies are counted, since one reply corresponds to one API
 /// call; user and tool records ride along inside the call that reads them. Each
-/// reply is weighted by the context standing *before* it, since its own bytes
-/// are output rather than something it paid to read. Compaction resets the
-/// running context because it discards the transcript the following calls would
-/// otherwise re-read.
-fn transcript_turns(jsonl: &Path) -> Vec<TranscriptTurn> {
+/// reply carries two weights: the context standing *before* it, which is what
+/// the call read, and its own bytes, which is what the call wrote. Compaction
+/// resets the running context because it discards the transcript the following
+/// calls would otherwise re-read.
+///
+/// Returns no turns for a transcript past `max_bytes`, which sends the session
+/// down the single-record fallback rather than paying an unbounded read.
+fn transcript_turns_bounded(jsonl: &Path, max_bytes: u64, max_turns: usize) -> Vec<TranscriptTurn> {
     let Ok(file) = std::fs::File::open(jsonl) else {
         return Vec::new();
     };
+    if file.metadata().map(|meta| meta.len()).unwrap_or(0) > max_bytes {
+        return Vec::new();
+    }
 
     let mut turns = Vec::new();
     let mut context_bytes: u128 = 0;
@@ -254,7 +286,17 @@ fn transcript_turns(jsonl: &Path) -> Vec<TranscriptTurn> {
             continue;
         }
 
-        let Some(timestamp) = record.get("timestamp").and_then(parse_timestamp_value) else {
+        // A non-positive timestamp is the parsers' "no usable time" sentinel,
+        // not an instant before 1970 — `rebucket_date` refuses to re-key one.
+        // The RFC3339 path has no such floor of its own, so a pre-epoch
+        // transcript timestamp would otherwise anchor a share of the session in
+        // 1969, where no date filter reaches it. Skipping the turn keeps its
+        // tokens in the session: apportioning runs over the turns that remain.
+        let Some(timestamp) = record
+            .get("timestamp")
+            .and_then(parse_timestamp_value)
+            .filter(|&ts| ts > 0)
+        else {
             continue;
         };
 
@@ -262,11 +304,49 @@ fn transcript_turns(jsonl: &Path) -> Vec<TranscriptTurn> {
             timestamp,
             // The first reply in a session reads a context of zero bytes but
             // still cost something, so every turn carries at least one unit.
-            weight: context_read.max(1),
+            context_weight: context_read.max(1),
+            output_weight: line_bytes.max(1),
         });
     }
 
+    coalesce_turns(turns, max_turns)
+}
+
+fn transcript_turns(jsonl: &Path) -> Vec<TranscriptTurn> {
+    transcript_turns_bounded(jsonl, MAX_TRANSCRIPT_BYTES, MAX_TURNS_PER_SESSION)
+}
+
+/// Fold consecutive turns into at most `max_turns` runs, summing their weights.
+///
+/// Coalescing rather than truncating keeps the apportioned total intact: every
+/// turn's weight still competes for the session's tokens, so no usage is
+/// dropped and the parts still sum to what Droid recorded. A run reports at its
+/// latest reply, which is where most of its weight sits — context grows
+/// monotonically within a run, so the last reply of the run is the heaviest.
+/// The parser cannot bucket by day itself: the day key is re-derived later
+/// under the user's pinned timezone, which is not known here.
+fn coalesce_turns(turns: Vec<TranscriptTurn>, max_turns: usize) -> Vec<TranscriptTurn> {
+    if max_turns == 0 || turns.len() <= max_turns {
+        return turns;
+    }
+
+    let run = turns.len().div_ceil(max_turns);
     turns
+        .chunks(run)
+        .map(|chunk| TranscriptTurn {
+            timestamp: chunk
+                .iter()
+                .map(|turn| turn.timestamp)
+                .max()
+                .unwrap_or_default(),
+            context_weight: chunk
+                .iter()
+                .fold(0u128, |sum, turn| sum.saturating_add(turn.context_weight)),
+            output_weight: chunk
+                .iter()
+                .fold(0u128, |sum, turn| sum.saturating_add(turn.output_weight)),
+        })
+        .collect()
 }
 
 /// Split `total` across `weights` so the parts sum back to exactly `total`.
@@ -363,15 +443,23 @@ pub fn parse_droid_file(path: &Path) -> Vec<UnifiedMessage> {
     let turns = droid_jsonl_path(path)
         .map(|jsonl| transcript_turns(&jsonl))
         .unwrap_or_default();
-    let total_weight: u128 = turns.iter().map(|turn| turn.weight).sum();
+    // Read cost and write cost are apportioned on different weights. Input,
+    // cache reads and cache writes are all charged for the conversation the
+    // call had to send, so they follow the context standing before the reply.
+    // Output and reasoning are what the call produced, so they follow the
+    // reply's own size — a verbose answer on a short context earns its output
+    // share without also claiming the input share of the replies around it.
+    let context_weights: Vec<u128> = turns.iter().map(|turn| turn.context_weight).collect();
+    let output_weights: Vec<u128> = turns.iter().map(|turn| turn.output_weight).collect();
+    let total_context: u128 = context_weights.iter().sum();
+    let total_output: u128 = output_weights.iter().sum();
 
-    if !turns.is_empty() && total_weight > 0 {
-        let weights: Vec<u128> = turns.iter().map(|turn| turn.weight).collect();
-        let input = apportion(totals.input, &weights, total_weight);
-        let output = apportion(totals.output, &weights, total_weight);
-        let cache_read = apportion(totals.cache_read, &weights, total_weight);
-        let cache_write = apportion(totals.cache_write, &weights, total_weight);
-        let reasoning = apportion(totals.reasoning, &weights, total_weight);
+    if !turns.is_empty() && total_context > 0 && total_output > 0 {
+        let input = apportion(totals.input, &context_weights, total_context);
+        let cache_read = apportion(totals.cache_read, &context_weights, total_context);
+        let cache_write = apportion(totals.cache_write, &context_weights, total_context);
+        let output = apportion(totals.output, &output_weights, total_output);
+        let reasoning = apportion(totals.reasoning, &output_weights, total_output);
 
         return turns
             .iter()
@@ -564,6 +652,195 @@ mod tests {
             "a long reply inflated its own share: {:?}",
             messages.iter().map(|m| m.tokens.input).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_output_follows_the_replys_own_size_not_the_context_it_read() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        // Two replies reading the same conversation, one of them far longer.
+        // They read the same bytes, so the input split is even; the long one
+        // produced far more, so it must carry far more of the output total.
+        let settings = write_session(
+            temp_dir.path(),
+            "55555555-5555-5555-5555-555555555555",
+            r#"{"inputTokens":1000,"outputTokens":1000,"thinkingTokens":1000}"#,
+            &[
+                &user("2026-08-07T11:00:00Z", 4000),
+                &assistant("2026-08-07T12:00:00Z", 10),
+                &assistant("2026-08-07T13:00:00Z", 10),
+            ],
+        );
+
+        let messages = parse_droid_file(&settings);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 1000);
+        // The second reply reads the first one's bytes too, but 10 bytes on top
+        // of a 4KB context barely moves the input split.
+        let input_ratio = messages[1].tokens.input as f64 / messages[0].tokens.input as f64;
+        assert!(
+            input_ratio < 1.1,
+            "identical context should split input evenly, got {:?}",
+            messages.iter().map(|m| m.tokens.input).collect::<Vec<_>>()
+        );
+        // Same-length replies split output evenly here; the discriminating case
+        // is below, where one reply is much longer than the other.
+        assert_eq!(messages[0].tokens.output, messages[1].tokens.output);
+
+        let settings = write_session(
+            temp_dir.path(),
+            "66666666-6666-6666-6666-666666666666",
+            r#"{"inputTokens":1000,"outputTokens":1000,"thinkingTokens":1000}"#,
+            &[
+                &user("2026-08-07T11:00:00Z", 4000),
+                &assistant("2026-08-07T12:00:00Z", 50_000),
+                &assistant("2026-08-07T13:00:00Z", 10),
+            ],
+        );
+
+        let messages = parse_droid_file(&settings);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 1000);
+        assert_eq!(
+            messages.iter().map(|m| m.tokens.reasoning).sum::<i64>(),
+            1000
+        );
+        assert!(
+            messages[0].tokens.output > messages[1].tokens.output * 10,
+            "the long reply should carry the output it produced: {:?}",
+            messages.iter().map(|m| m.tokens.output).collect::<Vec<_>>()
+        );
+        assert!(
+            messages[0].tokens.reasoning > messages[1].tokens.reasoning * 10,
+            "reasoning is produced alongside output: {:?}",
+            messages
+                .iter()
+                .map(|m| m.tokens.reasoning)
+                .collect::<Vec<_>>()
+        );
+        // ...while the input split still follows what each call read, so the
+        // long reply does not also take the other's input share.
+        assert!(
+            messages[1].tokens.input > messages[0].tokens.input,
+            "input must still follow the context each call read: {:?}",
+            messages.iter().map(|m| m.tokens.input).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_pre_epoch_transcript_timestamp_is_not_an_attribution_anchor() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        // A clock artifact in the transcript. Anchoring a share of the session
+        // on it buckets those tokens in 1969, past every date filter.
+        let settings = write_session(
+            temp_dir.path(),
+            "77777777-7777-7777-7777-777777777777",
+            r#"{"inputTokens":900,"outputTokens":100}"#,
+            &[
+                &assistant("1969-07-20T20:17:00Z", 10),
+                &assistant("2026-08-09T12:00:00Z", 10),
+            ],
+        );
+
+        let messages = parse_droid_file(&settings);
+
+        assert_eq!(
+            messages.len(),
+            1,
+            "the pre-epoch reply is not a usable turn"
+        );
+        assert!(messages.iter().all(|m| m.timestamp > 0));
+        // Nothing is dropped: the surviving turn carries the whole session.
+        assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 900);
+        assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 100);
+    }
+
+    #[test]
+    fn test_transcript_of_only_pre_epoch_replies_falls_back_to_one_record() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let settings = write_session(
+            temp_dir.path(),
+            "88888888-8888-8888-8888-888888888888",
+            r#"{"inputTokens":900}"#,
+            &[&assistant("1969-07-20T20:17:00Z", 10)],
+        );
+
+        let messages = parse_droid_file(&settings);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 900);
+        assert!(
+            messages[0].timestamp > 0,
+            "the fallback anchor must stay in a reachable bucket"
+        );
+    }
+
+    #[test]
+    fn test_oversized_transcript_takes_the_single_record_path() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let settings = write_session(
+            temp_dir.path(),
+            "99999999-9999-9999-9999-999999999999",
+            r#"{"inputTokens":900}"#,
+            &[
+                &assistant("2026-08-07T12:00:00Z", 200),
+                &assistant("2026-08-09T12:00:00Z", 200),
+            ],
+        );
+        let jsonl = droid_jsonl_path(&settings).unwrap();
+        let size = std::fs::metadata(&jsonl).unwrap().len();
+
+        // Under the ceiling the transcript still shapes the session.
+        assert_eq!(
+            transcript_turns_bounded(&jsonl, size, MAX_TURNS_PER_SESSION).len(),
+            2
+        );
+        // Past it, no turns — which is what routes the session to the
+        // mtime-anchored single record instead of an unbounded read.
+        assert!(transcript_turns_bounded(&jsonl, size - 1, MAX_TURNS_PER_SESSION).is_empty());
+    }
+
+    #[test]
+    fn test_turn_count_is_capped_without_losing_usage() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let transcript: Vec<String> = (0..50)
+            .map(|i| {
+                assistant(
+                    &format!("2026-08-{:02}T{:02}:00:00Z", 1 + i / 24, i % 24),
+                    10,
+                )
+            })
+            .collect();
+        let settings = write_session(
+            temp_dir.path(),
+            "aaaaaaaa-0000-0000-0000-000000000000",
+            r#"{"inputTokens":1000}"#,
+            &transcript.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        let jsonl = droid_jsonl_path(&settings).unwrap();
+
+        let uncapped = transcript_turns_bounded(&jsonl, MAX_TRANSCRIPT_BYTES, usize::MAX);
+        assert_eq!(uncapped.len(), 50);
+
+        let capped = transcript_turns_bounded(&jsonl, MAX_TRANSCRIPT_BYTES, 7);
+        assert!(capped.len() <= 7, "cap not honoured: {}", capped.len());
+        // Coalescing folds weight rather than discarding it, so the session
+        // still apportions the same total across the runs that remain.
+        assert_eq!(
+            capped.iter().map(|turn| turn.context_weight).sum::<u128>(),
+            uncapped
+                .iter()
+                .map(|turn| turn.context_weight)
+                .sum::<u128>()
+        );
+        assert_eq!(
+            capped.iter().map(|turn| turn.output_weight).sum::<u128>(),
+            uncapped.iter().map(|turn| turn.output_weight).sum::<u128>()
+        );
+        // Every run reports at a real reply instant inside the session.
+        assert!(capped.iter().all(|turn| turn.timestamp > 0));
+        assert!(capped.windows(2).all(|w| w[0].timestamp <= w[1].timestamp));
     }
 
     #[test]
