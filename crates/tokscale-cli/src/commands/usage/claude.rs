@@ -39,7 +39,23 @@ struct UsageResponse {
     five_hour: Option<Window>,
     seven_day: Option<Window>,
     seven_day_opus: Option<Window>,
-    limits: Option<Vec<PlanLimit>>,
+    #[serde(default, deserialize_with = "lenient_limits")]
+    limits: Vec<PlanLimit>,
+}
+
+/// A limits entry tokscale cannot parse must not cost the whole response: the
+/// legacy windows and every other entry still report. The array is a moving
+/// server-side schema, and this module only reads a handful of its fields.
+fn lenient_limits<'de, D>(deserializer: D) -> Result<Vec<PlanLimit>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let entries = Option::<Vec<serde_json::Value>>::deserialize(deserializer)?;
+    Ok(entries
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| serde_json::from_value(entry).ok())
+        .collect())
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,13 +256,7 @@ fn usage_metrics(resp: &UsageResponse) -> Vec<UsageMetric> {
     }
 
     let mut scoped: Vec<ScopedLimit> = Vec::new();
-    for candidate in resp
-        .limits
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(scoped_limit_metric)
-    {
+    for candidate in resp.limits.iter().filter_map(scoped_limit_metric) {
         match scoped
             .iter_mut()
             .find(|existing| same_scoped_model(existing, &candidate))
@@ -866,6 +876,28 @@ mod tests {
         assert!((metrics[1].used_percent - 60.0).abs() < f64::EPSILON);
         assert_eq!(metrics[1].resets_at.as_deref(), Some("legacy-reset"));
         assert!((metrics[2].used_percent - 38.0).abs() < f64::EPSILON);
+    }
+
+    /// The `limits` array is a server-side schema this module reads a few fields
+    /// of. An entry it cannot parse is dropped on its own; the legacy windows
+    /// and the entries it can parse still report.
+    #[test]
+    fn unparseable_limit_entry_does_not_sink_the_response() {
+        let metrics = usage_metrics(&parse(
+            r#"{
+  "five_hour": { "utilization": 41, "resets_at": "session-reset" },
+  "limits": [
+    { "kind": 7, "group": "weekly", "percent": 50 },
+    { "kind": "weekly_scoped", "group": "weekly", "percent": "38",
+      "scope": { "model": { "display_name": "Sonnet" } } },
+    { "kind": "weekly_scoped", "group": "weekly", "percent": 38,
+      "scope": { "model": { "display_name": "Fable" } }, "is_active": false }
+  ]
+}"#,
+        ));
+
+        assert_eq!(labels(&metrics), ["Session", "Fable"]);
+        assert!((metrics[1].used_percent - 38.0).abs() < f64::EPSILON);
     }
 
     /// A response with no `limits` array at all is the old shape, and still has
