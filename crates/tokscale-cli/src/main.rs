@@ -8232,6 +8232,21 @@ mod tests {
         );
     }
 
+    /// Droid is bounded by the server's device/client lifetime high-water
+    /// (`SUPPORTED_VERSIONED_PARSERS` in packages/frontend/src/lib/db/parserHighWater.ts),
+    /// which accepts generation 1 for it. The submission generation is not the
+    /// cache `parser_version`: re-attribution changes which day a token lands
+    /// on, never the lifetime total, so no installed generation has to be
+    /// frozen out. Declaring anything else here freezes every Droid submission
+    /// server-side until the registry is bumped in lockstep.
+    #[test]
+    fn submit_scan_scope_declares_the_droid_generation_the_server_registers() {
+        let clients = vec!["droid".to_string()];
+        let scope = submit_scan_scope(Some(&clients), true).expect("droid scope");
+
+        assert_eq!(scope.parser_versions.get("droid"), Some(&1));
+    }
+
     #[test]
     #[cfg(target_os = "macos")]
     #[serial_test::serial]
