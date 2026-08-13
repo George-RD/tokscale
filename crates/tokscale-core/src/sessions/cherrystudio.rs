@@ -10,7 +10,9 @@
 //!
 //! Unlike a stock Claude Code transcript, Cherry Studio appends the **same API
 //! call to the file 3-4 times** (different `uuid`, identical `requestId`,
-//! `message.id`, and `usage`) as the streaming response progresses. Naively
+//! `message.id`, and `usage`) as the streaming response progresses. `requestId`
+//! is the API-call identity, so records sharing it are one call even when a
+//! streaming record later gains or changes `message.id`. Naively
 //! summing every assistant row triple-counts each call (verified ~3x over the
 //! true figure). The canonical fix — validated against DeepSeek's platform
 //! per-hour billing, <1% error — is to dedupe by the stable request and/or
@@ -27,10 +29,133 @@ use super::utils::{file_modified_timestamp_ms, parse_timestamp_str};
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::TokenBreakdown;
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 const CLIENT_ID: &str = "cherrystudio";
+
+/// The strongest identity an accepted record has contributed to an alias set.
+///
+/// Cherry Studio's `requestId` names an API call. A `message.id` can arrive
+/// later as that call streams, while `uuid` identifies only a written event.
+/// We therefore only let a lower-fidelity alias join an existing, lower-fidelity
+/// record. In particular, two records with distinct request IDs remain distinct
+/// even if malformed/replayed data happens to reuse a message ID or UUID.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum IdentityStrength {
+    Uuid,
+    Message,
+    Request,
+}
+
+/// Alias-aware deduplication for one Cherry Studio transcript.
+///
+/// A stream can begin as `uuid`, acquire `message.id`, then acquire `requestId`.
+/// Each accepted row registers every supplied alias, so either ordering of those
+/// transitions collapses. Request ID is authoritative when present: an existing
+/// message/UUID alias can only absorb a new request if that old row had not
+/// already established a request of its own.
+#[derive(Default)]
+struct IdentityAliases {
+    aliases: HashMap<String, usize>,
+    /// Lower-fidelity aliases observed under distinct API requests. They cannot
+    /// safely identify a request-only/missing-ID record any longer.
+    ambiguous_aliases: HashSet<String>,
+    strengths: Vec<IdentityStrength>,
+}
+
+impl IdentityAliases {
+    fn owner(&self, key: &str) -> Option<usize> {
+        (!self.ambiguous_aliases.contains(key))
+            .then(|| self.aliases.get(key).copied())
+            .flatten()
+    }
+
+    fn register(&mut self, key: String, owner: usize, strength: IdentityStrength) {
+        match self.aliases.get(&key) {
+            Some(&existing) if existing != owner && strength < IdentityStrength::Request => {
+                // A reused message/UUID cannot link records once two API calls
+                // have claimed it. Preserve both requests and retain future
+                // sparse records rather than guessing which call they replay.
+                self.ambiguous_aliases.insert(key);
+            }
+            Some(_) => {}
+            None => {
+                self.aliases.insert(key, owner);
+            }
+        }
+    }
+
+    fn is_duplicate_and_register(
+        &mut self,
+        request_id: Option<&str>,
+        message_id: Option<&str>,
+        uuid: Option<&str>,
+    ) -> bool {
+        let request_key = request_id.map(|id| format!("request:{id}"));
+        let message_key = message_id.map(|id| format!("message:{id}"));
+        let uuid_key = uuid.map(|id| format!("uuid:{id}"));
+
+        let existing = match request_key
+            .as_deref()
+            .and_then(|key| self.aliases.get(key).copied())
+        {
+            // A request ID is Cherry Studio's API-call identity, including when
+            // the associated message ID is populated or changes later.
+            Some(owner) => Some(owner),
+            None if request_key.is_some() => message_key
+                .as_deref()
+                .and_then(|key| self.owner(key))
+                .filter(|&owner| self.strengths[owner] < IdentityStrength::Request)
+                .or_else(|| {
+                    uuid_key
+                        .as_deref()
+                        .and_then(|key| self.owner(key))
+                        .filter(|&owner| self.strengths[owner] == IdentityStrength::Uuid)
+                }),
+            // A message ID is sufficient only when no request ID is available.
+            // A UUID may join it only when the earlier record was UUID-only.
+            None if message_key.is_some() => message_key
+                .as_deref()
+                .and_then(|key| self.owner(key))
+                .or_else(|| {
+                    uuid_key
+                        .as_deref()
+                        .and_then(|key| self.owner(key))
+                        .filter(|&owner| self.strengths[owner] == IdentityStrength::Uuid)
+                }),
+            // UUID is an event fallback. It is deliberately not inferred from
+            // usage, so records with no stable identity remain conservative.
+            None => uuid_key.as_deref().and_then(|key| self.owner(key)),
+        };
+
+        let strength = if request_key.is_some() {
+            IdentityStrength::Request
+        } else if message_key.is_some() {
+            IdentityStrength::Message
+        } else if uuid_key.is_some() {
+            IdentityStrength::Uuid
+        } else {
+            return false;
+        };
+        let owner = existing.unwrap_or_else(|| {
+            self.strengths.push(strength);
+            self.strengths.len() - 1
+        });
+        self.strengths[owner] = self.strengths[owner].max(strength);
+        if let Some(key) = request_key {
+            self.register(key, owner, IdentityStrength::Request);
+        }
+        if let Some(key) = message_key {
+            self.register(key, owner, IdentityStrength::Message);
+        }
+        if let Some(key) = uuid_key {
+            self.register(key, owner, IdentityStrength::Uuid);
+        }
+        existing.is_some()
+    }
+}
 
 fn provider_for_model(model: &str) -> &'static str {
     let lower = model.to_lowercase();
@@ -80,7 +205,7 @@ pub fn parse_cherrystudio_file(path: &Path) -> Vec<UnifiedMessage> {
 
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
-    let mut seen_identities = std::collections::HashSet::new();
+    let mut identities = IdentityAliases::default();
     let session_id = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -168,16 +293,7 @@ pub fn parse_cherrystudio_file(path: &Path) -> Vec<UnifiedMessage> {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|id| !id.is_empty());
-        let identity = if request_id.is_some() || message_id.is_some() {
-            Some(format!(
-                "request:{}\u{1f}message:{}",
-                request_id.unwrap_or(""),
-                message_id.unwrap_or("")
-            ))
-        } else {
-            uuid.map(|id| format!("uuid:{id}"))
-        };
-        if identity.is_some_and(|identity| !seen_identities.insert(identity)) {
+        if identities.is_duplicate_and_register(request_id, message_id, uuid) {
             continue;
         }
 
@@ -306,6 +422,117 @@ mod tests {
                 .sum::<i64>(),
             220
         );
+    }
+
+    #[test]
+    fn dedupes_request_only_record_when_later_record_has_message_id() {
+        let dir = tempdir().unwrap();
+        let path = write_transcript(
+            dir.path(),
+            "session.jsonl",
+            &[
+                // Reviewer repro: a streaming row gains message.id later.
+                r#"{"type":"assistant","uuid":"stream-early","requestId":"request-1","message":{"model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+                r#"{"type":"assistant","uuid":"stream-late","requestId":"request-1","message":{"id":"message-1","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+            ],
+        );
+
+        assert_eq!(parse_cherrystudio_file(&path).len(), 1);
+    }
+
+    #[test]
+    fn dedupes_message_only_record_when_later_record_has_request_id() {
+        let dir = tempdir().unwrap();
+        let path = write_transcript(
+            dir.path(),
+            "session.jsonl",
+            &[
+                // The inverse transition must also collapse, even though the
+                // replay's event UUID differs.
+                r#"{"type":"assistant","uuid":"stream-early","message":{"id":"message-1","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+                r#"{"type":"assistant","uuid":"stream-late","requestId":"request-1","message":{"id":"message-1","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+            ],
+        );
+
+        assert_eq!(parse_cherrystudio_file(&path).len(), 1);
+    }
+
+    #[test]
+    fn request_id_defines_one_call_even_when_message_id_changes() {
+        let dir = tempdir().unwrap();
+        let path = write_transcript(
+            dir.path(),
+            "session.jsonl",
+            &[
+                // Cherry Studio's requestId is its API-call ID; message.id is
+                // response metadata populated as the stream evolves. A changed
+                // message ID under the same request is therefore a replay, not
+                // a second billed request.
+                r#"{"type":"assistant","requestId":"request-1","message":{"id":"message-early","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+                r#"{"type":"assistant","requestId":"request-1","message":{"id":"message-late","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+            ],
+        );
+
+        assert_eq!(parse_cherrystudio_file(&path).len(), 1);
+    }
+
+    #[test]
+    fn keeps_distinct_requests_when_message_id_is_reused() {
+        let dir = tempdir().unwrap();
+        let path = write_transcript(
+            dir.path(),
+            "session.jsonl",
+            &[
+                // A malformed/replayed message ID must not override a distinct
+                // API request. Each request still represents one billable call.
+                r#"{"type":"assistant","requestId":"request-1","message":{"id":"message-shared","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+                r#"{"type":"assistant","requestId":"request-2","message":{"id":"message-shared","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+                r#"{"type":"assistant","uuid":"replay-with-new-uuid","requestId":"request-2","message":{"id":"message-shared","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+            ],
+        );
+
+        assert_eq!(
+            parse_cherrystudio_file(&path).len(),
+            2,
+            "different request IDs stay distinct; the request-2 replay collapses"
+        );
+    }
+
+    #[test]
+    fn keeps_sparse_message_after_distinct_requests_reuse_its_id() {
+        let dir = tempdir().unwrap();
+        let path = write_transcript(
+            dir.path(),
+            "session.jsonl",
+            &[
+                // The two request IDs prove these are distinct calls, making
+                // their shared lower-fidelity alias ambiguous.
+                r#"{"type":"assistant","requestId":"request-1","message":{"id":"message-shared","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+                r#"{"type":"assistant","requestId":"request-2","message":{"id":"message-shared","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+                // Without a request ID, this could replay either call. Keep it
+                // rather than silently discarding a potentially genuine call.
+                r#"{"type":"assistant","message":{"id":"message-shared","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+            ],
+        );
+
+        assert_eq!(parse_cherrystudio_file(&path).len(), 3);
+    }
+
+    #[test]
+    fn dedupes_uuid_to_complete_identity_transition() {
+        let dir = tempdir().unwrap();
+        let path = write_transcript(
+            dir.path(),
+            "session.jsonl",
+            &[
+                r#"{"type":"assistant","uuid":"stable-event","message":{"model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+                r#"{"type":"assistant","uuid":"stable-event","requestId":"request-1","message":{"id":"message-1","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+                // UUID changes after request/message aliases were learned.
+                r#"{"type":"assistant","uuid":"replayed-event","requestId":"request-1","message":{"id":"message-1","model":"deepseek-v4-pro","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+            ],
+        );
+
+        assert_eq!(parse_cherrystudio_file(&path).len(), 1);
     }
 
     #[test]
