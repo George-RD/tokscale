@@ -4,6 +4,11 @@ pub enum PathRoot {
     ReasonixHome,
     XdgData,
     Config,
+    /// The per-user application data directory, resolved via the `dirs` crate:
+    /// `%APPDATA%` on Windows, `~/Library/Application Support` on macOS, and
+    /// the XDG config home on Linux. When an explicit home is supplied, this
+    /// root is derived from that home using the matching platform convention.
+    AppData,
     EnvVar {
         var: &'static str,
         fallback_relative: &'static str,
@@ -43,12 +48,12 @@ impl PathRoot {
                             return config_dir.join("reasonix").to_string_lossy().into_owned();
                         }
                     }
-                    return std::path::Path::new(home_dir)
+                    std::path::Path::new(home_dir)
                         .join("AppData")
                         .join("Roaming")
                         .join("reasonix")
                         .to_string_lossy()
-                        .into_owned();
+                        .into_owned()
                 }
                 #[cfg(not(target_os = "windows"))]
                 {
@@ -93,6 +98,29 @@ impl PathRoot {
                 }
 
                 join_home(home_dir, ".config/tokscale")
+            }
+            PathRoot::AppData => {
+                if use_env_roots {
+                    if let Some(dir) = dirs::config_dir() {
+                        return dir.to_string_lossy().into_owned();
+                    }
+                }
+                // Without env roots (tests, explicit `--home`) the other roots
+                // resolve under the given home; follow the same convention so
+                // an AppData-rooted client cannot leak the machine's real
+                // per-user data into a hermetic scan.
+                #[cfg(target_os = "windows")]
+                {
+                    join_home(home_dir, "AppData/Roaming")
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    join_home(home_dir, "Library/Application Support")
+                }
+                #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+                {
+                    join_home(home_dir, ".config")
+                }
             }
             PathRoot::EnvVar {
                 var,
@@ -819,6 +847,23 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // Cherry Studio (Electron desktop client) writes standard Claude Code
+    // transcripts under its per-user app-data directory. V2 uses
+    // `%APPDATA%\CherryStudio\Data\Agents\.claude\projects` on Windows;
+    // V1 uses the root below. The transcript format is identical to Claude
+    // Code's, but parsing uses the dedicated `sessions::cherrystudio` parser,
+    // which dedupes replayed records by stable request/message IDs.
+    CherryStudio = 45 => {
+        id: "cherrystudio",
+        display: "Cherry Studio",
+        logo: None,
+        root: PathRoot::AppData,
+        relative: "CherryStudio/.claude/projects",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -934,7 +979,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 45);
+        assert_eq!(ClientId::COUNT, 46);
     }
 
     #[test]
@@ -993,6 +1038,30 @@ mod tests {
         assert!(
             !joined.contains('/'),
             "mixed separators in resolved path: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn test_explicit_home_app_data_root_uses_platform_layout() {
+        let home = absolute_test_path("explicit-home");
+        let expected = {
+            #[cfg(target_os = "windows")]
+            {
+                home.join("AppData").join("Roaming")
+            }
+            #[cfg(target_os = "macos")]
+            {
+                home.join("Library").join("Application Support")
+            }
+            #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+            {
+                home.join(".config")
+            }
+        };
+
+        assert_eq!(
+            PathRoot::AppData.resolve_with_env_strategy(home.to_str().unwrap(), false),
+            expected.to_string_lossy()
         );
     }
 

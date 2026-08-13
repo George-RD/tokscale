@@ -1333,6 +1333,37 @@ pub fn scan_all_clients_with_env_strategy(
     )
 }
 
+/// Keep the V2 copy of a Cherry Studio session file that exists under both
+/// transcript roots, filling in the V1-only leftovers. `files` carries the
+/// `(is_v2_root, path_relative_to_root, absolute_path)` triples the aggregation
+/// pass collects; a same-name session exists in both roots because Cherry
+/// Studio migrated the active transcripts to `Data/Agents/.claude/projects`
+/// (V2) while the legacy `CherryStudio/.claude/projects` (V1) root keeps the
+/// untransferred history. V2 receives new writes, so it wins on a conflict.
+fn is_cherrystudio_v2_root(root: &Path) -> bool {
+    root.components()
+        .rev()
+        .zip(["projects", ".claude", "Agents", "Data"])
+        .all(|(component, expected)| component.as_os_str().eq_ignore_ascii_case(expected))
+        && root.components().count() >= 4
+}
+
+fn dedupe_cherrystudio_transcripts(files: Vec<(bool, String, PathBuf)>) -> Vec<PathBuf> {
+    let v2_keys: HashSet<&String> = files
+        .iter()
+        .filter(|(is_v2, _, _)| *is_v2)
+        .map(|(_, rel, _)| rel)
+        .collect();
+    let mut out = Vec::with_capacity(files.len());
+    for (is_v2, rel, path) in &files {
+        if !is_v2 && v2_keys.contains(rel) {
+            continue;
+        }
+        out.push(path.clone());
+    }
+    out
+}
+
 fn scan_all_clients_with_env_strategy_inner(
     home_dir: &str,
     clients: &[String],
@@ -1982,6 +2013,41 @@ fn scan_all_clients_with_env_strategy_inner(
         }
     }
 
+    if enabled.contains(&ClientId::CherryStudio) {
+        let cherry_projects = ClientId::CherryStudio
+            .data()
+            .resolve_path_with_env_strategy(home_dir, use_env_roots);
+        push_unique_scan_task_with_pattern(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::CherryStudio,
+            cherry_projects.clone(),
+            "*.jsonl",
+        );
+        // Cherry Studio V2 moved the Claude Code transcripts under
+        // `<config_dir>/CherryStudio/Data/Agents/.claude/projects`; the legacy
+        // V1 location keeps the untransferred history. Scan both roots and
+        // dedupe by relative path below (V2 wins for same-name sessions).
+        let cherry_v2_root = Path::new(&cherry_projects)
+            .parent()
+            .and_then(Path::parent)
+            .map(|base| {
+                base.join("Data")
+                    .join("Agents")
+                    .join(".claude")
+                    .join("projects")
+            });
+        if let Some(cherry_v2) = cherry_v2_root {
+            push_unique_scan_task_with_pattern(
+                &mut tasks,
+                &mut seen_scan_roots,
+                ClientId::CherryStudio,
+                cherry_v2,
+                "*.jsonl",
+            );
+        }
+    }
+
     if enabled.contains(&ClientId::Kiro) {
         let kiro_cli_path = ClientId::Kiro
             .data()
@@ -2156,25 +2222,42 @@ fn scan_all_clients_with_env_strategy_inner(
     }
 
     // Execute scans in parallel
-    let scan_results: Vec<(ClientId, Vec<PathBuf>)> = tasks
+    let scan_results: Vec<(ClientId, String, Vec<PathBuf>)> = tasks
         .into_par_iter()
         .map(|(client_id, path, pattern)| {
             let files = scan_directory(&path, pattern);
-            (client_id, files)
+            (client_id, path, files)
         })
         .collect();
 
     // Aggregate results, deduplicating canonical file paths across overlapping
-    // roots while preserving one copy per client. Canonical keys collapse a
-    // symlinked root onto its real path; keeping the client in the key avoids
-    // suppressing an independent client that intentionally scans the same file.
+    // roots while preserving one copy per client. Cherry Studio's V1 and V2
+    // roots intentionally retain the same relative transcript names, so defer
+    // its path selection until V2 can win over a V1 counterpart.
     let mut seen: HashSet<(ClientId, PathBuf)> = HashSet::new();
-    for (client_id, files) in scan_results {
+    let mut cherry_files: Vec<(bool, String, PathBuf)> = Vec::new();
+    for (client_id, root, files) in scan_results {
         for file in files {
-            let key = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
-            if seen.insert((client_id, key)) {
-                result.get_mut(client_id).push(file);
+            if client_id == ClientId::CherryStudio {
+                let is_v2 = is_cherrystudio_v2_root(Path::new(&root));
+                let rel = file
+                    .strip_prefix(&root)
+                    .unwrap_or(&file)
+                    .to_string_lossy()
+                    .to_string();
+                cherry_files.push((is_v2, rel, file));
+            } else {
+                let key = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+                if seen.insert((client_id, key)) {
+                    result.get_mut(client_id).push(file);
+                }
             }
+        }
+    }
+    for file in dedupe_cherrystudio_transcripts(cherry_files) {
+        let key = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+        if seen.insert((ClientId::CherryStudio, key)) {
+            result.get_mut(ClientId::CherryStudio).push(file);
         }
     }
 
@@ -6425,6 +6508,100 @@ mod tests {
             "Windows scan root must not contain non-native separators: {}",
             omo_root.display()
         );
+    }
+
+    fn explicit_home_app_data_root(home: &Path) -> PathBuf {
+        #[cfg(target_os = "windows")]
+        {
+            home.join("AppData").join("Roaming")
+        }
+        #[cfg(target_os = "macos")]
+        {
+            home.join("Library").join("Application Support")
+        }
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        {
+            home.join(".config")
+        }
+    }
+
+    #[test]
+    fn test_cherrystudio_dual_root_dedup_ignores_hostile_home_ancestor_names() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("data-and-agents-ancestor/home");
+        let app_data = explicit_home_app_data_root(&home);
+        let v1_root = app_data.join("CherryStudio/.claude/projects");
+        let v2_root = app_data.join("CherryStudio/Data/Agents/.claude/projects");
+        let relative_session = Path::new("workspace/session.jsonl");
+        let v1_session = v1_root.join(relative_session);
+        let v2_session = v2_root.join(relative_session);
+        let transcript = "{\"type\":\"assistant\"}\n";
+
+        fs::create_dir_all(v1_session.parent().unwrap()).unwrap();
+        fs::create_dir_all(v2_session.parent().unwrap()).unwrap();
+        fs::write(&v1_session, transcript).unwrap();
+        fs::write(&v2_session, transcript).unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            home.to_str().unwrap(),
+            &["cherrystudio".to_string()],
+            false,
+        );
+
+        assert_eq!(
+            result.get(ClientId::CherryStudio),
+            &vec![v2_session],
+            "the V2 copy must win and the V1 copy must not be counted when the --home path has arbitrary data/agents substrings"
+        );
+    }
+
+    #[test]
+    fn test_cherrystudio_dual_root_dedup_prefers_v2() {
+        let files = vec![
+            (
+                false,
+                "ws/session-a.jsonl".to_string(),
+                PathBuf::from("v1/ws/session-a.jsonl"),
+            ),
+            (
+                true,
+                "ws/session-a.jsonl".to_string(),
+                PathBuf::from("v2/ws/session-a.jsonl"),
+            ),
+            (
+                true,
+                "ws/session-b.jsonl".to_string(),
+                PathBuf::from("v2/ws/session-b.jsonl"),
+            ),
+            (
+                false,
+                "ws/session-c.jsonl".to_string(),
+                PathBuf::from("v1/ws/session-c.jsonl"),
+            ),
+        ];
+        let out = dedupe_cherrystudio_transcripts(files);
+        assert_eq!(out.len(), 3, "same-name session collapses to the V2 copy");
+        assert!(out.contains(&PathBuf::from("v2/ws/session-a.jsonl")));
+        assert!(!out.contains(&PathBuf::from("v1/ws/session-a.jsonl")));
+        assert!(out.contains(&PathBuf::from("v2/ws/session-b.jsonl")));
+        assert!(out.contains(&PathBuf::from("v1/ws/session-c.jsonl")));
+    }
+
+    #[test]
+    fn test_cherrystudio_dual_root_dedup_keeps_v2_only_files() {
+        let files = vec![(
+            true,
+            "ws/session-x.jsonl".to_string(),
+            PathBuf::from("v2/ws/session-x.jsonl"),
+        )];
+        let out = dedupe_cherrystudio_transcripts(files);
+        assert_eq!(out, vec![PathBuf::from("v2/ws/session-x.jsonl")]);
+    }
+
+    #[test]
+    fn test_cherrystudio_dual_root_dedup_empty_input() {
+        let out = dedupe_cherrystudio_transcripts(Vec::new());
+        assert!(out.is_empty());
     }
 
     #[test]
