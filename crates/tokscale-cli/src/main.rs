@@ -95,7 +95,7 @@ struct Cli {
 
     #[arg(
         long = "merge-worktrees",
-        help = "With --group-by workspace,model: fold worktrees kept inside the repo (.claude/worktrees/, .git/worktrees/) into their parent repository so each repo is one row"
+        help = "With --group-by workspace,model: fold git worktrees into their parent repository so each repo is one row"
     )]
     merge_worktrees: bool,
 
@@ -126,7 +126,7 @@ enum Commands {
         group_by: String,
         #[arg(
             long = "merge-worktrees",
-            help = "With --group-by workspace,model: fold worktrees kept inside the repo (.claude/worktrees/, .git/worktrees/) into their parent repository so each repo is one row"
+            help = "With --group-by workspace,model: fold git worktrees into their parent repository so each repo is one row"
         )]
         merge_worktrees: bool,
         #[arg(

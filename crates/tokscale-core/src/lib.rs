@@ -2941,7 +2941,7 @@ impl WorkspaceLabeler {
         // the marker is only visible once the real path is recovered.
         let decoded = sessions::decode_claude_project_slug(key);
         let path = decoded.as_deref().unwrap_or(key);
-        let root = sessions::workspace_repo_root(path)
+        let root = sessions::workspace_repo_root_resolved(path)
             // Not a worktree: the decoded path is already the repo identity.
             .or_else(|| decoded.clone())
             // Undecodable slug (deleted worktree): fall back to the repo prefix
@@ -6322,19 +6322,9 @@ mod tests {
         // Claude Code writes a dash-mangled slug and Codex/OpenCode write real
         // paths for the SAME directory. Under rollup both must resolve to one
         // identity, or "one row per repo" silently still yields two.
-        let temp = tempfile::tempdir().unwrap();
-        // Spell the fixture the way `read_dir` reports it: Windows `%TEMP%` can be
-        // an 8.3 short name the decoder's directory walk never sees, and
-        // `canonicalize` returns a `\\?\` verbatim prefix that is not a walkable
-        // root. Both would make the slug describe a path no listing contains.
-        let temp_root = {
-            let canonical = std::fs::canonicalize(temp.path()).unwrap();
-            let spelled = canonical.to_string_lossy().to_string();
-            spelled
-                .strip_prefix(r"\\?\")
-                .map(std::path::PathBuf::from)
-                .unwrap_or(canonical)
-        };
+        // Spell the fixture the way `read_dir` reports it -- see
+        // `sessions::canonical_tempdir` for why that is not just `tempdir()`.
+        let (_temp, temp_root) = crate::sessions::canonical_tempdir();
         let repo = temp_root.join("devpro/ing/claude-witness");
         std::fs::create_dir_all(repo.join(".claude/worktrees/feature-x")).unwrap();
 

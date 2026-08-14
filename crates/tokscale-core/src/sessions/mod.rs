@@ -551,6 +551,35 @@ fn find_segment_marker(key: &str, marker: &str) -> Option<usize> {
     None
 }
 
+/// The repo root of a worktree checked out *beside* its repository.
+///
+/// `git worktree add ../feature-x` leaves nothing in the worktree's own path to
+/// key on — the only link is a `.git` FILE holding
+/// `gitdir: /path/to/repo/.git/worktrees/feature-x`. A normal checkout has a
+/// `.git` DIRECTORY there, so the read simply fails and this returns `None`;
+/// a submodule points at `.git/modules/...`, which carries no worktree marker
+/// and is likewise rejected.
+pub fn workspace_git_worktree_root(path: &str) -> Option<String> {
+    let contents = std::fs::read_to_string(Path::new(path).join(".git")).ok()?;
+    let pointer = contents
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("gitdir:"))?
+        .trim();
+    // Git may record the pointer relative to the worktree directory.
+    let gitdir = if Path::new(pointer).is_absolute() || pointer.starts_with('/') {
+        normalize_workspace_key(pointer)?
+    } else {
+        normalize_workspace_key(&Path::new(path).join(pointer).to_string_lossy())?
+    };
+    workspace_repo_root(&gitdir)
+}
+
+/// The repository root for `path` whether its worktree lives inside the repo
+/// (a path prefix) or beside it (a `gitdir:` pointer file).
+pub fn workspace_repo_root_resolved(path: &str) -> Option<String> {
+    workspace_repo_root(path).or_else(|| workspace_git_worktree_root(path))
+}
+
 /// Human-readable label for a workspace key: `repo` or `repo ⑃ worktree`.
 ///
 /// The key is whatever the originating client wrote to disk, so this also has to
@@ -561,7 +590,7 @@ fn find_segment_marker(key: &str, marker: &str) -> Option<usize> {
 pub fn workspace_display_label(key: &str) -> Option<String> {
     let path = decode_claude_project_slug(key).unwrap_or_else(|| key.to_string());
 
-    if let Some(root) = workspace_repo_root(&path) {
+    if let Some(root) = workspace_repo_root_resolved(&path) {
         let repo = workspace_label_from_key(&root)?;
         return match workspace_label_from_key(&path) {
             Some(worktree) => Some(format!("{repo}{WORKTREE_SEPARATOR}{worktree}")),
@@ -718,6 +747,31 @@ fn slugify_path_segment(name: &str) -> String {
         .collect()
 }
 
+/// A temp directory whose path is spelled the way `read_dir` reports it.
+///
+/// The slug decoder matches against real directory entries, so the fixture path
+/// has to agree with what the OS enumerates. On Windows `%TEMP%` is often an 8.3
+/// short name (`RUNNER~1`) while `read_dir` yields the long name
+/// (`runneradmin`), and `canonicalize` returns a `\\?\` verbatim prefix that is
+/// not a walkable root — so strip that and let the walk start at the drive.
+/// Without this the slug describes a path no directory listing contains and the
+/// decode correctly finds nothing.
+///
+/// Lives outside `mod tests` so the decoder tests here and the aggregation tests
+/// in `crate::lib` share one copy: two copies means a verbatim-prefix fix lands
+/// in one of them and the other keeps failing on Windows only.
+#[cfg(test)]
+pub(crate) fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().unwrap();
+    let canonical = std::fs::canonicalize(temp.path()).unwrap();
+    let spelled = canonical.to_string_lossy().to_string();
+    let stripped = spelled
+        .strip_prefix(r"\\?\")
+        .map(PathBuf::from)
+        .unwrap_or(canonical);
+    (temp, stripped)
+}
+
 /// Convert Unix milliseconds to a local YYYY-MM-DD date string.
 fn timestamp_to_date(timestamp_ms: i64) -> String {
     timestamp_to_date_with_timezone(timestamp_ms, &chrono::Local)
@@ -806,6 +860,64 @@ mod tests {
         );
     }
 
+    /// `git worktree add ../feature-x` leaves no marker in the worktree's own
+    /// path: only a `.git` FILE pointing back at the repository. Without reading
+    /// it, `--merge-worktrees` silently left those rows unmerged.
+    #[test]
+    fn sibling_worktrees_resolve_their_repo_through_the_gitdir_pointer() {
+        let (_temp, root) = canonical_tempdir();
+        let repo = root.join("devpro/api");
+        let worktree = root.join("devpro/api-feature-x");
+        std::fs::create_dir_all(repo.join(".git/worktrees/feature-x")).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                repo.join(".git/worktrees/feature-x").to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let key = normalize_workspace_key(&worktree.to_string_lossy()).unwrap();
+        let expected = normalize_workspace_key(&repo.to_string_lossy()).unwrap();
+
+        assert_eq!(workspace_repo_root(&key), None, "no marker in its own path");
+        assert_eq!(
+            workspace_repo_root_resolved(&key).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            workspace_display_label(&key).as_deref(),
+            Some("api ⑃ api-feature-x")
+        );
+    }
+
+    /// A submodule's `.git` file points at `.git/modules/...`, which is not a
+    /// worktree — rolling it up would merge a submodule into its superproject.
+    /// An ordinary checkout has a `.git` DIRECTORY and must be left alone too.
+    #[test]
+    fn gitdir_pointers_that_are_not_worktrees_are_ignored() {
+        let (_temp, root) = canonical_tempdir();
+        let submodule = root.join("super/vendor/lib");
+        std::fs::create_dir_all(&submodule).unwrap();
+        std::fs::create_dir_all(root.join("super/.git/modules/vendor/lib")).unwrap();
+        std::fs::write(
+            submodule.join(".git"),
+            "gitdir: ../../.git/modules/vendor/lib\n",
+        )
+        .unwrap();
+
+        let key = normalize_workspace_key(&submodule.to_string_lossy()).unwrap();
+        assert_eq!(workspace_repo_root_resolved(&key), None);
+        assert_eq!(workspace_display_label(&key).as_deref(), Some("lib"));
+
+        let plain = root.join("super");
+        std::fs::create_dir_all(plain.join(".git")).unwrap();
+        let plain_key = normalize_workspace_key(&plain.to_string_lossy()).unwrap();
+        assert_eq!(workspace_repo_root_resolved(&plain_key), None);
+    }
+
     #[test]
     fn decode_claude_project_slug_recovers_names_containing_dashes() {
         let (_temp, root) = canonical_tempdir();
@@ -829,26 +941,6 @@ mod tests {
     fn slug_for(path: &Path) -> String {
         let normalized = normalize_workspace_key(&path.to_string_lossy()).unwrap();
         super::slugify_path_segment(&normalized)
-    }
-
-    /// A temp directory whose path is spelled the way `read_dir` reports it.
-    ///
-    /// The decoder matches slugs against real directory entries, so the fixture
-    /// path has to agree with what the OS enumerates. On Windows `%TEMP%` is
-    /// often an 8.3 short name (`RUNNER~1`) while `read_dir` yields the long name
-    /// (`runneradmin`), and `canonicalize` returns a `\\?\` verbatim prefix that
-    /// is not a walkable root — so strip that and let the walk start at the
-    /// drive. Without this the slug describes a path no directory listing
-    /// contains and the decode correctly finds nothing.
-    fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
-        let temp = tempfile::tempdir().unwrap();
-        let canonical = std::fs::canonicalize(temp.path()).unwrap();
-        let spelled = canonical.to_string_lossy().to_string();
-        let stripped = spelled
-            .strip_prefix(r"\\?\")
-            .map(PathBuf::from)
-            .unwrap_or(canonical);
-        (temp, stripped)
     }
 
     #[test]
