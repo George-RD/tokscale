@@ -311,7 +311,7 @@ TUIで`g`を押すか、`--light`/`--json`モードで`--group-by`を使用し�
 | **モデル** | `--group-by model` | ✅ | モデルごとに1行 — すべてのクライアントとプロバイダーを統合 |
 | **クライアント + モデル** | `--group-by client,model` | | クライアント-モデルペアごとに1行 |
 | **クライアント + プロバイダー + モデル** | `--group-by client,provider,model` | | 最も詳細 — 統合なし |
-| **ワークスペース + モデル** | `--group-by workspace,model` | | ローカル使用量をワークスペースキー、次にモデルでグループ化。[`--merge-worktrees`](README.md#per-workspace-cost) を追加すると、リポジトリ内のワークツリーを親リポジトリに畳み込みます |
+| **ワークスペース + モデル** | `--group-by workspace,model` | | ローカル使用量をワークスペースキー、次にモデルでグループ化。[`--merge-worktrees`](#ワークスペース別コスト) を追加すると、git ワークツリーを親リポジトリに畳み込みます |
 | **セッション + モデル** | `--group-by session,model` | | `session_id` とモデルごとに1行 — 特定のエージェント CLI セッションにコストを帰属 |
 | **クライアント + セッション + モデル** | `--group-by client,session,model` | | クライアント・セッション・モデルごとに1行 — `session_id` で結合するマルチエージェントランナーに便利 |
 
@@ -363,6 +363,30 @@ TUIで`g`を押すか、`--light`/`--json`モードで`--group-by`を使用し�
 ```
 
 すべての行にクライアント名も必要な場合は `--group-by client,session,model` を使用してください（20以上の対応 CLI 全体を一度に1スポーンで処理）。
+
+#### ワークスペース別コスト
+
+`--group-by workspace,model` は、エージェントが実行されたディレクトリに使用量を帰属させるため、プロジェクトごとのコストが分かります:
+
+```bash
+# (ワークスペース, モデル) ごとに1行
+tokscale models --light --group-by workspace,model --month
+
+# すべての git ワークツリーを親リポジトリに畳み込む — リポジトリごとに1行
+tokscale models --light --group-by workspace,model --merge-worktrees --month
+
+# JSON には workspaceKey (グループ化の識別子) と workspaceLabel (表示名) が含まれます
+tokscale models --json --group-by workspace,model --merge-worktrees
+```
+
+TUI では `g` → **ワークスペース + モデル** を選び、`w` でワークツリーの畳み込みを切り替えます (フッターに `[w:worktrees]` / `[w:repos]` と表示されます)。
+
+ワークスペース行のラベルは `repo` または `repo ⑃ worktree` です。ワークスペースの記録方法はクライアントごとに異なり (Claude Code はダッシュで変換したディレクトリスラッグ `-Users-me-devpro-app`、Codex と OpenCode は実パス)、tokscale はスラッグをファイルシステムと照合して実パスへ復元します。知っておくべき点が4つあります:
+
+- **`--merge-worktrees` を付けない場合、各 git ワークツリーが独立した行になります。** タスクごとにワークツリーを切るエージェント CLI では、1つのリポジトリが多数の行に分散します。`--merge-worktrees` はそれらを統合します (異なるクライアントが異なるキー形式で記録した同一リポジトリも統合します)。
+- **`--merge-worktrees` はリポジトリ内部と外部のどちらのワークツリーも検出します。** `<repo>/.claude/worktrees/<name>` (エージェント CLI が作成する形) と `<repo>/.git/worktrees/<name>` はパスだけで判別します。別の場所にチェックアウトしたワークツリー (`git worktree add ../feature-x`) は `.git` ポインタファイルを読み、リポジトリまで辿ります。ただしシンボリックリンクと実体のように2通りのパス表記で到達できるリポジトリは、ワークスペース識別子を文字列比較するため2行のままです。いずれの場合も合計は変わりません — 使用量は行に分かれるだけで、失われることも二重計上されることもありません。
+- **同じ名前になる行は親ディレクトリで修飾されます。** ラベルはディレクトリ名そのものなので、`~/work/api` と `~/oss/api` はどちらも `api` になってしまいます。衝突したラベルには区別できるまでパスの先頭要素が付きます (`work/api`, `oss/api`)。パス要素では区別できない場合 — 同じディレクトリを2つのクライアントが別のキー形式で記録した場合 — はワークスペースキーが付きます。グループ化には影響せず、表示文字列だけが変わります。
+- **ワークスペースを記録しないクライアントは単一の `Unknown workspace` 行にまとまります。** 対応クライアントの約半数 (gemini, cursor, amp, droid, roocode, kilocode, goose, Copilot の OTEL 経路など) はワークスペースを書き出さないため、ディレクトリに帰属させられません。
 
 ### プラットフォーム別フィルタリング
 
