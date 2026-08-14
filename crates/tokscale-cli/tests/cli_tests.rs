@@ -1187,26 +1187,36 @@ fn write_codex_token_session(dir: &Path, name: &str, model: &str, input: i64, ou
     .unwrap();
 }
 
+/// The V1 Cherry Studio transcript root under a sandboxed home, spelled the
+/// way `PathRoot::AppData` resolves it per platform.
+///
+/// Built component-by-component rather than from a single `/`-joined literal:
+/// `Path::join` only normalizes the junction, so a `"AppData/Roaming/..."`
+/// literal keeps its own forward slashes on Windows and the fixture would not
+/// exercise the real `AppData\Roaming\CherryStudio\.claude\projects`
+/// layout the scanner walks (#1048).
 fn cherrystudio_projects_root(base: &Path) -> std::path::PathBuf {
     #[cfg(target_os = "windows")]
-    {
-        base.join("AppData/Roaming/CherryStudio/.claude/projects")
-    }
+    let relative = "AppData/Roaming/CherryStudio/.claude/projects";
     #[cfg(target_os = "macos")]
-    {
-        base.join("Library/Application Support/CherryStudio/.claude/projects")
-    }
+    let relative = "Library/Application Support/CherryStudio/.claude/projects";
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    {
-        base.join(".config/CherryStudio/.claude/projects")
+    let relative = ".config/CherryStudio/.claude/projects";
+
+    let mut path = base.to_path_buf();
+    for component in relative.split('/') {
+        path.push(component);
     }
+    path
 }
 
 /// Four snapshots of one streamed Cherry Studio API call. The final snapshot
 /// connects the UUID-only, message-only, and request-only partial records and
 /// carries the final streamed output count.
 fn write_cherrystudio_connected_alias_transcript(base: &Path) {
-    let path = cherrystudio_projects_root(base).join("workspace/session.jsonl");
+    let path = cherrystudio_projects_root(base)
+        .join("workspace")
+        .join("session.jsonl");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(
         path,
@@ -1228,7 +1238,9 @@ fn write_cherrystudio_connected_alias_transcript(base: &Path) {
 /// replay. The replay grows output usage but must not take the transcript mtime
 /// as the call timestamp when its component has a valid event timestamp.
 fn write_cherrystudio_historical_replay_without_timestamp(base: &Path) {
-    let path = cherrystudio_projects_root(base).join("workspace/historical.jsonl");
+    let path = cherrystudio_projects_root(base)
+        .join("workspace")
+        .join("historical.jsonl");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(
         path,
@@ -1997,6 +2009,40 @@ fn test_models_with_client_filter_jcode() {
     assert_eq!(entry["cacheWrite"].as_i64().unwrap(), 50);
     assert_eq!(entry["output"].as_i64().unwrap(), 250);
     assert_eq!(entry["reasoning"].as_i64().unwrap(), 25);
+}
+
+/// The Windows regression guard for the two tests below.
+///
+/// Both of them assert on parsed totals, so when discovery silently reads the
+/// wrong root they fail as `Some(0)` vs `Some(1)` with nothing pointing at the
+/// path. `PathRoot::AppData` used to resolve to the `FOLDERID_RoamingAppData`
+/// known folder under env roots, which no environment variable can redirect,
+/// so on Windows the scan walked the live profile instead of this sandbox and
+/// the fixture was never seen. Assert the emitted scan root directly.
+#[test]
+fn test_clients_json_cherrystudio_scan_root_stays_inside_the_sandboxed_home() {
+    let tmp = create_empty_fixture_dir();
+    write_cherrystudio_connected_alias_transcript(tmp.path());
+
+    let output = cmd_with_home(tmp.path())
+        .args(["clients", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let cherry = json["clients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["client"] == "cherrystudio")
+        .expect("cherrystudio must appear in `clients --json`");
+
+    assert_eq!(
+        cherry["sessionsPath"],
+        serde_json::json!(cherrystudio_projects_root(tmp.path()).to_string_lossy()),
+        "Cherry Studio's scan root must follow the sandboxed home, not the machine's app-data folder"
+    );
 }
 
 #[test]
