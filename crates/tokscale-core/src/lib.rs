@@ -1253,6 +1253,17 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     /// — same `message.id`, time and usage, under a different session id — so
     /// the per-source cache alone cannot collapse the copy. Dedup keys survive
     /// a warm cache hit, so the pass behaves identically cold and warm.
+    ///
+    /// Ownership, and what this pass does not decide: when the child header
+    /// carries `seedLength` the parser drops the seeded rows at the source, so
+    /// the parent's copy survives whatever order the scan hands the files over
+    /// in. This pass is the fallback for a header that lost the field, which
+    /// DSH's own readers treat as an unseeded log (`header.seedLength ?? 0` in
+    /// `core/agent/src/inbox.ts` and `schedule/src/invariant.ts`) — nothing in
+    /// the transcript then marks the prefix as inherited. It degrades to
+    /// first-wins in scan-path order: totals and per-model rollups stay
+    /// correct, and only the session label on the surviving row depends on
+    /// which transcript sorts first.
     fn parse_cached_lane_deduped<F>(
         scan_result: &scanner::ScanResult,
         source_cache: &mut message_cache::SourceMessageCache,
