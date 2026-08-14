@@ -1087,7 +1087,11 @@ fn parser_version(client: ClientId) -> u32 {
         // the transcript ceiling, and a transcript that could not be read whole
         // takes the single-record path rather than apportioning the session
         // over the prefix that was read.
-        ClientId::Droid => 6,
+        // v6->v7: the apportioned records are attribution fragments of one
+        // session, so the session's reply count now rides on exactly one of
+        // them. v6 entries carry a count on every record, which `sessionize`
+        // reads as one session per record.
+        ClientId::Droid => 7,
         _ => 1,
     }
 }
@@ -2978,7 +2982,7 @@ mod tests {
         // A finished Droid session's settings.json is never rewritten again, so
         // its fingerprint keeps matching and only the version bump discards the
         // v1 lock-timestamp anchor.
-        assert_eq!(parser_version(ClientId::Droid), 6);
+        assert_eq!(parser_version(ClientId::Droid), 7);
     }
 
     #[test]
