@@ -873,7 +873,8 @@ fn cmd_with_home(tmp: &Path) -> Command {
         .env_remove("HERMES_HOME")
         .env_remove("PRIME_AGENT_CODING_AGENT_DIR")
         .env_remove("PRIME_AGENT_SESSION_DIR")
-        .env_remove("PRIME_AGENT_CODING_AGENT_SESSION_DIR");
+        .env_remove("PRIME_AGENT_CODING_AGENT_SESSION_DIR")
+        .env_remove("DSH_HOME");
     cmd
 }
 
@@ -1252,6 +1253,104 @@ fn write_cherrystudio_historical_replay_without_timestamp(base: &Path) {
         ),
     )
     .unwrap();
+}
+
+/// The DSH transcript root under a sandboxed home: `<home>/.dsh/sessions`.
+///
+/// DSH keeps all user data under one root, resolved as an explicit config
+/// path, then `$DSH_HOME`, then `~/.dsh` (`util/home-paths`, `resolveDshHome`);
+/// the shipped base composition pins the session store to `sessions` beneath
+/// it. `cmd_with_home` clears `DSH_HOME` so this test reads the sandbox.
+fn dsh_sessions_root(base: &Path) -> std::path::PathBuf {
+    base.join(".dsh").join("sessions")
+}
+
+/// One zstd DSH transcript with a reasoning-bearing call, written to
+/// `<home>/.dsh/sessions/<encoded-cwd>/<session-id>/session.jsonl.zstd`.
+///
+/// Usage numbers are the committed vendor pair from
+/// `examples/acp-agent/tests/snapshots/subagent-fork-in-process`.
+fn write_dsh_zstd_session(base: &Path) {
+    let dir = dsh_sessions_root(base)
+        .join("-tmp-dsh-workspace")
+        .join("96cf59c9-b347-48b9-b234-a5200913ad05");
+    fs::create_dir_all(&dir).unwrap();
+    let payload = concat!(
+        r#"{"type":"session","version":0,"id":"96cf59c9-b347-48b9-b234-a5200913ad05","createdAt":1783352134832,"cwd":"/tmp/dsh-workspace","delegationDepth":0}"#,
+        "
+",
+        r#"{"type":"assistant/message","seq":39,"time":1785730448979,"data":{"turn":1,"message":{"id":"7ac2e3d7-d558-4b24-b71e-40fc2f42216d","source":{"kind":"model","provider":"deepseek","model":"deepseek-reasoner"}},"usage":{"inputTokens":2885,"outputTokens":25,"cacheReadTokens":0,"reasoningTokens":23}}}"#,
+        "
+"
+    );
+    fs::write(
+        dir.join("session.jsonl.zstd"),
+        zstd::encode_all(payload.as_bytes(), 3).unwrap(),
+    )
+    .unwrap();
+}
+
+/// A DSH fork pair: the parent transcript plus the child whose seeded prefix
+/// repeats the parent's seq-39 call verbatim under a different session id.
+fn write_dsh_fork_pair(base: &Path) {
+    write_dsh_zstd_session(base);
+
+    let dir = dsh_sessions_root(base)
+        .join("-tmp-dsh-workspace")
+        .join("ada8966c-9fa3-441b-8721-37ff1e795e6a");
+    fs::create_dir_all(&dir).unwrap();
+    let payload = concat!(
+        r#"{"type":"session","version":0,"id":"ada8966c-9fa3-441b-8721-37ff1e795e6a","createdAt":1783352137161,"cwd":"/tmp/dsh-workspace","parentSession":"96cf59c9-b347-48b9-b234-a5200913ad05","seedLength":42,"origin":"subagent","delegationDepth":1}"#,
+        "
+",
+        r#"{"type":"assistant/message","seq":39,"time":1785730448979,"data":{"turn":1,"message":{"id":"7ac2e3d7-d558-4b24-b71e-40fc2f42216d","source":{"kind":"model","provider":"deepseek","model":"deepseek-reasoner"}},"usage":{"inputTokens":2885,"outputTokens":25,"cacheReadTokens":0,"reasoningTokens":23}}}"#,
+        "
+",
+        r#"{"type":"assistant/message","seq":96,"time":1786358035361,"data":{"turn":2,"message":{"id":"cdc56e00-c648-4669-92b2-7299e41cb743","source":{"kind":"model","provider":"deepseek","model":"deepseek-reasoner"}},"usage":{"inputTokens":97,"outputTokens":39,"cacheReadTokens":2816,"reasoningTokens":34}}}"#,
+        "
+"
+    );
+    fs::write(
+        dir.join("session.jsonl.zstd"),
+        zstd::encode_all(payload.as_bytes(), 3).unwrap(),
+    )
+    .unwrap();
+}
+
+/// A DSH transcript pair whose child header carries no `seedLength`, so only
+/// the per-call `message.id` marks the seeded rows as the parent's work.
+fn write_dsh_seeded_pair_without_seed_length(base: &Path) {
+    let row = concat!(
+        r#"{"type":"assistant/message","seq":39,"time":1785730448979,"data":{"turn":1,"message":{"id":"7ac2e3d7-d558-4b24-b71e-40fc2f42216d","source":{"kind":"model","provider":"deepseek","model":"deepseek-reasoner"}},"usage":{"inputTokens":2885,"outputTokens":25,"cacheReadTokens":0,"reasoningTokens":23}}}"#,
+        "\n"
+    );
+
+    for (session_id, header) in [
+        (
+            "96cf59c9-b347-48b9-b234-a5200913ad05",
+            concat!(
+                r#"{"type":"session","version":0,"id":"96cf59c9-b347-48b9-b234-a5200913ad05","createdAt":1783352134832,"cwd":"/tmp/dsh-workspace"}"#,
+                "\n"
+            ),
+        ),
+        (
+            "ada8966c-9fa3-441b-8721-37ff1e795e6a",
+            concat!(
+                r#"{"type":"session","version":0,"id":"ada8966c-9fa3-441b-8721-37ff1e795e6a","createdAt":1783352137161,"cwd":"/tmp/dsh-workspace","parentSession":"96cf59c9-b347-48b9-b234-a5200913ad05"}"#,
+                "\n"
+            ),
+        ),
+    ] {
+        let dir = dsh_sessions_root(base)
+            .join("-tmp-dsh-workspace")
+            .join(session_id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("session.jsonl.zstd"),
+            zstd::encode_all(format!("{header}{row}").as_bytes(), 3).unwrap(),
+        )
+        .unwrap();
+    }
 }
 
 fn write_jcode_session(base: &Path) {
@@ -2043,6 +2142,140 @@ fn test_clients_json_cherrystudio_scan_root_stays_inside_the_sandboxed_home() {
         serde_json::json!(cherrystudio_projects_root(tmp.path()).to_string_lossy()),
         "Cherry Studio's scan root must follow the sandboxed home, not the machine's app-data folder"
     );
+}
+
+/// DSH resolves its root from `$DSH_HOME` with a `~/.dsh` fallback, so a
+/// sandboxed `HOME` must move the scan root with it. Asserting the emitted
+/// path directly keeps a discovery regression from surfacing as a bare
+/// `Some(0)` vs `Some(1)` totals mismatch in the tests below.
+#[test]
+fn test_clients_json_dsh_scan_root_stays_inside_the_sandboxed_home() {
+    let tmp = create_empty_fixture_dir();
+    write_dsh_zstd_session(tmp.path());
+
+    let output = cmd_with_home(tmp.path())
+        .args(["clients", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let dsh = json["clients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["client"] == "dsh")
+        .expect("dsh must appear in `clients --json`");
+
+    assert_eq!(
+        dsh["sessionsPath"],
+        serde_json::json!(dsh_sessions_root(tmp.path()).to_string_lossy()),
+        "DSH's scan root must follow the sandboxed home, not the machine's ~/.dsh"
+    );
+}
+
+/// The zstd lane's cache parity guard.
+///
+/// The first pass decodes the transcript and writes the source cache; the
+/// second serves it warm. Both must report the same reasoning-corrected
+/// buckets — `reasoningTokens` is a subset of `outputTokens`, so 25 output
+/// tokens with 23 reasoning tokens leave 2 in the additive output bucket.
+#[test]
+fn test_dsh_zstd_transcript_counts_identically_cold_and_warm_cache() {
+    let tmp = create_empty_fixture_dir();
+    write_dsh_zstd_session(tmp.path());
+
+    for pass in ["cold", "warm"] {
+        let output = cmd_with_home(tmp.path())
+            .args(["models", "--json", "--client", "dsh", "--no-spinner"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{pass} cache pass failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let entries = json["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{pass} cache pass");
+        let entry = &entries[0];
+        assert_eq!(entry["client"].as_str(), Some("dsh"), "{pass} cache pass");
+        assert_eq!(
+            entry["provider"].as_str(),
+            Some("deepseek"),
+            "{pass} cache pass"
+        );
+        assert_eq!(
+            entry["model"].as_str(),
+            Some("deepseek-reasoner"),
+            "{pass} cache pass"
+        );
+        assert_eq!(entry["input"].as_i64(), Some(2885), "{pass} cache pass");
+        assert_eq!(entry["output"].as_i64(), Some(2), "{pass} cache pass");
+        assert_eq!(entry["reasoning"].as_i64(), Some(23), "{pass} cache pass");
+        assert_eq!(json["totalMessages"].as_i64(), Some(1), "{pass} cache pass");
+    }
+}
+
+/// A forked DSH session copies the parent's completed prefix into the child
+/// transcript verbatim, so the pair must still bill the seeded call once.
+#[test]
+fn test_dsh_forked_session_counts_the_seeded_prefix_once_cold_and_warm_cache() {
+    let tmp = create_empty_fixture_dir();
+    write_dsh_fork_pair(tmp.path());
+
+    for pass in ["cold", "warm"] {
+        let output = cmd_with_home(tmp.path())
+            .args(["models", "--json", "--client", "dsh", "--no-spinner"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{pass} cache pass failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        // Two distinct calls: the parent's seq-39 message and the child's own
+        // seq-96 message. The child's copy of seq 39 is the parent's work.
+        assert_eq!(json["totalMessages"].as_i64(), Some(2), "{pass} cache pass");
+        assert_eq!(
+            json["totalInput"].as_i64(),
+            Some(2885 + 97),
+            "{pass} cache pass"
+        );
+        assert_eq!(
+            json["totalOutput"].as_i64(),
+            Some(2 + 5),
+            "{pass} cache pass"
+        );
+    }
+}
+
+/// The lane's cross-file dedup pass, isolated from the seq boundary.
+///
+/// Without `seedLength` in the header the parser cannot tell a seeded row from
+/// an owned one, so the duplicate is only collapsed by the per-call
+/// `message.id` dedup key, cold and warm alike.
+#[test]
+fn test_dsh_repeated_message_ids_across_transcripts_count_once_cold_and_warm_cache() {
+    let tmp = create_empty_fixture_dir();
+    write_dsh_seeded_pair_without_seed_length(tmp.path());
+
+    for pass in ["cold", "warm"] {
+        let output = cmd_with_home(tmp.path())
+            .args(["models", "--json", "--client", "dsh", "--no-spinner"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{pass} cache pass failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["totalMessages"].as_i64(), Some(1), "{pass} cache pass");
+        assert_eq!(json["totalInput"].as_i64(), Some(2885), "{pass} cache pass");
+        assert_eq!(json["totalOutput"].as_i64(), Some(2), "{pass} cache pass");
+    }
 }
 
 #[test]

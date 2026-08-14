@@ -3503,6 +3503,7 @@ dependencies = [
  "unicode-width 0.2.0",
  "usvg",
  "uuid",
+ "zstd",
 ]
 
 [[package]]

@@ -79,3 +79,5 @@ assert_cmd = "2.0"
 predicates = "3.0"
 tempfile = "3.0"
 serial_test = "3.0"
+# DSH transcript fixtures are zstd frames; the CLI tests write them directly.
+zstd = { workspace = true }
