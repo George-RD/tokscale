@@ -1386,10 +1386,13 @@ mod tests {
     /// again at the width the column actually gets.
     #[test]
     fn fit_workspace_label_budgets_across_the_worktree_separator() {
-        let labels: Vec<String> = ["pirka-runtime-replacement-plan", "followup-attachments-plan"]
-            .iter()
-            .map(|worktree| format!("wrks-sisyphus ⑃ {worktree} (/Users/junhoyeo/{worktree})"))
-            .collect();
+        let labels: Vec<String> = [
+            "pirka-runtime-replacement-plan",
+            "followup-attachments-plan",
+        ]
+        .iter()
+        .map(|worktree| format!("wrks-sisyphus ⑃ {worktree} (/Users/junhoyeo/{worktree})"))
+        .collect();
         let fitted: Vec<String> = labels
             .iter()
             .map(|label| fit_workspace_label_to_width(label, 18))

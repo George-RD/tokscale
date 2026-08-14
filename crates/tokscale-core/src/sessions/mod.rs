@@ -501,7 +501,9 @@ fn windows_drive_root(key: &str, colon: char, separator: char) -> Option<(char, 
         return None;
     }
     let remaining = key[1..].strip_prefix(colon)?;
-    remaining.starts_with(separator).then_some((drive, remaining))
+    remaining
+        .starts_with(separator)
+        .then_some((drive, remaining))
 }
 
 pub fn workspace_label_from_key(key: &str) -> Option<String> {
