@@ -9,7 +9,7 @@ use super::UnifiedMessage;
 use crate::{provider_identity, TokenBreakdown};
 use serde::Deserialize;
 use serde_json::Value;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek};
 use std::path::{Path, PathBuf};
 
 /// Droid settings.json structure
@@ -196,10 +196,15 @@ fn resolve_usage_timestamp(lock_timestamp: Option<i64>, modified: Option<i64>) -
 /// together. `context_weight` is the conversation standing before the reply,
 /// which is what the call had to read; `output_weight` is the reply's own
 /// bytes, which is what the call produced.
+///
+/// `replies` is how many assistant replies the turn stands for. It is 1 until
+/// `coalesce_turns` folds a run together, and the emitted record carries it as
+/// its message count so the session still reports the number of calls it made.
 struct TranscriptTurn {
     timestamp: i64,
     context_weight: u128,
     output_weight: u128,
+    replies: i32,
 }
 
 /// Ceiling on the transcript bytes read to shape one session's spend.
@@ -240,20 +245,29 @@ const MAX_TURNS_PER_SESSION: usize = 1024;
 /// resets the running context because it discards the transcript the following
 /// calls would otherwise re-read.
 ///
-/// Returns no turns for a transcript past `max_bytes`, which sends the session
-/// down the single-record fallback rather than paying an unbounded read.
+/// Returns no turns for a transcript past `max_bytes`, or for one that could
+/// not be read whole, which sends the session down the single-record fallback
+/// rather than paying an unbounded read or splitting on partial evidence.
 fn transcript_turns_bounded(jsonl: &Path, max_bytes: u64, max_turns: usize) -> Vec<TranscriptTurn> {
     let Ok(file) = std::fs::File::open(jsonl) else {
         return Vec::new();
     };
-    if file.metadata().map(|meta| meta.len()).unwrap_or(0) > max_bytes {
+    // Fail closed. A metadata call that does not answer says nothing about the
+    // size of what follows, and treating that silence as zero would license
+    // exactly the unbounded read this ceiling exists to prevent. The session
+    // still reports its identical total through the single-record fallback.
+    let Ok(declared_bytes) = file.metadata().map(|meta| meta.len()) else {
+        return Vec::new();
+    };
+    if declared_bytes > max_bytes {
         return Vec::new();
     }
 
     let mut turns = Vec::new();
     let mut context_bytes: u128 = 0;
+    let mut reader = BufReader::new(file);
 
-    for line in lossy_lines(BufReader::new(file)) {
+    for line in lossy_lines(&mut reader) {
         let line_bytes = line.len() as u128;
         let Ok(record) = serde_json::from_str::<Value>(&line) else {
             // A malformed line still occupied context in the real conversation.
@@ -306,7 +320,21 @@ fn transcript_turns_bounded(jsonl: &Path, max_bytes: u64, max_turns: usize) -> V
             // still cost something, so every turn carries at least one unit.
             context_weight: context_read.max(1),
             output_weight: line_bytes.max(1),
+            replies: 1,
         });
+    }
+
+    // `lossy_lines` ends silently on a hard I/O failure (vanished network
+    // mount, EIO), so a prefix of the transcript is indistinguishable from the
+    // whole of it by the turn list alone. Apportioning the session's total over
+    // that prefix would move every token the unread tail earned onto the days
+    // the prefix covers, and the parse is cached under a fingerprint that a
+    // finished session never invalidates again, so the misattribution would
+    // stick. A short read is therefore no evidence at all: fall back.
+    // Reading past `declared_bytes` is normal — a live session appends while
+    // this runs — and only a read that stopped early disqualifies the split.
+    if reader.stream_position().unwrap_or(0) < declared_bytes {
+        return Vec::new();
     }
 
     coalesce_turns(turns, max_turns)
@@ -325,6 +353,10 @@ fn transcript_turns(jsonl: &Path) -> Vec<TranscriptTurn> {
 /// monotonically within a run, so the last reply of the run is the heaviest.
 /// The parser cannot bucket by day itself: the day key is re-derived later
 /// under the user's pinned timezone, which is not known here.
+///
+/// A run also carries the number of replies it folded, so the session's message
+/// count survives coalescing: the resolution of *when* the calls happened
+/// drops, but not *how many* there were.
 fn coalesce_turns(turns: Vec<TranscriptTurn>, max_turns: usize) -> Vec<TranscriptTurn> {
     if max_turns == 0 || turns.len() <= max_turns {
         return turns;
@@ -345,6 +377,9 @@ fn coalesce_turns(turns: Vec<TranscriptTurn>, max_turns: usize) -> Vec<Transcrip
             output_weight: chunk
                 .iter()
                 .fold(0u128, |sum, turn| sum.saturating_add(turn.output_weight)),
+            replies: chunk
+                .iter()
+                .fold(0i32, |sum, turn| sum.saturating_add(turn.replies)),
         })
         .collect()
 }
@@ -465,7 +500,7 @@ pub fn parse_droid_file(path: &Path) -> Vec<UnifiedMessage> {
             .iter()
             .enumerate()
             .map(|(index, turn)| {
-                UnifiedMessage::new(
+                let mut message = UnifiedMessage::new(
                     "droid",
                     model.clone(),
                     provider.clone(),
@@ -479,7 +514,12 @@ pub fn parse_droid_file(path: &Path) -> Vec<UnifiedMessage> {
                         reasoning: reasoning[index],
                     },
                     0.0,
-                )
+                );
+                // One record per API call, except where coalescing folded a run
+                // of them into one. Counting a run as a single message would
+                // understate a long session's calls by the coalescing factor.
+                message.message_count = turn.replies.max(1);
+                message
             })
             .collect();
     }
@@ -841,6 +881,64 @@ mod tests {
         // Every run reports at a real reply instant inside the session.
         assert!(capped.iter().all(|turn| turn.timestamp > 0));
         assert!(capped.windows(2).all(|w| w[0].timestamp <= w[1].timestamp));
+        // A run also remembers how many calls it stands for, so the cap costs
+        // attribution resolution and not the session's message count.
+        assert_eq!(capped.iter().map(|turn| turn.replies).sum::<i32>(), 50);
+        assert_eq!(uncapped.iter().map(|turn| turn.replies).sum::<i32>(), 50);
+    }
+
+    #[test]
+    fn test_coalesced_session_still_reports_every_reply_it_made() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        // More replies than the cap, so the emitted records are runs rather
+        // than calls. Counting a run as one message would report this session
+        // as having made 1024 calls instead of the 1200 it made.
+        let replies = MAX_TURNS_PER_SESSION + 176;
+        let transcript: Vec<String> = (0..replies)
+            .map(|i| assistant(&format!("2026-08-07T12:00:{:02}Z", i % 60), 10))
+            .collect();
+        let settings = write_session(
+            temp_dir.path(),
+            "aaaaaaaa-1111-1111-1111-111111111111",
+            r#"{"inputTokens":1000}"#,
+            &transcript.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+
+        let messages = parse_droid_file(&settings);
+
+        assert!(
+            messages.len() <= MAX_TURNS_PER_SESSION,
+            "record count not capped: {}",
+            messages.len()
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m.message_count as usize)
+                .sum::<usize>(),
+            replies
+        );
+        // The cap changes resolution, never the total it splits.
+        assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 1000);
+    }
+
+    #[test]
+    fn test_uncoalesced_replies_each_count_as_one_message() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let settings = write_session(
+            temp_dir.path(),
+            "aaaaaaaa-2222-2222-2222-222222222222",
+            r#"{"inputTokens":1000}"#,
+            &[
+                &assistant("2026-08-07T12:00:00Z", 10),
+                &assistant("2026-08-08T12:00:00Z", 10),
+            ],
+        );
+
+        let messages = parse_droid_file(&settings);
+
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|m| m.message_count == 1));
     }
 
     #[test]

@@ -1082,7 +1082,12 @@ fn parser_version(client: ClientId) -> u32 {
         // takes the single-record path. Versions 2 through 4 only ever existed
         // in pre-release builds of this change; the bump past them keeps anyone
         // who ran one from holding a superseded split.
-        ClientId::Droid => 5,
+        // v5->v6: a coalesced run of replies now reports how many calls it
+        // stands for instead of one, an unreadable file size no longer waives
+        // the transcript ceiling, and a transcript that could not be read whole
+        // takes the single-record path rather than apportioning the session
+        // over the prefix that was read.
+        ClientId::Droid => 6,
         _ => 1,
     }
 }
@@ -2973,7 +2978,7 @@ mod tests {
         // A finished Droid session's settings.json is never rewritten again, so
         // its fingerprint keeps matching and only the version bump discards the
         // v1 lock-timestamp anchor.
-        assert_eq!(parser_version(ClientId::Droid), 5);
+        assert_eq!(parser_version(ClientId::Droid), 6);
     }
 
     #[test]
