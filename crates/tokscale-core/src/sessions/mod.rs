@@ -580,6 +580,20 @@ pub fn workspace_repo_root_resolved(path: &str) -> Option<String> {
     workspace_repo_root(path).or_else(|| workspace_git_worktree_root(path))
 }
 
+/// The real filesystem path a workspace key names: the key itself when it is
+/// already a path, or the directory a Claude Code slug was built from.
+///
+/// `None` for keys that are not paths at all (Warp's workspace UUID) and for
+/// slugs whose directory is gone — which is exactly when there is no parent
+/// segment available to disambiguate a colliding label with.
+pub fn workspace_path_for_key(key: &str) -> Option<String> {
+    if let Some(decoded) = decode_claude_project_slug(key) {
+        return Some(decoded);
+    }
+    let normalized = normalize_workspace_key(key)?;
+    normalized.contains('/').then_some(normalized)
+}
+
 /// Human-readable label for a workspace key: `repo` or `repo ⑃ worktree`.
 ///
 /// The key is whatever the originating client wrote to disk, so this also has to
@@ -942,6 +956,28 @@ mod tests {
         std::fs::create_dir_all(plain.join(".git")).unwrap();
         let plain_key = normalize_workspace_key(&plain.to_string_lossy()).unwrap();
         assert_eq!(workspace_repo_root_resolved(&plain_key), None);
+    }
+
+    #[test]
+    fn workspace_path_for_key_separates_paths_from_opaque_ids() {
+        assert_eq!(
+            workspace_path_for_key("/Users/z/devpro/witness").as_deref(),
+            Some("/Users/z/devpro/witness")
+        );
+        assert_eq!(
+            workspace_path_for_key(r"C:\work\api").as_deref(),
+            Some("C:/work/api")
+        );
+        // Opaque client ids and slugs whose directory is gone carry no parent
+        // segment, which is what makes the label fall back to the key itself.
+        assert_eq!(
+            workspace_path_for_key("9f2c1a04-1e4b-4c3f-a0d1-77b2e5c9aa10"),
+            None
+        );
+        assert_eq!(
+            workspace_path_for_key("-nonexistent-tokscale-probe-dir-xyz"),
+            None
+        );
     }
 
     #[test]
