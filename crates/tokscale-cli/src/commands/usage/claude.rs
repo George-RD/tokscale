@@ -235,7 +235,11 @@ fn scoped_limit_metric(limit: &PlanLimit) -> Option<ScopedLimit> {
 }
 
 /// Two entries describe the same quota when their model ids match; the display
-/// name is the fallback for entries the server sends without an id.
+/// name is the fallback for entries the server sends without an id. Name
+/// matching is only reachable while one side is still id-less, because folding
+/// sharpens a bucket's id (see [`usage_metrics`]), so an entry that arrives
+/// without an id joins the first bucket wearing its label and every later entry
+/// is then compared against a known id.
 fn same_scoped_model(a: &ScopedLimit, b: &ScopedLimit) -> bool {
     match (a.id.as_deref(), b.id.as_deref()) {
         (Some(a_id), Some(b_id)) => a_id == b_id,
@@ -261,11 +265,24 @@ fn usage_metrics(resp: &UsageResponse) -> Vec<UsageMetric> {
             .iter_mut()
             .find(|existing| same_scoped_model(existing, &candidate))
         {
-            // The binding window is the authoritative reading when the same
-            // model is reported twice; otherwise the first entry wins, so the
-            // order the server sent is what renders.
-            Some(existing) if candidate.is_active && !existing.is_active => *existing = candidate,
-            Some(_) => {}
+            Some(existing) => {
+                // Every fold sharpens the bucket's identity, including the one
+                // that replaces the reading: an id-less bucket adopts the first
+                // id folded into it, and a bucket that has an id keeps it when
+                // an id-less entry folds in. Without this, `same_scoped_model`
+                // is not transitive -- an id-less "Opus" bucket would swallow
+                // both `claude-opus-4-5` and `claude-opus-4-6` by name, dropping
+                // a distinct quota, and which of the two survived depended on
+                // whichever entry happened to carry `is_active`.
+                let id = existing.id.take().or_else(|| candidate.id.clone());
+                // The binding window is the authoritative reading when the same
+                // model is reported twice; otherwise the first entry wins, so
+                // the order the server sent is what renders.
+                if candidate.is_active && !existing.is_active {
+                    *existing = candidate;
+                }
+                existing.id = id;
+            }
             None => scoped.push(candidate),
         }
     }
@@ -826,6 +843,112 @@ mod tests {
         assert_eq!(labels(&metrics), ["Opus", "Opus"]);
         assert!((metrics[0].used_percent - 12.0).abs() < f64::EPSILON);
         assert!((metrics[1].used_percent - 38.0).abs() < f64::EPSILON);
+    }
+
+    /// An entry the server sent without an id must not swallow the models that
+    /// do carry one. Name matching is the only identity an id-less entry has, so
+    /// it folds into the first bucket wearing its label -- and that fold has to
+    /// sharpen the bucket's id, or the bucket keeps matching every later id by
+    /// name and the third entry's distinct quota is silently dropped.
+    #[test]
+    fn id_less_entry_does_not_swallow_distinct_model_ids() {
+        let metrics = usage_metrics(&parse(
+            r#"{
+  "limits": [
+    { "kind": "weekly_scoped", "group": "weekly", "percent": 10,
+      "scope": { "model": { "id": null, "display_name": "Opus" } },
+      "is_active": false },
+    { "kind": "weekly_scoped", "group": "weekly", "percent": 20,
+      "scope": { "model": { "id": "claude-opus-4-5", "display_name": "Opus" } },
+      "is_active": false },
+    { "kind": "weekly_scoped", "group": "weekly", "percent": 30,
+      "scope": { "model": { "id": "claude-opus-4-6", "display_name": "Opus" } },
+      "is_active": false }
+  ]
+}"#,
+        ));
+
+        assert_eq!(labels(&metrics), ["Opus", "Opus"]);
+        assert!((metrics[0].used_percent - 10.0).abs() < f64::EPSILON);
+        assert!((metrics[1].used_percent - 30.0).abs() < f64::EPSILON);
+    }
+
+    /// The same three entries with the binding flag on the middle one. Which
+    /// entry happens to be active decides which reading survives the fold, and
+    /// it must not decide how many quotas the account has.
+    #[test]
+    fn active_entry_does_not_change_how_many_scoped_rows_survive() {
+        let metrics = usage_metrics(&parse(
+            r#"{
+  "limits": [
+    { "kind": "weekly_scoped", "group": "weekly", "percent": 10,
+      "scope": { "model": { "id": null, "display_name": "Opus" } },
+      "is_active": false },
+    { "kind": "weekly_scoped", "group": "weekly", "percent": 20,
+      "scope": { "model": { "id": "claude-opus-4-5", "display_name": "Opus" } },
+      "is_active": true },
+    { "kind": "weekly_scoped", "group": "weekly", "percent": 30,
+      "scope": { "model": { "id": "claude-opus-4-6", "display_name": "Opus" } },
+      "is_active": false }
+  ]
+}"#,
+        ));
+
+        assert_eq!(labels(&metrics), ["Opus", "Opus"]);
+        assert!((metrics[0].used_percent - 20.0).abs() < f64::EPSILON);
+        assert!((metrics[1].used_percent - 30.0).abs() < f64::EPSILON);
+    }
+
+    /// Taking the binding entry's reading must not cost the bucket the id it
+    /// already knew: the active entry here has none, and a bucket reset to
+    /// id-less would go on to swallow the distinct model that follows.
+    #[test]
+    fn active_id_less_entry_keeps_the_bucket_model_id() {
+        let metrics = usage_metrics(&parse(
+            r#"{
+  "limits": [
+    { "kind": "weekly_scoped", "group": "weekly", "percent": 20,
+      "scope": { "model": { "id": "claude-opus-4-5", "display_name": "Opus" } },
+      "is_active": false },
+    { "kind": "weekly_scoped", "group": "weekly", "percent": 40,
+      "scope": { "model": { "display_name": "Opus" } },
+      "is_active": true },
+    { "kind": "weekly_scoped", "group": "weekly", "percent": 30,
+      "scope": { "model": { "id": "claude-opus-4-6", "display_name": "Opus" } },
+      "is_active": false }
+  ]
+}"#,
+        ));
+
+        assert_eq!(labels(&metrics), ["Opus", "Opus"]);
+        assert!((metrics[0].used_percent - 40.0).abs() < f64::EPSILON);
+        assert!((metrics[1].used_percent - 30.0).abs() < f64::EPSILON);
+    }
+
+    /// Sharpening the bucket id must not hand the same model two rows: an entry
+    /// that arrives without an id still folds into the bucket its label names.
+    #[test]
+    fn id_less_entries_still_fold_into_an_identified_bucket() {
+        let metrics = usage_metrics(&parse(
+            r#"{
+  "limits": [
+    { "kind": "weekly_scoped", "group": "weekly", "percent": 12,
+      "scope": { "model": { "id": null, "display_name": "Opus" } },
+      "is_active": false },
+    { "kind": "weekly_scoped", "group": "weekly", "percent": 38,
+      "resets_at": "binding-reset",
+      "scope": { "model": { "id": "claude-opus-4-6", "display_name": "Opus" } },
+      "is_active": true },
+    { "kind": "weekly_scoped", "group": "weekly", "percent": 99,
+      "scope": { "model": { "display_name": "opus" } },
+      "is_active": false }
+  ]
+}"#,
+        ));
+
+        assert_eq!(labels(&metrics), ["Opus"]);
+        assert!((metrics[0].used_percent - 38.0).abs() < f64::EPSILON);
+        assert_eq!(metrics[0].resets_at.as_deref(), Some("binding-reset"));
     }
 
     /// A scoped entry outside the weekly group is not a weekly quota row.
