@@ -588,7 +588,13 @@ pub fn workspace_repo_root_resolved(path: &str) -> Option<String> {
 /// and therefore used to render as the entire path — the exact prefix every row
 /// shares, so truncation dropped the only distinguishing part.
 pub fn workspace_display_label(key: &str) -> Option<String> {
-    let path = decode_claude_project_slug(key).unwrap_or_else(|| key.to_string());
+    // Normalize before splitting: a client that recorded a raw Windows path
+    // (`C:\a\repo`) carries no `/` to split on, so without this the label
+    // would be the whole path — the same unreadable row this function exists to
+    // prevent, on the one platform the slug decoder cannot help with either.
+    let path = decode_claude_project_slug(key)
+        .or_else(|| normalize_workspace_key(key))
+        .unwrap_or_else(|| key.to_string());
 
     if let Some(root) = workspace_repo_root_resolved(&path) {
         let repo = workspace_label_from_key(&root)?;
@@ -857,6 +863,26 @@ mod tests {
         assert_eq!(
             workspace_display_label(nested).as_deref(),
             Some("witness ⑃ inner")
+        );
+    }
+
+    /// Clients that never normalized their keys hand us native Windows paths.
+    /// Splitting on `/` alone made the entire path the label, which is the
+    /// unreadable row this labeling exists to prevent.
+    #[test]
+    fn workspace_display_label_handles_windows_style_paths() {
+        assert_eq!(
+            workspace_display_label(r"C:\Users\me\devpro\app").as_deref(),
+            Some("app")
+        );
+        assert_eq!(
+            workspace_display_label(r"C:\Users\me\devpro\app\.claude\worktrees\feature-x")
+                .as_deref(),
+            Some("app ⑃ feature-x")
+        );
+        assert_eq!(
+            workspace_display_label(r"\\server\share\team\app").as_deref(),
+            Some("app")
         );
     }
 
