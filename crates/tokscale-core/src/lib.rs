@@ -2913,6 +2913,8 @@ pub struct WorkspaceLabeler {
     labels: HashMap<String, String>,
     roots: HashMap<String, Option<String>>,
     paths: HashMap<String, Option<String>>,
+    decoded: HashMap<String, Option<String>>,
+    resolved_roots: HashMap<String, Option<String>>,
 }
 
 impl WorkspaceLabeler {
@@ -2920,7 +2922,8 @@ impl WorkspaceLabeler {
         if let Some(cached) = self.labels.get(key) {
             return cached.clone();
         }
-        let label = sessions::workspace_display_label(key)
+        let decoded = self.decoded(key);
+        let label = sessions::workspace_display_label_for_decoded_key(key, decoded.as_deref())
             .unwrap_or_else(|| UNKNOWN_WORKSPACE_LABEL.to_string());
         self.labels.insert(key.to_string(), label.clone());
         label
@@ -2933,9 +2936,46 @@ impl WorkspaceLabeler {
         if let Some(cached) = self.paths.get(key) {
             return cached.clone();
         }
-        let path = sessions::workspace_path_for_key(key);
+        let decoded = self.decoded(key);
+        let path = sessions::workspace_path_for_decoded_key(key, decoded.as_deref());
         self.paths.insert(key.to_string(), path.clone());
         path
+    }
+
+    /// Claude Code's slug decoded to a real path, memoized.
+    ///
+    /// The decode is the expensive half of every method here: it walks the
+    /// filesystem, backtracking over the ambiguity in the dash encoding. Without
+    /// this cache `label`, `path` and `repo_root` each ran their own walk for the
+    /// same key, so a slug that took 7s to decode cost 23s across one row.
+    fn decoded(&mut self, key: &str) -> Option<String> {
+        if let Some(cached) = self.decoded.get(key) {
+            return cached.clone();
+        }
+        let decoded = sessions::decode_claude_project_slug(key);
+        self.decoded.insert(key.to_string(), decoded.clone());
+        decoded
+    }
+
+    /// Distinct keys whose slug decode has been resolved, for tests that need to
+    /// prove the walk is shared across `label`, `path` and `repo_root`.
+    #[cfg(test)]
+    pub(crate) fn decoded_key_count(&self) -> usize {
+        self.decoded.len()
+    }
+
+    /// The repo root a resolved filesystem path belongs to, memoized.
+    ///
+    /// Distinct from [`Self::repo_root`], which is keyed by the workspace key and
+    /// applies the slug fallbacks. This one is keyed by path because it reads the
+    /// `.git` pointer file, and several keys can resolve to the same directory.
+    pub fn repo_root_of_path(&mut self, path: &str) -> Option<String> {
+        if let Some(cached) = self.resolved_roots.get(path) {
+            return cached.clone();
+        }
+        let root = sessions::workspace_repo_root_resolved(path);
+        self.resolved_roots.insert(path.to_string(), root.clone());
+        root
     }
 
     /// The canonical repo identity for `key`: the real filesystem path, with any
@@ -2952,9 +2992,10 @@ impl WorkspaceLabeler {
         }
         // Decode first: Claude's slug encodes `.claude/worktrees/` as dashes, so
         // the marker is only visible once the real path is recovered.
-        let decoded = sessions::decode_claude_project_slug(key);
-        let path = decoded.as_deref().unwrap_or(key);
-        let root = sessions::workspace_repo_root_resolved(path)
+        let decoded = self.decoded(key);
+        let path = decoded.clone().unwrap_or_else(|| key.to_string());
+        let root = self
+            .repo_root_of_path(&path)
             // Not a worktree: the decoded path is already the repo identity.
             .or_else(|| decoded.clone())
             // Undecodable slug (deleted worktree): fall back to the repo prefix
@@ -3142,7 +3183,7 @@ fn workspace_parent_segments(labeler: &mut WorkspaceLabeler, key: &str) -> Vec<S
     };
     // A worktree label reads `repo ⑃ worktree`, so it is the REPO whose parents
     // disambiguate it, not the worktree's `.claude/worktrees` scaffolding.
-    let anchor = sessions::workspace_repo_root_resolved(&path).unwrap_or(path);
+    let anchor = labeler.repo_root_of_path(&path).unwrap_or(path);
     let mut segments: Vec<String> = anchor
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -6632,6 +6673,31 @@ mod tests {
             entries[0].workspace_key.as_deref(),
             Some("9f2c1a04-1e4b-4c3f-a0d1-77b2e5c9aa10")
         );
+    }
+
+    /// Resolving one workspace key used to walk the filesystem three times —
+    /// once each for the label, the path and the repo root — so a slug that took
+    /// seconds to decode cost three times that per row. The decode is memoized
+    /// on the labeler and shared by all three.
+    #[test]
+    fn workspace_labeler_decodes_each_key_once() {
+        let mut labeler = crate::WorkspaceLabeler::default();
+        let key = "-nonexistent-tokscale-decode-probe";
+
+        let label = labeler.label(key);
+        let path = labeler.path(key);
+        let root = labeler.repo_root(key);
+        assert_eq!(
+            labeler.decoded_key_count(),
+            1,
+            "label/path/repo_root must share one decode"
+        );
+
+        // Repeating every call adds no decodes and changes no answers.
+        assert_eq!(labeler.label(key), label);
+        assert_eq!(labeler.path(key), path);
+        assert_eq!(labeler.repo_root(key), root);
+        assert_eq!(labeler.decoded_key_count(), 1);
     }
 
     /// Two directories that share a basename produced the same row text, which

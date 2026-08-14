@@ -53,6 +53,7 @@ pub mod workbuddy;
 pub mod zcode;
 pub mod zed;
 
+use std::io::Read;
 use std::path::{Path, PathBuf, MAIN_SEPARATOR_STR};
 
 use crate::TokenBreakdown;
@@ -499,16 +500,29 @@ const ENCODED_WORKTREE_MARKERS: [&str; 2] = ["--claude-worktrees-", "--git-workt
 /// name). Lets rollup and labeling keep working for worktrees whose directories
 /// have since been deleted — otherwise those rows keep the raw slug forever.
 fn split_encoded_worktree(key: &str) -> Option<(String, String)> {
-    for marker in ENCODED_WORKTREE_MARKERS {
-        if let Some(index) = key.find(marker) {
-            let repo = &key[..index];
-            let worktree = &key[index + marker.len()..];
-            if !repo.is_empty() && !worktree.is_empty() {
-                return Some((repo.to_string(), worktree.to_string()));
-            }
-        }
+    let (index, marker_len) = first_encoded_worktree_marker(key)?;
+    let repo = &key[..index];
+    // Nested worktrees name the row after the INNERMOST one, the same way the
+    // path form resolves `.../worktrees/outer/.claude/worktrees/inner`.
+    let mut worktree = &key[index + marker_len..];
+    while let Some((inner, inner_len)) = first_encoded_worktree_marker(worktree) {
+        worktree = &worktree[inner + inner_len..];
     }
-    None
+    Some((repo.to_string(), worktree.to_string()))
+}
+
+/// Earliest encoded worktree marker in `key`, as `(offset, marker length)`.
+///
+/// Smallest offset, not first marker in the array: a nested slug carries both
+/// kinds, and the repository ends at whichever one appears first in the string.
+/// Occurrences that would leave an empty repo or an empty worktree name are not
+/// splits at all.
+fn first_encoded_worktree_marker(key: &str) -> Option<(usize, usize)> {
+    ENCODED_WORKTREE_MARKERS
+        .iter()
+        .filter_map(|marker| key.find(marker).map(|index| (index, marker.len())))
+        .filter(|(index, marker_len)| *index > 0 && index + marker_len < key.len())
+        .min()
 }
 
 /// The repository root a workspace key belongs to, with any worktree suffix
@@ -522,15 +536,17 @@ fn split_encoded_worktree(key: &str) -> Option<(String, String)> {
 /// marker in the path is the one the repo owns.
 pub fn workspace_repo_root(key: &str) -> Option<String> {
     let key = normalize_workspace_key(key)?;
-    for marker in WORKTREE_MARKERS {
-        if let Some(index) = find_segment_marker(&key, marker) {
-            let root = key[..index].trim_end_matches('/');
-            if !root.is_empty() {
-                return Some(root.to_string());
-            }
-        }
-    }
-    None
+    // Smallest offset, not first marker in the array: a path can contain both
+    // kinds (`/a/.git/worktrees/x/.claude/worktrees/y`), and iterating the array
+    // would answer with whichever marker happens to be listed first rather than
+    // with the outermost one. That named `/a/.git/worktrees/x` as the repo, so
+    // `--merge-worktrees` gave one repository two rows.
+    let index = WORKTREE_MARKERS
+        .iter()
+        .filter_map(|marker| find_segment_marker(&key, marker))
+        .filter(|index| !key[..*index].trim_end_matches('/').is_empty())
+        .min()?;
+    Some(key[..index].trim_end_matches('/').to_string())
 }
 
 /// Locate `marker` where it starts a path segment.
@@ -560,7 +576,7 @@ fn find_segment_marker(key: &str, marker: &str) -> Option<usize> {
 /// a submodule points at `.git/modules/...`, which carries no worktree marker
 /// and is likewise rejected.
 pub fn workspace_git_worktree_root(path: &str) -> Option<String> {
-    let contents = std::fs::read_to_string(Path::new(path).join(".git")).ok()?;
+    let contents = read_git_pointer_file(&Path::new(path).join(".git"))?;
     let pointer = contents
         .lines()
         .find_map(|line| line.trim().strip_prefix("gitdir:"))?
@@ -572,6 +588,46 @@ pub fn workspace_git_worktree_root(path: &str) -> Option<String> {
         normalize_workspace_key(&Path::new(path).join(pointer).to_string_lossy())?
     };
     repo_root_from_gitdir(&lexically_normalize(&joined)?)
+}
+
+/// Largest `.git` pointer file worth reading.
+///
+/// Git writes a single short `gitdir: <path>` line. Anything past this is not a
+/// pointer file, and reading it whole would let an unrelated directory dictate
+/// how much memory a report allocates.
+const GIT_POINTER_MAX_BYTES: u64 = 64 * 1024;
+
+/// Read a `.git` pointer file, refusing anything that is not an ordinary file of
+/// plausible size.
+///
+/// This runs once per distinct workspace key on every report and every TUI
+/// refresh, against directories the user never named — the workspace key comes
+/// from whatever a client recorded. A bare `read_to_string` there is a liability:
+/// `open` on a FIFO blocks until someone writes to the other end, so a `.git`
+/// FIFO wedges the whole report forever, and a 20MB regular file is read in full
+/// on every refresh. `symlink_metadata` first so a `.git` symlink is resolved
+/// deliberately rather than followed blind, and the resolved target is checked
+/// again: only a regular file within the cap is ever opened.
+fn read_git_pointer_file(path: &Path) -> Option<String> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    let metadata = if metadata.is_symlink() {
+        std::fs::metadata(path).ok()?
+    } else {
+        metadata
+    };
+    if !metadata.is_file() || metadata.len() > GIT_POINTER_MAX_BYTES {
+        return None;
+    }
+
+    // Bounded read rather than `read_to_string`: `stat` and `open` are two
+    // syscalls, and the file can grow between them.
+    let mut contents = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(GIT_POINTER_MAX_BYTES)
+        .read_to_string(&mut contents)
+        .ok()?;
+    Some(contents)
 }
 
 /// Resolve `.` and `..` segments without touching the filesystem.
@@ -642,8 +698,16 @@ pub fn workspace_repo_root_resolved(path: &str) -> Option<String> {
 /// slugs whose directory is gone — which is exactly when there is no parent
 /// segment available to disambiguate a colliding label with.
 pub fn workspace_path_for_key(key: &str) -> Option<String> {
-    if let Some(decoded) = decode_claude_project_slug(key) {
-        return Some(decoded);
+    workspace_path_for_decoded_key(key, decode_claude_project_slug(key).as_deref())
+}
+
+/// [`workspace_path_for_key`] with the slug decode already done.
+///
+/// Decoding walks the filesystem, and a caller that needs the label, the path
+/// and the repo root for one key would otherwise pay for that walk three times.
+pub fn workspace_path_for_decoded_key(key: &str, decoded: Option<&str>) -> Option<String> {
+    if let Some(decoded) = decoded {
+        return Some(decoded.to_string());
     }
     let normalized = normalize_workspace_key(key)?;
     normalized.contains('/').then_some(normalized)
@@ -657,11 +721,18 @@ pub fn workspace_path_for_key(key: &str) -> Option<String> {
 /// and therefore used to render as the entire path — the exact prefix every row
 /// shares, so truncation dropped the only distinguishing part.
 pub fn workspace_display_label(key: &str) -> Option<String> {
+    workspace_display_label_for_decoded_key(key, decode_claude_project_slug(key).as_deref())
+}
+
+/// [`workspace_display_label`] with the slug decode already done. See
+/// [`workspace_path_for_decoded_key`] for why the decode is hoisted out.
+pub fn workspace_display_label_for_decoded_key(key: &str, decoded: Option<&str>) -> Option<String> {
     // Normalize before splitting: a client that recorded a raw Windows path
     // (`C:\a\repo`) carries no `/` to split on, so without this the label
     // would be the whole path — the same unreadable row this function exists to
     // prevent, on the one platform the slug decoder cannot help with either.
-    let path = decode_claude_project_slug(key)
+    let path = decoded
+        .map(str::to_string)
         .or_else(|| normalize_workspace_key(key))
         .unwrap_or_else(|| key.to_string());
 
@@ -721,7 +792,33 @@ pub fn decode_claude_project_slug(key: &str) -> Option<String> {
     }
 
     let (root, remaining) = slug_root_and_remainder(key)?;
-    resolve_slug_under(&root, remaining)
+    let mut budget = SLUG_DECODE_STEP_BUDGET;
+    resolve_slug_under(&root, remaining, &mut budget)
+}
+
+/// Filesystem probes one slug decode may spend before it gives up.
+///
+/// `resolve_slug_under` backtracks, so its search tree grows with the number of
+/// dashes a slug can split on: an adversarial 69-character key laid out over a
+/// few symlinked directories took 7.3s for a single label, and the labeler asked
+/// for it once per method. A real slug resolves in roughly one probe per path
+/// segment, so this is orders of magnitude above any honest decode while still
+/// making the worst case finite. Exceeding it costs a prettier label, never
+/// correctness: the caller falls back to naming the row from the slug string.
+const SLUG_DECODE_STEP_BUDGET: u32 = 4_096;
+
+/// Charge `cost` probes against `budget`, reporting whether it could be paid.
+fn spend_slug_budget(budget: &mut u32, cost: u32) -> bool {
+    match budget.checked_sub(cost) {
+        Some(remaining) => {
+            *budget = remaining;
+            true
+        }
+        None => {
+            *budget = 0;
+            false
+        }
+    }
 }
 
 /// Split a slug into the filesystem root it was anchored at and the rest.
@@ -760,7 +857,7 @@ fn slug_root_and_remainder(key: &str) -> Option<(PathBuf, &str)> {
 /// pass mis-resolves paths like `claude-witness` (one directory, not two). This
 /// consumes one real directory at a time and backtracks when a branch dead-ends,
 /// which makes the result exact wherever the directory still exists on disk.
-fn resolve_slug_under(dir: &Path, remaining: &str) -> Option<String> {
+fn resolve_slug_under(dir: &Path, remaining: &str, budget: &mut u32) -> Option<String> {
     if remaining.is_empty() {
         // Hand back a normalized key, not a native path. Every consumer compares
         // against forward-slash markers (`workspace_repo_root` looks for
@@ -771,9 +868,12 @@ fn resolve_slug_under(dir: &Path, remaining: &str) -> Option<String> {
         return normalize_workspace_key(&dir.to_string_lossy());
     }
 
-    // Longest candidate first: prefer `IngTian.github.io` over a shorter
-    // `IngTian` that happens to also exist.
-    let mut candidates: Vec<String> = std::fs::read_dir(dir)
+    // One probe for the directory listing this node is about to make.
+    if !spend_slug_budget(budget, 1) {
+        return None;
+    }
+
+    let matched: Vec<String> = std::fs::read_dir(dir)
         .ok()?
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().to_string())
@@ -782,6 +882,17 @@ fn resolve_slug_under(dir: &Path, remaining: &str) -> Option<String> {
         // survivor, so ordering it second keeps the syscalls proportional to
         // matches rather than to directory size.
         .filter(|name| slug_matches_prefix(remaining, name))
+        .collect();
+    // The `stat` per survivor is the other unbounded cost here, so charge for it
+    // before paying it.
+    if !spend_slug_budget(budget, matched.len() as u32) {
+        return None;
+    }
+
+    // Longest candidate first: prefer `IngTian.github.io` over a shorter
+    // `IngTian` that happens to also exist.
+    let mut candidates: Vec<String> = matched
+        .into_iter()
         // `Path::is_dir` follows symlinks where `DirEntry::file_type` would not.
         // Symlinked directories are load-bearing here: macOS reaches temp dirs
         // through `/var -> /private/var`, and users symlink project roots.
@@ -794,7 +905,8 @@ fn resolve_slug_under(dir: &Path, remaining: &str) -> Option<String> {
 
     for name in candidates {
         let consumed = slugify_path_segment(&name).len() + 1;
-        if let Some(resolved) = resolve_slug_under(&dir.join(&name), &remaining[consumed..]) {
+        if let Some(resolved) = resolve_slug_under(&dir.join(&name), &remaining[consumed..], budget)
+        {
             return Some(resolved);
         }
     }
@@ -932,6 +1044,196 @@ mod tests {
         assert_eq!(
             workspace_display_label(nested).as_deref(),
             Some("witness ⑃ inner")
+        );
+    }
+
+    /// Nested worktrees of DIFFERENT kinds: the repo ends at the marker that
+    /// appears first in the path, not at whichever marker is listed first in
+    /// `WORKTREE_MARKERS`. Iterating the array answered `/a/.git/worktrees/x` for
+    /// the first case below, so `--merge-worktrees` gave one repository two rows.
+    #[test]
+    fn nested_worktrees_of_mixed_kinds_roll_up_to_the_outermost_repo() {
+        assert_eq!(
+            workspace_repo_root("/a/.git/worktrees/x/.claude/worktrees/y").as_deref(),
+            Some("/a")
+        );
+        assert_eq!(
+            workspace_repo_root("/a/.claude/worktrees/x/.git/worktrees/y").as_deref(),
+            Some("/a")
+        );
+        assert_eq!(
+            workspace_display_label("/a/.git/worktrees/x/.claude/worktrees/y").as_deref(),
+            Some("a ⑃ y")
+        );
+        // Same rule for the dash-encoded form, whose directory is gone.
+        assert_eq!(
+            workspace_display_label("-a--git-worktrees-x--claude-worktrees-y").as_deref(),
+            Some("a ⑃ y")
+        );
+        assert_eq!(
+            workspace_repo_root_from_slug("-a--git-worktrees-x--claude-worktrees-y").as_deref(),
+            Some("-a")
+        );
+    }
+
+    /// The `.git` pointer read runs once per distinct workspace key on every
+    /// report and every TUI refresh, against directories nobody vetted. A FIFO
+    /// there blocks `open` until something writes to the other end, which wedged
+    /// the whole report; a huge regular file was read into memory in full.
+    #[test]
+    fn git_pointer_reads_refuse_non_files_and_oversized_files() {
+        let (_temp, root) = canonical_tempdir();
+
+        let oversized = root.join("oversized");
+        std::fs::create_dir_all(&oversized).unwrap();
+        let mut body = String::from(
+            "gitdir: /repo/.git/worktrees/x
+",
+        );
+        body.push_str(&"x".repeat(GIT_POINTER_MAX_BYTES as usize + 1));
+        std::fs::write(oversized.join(".git"), body).unwrap();
+        assert_eq!(
+            workspace_git_worktree_root(&oversized.to_string_lossy()),
+            None,
+            "a .git file past the cap must not be read"
+        );
+
+        // A directory named `.git` is an ordinary checkout, not a pointer.
+        let checkout = root.join("checkout");
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        assert_eq!(
+            workspace_git_worktree_root(&checkout.to_string_lossy()),
+            None
+        );
+
+        // A pointer just under the cap still resolves, so the guard is not a
+        // blanket refusal.
+        let ok = root.join("ok");
+        std::fs::create_dir_all(&ok).unwrap();
+        std::fs::write(
+            ok.join(".git"),
+            "gitdir: /srv/api/.git/worktrees/x
+",
+        )
+        .unwrap();
+        assert_eq!(
+            workspace_git_worktree_root(&ok.to_string_lossy()).as_deref(),
+            Some("/srv/api")
+        );
+    }
+
+    /// The hang the size cap alone would not catch: `read_to_string` on a FIFO
+    /// never returns. The test asserts the call comes back at all — under the old
+    /// code it blocks until the harness is killed.
+    #[cfg(unix)]
+    #[test]
+    fn git_pointer_reads_do_not_block_on_a_fifo() {
+        use std::ffi::CString;
+
+        let (_temp, root) = canonical_tempdir();
+        let fifo_dir = root.join("fifo");
+        std::fs::create_dir_all(&fifo_dir).unwrap();
+        let fifo = fifo_dir.join(".git");
+        let path = CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: `path` is a NUL-terminated path inside a fresh temp directory.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
+
+        assert_eq!(
+            workspace_git_worktree_root(&fifo_dir.to_string_lossy()),
+            None
+        );
+        // And through the public entry point the report actually calls.
+        assert_eq!(
+            workspace_repo_root_resolved(&fifo_dir.to_string_lossy()),
+            None
+        );
+    }
+
+    /// A `.git` symlink is resolved deliberately: an ordinary file behind it is
+    /// still a valid pointer, but a FIFO behind it must be refused just like a
+    /// bare FIFO.
+    #[cfg(unix)]
+    #[test]
+    fn git_pointer_symlinks_are_resolved_then_rechecked() {
+        use std::ffi::CString;
+
+        let (_temp, root) = canonical_tempdir();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("pointer"),
+            "gitdir: /srv/api/.git/worktrees/x
+",
+        )
+        .unwrap();
+
+        let linked = root.join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(root.join("pointer"), linked.join(".git")).unwrap();
+        assert_eq!(
+            workspace_git_worktree_root(&linked.to_string_lossy()).as_deref(),
+            Some("/srv/api")
+        );
+
+        let fifo = root.join("target-fifo");
+        let path = CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: `path` is a NUL-terminated path inside a fresh temp directory.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
+        let linked_fifo = root.join("linked-fifo");
+        std::fs::create_dir_all(&linked_fifo).unwrap();
+        std::os::unix::fs::symlink(&fifo, linked_fifo.join(".git")).unwrap();
+        assert_eq!(
+            workspace_git_worktree_root(&linked_fifo.to_string_lossy()),
+            None
+        );
+    }
+
+    /// The slug decoder backtracks, so a dash-dense key has a search tree that
+    /// grows exponentially in the number of dashes. Without a budget one 69-char
+    /// key spent 7.3s in `resolve_slug_under`. The budget makes the worst case
+    /// finite; an honest slug never comes close to it.
+    #[test]
+    fn slug_decoding_is_bounded_and_still_resolves_real_paths() {
+        let (_temp, root) = canonical_tempdir();
+
+        // A directory tree where every level offers several encode-identical
+        // names, which is what makes the search branch.
+        let mut dir = root.clone();
+        for _ in 0..8 {
+            for name in ["a-b", "a.b", "a+b"] {
+                std::fs::create_dir_all(dir.join(name)).unwrap();
+            }
+            dir = dir.join("a-b");
+        }
+        let slug = format!(
+            "{}{}",
+            slugify_path_segment(&root.to_string_lossy()),
+            "-a-b".repeat(9)
+        );
+
+        let started = std::time::Instant::now();
+        let decoded = decode_claude_project_slug(&slug);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "bounded decode took {:?}",
+            started.elapsed()
+        );
+        // Whatever it answers, it must not be a lie: either the real directory or
+        // nothing at all.
+        if let Some(decoded) = decoded {
+            assert!(Path::new(&decoded).is_dir(), "decoded to {decoded}");
+        }
+
+        // An exhausted budget refuses rather than returning a wrong path.
+        let mut spent = 0u32;
+        assert_eq!(resolve_slug_under(&root, "-a-b", &mut spent), None);
+
+        // And an ordinary slug still decodes with the budget in place.
+        let plain = root.join("devpro/claude-witness");
+        std::fs::create_dir_all(&plain).unwrap();
+        let plain_slug = slugify_path_segment(&plain.to_string_lossy());
+        assert_eq!(
+            decode_claude_project_slug(&plain_slug),
+            normalize_workspace_key(&plain.to_string_lossy())
         );
     }
 
