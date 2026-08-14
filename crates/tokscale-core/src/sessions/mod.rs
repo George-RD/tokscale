@@ -476,6 +476,34 @@ pub fn normalize_workspace_key(raw: &str) -> Option<String> {
     }
 }
 
+/// Whether `key` names an absolute location rather than a relative fragment.
+///
+/// Both roots a workspace key can be anchored at: `/` (POSIX, and the `//` of a
+/// UNC share) or a Windows drive. Normalized first so `C:\\work\\api` answers the
+/// same as `C:/work/api`. Callers use this before touching the filesystem —
+/// a relative key resolves against the process working directory, which is not
+/// a place any workspace lives.
+fn is_absolute_workspace_key(key: &str) -> bool {
+    normalize_workspace_key(key)
+        .is_some_and(|key| key.starts_with('/') || windows_drive_root(&key, ':', '/').is_some())
+}
+
+/// Split a Windows drive anchor off the front of `key`, returning the drive
+/// letter and the remainder starting at `separator`.
+///
+/// Shared with the slug decoder, which sees the same anchor with both the colon
+/// and the separator encoded as `-` (`C:\\Users\\me` becomes `C--Users-me`). One
+/// test for what counts as a drive means a path and the slug built from it can
+/// never disagree about whether they are absolute.
+fn windows_drive_root(key: &str, colon: char, separator: char) -> Option<(char, &str)> {
+    let drive = key.chars().next()?;
+    if !drive.is_ascii_alphabetic() {
+        return None;
+    }
+    let remaining = key[1..].strip_prefix(colon)?;
+    remaining.starts_with(separator).then_some((drive, remaining))
+}
+
 pub fn workspace_label_from_key(key: &str) -> Option<String> {
     key.rsplit('/')
         .find(|segment| !segment.is_empty())
@@ -576,6 +604,14 @@ fn find_segment_marker(key: &str, marker: &str) -> Option<usize> {
 /// a submodule points at `.git/modules/...`, which carries no worktree marker
 /// and is likewise rejected.
 pub fn workspace_git_worktree_root(path: &str) -> Option<String> {
+    // Only an absolute key names a directory on its own. Claude Code's slug is
+    // relative, so `join` resolved it against the process working directory and
+    // read `$CWD/<slug>/.git` — a file the user never named, planted by whoever
+    // owns the directory the binary was started in, yet trusted to rename the
+    // row and, under `--merge-worktrees`, to re-key it.
+    if !is_absolute_workspace_key(path) {
+        return None;
+    }
     let contents = read_git_pointer_file(&Path::new(path).join(".git"))?;
     let pointer = contents
         .lines()
@@ -834,16 +870,10 @@ fn slug_root_and_remainder(key: &str) -> Option<(PathBuf, &str)> {
         return Some((PathBuf::from(MAIN_SEPARATOR_STR), key));
     }
 
-    let mut chars = key.chars();
-    let drive = chars.next()?;
-    if !drive.is_ascii_alphabetic() {
-        return None;
-    }
-    // The encoded colon, leaving the separator dash to start the first segment.
-    let remaining = key[1..].strip_prefix('-')?;
-    if !remaining.starts_with('-') {
-        return None;
-    }
+    // Both the colon and the separator arrive encoded as `-`; the remainder
+    // keeps its leading dash so `slug_matches_prefix` still sees every segment
+    // separator-first.
+    let (drive, remaining) = windows_drive_root(key, '-', '-')?;
     Some((
         PathBuf::from(format!("{drive}:{MAIN_SEPARATOR_STR}")),
         remaining,
@@ -1380,6 +1410,37 @@ mod tests {
         std::fs::create_dir_all(plain.join(".git")).unwrap();
         let plain_key = normalize_workspace_key(&plain.to_string_lossy()).unwrap();
         assert_eq!(workspace_repo_root_resolved(&plain_key), None);
+    }
+
+    /// A Claude Code slug is a RELATIVE key: on its own it names no directory,
+    /// so joining `.git` onto it resolved against the process working directory
+    /// and read `$CWD/<slug>/.git`. Any repository can carry such a file, and
+    /// the pointer it holds renamed the row and — under `--merge-worktrees` —
+    /// re-keyed it, purely because of where the binary happened to be run.
+    #[test]
+    #[serial_test::serial]
+    fn relative_keys_never_read_a_pointer_file_from_the_working_directory() {
+        let (_temp, root) = canonical_tempdir();
+        let slug = "-Users-junhoyeo-mlx-motif";
+        std::fs::create_dir_all(root.join(slug)).unwrap();
+        std::fs::write(
+            root.join(slug).join(".git"),
+            "gitdir: /srv/evilrepo/.git/worktrees/pwned\n",
+        )
+        .unwrap();
+
+        // Restore before asserting so a failure cannot strand the whole test
+        // binary in the temp directory.
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+        let pointer_root = workspace_git_worktree_root(slug);
+        let resolved = workspace_repo_root_resolved(slug);
+        let label = workspace_display_label(slug);
+        std::env::set_current_dir(&previous).unwrap();
+
+        assert_eq!(pointer_root, None, "a relative key names no directory");
+        assert_eq!(resolved, None, "--merge-worktrees must not re-key the row");
+        assert_eq!(label.as_deref(), Some(slug));
     }
 
     #[test]

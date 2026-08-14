@@ -1,5 +1,6 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Cell, ScrollbarState};
+use tokscale_core::sessions::WORKTREE_SEPARATOR;
 use tokscale_core::ClientId;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -189,7 +190,14 @@ pub fn suffix_to_width(s: &str, max_cells: usize) -> &str {
 
 /// One-cell ellipsis. A three-dot "..." costs three of the cells the elision is
 /// trying to conserve, which matters at an 18-cell column.
-const MIDDLE_ELLIPSIS: &str = "…";
+///
+/// U+22EF, not the usual U+2026 `…`. U+2026 is East-Asian-Ambiguous: terminals
+/// running a CJK locale render it two cells wide, and a fitted label can carry
+/// three markers, so the row that measured 18 cells here occupied 21 there and
+/// pushed the rest of the table sideways. U+22EF is Neutral, so it is one cell
+/// in both ambients and the budget this module computes is the width the
+/// terminal actually uses.
+const MIDDLE_ELLIPSIS: &str = "⋯";
 
 /// Fit `s` into `max_cells` by dropping its MIDDLE instead of its tail.
 ///
@@ -238,14 +246,15 @@ const MIN_SEGMENT_CELLS: usize = 4;
 /// `qualifier/name`, `name (key)` — whose segments are each identified by their
 /// own ends. Cutting the string once, from either end, throws away whole
 /// segments: at the 18 cells this column gets on an ordinary terminal a head cut
-/// rendered 915 of 1182 real workspace rows as some other row's twin. This
+/// rendered 915 of 1181 real workspace rows as some other row's twin. This
 /// budgets the column across the segments instead, so each one contributes as
 /// much of itself as the row can afford, and elides each segment's middle rather
 /// than its tail.
 ///
-/// Measured over 1182 real workspace keys, counting rows that render to a string
+/// Measured over 1181 real workspace keys, counting rows that render to a string
 /// some other row also renders to: 915 keys in 52 groups at 18 cells before,
-/// 34 keys in 17 groups after; 757/31 to 0 at 44 cells; 749/28 to 0 at 60.
+/// 30 keys in 15 groups after; 757/31 to 0 at 44 cells; 749/28 to 0 at 60. No key
+/// that a head cut kept distinct is merged here at any of those widths.
 pub fn fit_workspace_label_to_width(label: &str, max_cells: usize) -> String {
     if display_width(label) <= max_cells {
         return label.to_string();
@@ -254,23 +263,86 @@ pub fn fit_workspace_label_to_width(label: &str, max_cells: usize) -> String {
         return truncate_to_width(label, max_cells);
     }
 
-    let mut segments: Vec<&str> = label.split('/').collect();
+    match split_qualifying_key(label) {
+        Some((name, key)) => fit_qualified_label(name, key, max_cells),
+        None => fit_path_label(label, max_cells),
+    }
+}
+
+/// Fixed cells a ` (key)` qualifier costs regardless of the key: the separating
+/// space and the two parentheses. Held out of the budget rather than elided, so
+/// the qualifier always reads as one.
+const KEY_QUALIFIER_CELLS: usize = 3;
+
+/// Split `name (key)` into its two halves.
+///
+/// `disambiguate_workspace_labels` appends the grouping key verbatim to labels
+/// the filesystem could not separate, so the parenthesised part is a whole path
+/// and the only unique thing on the row. Treating it as ordinary path segments
+/// is what made it lose to them.
+fn split_qualifying_key(label: &str) -> Option<(&str, &str)> {
+    let inner = label.strip_suffix(')')?;
+    let open = inner.rfind(" (")?;
+    Some((&label[..open], &inner[open + 2..]))
+}
+
+/// Fit `name (key)` by giving the name what it needs and the key what is left.
+///
+/// The key is a path, but it is not part of the name's path, and the two are not
+/// peers: the name is what the row is read by, and the key is a tiebreaker that
+/// only has to contribute its own ends. Water-filling them together spent the
+/// column on whichever happened to be longer — `/Users/junhoyeo/tokscale-2` and
+/// `/Users/junhoyeo/tokscale-giwa-2` both rendered `tok⋯-2 (/⋯/tok⋯-2)` at 18
+/// cells, worse than the unqualified labels they started from, because the key
+/// took half the row and then collapsed its own interior. The name is capped
+/// only by the floor every segment gets, so what is left for the key is enough
+/// to show where it starts and where it ends and nothing more.
+fn fit_qualified_label(name: &str, key: &str, max_cells: usize) -> String {
+    let budget = max_cells.saturating_sub(KEY_QUALIFIER_CELLS);
+    if budget < MIN_SEGMENT_CELLS * 2 {
+        // No room to say anything about both halves; the qualifier is dead
+        // weight, so spend every cell on the name.
+        return elide_middle_to_width(&format!("{name} ({key})"), max_cells);
+    }
+
+    let name_cells = display_width(name).min(budget - MIN_SEGMENT_CELLS);
+    format!(
+        "{} ({})",
+        fit_path_label(name, name_cells),
+        elide_middle_to_width(key, budget - name_cells)
+    )
+}
+
+/// [`fit_workspace_label_to_width`] for a label that is only a path.
+fn fit_path_label(label: &str, max_cells: usize) -> String {
+    if display_width(label) <= max_cells {
+        return label.to_string();
+    }
+    if max_cells <= 2 {
+        return truncate_to_width(label, max_cells);
+    }
+
+    let (mut segments, mut separators) = split_label_parts(label);
     if segments.len() < 2 {
         return elide_middle_to_width(label, max_cells);
     }
 
     // The separators are not negotiable: they are what makes the result read as
     // a path rather than as one mangled word.
-    let mut budget = max_cells.saturating_sub(segments.len() - 1);
+    let separator_cells =
+        |separators: &[&str]| separators.iter().map(|s| display_width(s)).sum::<usize>();
+    let mut budget = max_cells.saturating_sub(separator_cells(&separators));
     let mut collapsed_interior = false;
     if budget < MIN_SEGMENT_CELLS * segments.len() && segments.len() > 2 {
         // Not enough cells to say anything about every segment. Keep the two
         // that carry the identity — the qualifier and the name — and say so with
         // a marker rather than quietly rendering a path that does not exist.
+        separators = vec![separators[0], separators[separators.len() - 1]];
         segments = vec![segments[0], segments[segments.len() - 1]];
         collapsed_interior = true;
-        // Two separators and the one-cell marker between them.
-        budget = max_cells.saturating_sub(3);
+        // The outer separators, kept so the result still reads as what it is,
+        // and the one-cell marker between them.
+        budget = max_cells.saturating_sub(separator_cells(&separators) + 1);
     }
     if budget < MIN_SEGMENT_CELLS * segments.len() {
         return elide_middle_to_width(label, max_cells);
@@ -285,10 +357,49 @@ pub fn fit_workspace_label_to_width(label: &str, max_cells: usize) -> String {
         .collect();
 
     if collapsed_interior {
-        format!("{}/{MIDDLE_ELLIPSIS}/{}", parts[0], parts[1])
-    } else {
-        parts.join("/")
+        return format!(
+            "{}{}{MIDDLE_ELLIPSIS}{}{}",
+            parts[0], separators[0], separators[1], parts[1]
+        );
     }
+    let mut fitted = parts[0].clone();
+    for (separator, part) in separators.iter().zip(&parts[1..]) {
+        fitted.push_str(separator);
+        fitted.push_str(part);
+    }
+    fitted
+}
+
+/// Split a label into its parts and the separators between them.
+///
+/// Both `/` and [`WORKTREE_SEPARATOR`] are structural: `repo ⑃ worktree` is two
+/// names the same way `parent/repo` is. Splitting on `/` alone made the repo
+/// half — which every worktree of one repo shares — and the worktree name one
+/// inseparable segment, so a middle elision cut through the only part that
+/// differed and six worktrees of `wrks-sisyphus` rendered as one row again.
+fn split_label_parts(label: &str) -> (Vec<&str>, Vec<&str>) {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut separators: Vec<&str> = Vec::new();
+    let mut rest = label;
+    while !rest.is_empty() {
+        let next = rest
+            .find('/')
+            .map(|index| (index, "/"))
+            .into_iter()
+            .chain(
+                rest.find(WORKTREE_SEPARATOR)
+                    .map(|index| (index, WORKTREE_SEPARATOR)),
+            )
+            .min_by_key(|(index, _)| *index);
+        let Some((index, separator)) = next else {
+            break;
+        };
+        parts.push(&rest[..index]);
+        separators.push(separator);
+        rest = &rest[index + separator.len()..];
+    }
+    parts.push(rest);
+    (parts, separators)
 }
 
 /// Split `budget` cells across segments of the given widths.
@@ -1178,8 +1289,14 @@ mod tests {
     /// Neither fitter may ever exceed the cell budget it was given, at any width,
     /// including widths that land mid-grapheme, or the table overflows its
     /// column and the row's numbers shift.
+    ///
+    /// Checked in both ambients. `unicode-width` resolves East-Asian-Ambiguous
+    /// characters to one cell by default and to two under `width_cjk`, which is
+    /// what a terminal in a CJK locale does, so a fitter whose own markers are
+    /// ambiguous keeps its budget on one machine and blows it on another.
     #[test]
     fn label_fitters_never_exceed_their_cell_budget() {
+        let mut ambient_independent_elisions = 0usize;
         for label in [
             "tokscale ⑃ worker-1",
             "tokscale-2 ⑃ wf_2429b20d-2d5-1",
@@ -1194,7 +1311,11 @@ mod tests {
             "/",
             "",
             "👩‍👩‍👧‍👦-family ⑃ 🇰🇷-flag-worktree",
+            // Ambiguous in its own right: the label already measures differently
+            // in the two ambients before the fitter touches it.
+            "notes·drafts/α-release ⑃ β",
         ] {
+            let ambient_independent = UnicodeWidthStr::width_cjk(label) == display_width(label);
             for width in 0usize..=80 {
                 for (name, out) in [
                     ("elide_middle", elide_middle_to_width(label, width)),
@@ -1205,9 +1326,27 @@ mod tests {
                         "{name}({label:?}, {width}) rendered {} cells: {out:?}",
                         display_width(&out)
                     );
+                    // A label that is already ambient-dependent is beyond the
+                    // fitter's control; what it must never do is ADD width that
+                    // only appears on a CJK-locale terminal.
+                    if !ambient_independent {
+                        continue;
+                    }
+                    assert!(
+                        UnicodeWidthStr::width_cjk(out.as_str()) <= width,
+                        "{name}({label:?}, {width}) rendered {} cells under width_cjk: {out:?}",
+                        UnicodeWidthStr::width_cjk(out.as_str())
+                    );
+                    if out.contains(MIDDLE_ELLIPSIS) {
+                        ambient_independent_elisions += 1;
+                    }
                 }
             }
         }
+        assert!(
+            ambient_independent_elisions > 0,
+            "the width_cjk check never saw an elision marker"
+        );
     }
 
     /// A label only a little too wide must lose those cells from its longest
@@ -1229,9 +1368,59 @@ mod tests {
     /// to a marker rather than silently rendering a path that never existed.
     #[test]
     fn fit_workspace_label_marks_a_collapsed_interior() {
-        let out = fit_workspace_label_to_width("agent-runtime (/Users/junhoyeo/agent-runtime)", 18);
-        assert!(out.contains("/…/"), "{out:?}");
+        let out = fit_workspace_label_to_width("a/b/c/d/e/f/g/hello-world-long-name", 18);
+        assert!(out.contains(&format!("/{MIDDLE_ELLIPSIS}/")), "{out:?}");
         assert!(display_width(&out) <= 18, "{out:?}");
+
+        // The outer separators survive the collapse, so a label whose parts are
+        // joined by different separators still reads as what it is.
+        let mixed = fit_workspace_label_to_width("org/team/project/repo ⑃ feature", 18);
+        assert!(mixed.starts_with("org/"), "{mixed:?}");
+        assert!(mixed.ends_with(" ⑃ feature"), "{mixed:?}");
+        assert!(mixed.contains(MIDDLE_ELLIPSIS), "{mixed:?}");
+    }
+
+    /// `repo ⑃ worktree` is two names the same way `parent/repo` is. Budgeting
+    /// them as one segment cut through the worktree name — the only part that
+    /// differs between worktrees of one repo — and the rows collapsed together
+    /// again at the width the column actually gets.
+    #[test]
+    fn fit_workspace_label_budgets_across_the_worktree_separator() {
+        let labels: Vec<String> = ["pirka-runtime-replacement-plan", "followup-attachments-plan"]
+            .iter()
+            .map(|worktree| format!("wrks-sisyphus ⑃ {worktree} (/Users/junhoyeo/{worktree})"))
+            .collect();
+        let fitted: Vec<String> = labels
+            .iter()
+            .map(|label| fit_workspace_label_to_width(label, 18))
+            .collect();
+        assert_ne!(fitted[0], fitted[1], "{fitted:?}");
+        for out in &fitted {
+            assert!(display_width(out) <= 18, "{out:?}");
+            assert!(out.contains(WORKTREE_SEPARATOR), "{out:?}");
+        }
+    }
+
+    /// The parenthesised key is the only unique thing on a row the filesystem
+    /// could not separate. Water-filling it as if it were the name's own path
+    /// segments let them outbid it, and once its interior collapsed to `/⋯/` the
+    /// qualifier said nothing: two different repos both rendered
+    /// `tok⋯-2 (/⋯/tok⋯-2)`, which is worse than the labels they started from.
+    #[test]
+    fn fit_workspace_label_keeps_a_key_qualifier_distinguishing() {
+        let a = "tokscale-2 (/Users/junhoyeo/tokscale-2)";
+        let b = "tokscale-giwa-2 (/Users/junhoyeo/tokscale-giwa-2)";
+        for width in [18usize, 24, 30, 44] {
+            let fitted_a = fit_workspace_label_to_width(a, width);
+            let fitted_b = fit_workspace_label_to_width(b, width);
+            assert_ne!(fitted_a, fitted_b, "at {width} cells");
+            assert!(display_width(&fitted_a) <= width, "{fitted_a:?}");
+            assert!(display_width(&fitted_b) <= width, "{fitted_b:?}");
+            // The qualifier still reads as one, and still shows both ends of the
+            // key rather than a marker where its middle used to be.
+            assert!(fitted_a.ends_with("-2)"), "{fitted_a:?}");
+            assert!(fitted_a.contains(" (/"), "{fitted_a:?}");
+        }
     }
 
     /// The point of the elision: both ends survive, so the segment that tells two
@@ -1243,7 +1432,7 @@ mod tests {
         assert_eq!(display_width(&out), 18, "{out:?}");
         assert!(out.starts_with("tokscale"), "{out:?}");
         assert!(out.ends_with("2d5-1"), "{out:?}");
-        assert!(out.contains('…'), "{out:?}");
+        assert!(out.contains(MIDDLE_ELLIPSIS), "{out:?}");
 
         // Nothing is elided when it already fits.
         assert_eq!(elide_middle_to_width("tokscale", 18), "tokscale");
