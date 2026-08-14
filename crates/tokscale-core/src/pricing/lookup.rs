@@ -333,6 +333,10 @@ impl PricingLookup {
         sakana: HashMap<String, ModelPricing>,
         models_dev: HashMap<String, ModelPricing>,
     ) -> Self {
+        // Longest key first, then alphabetical. The alphabetical leg only pins
+        // equal-length ties so a run is reproducible; it carries no pricing
+        // meaning, and the cheaper or more authoritative row does not win by
+        // being sorted earlier.
         let mut litellm_keys: Vec<String> = litellm.keys().cloned().collect();
         litellm_keys.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
 
@@ -7197,64 +7201,49 @@ mod tests {
         );
     }
 
+    /// Regression (#1092): equal-length candidate keys must be ordered by the
+    /// index, not by `HashMap` iteration order. This exercises the ordered
+    /// candidate list consumed by `select_best_match` — two litellm keys of the
+    /// same length, no models.dev entries, so the only thing that can decide the
+    /// winner is the tiebreak in the key sort. Without it the lookup returns
+    /// whichever key the hasher happened to yield first, and the reported rate
+    /// flips between $0.01 and $0.02 across processes.
     #[test]
     fn test_pricing_index_deterministic_key_sorting_equal_length() {
-        // Equal length keys inserted in different orders must produce identical candidate key ordering
-        let mut map_a = HashMap::new();
-        map_a.insert(
-            "bedrock/us-east-1/zai.glm-5".to_string(),
-            ModelPricing {
-                input_cost_per_token: Some(0.01),
-                ..Default::default()
-            },
-        );
-        map_a.insert(
-            "bedrock/us-west-2/zai.glm-5".to_string(),
-            ModelPricing {
-                input_cost_per_token: Some(0.02),
-                ..Default::default()
-            },
-        );
+        let build = |first: (&str, f64), second: (&str, f64)| {
+            let mut litellm = HashMap::new();
+            for (key, input_cost) in [first, second] {
+                litellm.insert(
+                    key.to_string(),
+                    ModelPricing {
+                        input_cost_per_token: Some(input_cost),
+                        ..Default::default()
+                    },
+                );
+            }
+            PricingLookup::new_with_models_dev(
+                litellm,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+        };
 
-        let mut map_b = HashMap::new();
-        map_b.insert(
-            "bedrock/us-west-2/zai.glm-5".to_string(),
-            ModelPricing {
-                input_cost_per_token: Some(0.02),
-                ..Default::default()
-            },
-        );
-        map_b.insert(
-            "bedrock/us-east-1/zai.glm-5".to_string(),
-            ModelPricing {
-                input_cost_per_token: Some(0.01),
-                ..Default::default()
-            },
-        );
+        let east = ("bedrock/us-east-1/zai.glm-5", 0.01);
+        let west = ("bedrock/us-west-2/zai.glm-5", 0.02);
+        assert_eq!(east.0.len(), west.0.len());
 
-        let index_a = PricingLookup::new_with_models_dev(
-            map_a.clone(),
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
-            map_a,
-        );
-        let index_b = PricingLookup::new_with_models_dev(
-            map_b.clone(),
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
-            map_b,
-        );
-
-        let res_a = index_a.lookup("zai.glm-5").unwrap();
-        let res_b = index_b.lookup("zai.glm-5").unwrap();
-
-        assert_eq!(
-            res_a.matched_key, res_b.matched_key,
-            "Pricing lookup for equal length keys must be deterministic regardless of insertion order"
-        );
-        assert_eq!(res_a.matched_key, "bedrock/us-east-1/zai.glm-5");
+        for (order, index) in [build(east, west), build(west, east)].iter().enumerate() {
+            let result = index
+                .lookup_with_provider("zai.glm-5", Some("bedrock"))
+                .unwrap_or_else(|| panic!("insertion order {order} must resolve zai.glm-5"));
+            assert_eq!(
+                result.matched_key, "bedrock/us-east-1/zai.glm-5",
+                "equal-length candidates must resolve to the alphabetically first key regardless of insertion order (order {order})"
+            );
+            assert_eq!(result.pricing.input_cost_per_token, Some(0.01));
+        }
     }
 
     /// Regression (#1062): a bare router label must not be priced from a
