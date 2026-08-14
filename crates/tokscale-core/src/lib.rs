@@ -1246,6 +1246,43 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         }
     }
 
+    /// Same as [`parse_cached_lane`], for a client whose transcripts can repeat
+    /// one another's rows verbatim.
+    ///
+    /// A DSH fork seeds the child transcript with the parent's completed prefix
+    /// — same `message.id`, time and usage, under a different session id — so
+    /// the per-source cache alone cannot collapse the copy. Dedup keys survive
+    /// a warm cache hit, so the pass behaves identically cold and warm.
+    fn parse_cached_lane_deduped<F>(
+        scan_result: &scanner::ScanResult,
+        source_cache: &mut message_cache::SourceMessageCache,
+        pricing: Option<&pricing::PricingService>,
+        all_messages: &mut Vec<UnifiedMessage>,
+        scan_client: ClientId,
+        parse: F,
+    ) where
+        F: Fn(&Path) -> Vec<UnifiedMessage> + Sync,
+    {
+        let cache_identity = message_cache::CacheIdentity::for_client(scan_client);
+        let outcomes: Vec<CachedParseOutcome> = scan_result
+            .get(scan_client)
+            .par_iter()
+            .map(|path| load_or_parse_source(cache_identity, path, source_cache, pricing, &parse))
+            .collect();
+        let mut seen: HashSet<String> = HashSet::new();
+        for outcome in outcomes {
+            all_messages.extend(
+                outcome
+                    .messages
+                    .into_iter()
+                    .filter(|message| should_keep_deduped_message(&mut seen, message)),
+            );
+            if let Some(entry) = outcome.cache_entry {
+                source_cache.insert(entry);
+            }
+        }
+    }
+
     fn uncached_prime_outcome(
         mut messages: Vec<UnifiedMessage>,
         accounting: sessions::prime_agent::PrimeFileAccounting,
@@ -2267,8 +2304,10 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     // DeepSeek Harness (DSH) zstd JSONL transcripts. Every `assistant/message`
     // carries authoritative usage but never a cost, so pricing is the only cost
     // source — the generic source cache (which reprices unconditionally) is
-    // safe here, same as opencodereview.
-    parse_cached_lane(
+    // safe here, same as opencodereview. Forking copies the parent's completed
+    // prefix into the child transcript verbatim, so the lane also needs one
+    // cross-file dedup pass on the per-call `message.id`.
+    parse_cached_lane_deduped(
         &scan_result,
         &mut source_cache,
         pricing,
@@ -4373,16 +4412,18 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::CherryStudio, cherrystudio_count);
     messages.extend(cherrystudio_msgs);
 
-    // DeepSeek Harness zstd JSONL transcripts.
-    let dsh_msgs: Vec<ParsedMessage> = scan_result
+    // DeepSeek Harness zstd JSONL transcripts. A fork's seeded prefix repeats
+    // the parent's rows verbatim in a second file, so dedup across the lane.
+    let dsh_msgs_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Dsh)
         .par_iter()
-        .flat_map(|path| {
-            sessions::dsh::parse_dsh_file(path)
-                .into_iter()
-                .map(|message| unified_to_parsed(&message))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|path| sessions::dsh::parse_dsh_file(path))
+        .collect();
+    let mut dsh_seen: HashSet<String> = HashSet::new();
+    let dsh_msgs: Vec<ParsedMessage> = dsh_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut dsh_seen, message))
+        .map(|message| unified_to_parsed(&message))
         .collect();
     let dsh_count = summed_parsed_message_count(&dsh_msgs);
     counts.set(ClientId::Dsh, dsh_count);
