@@ -55,12 +55,42 @@ fn app_data_follows_home(home_dir: &str) -> bool {
     #[cfg(target_os = "windows")]
     {
         let home = std::path::Path::new(home_dir);
-        home.is_absolute() && dirs::home_dir().is_none_or(|profile| profile != home)
+        if !home.is_absolute() {
+            return false;
+        }
+        match dirs::home_dir() {
+            Some(profile) => !same_windows_dir(home, &profile),
+            None => true,
+        }
     }
     #[cfg(not(target_os = "windows"))]
     {
         let _ = home_dir;
         false
+    }
+}
+
+/// Whether two absolute Windows paths name the same directory.
+///
+/// A lexical comparison is not enough here, and getting it wrong is not
+/// symmetric: a home that merely *spells* the profile differently would be
+/// misread as a redirect, and on a machine whose `FOLDERID_RoamingAppData` is
+/// itself redirected that would move the scan to `<profile>\AppData\Roaming`
+/// and lose the user's transcripts. Windows offers at least three such
+/// spellings — different casing (`c:\users\me`), the 8.3 alias
+/// (`C:\Users\RUNNER~1`), and a junction or symlink pointing at the profile —
+/// and `Path`'s component comparison treats all three as different paths.
+///
+/// `canonicalize` resolves every one of them to the same `\\?\`-verbatim
+/// path. It touches the filesystem and fails on a path that does not exist, so
+/// fall back to the lexical comparison when either side cannot be
+/// canonicalized: a home that is not on disk cannot be the live profile under
+/// another spelling, and the fallback then correctly reports a redirect.
+#[cfg(target_os = "windows")]
+fn same_windows_dir(home: &std::path::Path, profile: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(home), std::fs::canonicalize(profile)) {
+        (Ok(home_real), Ok(profile_real)) => home_real == profile_real,
+        _ => home == profile,
     }
 }
 
@@ -1149,6 +1179,40 @@ mod tests {
             !app_data_follows_home(&profile.to_string_lossy()),
             "the machine profile is not a redirect and must not override the platform lookup"
         );
+    }
+
+    /// A home that only *spells* the profile differently is not a redirect.
+    ///
+    /// Windows reaches the same directory through different casing, through the
+    /// 8.3 alias (`C:\Users\RUNNER~1`), and through junctions, and `Path`
+    /// compares all of those as distinct. Reading one as a redirect would pull
+    /// the app-data root off the known folder, and on a machine whose
+    /// `FOLDERID_RoamingAppData` is itself redirected that loses the user's
+    /// transcripts. Both assertions are skipped rather than inverted if
+    /// `canonicalize` cannot resolve the spelling, since a case-sensitive
+    /// volume would legitimately make them different directories.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_env_roots_app_data_sees_through_windows_spellings_of_the_profile() {
+        let Some(profile) = dirs::home_dir() else {
+            return;
+        };
+        let Ok(canonical_profile) = std::fs::canonicalize(&profile) else {
+            return;
+        };
+
+        assert!(
+            !app_data_follows_home(&canonical_profile.to_string_lossy()),
+            "the verbatim spelling of the profile is the profile, not a redirect"
+        );
+
+        let shouted = profile.to_string_lossy().to_uppercase();
+        if std::fs::canonicalize(&shouted).is_ok_and(|resolved| resolved == canonical_profile) {
+            assert!(
+                !app_data_follows_home(&shouted),
+                "a case variant of the profile must not read as a redirect"
+            );
+        }
     }
 
     /// A POSIX-shaped `HOME` (Git Bash, MSYS2, Cygwin) is not a redirect.
