@@ -198,8 +198,9 @@ fn resolve_usage_timestamp(lock_timestamp: Option<i64>, modified: Option<i64>) -
 /// bytes, which is what the call produced.
 ///
 /// `replies` is how many assistant replies the turn stands for. It is 1 until
-/// `coalesce_turns` folds a run together, and the emitted record carries it as
-/// its message count so the session still reports the number of calls it made.
+/// `coalesce_turns` folds a run together. The session's replies are summed and
+/// carried on a single emitted record, so the session reports the number of
+/// calls it made without its apportioned records counting as separate sessions.
 struct TranscriptTurn {
     timestamp: i64,
     context_weight: u128,
@@ -489,12 +490,20 @@ pub fn parse_droid_file(path: &Path) -> Vec<UnifiedMessage> {
     let total_context: u128 = context_weights.iter().sum();
     let total_output: u128 = output_weights.iter().sum();
 
-    if !turns.is_empty() && total_context > 0 && total_output > 0 {
+    // Every weight is `.max(1)`, so a non-empty turn list always has positive
+    // weight in both columns and the apportioning below is well defined.
+    if !turns.is_empty() {
         let input = apportion(totals.input, &context_weights, total_context);
         let cache_read = apportion(totals.cache_read, &context_weights, total_context);
         let cache_write = apportion(totals.cache_write, &context_weights, total_context);
         let output = apportion(totals.output, &output_weights, total_output);
         let reasoning = apportion(totals.reasoning, &output_weights, total_output);
+
+        // One Droid session made this many API calls, however many records its
+        // spend is spread over.
+        let session_replies = turns
+            .iter()
+            .fold(0i32, |sum, turn| sum.saturating_add(turn.replies.max(1)));
 
         return turns
             .iter()
@@ -515,10 +524,17 @@ pub fn parse_droid_file(path: &Path) -> Vec<UnifiedMessage> {
                     },
                     0.0,
                 );
-                // One record per API call, except where coalescing folded a run
-                // of them into one. Counting a run as a single message would
-                // understate a long session's calls by the coalescing factor.
-                message.message_count = turn.replies.max(1);
+                // These records are attribution fragments of one session, not
+                // separate sessions. `sessionize` opens a new interval whenever
+                // two records sit more than the idle gap apart and counts every
+                // interval that reports messages, so a count on each fragment
+                // would turn one Droid session into one session per apportioned
+                // record. Carry the session's authoritative reply total on
+                // exactly one record and make the rest count-neutral, the same
+                // split `copilot_desktop` applies to its shutdown fragments:
+                // the total number of calls stays exact, the session count
+                // stays one.
+                message.message_count = if index == 0 { session_replies } else { 0 };
                 message
             })
             .collect();
@@ -923,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn test_uncoalesced_replies_each_count_as_one_message() {
+    fn test_reply_count_rides_on_exactly_one_record() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let settings = write_session(
             temp_dir.path(),
@@ -938,7 +954,55 @@ mod tests {
         let messages = parse_droid_file(&settings);
 
         assert_eq!(messages.len(), 2);
-        assert!(messages.iter().all(|m| m.message_count == 1));
+        // Both calls are counted, but only one record is countable: the second
+        // is an attribution fragment of the same session, not a new session.
+        assert_eq!(messages.iter().map(|m| m.message_count).sum::<i32>(), 2);
+        assert_eq!(messages.iter().filter(|m| m.message_count > 0).count(), 1);
+    }
+
+    #[test]
+    fn test_apportioned_session_still_sessionizes_as_one_session() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        // 40 replies ten minutes apart: every gap exceeds the idle threshold,
+        // so each apportioned record would open its own session interval. The
+        // session count must stay 1 while all 40 calls are still reported.
+        let replies = 40;
+        let transcript: Vec<String> = (0..replies)
+            .map(|i| {
+                assistant(
+                    &format!(
+                        "2026-08-07T{:02}:{:02}:00Z",
+                        6 + (i * 10) / 60,
+                        (i * 10) % 60
+                    ),
+                    10,
+                )
+            })
+            .collect();
+        let settings = write_session(
+            temp_dir.path(),
+            "aaaaaaaa-3333-3333-3333-333333333333",
+            r#"{"inputTokens":4000,"outputTokens":400}"#,
+            &transcript.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+
+        let messages = parse_droid_file(&settings);
+        assert_eq!(messages.len(), replies as usize);
+        assert_eq!(
+            messages.iter().map(|m| m.message_count).sum::<i32>(),
+            replies
+        );
+
+        let intervals =
+            crate::sessionize::sessionize(&messages, crate::sessionize::DEFAULT_IDLE_GAP_MS);
+        let metrics = crate::sessionize::compute_time_metrics(
+            &intervals,
+            crate::sessionize::DEFAULT_IDLE_GAP_MS,
+        );
+        assert_eq!(metrics.session_count, 1);
+        // The totals the session actually recorded are untouched by the split.
+        assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 4000);
+        assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 400);
     }
 
     #[test]
