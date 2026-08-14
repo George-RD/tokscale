@@ -46,16 +46,27 @@ struct UsageResponse {
 /// A limits entry tokscale cannot parse must not cost the whole response: the
 /// legacy windows and every other entry still report. The array is a moving
 /// server-side schema, and this module only reads a handful of its fields.
+///
+/// The field is read as an untyped value rather than as a sequence for the same
+/// reason: if `limits` ever stops being an array, the strongly-typed form fails
+/// the whole document ("invalid type: map, expected a sequence") and takes the
+/// legacy Session/Weekly windows down with it. A shape this module cannot walk
+/// degrades to no scoped rows.
 fn lenient_limits<'de, D>(deserializer: D) -> Result<Vec<PlanLimit>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let entries = Option::<Vec<serde_json::Value>>::deserialize(deserializer)?;
-    Ok(entries
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|entry| serde_json::from_value(entry).ok())
-        .collect())
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| PlanLimit::deserialize(entry).ok())
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize)]
@@ -949,6 +960,37 @@ mod tests {
         assert_eq!(labels(&metrics), ["Opus"]);
         assert!((metrics[0].used_percent - 38.0).abs() < f64::EPSILON);
         assert_eq!(metrics[0].resets_at.as_deref(), Some("binding-reset"));
+    }
+
+    /// `limits` is a server-side schema, and its container type is as much a
+    /// moving part as its entries. A `limits` that stops being an array must
+    /// cost the scoped rows only -- a strongly-typed sequence fails the whole
+    /// document ("invalid type: map, expected a sequence") and the user sees
+    /// "Claude usage unavailable" instead of Session and Weekly.
+    #[test]
+    fn non_array_limits_does_not_sink_the_response() {
+        for limits in [
+            r#"{ "weekly_scoped": [] }"#,
+            r#""weekly_scoped""#,
+            "7",
+            "true",
+        ] {
+            let body = format!(
+                r#"{{
+  "five_hour": {{ "utilization": 41, "resets_at": "session-reset" }},
+  "seven_day": {{ "utilization": 20, "resets_at": "weekly-reset" }},
+  "limits": {limits}
+}}"#
+            );
+
+            let metrics = usage_metrics(&parse(&body));
+
+            assert_eq!(
+                labels(&metrics),
+                ["Session", "Weekly"],
+                "legacy windows lost to a `limits` of {limits}"
+            );
+        }
     }
 
     /// A scoped entry outside the weekly group is not a weekly quota row.
