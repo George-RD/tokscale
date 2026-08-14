@@ -500,6 +500,15 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                             .unwrap_or(false)
                 }
                 "sessions.json" => file_name == "sessions.json",
+                // DeepSeek Harness: one JSONL transcript per session at any
+                // depth under `~/.dsh/sessions/`. The `.zstd` suffix marks the
+                // physical encoding only — a backend configured with
+                // `compression: none` writes the same rows to a plain
+                // `session.jsonl` in the same directory — so both spellings
+                // are session logs and the parser sniffs the frame magic.
+                "dsh-session-log" => {
+                    file_name == "session.jsonl.zstd" || file_name == "session.jsonl"
+                }
                 "wire.jsonl" => file_name == "wire.jsonl",
                 "updates.jsonl" => file_name == "updates.jsonl",
                 "unified.jsonl" => file_name == "unified.jsonl",
@@ -2582,6 +2591,42 @@ mod tests {
                 .unwrap_or_default()
                 == "ui_messages.json"
         }));
+    }
+
+    #[test]
+    fn test_scan_directory_dsh_session_log() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+
+        // DeepSeek Harness layout: sessions/<encoded-cwd>/<session-id>/session.jsonl.zstd
+        let session_dir = path
+            .join("sessions")
+            .join("--E-Code-proj--")
+            .join("session-abc-123");
+        fs::create_dir_all(&session_dir).unwrap();
+        File::create(session_dir.join("session.jsonl.zstd")).unwrap();
+
+        // `compression: none` writes the same rows to `session.jsonl`; a
+        // second session directory covers that spelling.
+        let plain_dir = path
+            .join("sessions")
+            .join("--E-Code-proj--")
+            .join("session-def-456");
+        fs::create_dir_all(&plain_dir).unwrap();
+        File::create(plain_dir.join("session.jsonl")).unwrap();
+
+        // Non-matching siblings must be excluded: other zstd files and any
+        // differently named file in the tree.
+        File::create(path.join("sessions").join("other.jsonl.zstd")).unwrap();
+        File::create(path.join("sessions").join("unrelated.txt")).unwrap();
+
+        let files = scan_directory(path.to_str().unwrap(), "dsh-session-log");
+        let names: Vec<&str> = files
+            .iter()
+            .filter_map(|file| file.file_name().and_then(|name| name.to_str()))
+            .collect();
+        // Byte-lexical path order: `session-abc-123` sorts before `session-def-456`.
+        assert_eq!(names, vec!["session.jsonl.zstd", "session.jsonl"]);
     }
 
     #[test]
