@@ -1065,14 +1065,19 @@ mod tests {
             workspace_display_label("/a/.git/worktrees/x/.claude/worktrees/y").as_deref(),
             Some("a ⑃ y")
         );
-        // Same rule for the dash-encoded form, whose directory is gone.
+        // Same rule for the dash-encoded form, whose directory is gone. The root
+        // segment is spelled so that no machine has such a directory: these
+        // assertions are about the string fallback, and a slug that happens to
+        // resolve on the runner (Windows CI really does have a `C:\a`) would be
+        // testing the decoder instead.
+        let encoded = "-tokscale-probe-repo--git-worktrees-x--claude-worktrees-y";
         assert_eq!(
-            workspace_display_label("-a--git-worktrees-x--claude-worktrees-y").as_deref(),
-            Some("a ⑃ y")
+            workspace_display_label(encoded).as_deref(),
+            Some("repo ⑃ y")
         );
         assert_eq!(
-            workspace_repo_root_from_slug("-a--git-worktrees-x--claude-worktrees-y").as_deref(),
-            Some("-a")
+            workspace_repo_root_from_slug(encoded).as_deref(),
+            Some("-tokscale-probe-repo")
         );
     }
 
