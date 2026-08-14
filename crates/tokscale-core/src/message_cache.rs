@@ -1063,6 +1063,35 @@ fn parser_version(client: ClientId) -> u32 {
         // v2->v3: duplicate merging now upgrades the retained row when a later
         // copy carries an explicit cost, including zero.
         ClientId::MiMoCode => 3,
+        // Droid's cumulative session totals now anchor on the settings file's
+        // mtime (floored at providerLockTimestamp) instead of the lock
+        // timestamp alone, so a long-running session stops reporting every
+        // token it ever spent against the day it was started. A session that
+        // has since ended never changes its bytes again, so its fingerprint
+        // stays valid forever and only this bump discards the v1 anchor.
+        // v2->v3: a session's cumulative total is no longer one record at one
+        // instant. It is now apportioned across the assistant replies in the
+        // sibling transcript, weighted by the context each reply read, so a
+        // multi-day session reports against the days it actually ran.
+        // v3->v4: a reply is weighted by the context standing before it rather
+        // than including its own bytes, so a long answer no longer charges
+        // itself for its own output.
+        // v4->v5: output and reasoning follow the reply's own size instead of
+        // the context it read, a pre-epoch transcript timestamp no longer
+        // anchors a share of the session in 1969, and an oversized transcript
+        // takes the single-record path. Versions 2 through 4 only ever existed
+        // in pre-release builds of this change; the bump past them keeps anyone
+        // who ran one from holding a superseded split.
+        // v5->v6: a coalesced run of replies now reports how many calls it
+        // stands for instead of one, an unreadable file size no longer waives
+        // the transcript ceiling, and a transcript that could not be read whole
+        // takes the single-record path rather than apportioning the session
+        // over the prefix that was read.
+        // v6->v7: the apportioned records are attribution fragments of one
+        // session, so the session's reply count now rides on exactly one of
+        // them. v6 entries carry a count on every record, which `sessionize`
+        // reads as one session per record.
+        ClientId::Droid => 7,
         _ => 1,
     }
 }
@@ -2946,6 +2975,14 @@ mod tests {
         // fingerprint forever, so only the version bump discards the truncated
         // v6 parse and forces a cold reparse.
         assert_eq!(parser_version(ClientId::Grok), 7);
+    }
+
+    #[test]
+    fn test_droid_usage_anchor_parser_version_invalidates_v1_entries() {
+        // A finished Droid session's settings.json is never rewritten again, so
+        // its fingerprint keeps matching and only the version bump discards the
+        // v1 lock-timestamp anchor.
+        assert_eq!(parser_version(ClientId::Droid), 7);
     }
 
     #[test]
