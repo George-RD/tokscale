@@ -253,8 +253,18 @@ const MIN_SEGMENT_CELLS: usize = 4;
 ///
 /// Measured over 1181 real workspace keys, counting rows that render to a string
 /// some other row also renders to: 915 keys in 52 groups at 18 cells before,
-/// 30 keys in 15 groups after; 757/31 to 0 at 44 cells; 749/28 to 0 at 60. No key
-/// that a head cut kept distinct is merged here at any of those widths.
+/// 30 keys in 15 groups after; 757/31 to 0 at 44 cells; 749/28 to 0 at 60.
+///
+/// That is a large net reduction in rendered collisions, not a strict
+/// improvement per key. Spending the column on every segment's ends can merge a
+/// pair that a single head cut happened to keep apart, because the head cut kept
+/// one segment whole. On an independent 2364-label corpus at 18 cells this
+/// removed 29457 colliding pairs and introduced 42 (13 plain paths, 29
+/// qualified) against a head cut, and introduced 17 against the previous
+/// fitter — `agent-runtime ⑃ desktop-skill-session` and
+/// `agent-runtime ⑃ desktop-window-drag-permission` render alike here and did
+/// not before. The column is a summary; the full key stays in `--json` and in
+/// the wider layouts this same function produces.
 pub fn fit_workspace_label_to_width(label: &str, max_cells: usize) -> String {
     if display_width(label) <= max_cells {
         return label.to_string();

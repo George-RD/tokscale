@@ -464,7 +464,18 @@ pub fn normalize_workspace_key(raw: &str) -> Option<String> {
         }
     }
 
-    let minimum_len = if preserve_unc_prefix { 2 } else { 1 };
+    // A root is not a trailing separator to strip. `/` survives on length alone
+    // and `//share` on the UNC minimum, but `C:/` did not: stripping left `C:`,
+    // which is Windows' DRIVE-RELATIVE form (`C:work` means "work under the
+    // current directory of drive C"), so a real drive root classified as
+    // relative and was refused a filesystem read it was entitled to.
+    let minimum_len = if preserve_unc_prefix {
+        2
+    } else if windows_drive_root(&normalized, ':', '/').is_some() {
+        3
+    } else {
+        1
+    };
     if normalized.len() > minimum_len {
         normalized = normalized.trim_end_matches('/').to_string();
     }
@@ -611,7 +622,14 @@ pub fn workspace_git_worktree_root(path: &str) -> Option<String> {
     // read `$CWD/<slug>/.git` — a file the user never named, planted by whoever
     // owns the directory the binary was started in, yet trusted to rename the
     // row and, under `--merge-worktrees`, to re-key it.
-    if !is_absolute_workspace_key(path) {
+    //
+    // Both spellings have to be absolute, because the test and the read see
+    // different strings: `is_absolute_workspace_key` normalizes separators, so a
+    // Windows-shaped key passes it on any host, while the read below hands the
+    // RAW key to `Path`. On POSIX `Path::new(r"C:\Users\me\repo")` is one
+    // relative filename, so that key resolved against `$CWD` again — the same
+    // hole the slug closed, entered through a different door.
+    if !is_absolute_workspace_key(path) || !Path::new(path).is_absolute() {
         return None;
     }
     let contents = read_git_pointer_file(&Path::new(path).join(".git"))?;
@@ -1443,6 +1461,62 @@ mod tests {
         assert_eq!(pointer_root, None, "a relative key names no directory");
         assert_eq!(resolved, None, "--merge-worktrees must not re-key the row");
         assert_eq!(label.as_deref(), Some(slug));
+    }
+
+    /// The same hole through the other door: the absoluteness test normalizes
+    /// separators, so `C:\Users\me\repo` passed it on macOS and Linux, but the
+    /// pointer read hands the RAW key to `Path`, where that string is a single
+    /// relative filename. A directory of that name in `$CWD` got its `.git`
+    /// read and re-keyed the row, exactly as the slug used to.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn windows_shaped_keys_never_read_a_pointer_file_from_the_working_directory() {
+        let (_temp, root) = canonical_tempdir();
+        let key = "C:\\Users\\me\\repo";
+        std::fs::create_dir_all(root.join(key)).unwrap();
+        std::fs::write(
+            root.join(key).join(".git"),
+            "gitdir: /srv/evilrepo/.git/worktrees/pwned\n",
+        )
+        .unwrap();
+
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+        let pointer_root = workspace_git_worktree_root(key);
+        let resolved = workspace_repo_root_resolved(key);
+        std::env::set_current_dir(&previous).unwrap();
+
+        assert_eq!(
+            pointer_root, None,
+            "a Windows-shaped key names no directory on this host"
+        );
+        assert_eq!(resolved, None, "--merge-worktrees must not re-key the row");
+    }
+
+    /// `C:\` is a root, not a path with a trailing separator. Trimming it left
+    /// `C:` — Windows' drive-RELATIVE form — so the top of a drive classified as
+    /// relative while POSIX `/` stayed absolute.
+    #[test]
+    fn windows_drive_roots_stay_absolute() {
+        assert_eq!(normalize_workspace_key("C:\\").as_deref(), Some("C:/"));
+        assert_eq!(normalize_workspace_key("C:/").as_deref(), Some("C:/"));
+        assert_eq!(normalize_workspace_key("C:///").as_deref(), Some("C:/"));
+        assert!(is_absolute_workspace_key("C:\\"));
+        assert!(is_absolute_workspace_key("C:/"));
+        assert!(is_absolute_workspace_key("/"));
+
+        // A bare drive is not a root: `C:work` is relative to whatever directory
+        // that drive is currently sitting in.
+        assert!(!is_absolute_workspace_key("C:"));
+        assert!(!is_absolute_workspace_key("C:work"));
+        assert!(!is_absolute_workspace_key("repo/x"));
+
+        // Deeper keys still lose their trailing separator.
+        assert_eq!(
+            normalize_workspace_key("C:\\work\\api\\").as_deref(),
+            Some("C:/work/api")
+        );
     }
 
     #[test]
