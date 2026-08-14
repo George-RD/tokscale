@@ -566,12 +566,67 @@ pub fn workspace_git_worktree_root(path: &str) -> Option<String> {
         .find_map(|line| line.trim().strip_prefix("gitdir:"))?
         .trim();
     // Git may record the pointer relative to the worktree directory.
-    let gitdir = if Path::new(pointer).is_absolute() || pointer.starts_with('/') {
+    let joined = if Path::new(pointer).is_absolute() || pointer.starts_with('/') {
         normalize_workspace_key(pointer)?
     } else {
         normalize_workspace_key(&Path::new(path).join(pointer).to_string_lossy())?
     };
-    workspace_repo_root(&gitdir)
+    repo_root_from_gitdir(&lexically_normalize(&joined)?)
+}
+
+/// Resolve `.` and `..` segments without touching the filesystem.
+///
+/// A relative pointer joins into `/work/feature-x/../api/.git/worktrees/x`,
+/// which names the right directory but is not the string the repository's own
+/// row is keyed by. Rollup compares identities as strings, so leaving the `..`
+/// in would keep the worktree and its repo in separate rows — the exact thing
+/// reading the pointer is meant to fix. Lexical rather than `canonicalize` so a
+/// symlinked path keeps the spelling its own row uses.
+fn lexically_normalize(key: &str) -> Option<String> {
+    let prefix_len = if key.starts_with("//") {
+        2
+    } else if key.starts_with('/') {
+        1
+    } else {
+        0
+    };
+    let (prefix, rest) = key.split_at(prefix_len);
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in rest.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                // Above an absolute root there is nothing to pop, and POSIX
+                // defines `/..` as `/`; a relative key has to keep the segment.
+                if segments.last().is_some_and(|last| *last != "..") {
+                    segments.pop();
+                } else if prefix.is_empty() {
+                    segments.push("..");
+                }
+            }
+            other => segments.push(other),
+        }
+    }
+    normalize_workspace_key(&format!("{prefix}{}", segments.join("/")))
+}
+
+/// The repository a `gitdir:` pointer belongs to.
+///
+/// Git always writes `<git dir>/worktrees/<name>`, so the segment before
+/// `worktrees` is the repository's git directory: `<repo>/.git` for an ordinary
+/// checkout, and the repository itself (`/srv/repo.git`) when it is bare. Bare
+/// layouts have to be handled here rather than by `workspace_repo_root`, which
+/// deliberately refuses to read `.git/worktrees/` out of a `repo.git` segment —
+/// from a bare path alone there is nothing to distinguish a repository from a
+/// directory that merely ends in `.git`. Arriving through a `.git` pointer file
+/// is what makes it certain.
+fn repo_root_from_gitdir(gitdir: &str) -> Option<String> {
+    let (git_dir, worktree) = gitdir.rsplit_once("/worktrees/")?;
+    if worktree.is_empty() {
+        return None;
+    }
+    let root = git_dir.strip_suffix("/.git").unwrap_or(git_dir);
+    (!root.is_empty()).then(|| root.to_string())
 }
 
 /// The repository root for `path` whether its worktree lives inside the repo
@@ -931,6 +986,68 @@ mod tests {
             workspace_display_label(&key).as_deref(),
             Some("api ⑃ api-feature-x")
         );
+    }
+
+    /// Git writes the pointer relative to the worktree whenever the two live on
+    /// the same volume, which is the common case for `git worktree add ../x`.
+    /// Joining it leaves a `..` in the middle of the path, and a repo identity
+    /// spelled `/work/feature-x/../api` never string-matches the repository's
+    /// own row, so rollup silently did nothing.
+    #[test]
+    fn relative_gitdir_pointers_resolve_to_the_repos_own_key() {
+        let (_temp, root) = canonical_tempdir();
+        let repo = root.join("devpro/api");
+        let worktree = root.join("devpro/api-feature-x");
+        std::fs::create_dir_all(repo.join(".git/worktrees/feature-x")).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: ../api/.git/worktrees/feature-x\n",
+        )
+        .unwrap();
+
+        let key = normalize_workspace_key(&worktree.to_string_lossy()).unwrap();
+        let expected = normalize_workspace_key(&repo.to_string_lossy()).unwrap();
+        assert_eq!(
+            workspace_repo_root_resolved(&key).as_deref(),
+            Some(expected.as_str()),
+            "the rolled-up identity must be spelled like the repo's own key"
+        );
+    }
+
+    /// A worktree of a BARE repository points at `/srv/api.git/worktrees/x`,
+    /// which carries no standalone `.git` segment for the marker search to find.
+    /// The pointer file is what proves `api.git` is a repository rather than a
+    /// directory that happens to end in `.git`.
+    #[test]
+    fn bare_repository_worktrees_resolve_to_the_bare_repo() {
+        let (_temp, root) = canonical_tempdir();
+        let bare = root.join("srv/api.git");
+        let worktree = root.join("srv/feature-x");
+        std::fs::create_dir_all(bare.join("worktrees/feature-x")).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                bare.join("worktrees/feature-x").to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let key = normalize_workspace_key(&worktree.to_string_lossy()).unwrap();
+        let expected = normalize_workspace_key(&bare.to_string_lossy()).unwrap();
+        assert_eq!(
+            workspace_repo_root_resolved(&key).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            workspace_display_label(&key).as_deref(),
+            Some("api.git ⑃ feature-x")
+        );
+        // A path that merely ENDS in `.git`, with no pointer file vouching for
+        // it, is still not a repository.
+        assert_eq!(workspace_repo_root("/notes/my.git/worktrees/draft"), None);
     }
 
     /// A submodule's `.git` file points at `.git/modules/...`, which is not a
