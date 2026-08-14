@@ -33,7 +33,7 @@ pub use sessionize::{
 pub use sessions::{CostSource, UnifiedMessage};
 
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -545,6 +545,9 @@ pub struct ReportOptions {
     pub until: Option<String>,
     pub year: Option<String>,
     pub group_by: GroupBy,
+    /// Whether `workspace,model` rows fold git worktrees into their parent repo.
+    /// Only consulted for [`GroupBy::WorkspaceModel`].
+    pub worktree_rollup: WorktreeRollup,
     /// Persistent scanner config loaded from `~/.config/tokscale/settings.json`.
     /// Defaults to empty when callers don't care about user-configured paths.
     pub scanner_settings: scanner::ScannerSettings,
@@ -2891,32 +2894,354 @@ fn filter_unified_messages(
     filtered
 }
 
-fn workspace_bucket(msg: &UnifiedMessage) -> (String, Option<String>, String) {
-    match (&msg.workspace_key, &msg.workspace_label) {
-        (Some(key), Some(label)) => (key.clone(), Some(key.clone()), label.clone()),
-        (Some(key), None) => (
-            key.clone(),
-            Some(key.clone()),
-            sessions::workspace_label_from_key(key)
-                .unwrap_or_else(|| UNKNOWN_WORKSPACE_LABEL.to_string()),
-        ),
-        _ => (
-            UNKNOWN_WORKSPACE_GROUP_KEY.to_string(),
-            None,
-            UNKNOWN_WORKSPACE_LABEL.to_string(),
-        ),
+/// How workspace rows treat git worktrees.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub enum WorktreeRollup {
+    /// One row per worktree — a task-isolating agent CLI produces many rows per repo.
+    #[default]
+    Separate,
+    /// Fold every worktree into its parent repository.
+    MergeIntoRepo,
+}
+
+/// Resolving a workspace key to a display label reads the filesystem (see
+/// [`sessions::decode_claude_project_slug`]). Reports iterate hundreds of
+/// thousands of messages over a handful of distinct workspaces, so memoize per
+/// key and keep the syscalls proportional to workspaces, not messages.
+#[derive(Default)]
+pub struct WorkspaceLabeler {
+    labels: HashMap<String, String>,
+    roots: HashMap<String, Option<String>>,
+    paths: HashMap<String, Option<String>>,
+    decoded: HashMap<String, Option<String>>,
+    resolved_roots: HashMap<String, Option<String>>,
+}
+
+impl WorkspaceLabeler {
+    pub fn label(&mut self, key: &str) -> String {
+        if let Some(cached) = self.labels.get(key) {
+            return cached.clone();
+        }
+        let decoded = self.decoded(key);
+        let label = sessions::workspace_display_label_for_decoded_key(key, decoded.as_deref())
+            .unwrap_or_else(|| UNKNOWN_WORKSPACE_LABEL.to_string());
+        self.labels.insert(key.to_string(), label.clone());
+        label
+    }
+
+    /// The real filesystem path `key` names, decoded from Claude Code's slug
+    /// where it is one. `None` when the key is not a path (an opaque client id)
+    /// or its directory is gone.
+    pub fn path(&mut self, key: &str) -> Option<String> {
+        if let Some(cached) = self.paths.get(key) {
+            return cached.clone();
+        }
+        let decoded = self.decoded(key);
+        let path = sessions::workspace_path_for_decoded_key(key, decoded.as_deref());
+        self.paths.insert(key.to_string(), path.clone());
+        path
+    }
+
+    /// Claude Code's slug decoded to a real path, memoized.
+    ///
+    /// The decode is the expensive half of every method here: it walks the
+    /// filesystem, backtracking over the ambiguity in the dash encoding. Without
+    /// this cache `label`, `path` and `repo_root` each ran their own walk for the
+    /// same key, so a slug that took 7s to decode cost 23s across one row.
+    fn decoded(&mut self, key: &str) -> Option<String> {
+        if let Some(cached) = self.decoded.get(key) {
+            return cached.clone();
+        }
+        let decoded = sessions::decode_claude_project_slug(key);
+        self.decoded.insert(key.to_string(), decoded.clone());
+        decoded
+    }
+
+    /// Distinct keys whose slug decode has been resolved, for tests that need to
+    /// prove the walk is shared across `label`, `path` and `repo_root`.
+    #[cfg(test)]
+    pub(crate) fn decoded_key_count(&self) -> usize {
+        self.decoded.len()
+    }
+
+    /// The repo root a resolved filesystem path belongs to, memoized.
+    ///
+    /// Distinct from [`Self::repo_root`], which is keyed by the workspace key and
+    /// applies the slug fallbacks. This one is keyed by path because it reads the
+    /// `.git` pointer file, and several keys can resolve to the same directory.
+    pub fn repo_root_of_path(&mut self, path: &str) -> Option<String> {
+        if let Some(cached) = self.resolved_roots.get(path) {
+            return cached.clone();
+        }
+        let root = sessions::workspace_repo_root_resolved(path);
+        self.resolved_roots.insert(path.to_string(), root.clone());
+        root
+    }
+
+    /// The canonical repo identity for `key`: the real filesystem path, with any
+    /// worktree suffix stripped. `None` when the key cannot be resolved to a path
+    /// (an opaque client id, or a directory no longer on disk), leaving the
+    /// original key as its own identity.
+    ///
+    /// Decoding is what makes the rollup actually merge. Claude Code writes a
+    /// dash-mangled slug and Codex/OpenCode write real paths, so without this the
+    /// same repo keeps two identities and the "one row per repo" promise fails.
+    pub fn repo_root(&mut self, key: &str) -> Option<String> {
+        if let Some(cached) = self.roots.get(key) {
+            return cached.clone();
+        }
+        // Decode first: Claude's slug encodes `.claude/worktrees/` as dashes, so
+        // the marker is only visible once the real path is recovered.
+        let decoded = self.decoded(key);
+        let path = decoded.clone().unwrap_or_else(|| key.to_string());
+        let root = self
+            .repo_root_of_path(&path)
+            // Not a worktree: the decoded path is already the repo identity.
+            .or_else(|| decoded.clone())
+            // Undecodable slug (deleted worktree): fall back to the repo prefix
+            // recovered from the slug string so it still merges with its repo.
+            .or_else(|| sessions::workspace_repo_root_from_slug(key));
+        self.roots.insert(key.to_string(), root.clone());
+        root
     }
 }
 
+/// Grouping key, stored key and display label for a message's workspace.
+///
+/// Shared with the TUI, which runs its own aggregation over the same messages —
+/// duplicating this would let the two drift on how worktrees roll up and how
+/// Claude Code's dash-mangled keys are labeled.
+pub fn workspace_bucket(
+    msg: &UnifiedMessage,
+    rollup: WorktreeRollup,
+    labeler: &mut WorkspaceLabeler,
+) -> (String, Option<String>, String) {
+    let Some(key) = msg.workspace_key.as_deref() else {
+        return (
+            UNKNOWN_WORKSPACE_GROUP_KEY.to_string(),
+            None,
+            UNKNOWN_WORKSPACE_LABEL.to_string(),
+        );
+    };
+
+    // Under MergeIntoRepo the repo root becomes the grouping identity, so every
+    // worktree of a repo lands in one row and the row reports the repo's path.
+    if rollup == WorktreeRollup::MergeIntoRepo {
+        if let Some(root) = labeler.repo_root(key) {
+            let label = labeler.label(&root);
+            return (root.clone(), Some(root), label);
+        }
+    }
+
+    // A parser-supplied label is authoritative — it is the only thing that can
+    // name a workspace whose key is not a path (Warp's workspace UUID). Keys
+    // that fell back to `workspace_label_from_key` are relabeled, because that
+    // helper returns the whole dash-mangled slug for Claude Code.
+    let label = match msg.workspace_label.as_deref() {
+        Some(label) if Some(label.to_string()) != sessions::workspace_label_from_key(key) => {
+            label.to_string()
+        }
+        _ => labeler.label(key),
+    };
+
+    (key.to_string(), Some(key.to_string()), label)
+}
+
+/// The label to display for every distinct workspace in `messages`, keyed by the
+/// grouping identity its rows will use.
+///
+/// A label is a basename, so `~/work/api` and `~/oss/api` render as the same
+/// text even though they stay separate rows with separate keys — the row is
+/// still correct, but the reader cannot tell which repo it is looking at. Each
+/// colliding label is qualified here with the fewest leading parent segments
+/// that tell the group apart (`work/api`, `oss/api`).
+///
+/// Grouping keys are never touched: this rewrites display text only, so no usage
+/// moves between rows and no total changes.
+///
+/// Resolved up front rather than as a post-pass over the rows: the daily
+/// breakdown keys its legend off the label while it aggregates, so fixing the
+/// table afterwards would leave the chart showing the ambiguous name.
+pub fn workspace_label_overrides(
+    messages: &[UnifiedMessage],
+    rollup: WorktreeRollup,
+    labeler: &mut WorkspaceLabeler,
+) -> HashMap<String, String> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut base: BTreeMap<String, String> = BTreeMap::new();
+    for msg in messages {
+        let Some(key) = msg.workspace_key.as_deref() else {
+            continue;
+        };
+        if !seen.insert(key) {
+            continue;
+        }
+        let (group_key, _, label) = workspace_bucket(msg, rollup, labeler);
+        base.entry(group_key).or_insert(label);
+    }
+
+    disambiguate_workspace_labels(
+        base.iter()
+            .map(|(key, label)| (key.as_str(), label.as_str())),
+        labeler,
+    )
+}
+
+/// Rewrite `labeled` — (grouping key, base label) pairs — so no two keys share a
+/// label, qualifying each collision with as few leading path segments as it
+/// takes and falling back to the grouping key when the filesystem cannot
+/// separate them at all.
+fn disambiguate_workspace_labels<'a>(
+    labeled: impl IntoIterator<Item = (&'a str, &'a str)>,
+    labeler: &mut WorkspaceLabeler,
+) -> HashMap<String, String> {
+    // BTree everywhere: with two directories that encode identically there is
+    // nothing on disk to order them by, so the output must not depend on hash
+    // iteration order.
+    let mut by_label: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for (key, label) in labeled {
+        by_label.entry(label).or_default().insert(key);
+    }
+
+    let mut resolved: BTreeMap<String, String> = BTreeMap::new();
+    for (label, keys) in by_label {
+        if keys.len() == 1 {
+            for key in keys {
+                resolved.insert(key.to_string(), label.to_string());
+            }
+            continue;
+        }
+
+        let keys: Vec<&str> = keys.into_iter().collect();
+        let parents: Vec<Vec<String>> = keys
+            .iter()
+            .map(|key| workspace_parent_segments(labeler, key))
+            .collect();
+        let max_depth = parents.iter().map(Vec::len).max().unwrap_or(0);
+
+        // Fewest segments that tell the most rows apart. Escalating past that
+        // buys nothing: when two keys name the SAME directory every remaining
+        // segment is identical on both rows, so a deeper qualifier only makes
+        // the label longer and pushes the part that actually differs — the key
+        // appended below — off a narrow row.
+        let mut depth = 0;
+        let mut separated = 0;
+        for candidate in 0..=max_depth {
+            let candidates: HashSet<String> = parents
+                .iter()
+                .map(|parents| qualify_workspace_label(label, parents, candidate))
+                .collect();
+            if candidates.len() > separated {
+                separated = candidates.len();
+                depth = candidate;
+            }
+            if separated == keys.len() {
+                break;
+            }
+        }
+
+        for (key, parents) in keys.iter().zip(&parents) {
+            resolved.insert(
+                (*key).to_string(),
+                qualify_workspace_label(label, parents, depth),
+            );
+        }
+    }
+
+    // Whatever the filesystem could not separate — two keys that resolve to the
+    // same directory, or keys with no path at all — is separated by the grouping
+    // key, which is unique by construction.
+    let mut duplicates: BTreeMap<&str, usize> = BTreeMap::new();
+    for label in resolved.values() {
+        *duplicates.entry(label.as_str()).or_default() += 1;
+    }
+    let ambiguous: HashSet<String> = duplicates
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(label, _)| label.to_string())
+        .collect();
+
+    resolved
+        .into_iter()
+        .map(|(key, label)| {
+            if ambiguous.contains(&label) {
+                let qualified = format!("{label} ({key})");
+                (key, qualified)
+            } else {
+                (key, label)
+            }
+        })
+        .collect()
+}
+
+/// Parent segments of the directory whose name the label leads with, nearest
+/// first. Empty when the key resolves to no path, which is what makes the
+/// caller fall through to qualifying by the key itself.
+fn workspace_parent_segments(labeler: &mut WorkspaceLabeler, key: &str) -> Vec<String> {
+    let Some(path) = labeler.path(key) else {
+        return Vec::new();
+    };
+    // A worktree label reads `repo ⑃ worktree`, so it is the REPO whose parents
+    // disambiguate it, not the worktree's `.claude/worktrees` scaffolding.
+    let anchor = labeler.repo_root_of_path(&path).unwrap_or(path);
+    let mut segments: Vec<String> = anchor
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect();
+    // The last segment is already the label's own name.
+    segments.pop();
+    segments.reverse();
+    segments
+}
+
+/// `label` prefixed with up to `depth` parent segments, outermost first, so the
+/// result reads like the tail of the path it came from.
+fn qualify_workspace_label(label: &str, parents: &[String], depth: usize) -> String {
+    let taken = depth.min(parents.len());
+    if taken == 0 {
+        return label.to_string();
+    }
+    let mut prefix: Vec<&str> = parents[..taken].iter().map(String::as_str).collect();
+    prefix.reverse();
+    format!("{}/{label}", prefix.join("/"))
+}
+
+#[cfg(test)]
 fn aggregate_model_usage_entries(
     messages: Vec<UnifiedMessage>,
     group_by: &GroupBy,
 ) -> Vec<ModelUsage> {
+    aggregate_model_usage_entries_with_rollup(messages, group_by, WorktreeRollup::default())
+}
+
+fn aggregate_model_usage_entries_with_rollup(
+    messages: Vec<UnifiedMessage>,
+    group_by: &GroupBy,
+    rollup: WorktreeRollup,
+) -> Vec<ModelUsage> {
     let mut model_map: HashMap<String, ModelUsage> = HashMap::new();
+    let mut labeler = WorkspaceLabeler::default();
+
+    // Bucketing a workspace resolves its label, which reads the filesystem. Every
+    // other grouping discards that label a few lines below, so skip the work rather
+    // than paying it on `tokscale --light`, `monthly`, and every TUI refresh.
+    let needs_workspace = matches!(group_by, GroupBy::WorkspaceModel);
+    let label_overrides = if needs_workspace {
+        workspace_label_overrides(&messages, rollup, &mut labeler)
+    } else {
+        HashMap::new()
+    };
 
     for msg in messages {
         let normalized = model_name_for_grouping(&msg.client, &msg.provider_id, &msg.model_id);
-        let (workspace_group_key, workspace_key, workspace_label) = workspace_bucket(&msg);
+        let (workspace_group_key, workspace_key, workspace_label) = if needs_workspace {
+            let (group_key, key, label) = workspace_bucket(&msg, rollup, &mut labeler);
+            let label = label_overrides.get(&group_key).cloned().unwrap_or(label);
+            (group_key, key, label)
+        } else {
+            (String::new(), None, String::new())
+        };
         let key = match group_by {
             GroupBy::Model => normalized.clone(),
             GroupBy::ClientModel => format!("{}:{}", msg.client, normalized),
@@ -3081,7 +3406,11 @@ pub async fn get_model_report(options: ReportOptions) -> Result<ModelReport, Str
     );
 
     let filtered = filter_messages_for_report(all_messages, &options);
-    let entries = aggregate_model_usage_entries(filtered, &options.group_by);
+    let entries = aggregate_model_usage_entries_with_rollup(
+        filtered,
+        &options.group_by,
+        options.worktree_rollup,
+    );
 
     let (total_input, total_output, total_cache_read, total_cache_write) =
         model_report_token_totals(&entries);
@@ -4968,6 +5297,10 @@ mod tests {
         MISSING_MODEL_PRICING_REASON, ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL,
         UNVERIFIED_MODEL_IDENTITY_REASON, UNVERIFIED_PROVIDER_IDENTITY_REASON,
     };
+    // Kept as its own statement rather than folded into the list above: that list
+    // is edited by nearly every PR that touches this file, and sharing it made
+    // this branch conflict on every single upstream merge.
+    use super::{aggregate_model_usage_entries_with_rollup, WorktreeRollup};
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
@@ -6127,6 +6460,513 @@ mod tests {
         assert_eq!(entries[0].output, 10);
         assert_eq!(entries[0].cost, 4.0);
         assert_eq!(entries[0].message_count, 2);
+    }
+
+    #[test]
+    fn worktree_rollup_merges_worktrees_of_one_repo_into_a_single_row() {
+        let messages = vec![
+            make_workspace_message(
+                "claude",
+                "claude-sonnet-4-5-20250929",
+                "anthropic",
+                "session-1",
+                1.0,
+                Some("/repo-a/.claude/worktrees/feature-x"),
+                None,
+            ),
+            make_workspace_message(
+                "claude",
+                "claude-sonnet-4-5-20250929",
+                "anthropic",
+                "session-2",
+                2.0,
+                Some("/repo-a/.claude/worktrees/feature-y"),
+                None,
+            ),
+            make_workspace_message(
+                "claude",
+                "claude-sonnet-4-5-20250929",
+                "anthropic",
+                "session-3",
+                4.0,
+                Some("/repo-a"),
+                None,
+            ),
+        ];
+
+        let separate = aggregate_model_usage_entries_with_rollup(
+            messages.clone(),
+            &GroupBy::WorkspaceModel,
+            WorktreeRollup::Separate,
+        );
+        assert_eq!(separate.len(), 3, "each worktree stays its own row");
+
+        let merged = aggregate_model_usage_entries_with_rollup(
+            messages,
+            &GroupBy::WorkspaceModel,
+            WorktreeRollup::MergeIntoRepo,
+        );
+        assert_eq!(merged.len(), 1, "every worktree folds into the repo row");
+        assert_eq!(merged[0].workspace_key.as_deref(), Some("/repo-a"));
+        assert_eq!(merged[0].workspace_label.as_deref(), Some("repo-a"));
+        // No usage may be lost or double counted by the rollup.
+        assert_eq!(merged[0].cost, 7.0);
+        assert_eq!(merged[0].message_count, 3);
+    }
+
+    #[test]
+    fn worktree_rollup_labels_name_the_repo_and_the_worktree() {
+        let entries = aggregate_model_usage_entries_with_rollup(
+            vec![make_workspace_message(
+                "claude",
+                "claude-sonnet-4-5-20250929",
+                "anthropic",
+                "session-1",
+                1.0,
+                Some("/repo-a/.claude/worktrees/feature-x"),
+                None,
+            )],
+            &GroupBy::WorkspaceModel,
+            WorktreeRollup::Separate,
+        );
+
+        // Without rollup the row must still say WHICH worktree it is -- the bug
+        // was a label that truncated to a shared, indistinguishable prefix.
+        assert_eq!(
+            entries[0].workspace_label.as_deref(),
+            Some("repo-a ⑃ feature-x")
+        );
+    }
+
+    #[test]
+    fn worktree_rollup_merges_a_slug_key_with_the_same_repos_real_path() {
+        // Claude Code writes a dash-mangled slug and Codex/OpenCode write real
+        // paths for the SAME directory. Under rollup both must resolve to one
+        // identity, or "one row per repo" silently still yields two.
+        // Spell the fixture the way `read_dir` reports it -- see
+        // `sessions::canonical_tempdir` for why that is not just `tempdir()`.
+        let (_temp, temp_root) = crate::sessions::canonical_tempdir();
+        let repo = temp_root.join("devpro/ing/claude-witness");
+        std::fs::create_dir_all(repo.join(".claude/worktrees/feature-x")).unwrap();
+
+        let real_path = crate::sessions::normalize_workspace_key(&repo.to_string_lossy()).unwrap();
+        let worktree_path = crate::sessions::normalize_workspace_key(
+            &repo.join(".claude/worktrees/feature-x").to_string_lossy(),
+        )
+        .unwrap();
+        // How Claude Code would name that worktree's project directory.
+        let slug: String = worktree_path
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+
+        let entries = aggregate_model_usage_entries_with_rollup(
+            vec![
+                make_workspace_message(
+                    "claude",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-1",
+                    1.0,
+                    Some(&slug),
+                    None,
+                ),
+                make_workspace_message(
+                    "opencode",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-2",
+                    2.0,
+                    Some(&real_path),
+                    None,
+                ),
+            ],
+            &GroupBy::WorkspaceModel,
+            WorktreeRollup::MergeIntoRepo,
+        );
+
+        assert_eq!(entries.len(), 1, "slug and real path must share one row");
+        assert_eq!(entries[0].cost, 3.0);
+        assert_eq!(
+            entries[0].workspace_label.as_deref(),
+            Some("claude-witness")
+        );
+    }
+
+    /// The same directory recorded twice — Claude Code's slug and another
+    /// client's real path — stays two rows without rollup, and those two rows
+    /// must still be tellable apart. No parent segment can do it (both resolve
+    /// to one directory), so the key does; escalating the parent qualifier
+    /// first would only push that key off a narrow row.
+    #[test]
+    fn same_directory_under_two_key_formats_is_separated_by_the_key() {
+        let (_temp, temp_root) = crate::sessions::canonical_tempdir();
+        let repo = temp_root.join("devpro/ing/claude-witness");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let real_path = crate::sessions::normalize_workspace_key(&repo.to_string_lossy()).unwrap();
+        let slug: String = real_path
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+
+        let entries = aggregate_model_usage_entries_with_rollup(
+            vec![
+                make_workspace_message(
+                    "claude",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-1",
+                    1.0,
+                    Some(&slug),
+                    None,
+                ),
+                make_workspace_message(
+                    "opencode",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-2",
+                    2.0,
+                    Some(&real_path),
+                    None,
+                ),
+            ],
+            &GroupBy::WorkspaceModel,
+            WorktreeRollup::Separate,
+        );
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.iter().map(|entry| entry.cost).sum::<f64>(), 3.0);
+        let labels: HashSet<&str> = entries
+            .iter()
+            .map(|entry| entry.workspace_label.as_deref().unwrap())
+            .collect();
+        assert_eq!(labels.len(), 2, "rows must be tellable apart: {labels:?}");
+        for label in labels {
+            assert!(
+                label.starts_with("claude-witness ("),
+                "the key qualifies the base label, not a longer path: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_rows_keep_parser_supplied_labels_for_non_path_keys() {
+        // Warp keys a workspace by opaque UUID; only the parser can name it, so
+        // relabeling must not clobber that.
+        let entries = aggregate_model_usage_entries_with_rollup(
+            vec![make_workspace_message(
+                "warp",
+                "claude-sonnet-4-5-20250929",
+                "anthropic",
+                "session-1",
+                1.0,
+                Some("9f2c1a04-1e4b-4c3f-a0d1-77b2e5c9aa10"),
+                Some("Ing's Team"),
+            )],
+            &GroupBy::WorkspaceModel,
+            WorktreeRollup::MergeIntoRepo,
+        );
+
+        assert_eq!(entries[0].workspace_label.as_deref(), Some("Ing's Team"));
+        assert_eq!(
+            entries[0].workspace_key.as_deref(),
+            Some("9f2c1a04-1e4b-4c3f-a0d1-77b2e5c9aa10")
+        );
+    }
+
+    /// Resolving one workspace key used to walk the filesystem three times —
+    /// once each for the label, the path and the repo root — so a slug that took
+    /// seconds to decode cost three times that per row. The decode is memoized
+    /// on the labeler and shared by all three.
+    #[test]
+    fn workspace_labeler_decodes_each_key_once() {
+        let mut labeler = crate::WorkspaceLabeler::default();
+        let key = "-nonexistent-tokscale-decode-probe";
+
+        let label = labeler.label(key);
+        let path = labeler.path(key);
+        let root = labeler.repo_root(key);
+        assert_eq!(
+            labeler.decoded_key_count(),
+            1,
+            "label/path/repo_root must share one decode"
+        );
+
+        // Repeating every call adds no decodes and changes no answers.
+        assert_eq!(labeler.label(key), label);
+        assert_eq!(labeler.path(key), path);
+        assert_eq!(labeler.repo_root(key), root);
+        assert_eq!(labeler.decoded_key_count(), 1);
+    }
+
+    /// Two directories that share a basename produced the same row text, which
+    /// made `--group-by workspace,model` unreadable exactly where it matters:
+    /// the rows are distinct and correctly separated, but nothing on screen said
+    /// which repo each one was.
+    #[test]
+    fn workspace_rows_disambiguate_colliding_basenames() {
+        let entries = aggregate_model_usage_entries_with_rollup(
+            vec![
+                make_workspace_message(
+                    "claude",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-1",
+                    1.0,
+                    Some("/work/proj"),
+                    None,
+                ),
+                make_workspace_message(
+                    "claude",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-2",
+                    2.0,
+                    Some("/oss/proj"),
+                    None,
+                ),
+            ],
+            &GroupBy::WorkspaceModel,
+            WorktreeRollup::Separate,
+        );
+
+        let labels: HashMap<&str, &str> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.workspace_key.as_deref().unwrap(),
+                    entry.workspace_label.as_deref().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(labels.get("/work/proj"), Some(&"work/proj"));
+        assert_eq!(labels.get("/oss/proj"), Some(&"oss/proj"));
+        // Grouping is untouched: only the display string changed.
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.iter().map(|entry| entry.cost).sum::<f64>(), 3.0);
+    }
+
+    /// One parent segment is not always enough. The qualifier has to keep
+    /// walking up until the rows actually differ, and stop as soon as they do.
+    #[test]
+    fn workspace_label_qualifier_walks_up_until_the_rows_differ() {
+        let entries = aggregate_model_usage_entries_with_rollup(
+            vec![
+                make_workspace_message(
+                    "claude",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-1",
+                    1.0,
+                    Some("/home/x/shared/api"),
+                    None,
+                ),
+                make_workspace_message(
+                    "claude",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-2",
+                    2.0,
+                    Some("/home/z/shared/api"),
+                    None,
+                ),
+                make_workspace_message(
+                    "claude",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-3",
+                    4.0,
+                    Some("/home/x/other/api"),
+                    None,
+                ),
+            ],
+            &GroupBy::WorkspaceModel,
+            WorktreeRollup::Separate,
+        );
+
+        let labels: HashMap<&str, &str> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.workspace_key.as_deref().unwrap(),
+                    entry.workspace_label.as_deref().unwrap(),
+                )
+            })
+            .collect();
+        // `shared/api` collides, so the group escalates one more segment -- and
+        // every member of the group escalates together, so the labels stay
+        // comparable to each other.
+        assert_eq!(labels.get("/home/x/shared/api"), Some(&"x/shared/api"));
+        assert_eq!(labels.get("/home/z/shared/api"), Some(&"z/shared/api"));
+        assert_eq!(labels.get("/home/x/other/api"), Some(&"x/other/api"));
+    }
+
+    /// Non-git directories are workspaces too: a plain folder must disambiguate
+    /// the same way, and a folder that merely LOOKS like git metadata
+    /// (`notes.git/worktrees/...`) must not be mistaken for a worktree.
+    #[test]
+    fn workspace_rows_disambiguate_non_git_paths() {
+        let entries = aggregate_model_usage_entries_with_rollup(
+            vec![
+                make_workspace_message(
+                    "claude",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-1",
+                    1.0,
+                    Some("/home/me/Documents/notes"),
+                    None,
+                ),
+                make_workspace_message(
+                    "claude",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-2",
+                    2.0,
+                    Some("/home/me/Dropbox/notes"),
+                    None,
+                ),
+                make_workspace_message(
+                    "claude",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-3",
+                    4.0,
+                    Some("/home/me/notes.git/worktrees/notes"),
+                    None,
+                ),
+            ],
+            &GroupBy::WorkspaceModel,
+            WorktreeRollup::MergeIntoRepo,
+        );
+
+        let labels: HashMap<&str, &str> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.workspace_key.as_deref().unwrap(),
+                    entry.workspace_label.as_deref().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            labels.get("/home/me/Documents/notes"),
+            Some(&"Documents/notes")
+        );
+        assert_eq!(labels.get("/home/me/Dropbox/notes"), Some(&"Dropbox/notes"));
+        // `notes.git` is a directory name, not git metadata: the row keeps its
+        // own key even under rollup, and is labeled from its real parent.
+        assert_eq!(
+            labels.get("/home/me/notes.git/worktrees/notes"),
+            Some(&"worktrees/notes")
+        );
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.iter().map(|entry| entry.cost).sum::<f64>(), 7.0);
+    }
+
+    /// Windows keys arrive with backslashes from clients that never normalized
+    /// them. Splitting on `/` alone made the whole path the label, which is the
+    /// unreadable row this labeling exists to prevent.
+    #[test]
+    fn workspace_rows_label_windows_style_paths() {
+        let entries = aggregate_model_usage_entries_with_rollup(
+            vec![
+                make_workspace_message(
+                    "claude",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-1",
+                    1.0,
+                    Some(r"C:\work\api"),
+                    None,
+                ),
+                make_workspace_message(
+                    "claude",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-2",
+                    2.0,
+                    Some(r"D:\work\api"),
+                    None,
+                ),
+                make_workspace_message(
+                    "claude",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-3",
+                    4.0,
+                    Some(r"C:\work\api\.claude\worktrees\feature-x"),
+                    None,
+                ),
+            ],
+            &GroupBy::WorkspaceModel,
+            WorktreeRollup::Separate,
+        );
+
+        let labels: HashMap<&str, &str> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.workspace_key.as_deref().unwrap(),
+                    entry.workspace_label.as_deref().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(labels.get(r"C:\work\api"), Some(&"C:/work/api"));
+        assert_eq!(labels.get(r"D:\work\api"), Some(&"D:/work/api"));
+        // The worktree row names its repo and its worktree, and does not collide
+        // with either repo row, so it needs no qualifier.
+        assert_eq!(
+            labels.get(r"C:\work\api\.claude\worktrees\feature-x"),
+            Some(&"api ⑃ feature-x")
+        );
+        // Keys are never rewritten -- a Windows key still groups as it arrived.
+        assert_eq!(entries.len(), 3);
+    }
+
+    /// Nothing on disk can separate two opaque client ids that were given the
+    /// same name, so the row falls back to the grouping key, which is unique by
+    /// construction. Distinguishable beats pretty here.
+    #[test]
+    fn workspace_rows_fall_back_to_the_key_when_nothing_else_separates_them() {
+        let entries = aggregate_model_usage_entries_with_rollup(
+            vec![
+                make_workspace_message(
+                    "warp",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-1",
+                    1.0,
+                    Some("9f2c1a04-1e4b-4c3f-a0d1-77b2e5c9aa10"),
+                    Some("Platform"),
+                ),
+                make_workspace_message(
+                    "warp",
+                    "claude-sonnet-4-5-20250929",
+                    "anthropic",
+                    "session-2",
+                    2.0,
+                    Some("0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9"),
+                    Some("Platform"),
+                ),
+            ],
+            &GroupBy::WorkspaceModel,
+            WorktreeRollup::Separate,
+        );
+
+        let labels: HashSet<&str> = entries
+            .iter()
+            .map(|entry| entry.workspace_label.as_deref().unwrap())
+            .collect();
+        assert_eq!(
+            labels.len(),
+            2,
+            "every row must be tellable apart: {labels:?}"
+        );
+        assert!(labels
+            .iter()
+            .all(|label| label.starts_with("Platform (") && label.ends_with(')')));
     }
 
     #[test]
@@ -12247,6 +13087,7 @@ mod tests {
                     until: None,
                     year: None,
                     group_by: GroupBy::default(),
+                    worktree_rollup: WorktreeRollup::default(),
                     scanner_settings: scanner::ScannerSettings::default(),
                 },
                 None,
