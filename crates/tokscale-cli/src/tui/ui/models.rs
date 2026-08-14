@@ -4,9 +4,9 @@ use ratatui::widgets::{
 };
 
 use super::widgets::{
-    format_cache_hit_rate, format_cost, format_cost_per_million, format_ms_per_1k, format_tokens,
-    get_client_display_name, get_provider_display_name, total_tokens_cell, truncate_text,
-    truncate_to_width, viewport_scrollbar_state,
+    fit_workspace_label_to_width, format_cache_hit_rate, format_cost, format_cost_per_million,
+    format_ms_per_1k, format_tokens, get_client_display_name, get_provider_display_name,
+    total_tokens_cell, truncate_text, truncate_to_width, viewport_scrollbar_state,
 };
 use crate::tui::app::{App, SortDirection, SortField};
 use tokscale_core::GroupBy;
@@ -263,7 +263,12 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             } else if group_by == GroupBy::WorkspaceModel {
                 vec![
                     Cell::from(format!("{}", idx + 1)).style(Style::default().fg(theme_muted)),
-                    Cell::from(truncate_to_width(
+                    // Not a plain head cut, unlike every other cell: a workspace
+                    // label is identified by the ends of each of its segments,
+                    // and cutting the tail leaves the prefix every row shares —
+                    // which rendered distinct worktrees as identical rows at the
+                    // 18 cells this column gets on an ordinary terminal.
+                    Cell::from(fit_workspace_label_to_width(
                         workspace_label(model),
                         granted(WORKSPACE_COL_WORKSPACE),
                     ))
@@ -534,6 +539,75 @@ mod tests {
         assert!(
             WORKSPACE_COLUMN_WIDE_WIDTH as usize
                 >= "ea-world-service ⑃ nicole-25-20".chars().count()
+        );
+    }
+
+    /// The Workspace column's granted width at the three terminal sizes the
+    /// column actually takes: 18 on anything below the surplus threshold, and 44
+    /// once above it.
+    fn workspace_cell_width(total: u16) -> usize {
+        workspace_granted_width(&workspace_table_widths(total), WORKSPACE_COL_WORKSPACE)
+    }
+
+    /// Labels drawn from the shapes the aggregator actually produces: sibling
+    /// worktrees whose names differ only in their last characters, six worktrees
+    /// of one repo, and parent-qualified repo names.
+    fn colliding_label_fixture() -> Vec<String> {
+        let mut labels = vec![
+            "tokscale-2 ⑃ wf_2429b20d-2d5-1".to_string(),
+            "tokscale-2 ⑃ wf_2429b20d-2d5-10".to_string(),
+            "tokscale-2 ⑃ wf_aacbce6c-c09-1".to_string(),
+            "tokscale-2 ⑃ wf_aacbce6c-c09-2".to_string(),
+            "junhoyeo/tokscale ⑃ pr1105-dedupe-p1".to_string(),
+            "junhoyeo/tokscale ⑃ pr1105-dedupe-p1-target".to_string(),
+            "swebench-matplotlib__matplotlib-25775-dven5vd8/matplotlib".to_string(),
+            "swebench-matplotlib__matplotlib-25775-8hddztzg/matplotlib".to_string(),
+            "swebench-matplotlib__matplotlib-24870-_z_ymmel/matplotlib".to_string(),
+        ];
+        labels.extend((1..=6).map(|n| format!("tokscale ⑃ worker-{n}")));
+        labels
+    }
+
+    /// The regression this fixes: the labels are unique STRINGS, but the row the
+    /// user sees is the truncated label, and a head-first cut rendered distinct
+    /// worktrees identically at the width the column is granted on an ordinary
+    /// terminal. Asserted at 18, 44 and 60 cells — the base column width, the
+    /// wide width, and a width in between — against the same head cut the column
+    /// used before, so the test fails if the elision is reverted.
+    #[test]
+    fn workspace_cells_render_distinctly_at_the_widths_the_column_gets() {
+        let labels = colliding_label_fixture();
+        for cells in [18usize, 44, 60] {
+            let rendered: std::collections::HashSet<String> = labels
+                .iter()
+                .map(|label| fit_workspace_label_to_width(label, cells))
+                .collect();
+            assert_eq!(
+                rendered.len(),
+                labels.len(),
+                "{cells}-cell rows collapsed onto each other: {rendered:?}"
+            );
+        }
+
+        // 18 and 44 are widths the layout really hands this column out, so the
+        // sizes above are ones a terminal produces rather than ones picked to
+        // make the numbers look good. 60 is measured too, as headroom for a
+        // future wider column.
+        for cells in [18u16, 44] {
+            assert!(
+                (78u16..=400).any(|total| workspace_cell_width(total) == cells as usize),
+                "no terminal width grants the Workspace column {cells} cells"
+            );
+        }
+
+        // The old head cut is what produced the collisions.
+        let head: std::collections::HashSet<String> = labels
+            .iter()
+            .map(|label| truncate_to_width(label, 18))
+            .collect();
+        assert!(
+            head.len() < labels.len(),
+            "fixture no longer reproduces the head-cut collision: {head:?}"
         );
     }
 

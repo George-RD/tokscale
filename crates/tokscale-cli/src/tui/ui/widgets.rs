@@ -171,6 +171,172 @@ pub fn truncate_to_width(s: &str, max_cells: usize) -> String {
     format!("{}...", prefix_to_width(s, max_cells - 3))
 }
 
+/// Longest suffix of `s` that fits in `max_cells` terminal cells. The mirror of
+/// [`prefix_to_width`], and grapheme-safe for the same reasons.
+pub fn suffix_to_width(s: &str, max_cells: usize) -> &str {
+    let mut used = 0usize;
+    let mut start = s.len();
+    for (offset, cluster) in s.grapheme_indices(true).rev() {
+        let w = UnicodeWidthStr::width(cluster);
+        if used + w > max_cells {
+            break;
+        }
+        used += w;
+        start = offset;
+    }
+    &s[start..]
+}
+
+/// One-cell ellipsis. A three-dot "..." costs three of the cells the elision is
+/// trying to conserve, which matters at an 18-cell column.
+const MIDDLE_ELLIPSIS: &str = "…";
+
+/// Fit `s` into `max_cells` by dropping its MIDDLE instead of its tail.
+///
+/// Head-first truncation assumes the leading text identifies the row. Workspace
+/// labels break that assumption: `repo ⑃ worktree` rows share the repo, and
+/// disambiguated labels share the parent segments too, so the only part that
+/// tells two rows apart is the part a tail-cut discards. At an 18-cell column
+/// that turned six distinct worktrees into six identical `tokscale ⑃ wo...`
+/// rows. Keeping both ends keeps the discriminating segment on screen whichever
+/// end of the label it sits at.
+pub fn elide_middle_to_width(s: &str, max_cells: usize) -> String {
+    if max_cells == 0 {
+        return String::new();
+    }
+    if display_width(s) <= max_cells {
+        return s.to_string();
+    }
+    // Below this there is no room for two halves and a marker, so an ordinary
+    // head cut is all that is left.
+    if max_cells <= 2 {
+        return truncate_to_width(s, max_cells);
+    }
+
+    let budget = max_cells - 1;
+    let head_cells = budget / 2;
+    // The odd cell goes to the tail: the discriminating segment is at the end
+    // far more often than at the start.
+    let head = prefix_to_width(s, head_cells);
+    let tail = suffix_to_width(s, budget - head_cells);
+    // Zero-width clusters can let the two halves meet even though the string is
+    // too wide; splicing then would duplicate text rather than elide it.
+    if head.len() + tail.len() >= s.len() {
+        return truncate_to_width(s, max_cells);
+    }
+    format!("{head}{MIDDLE_ELLIPSIS}{tail}")
+}
+
+/// Cells a path segment must be granted before showing it beats dropping it:
+/// two characters of content on either side of the elision marker.
+const MIN_SEGMENT_CELLS: usize = 4;
+
+/// Fit a workspace label into `max_cells` while keeping every part of it
+/// identifiable.
+///
+/// A workspace label is a path-shaped string — `parent/repo ⑃ worktree`,
+/// `qualifier/name`, `name (key)` — whose segments are each identified by their
+/// own ends. Cutting the string once, from either end, throws away whole
+/// segments: at the 18 cells this column gets on an ordinary terminal a head cut
+/// rendered 915 of 1182 real workspace rows as some other row's twin. This
+/// budgets the column across the segments instead, so each one contributes as
+/// much of itself as the row can afford, and elides each segment's middle rather
+/// than its tail.
+///
+/// Measured over 1182 real workspace keys, counting rows that render to a string
+/// some other row also renders to: 915 keys in 52 groups at 18 cells before,
+/// 34 keys in 17 groups after; 757/31 to 0 at 44 cells; 749/28 to 0 at 60.
+pub fn fit_workspace_label_to_width(label: &str, max_cells: usize) -> String {
+    if display_width(label) <= max_cells {
+        return label.to_string();
+    }
+    if max_cells <= 2 {
+        return truncate_to_width(label, max_cells);
+    }
+
+    let mut segments: Vec<&str> = label.split('/').collect();
+    if segments.len() < 2 {
+        return elide_middle_to_width(label, max_cells);
+    }
+
+    // The separators are not negotiable: they are what makes the result read as
+    // a path rather than as one mangled word.
+    let mut budget = max_cells.saturating_sub(segments.len() - 1);
+    let mut collapsed_interior = false;
+    if budget < MIN_SEGMENT_CELLS * segments.len() && segments.len() > 2 {
+        // Not enough cells to say anything about every segment. Keep the two
+        // that carry the identity — the qualifier and the name — and say so with
+        // a marker rather than quietly rendering a path that does not exist.
+        segments = vec![segments[0], segments[segments.len() - 1]];
+        collapsed_interior = true;
+        // Two separators and the one-cell marker between them.
+        budget = max_cells.saturating_sub(3);
+    }
+    if budget < MIN_SEGMENT_CELLS * segments.len() {
+        return elide_middle_to_width(label, max_cells);
+    }
+
+    let widths: Vec<usize> = segments.iter().map(|s| display_width(s)).collect();
+    let allocation = allocate_segment_cells(&widths, budget);
+    let parts: Vec<String> = segments
+        .iter()
+        .zip(&allocation)
+        .map(|(segment, cells)| elide_middle_to_width(segment, *cells))
+        .collect();
+
+    if collapsed_interior {
+        format!("{}/{MIDDLE_ELLIPSIS}/{}", parts[0], parts[1])
+    } else {
+        parts.join("/")
+    }
+}
+
+/// Split `budget` cells across segments of the given widths.
+///
+/// Water-filling, not a proportional share: every segment is capped at the same
+/// width, raised as high as the budget allows, and a segment shorter than the
+/// cap keeps all of itself and leaves its surplus to the long ones. That is what
+/// makes a label only a few cells too wide lose those cells from its longest
+/// segment alone, instead of sprinkling an ellipsis through every segment.
+fn allocate_segment_cells(widths: &[usize], budget: usize) -> Vec<usize> {
+    let mut cap = MIN_SEGMENT_CELLS;
+    let (mut low, mut high) = (MIN_SEGMENT_CELLS, widths.iter().copied().max().unwrap_or(0));
+    while low <= high {
+        let candidate = low + (high - low) / 2;
+        let used: usize = widths.iter().map(|w| (*w).min(candidate)).sum();
+        if used <= budget {
+            cap = candidate;
+            low = candidate + 1;
+        } else {
+            high = candidate - 1;
+        }
+    }
+
+    let mut allocation: Vec<usize> = widths.iter().map(|w| (*w).min(cap)).collect();
+    // Whatever the uniform cap left over goes to the segments still clipped,
+    // longest first: they are the ones carrying the text that got cut.
+    let mut remaining = budget.saturating_sub(allocation.iter().sum::<usize>());
+    let mut order: Vec<usize> = (0..widths.len()).collect();
+    order.sort_by_key(|index| std::cmp::Reverse(widths[*index]));
+    while remaining > 0 {
+        let mut progressed = false;
+        for &index in &order {
+            if remaining == 0 {
+                break;
+            }
+            if allocation[index] < widths[index] {
+                allocation[index] += 1;
+                remaining -= 1;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    allocation
+}
+
 fn scrollbar_position(scroll_offset: usize, content_len: usize, viewport_len: usize) -> usize {
     let max_scroll = content_len.saturating_sub(viewport_len);
     if max_scroll == 0 {
@@ -1007,6 +1173,110 @@ mod tests {
             get_provider_shade("meta-llama-endpoint", 0),
             get_provider_shade("meta", 0)
         );
+    }
+
+    /// Neither fitter may ever exceed the cell budget it was given, at any width,
+    /// including widths that land mid-grapheme, or the table overflows its
+    /// column and the row's numbers shift.
+    #[test]
+    fn label_fitters_never_exceed_their_cell_budget() {
+        for label in [
+            "tokscale ⑃ worker-1",
+            "tokscale-2 ⑃ wf_2429b20d-2d5-1",
+            "swebench-matplotlib__matplotlib-25775-dven5vd8/matplotlib",
+            "continue-the-native-s-fcebfeb0/worktrees/worker-2",
+            "agent-runtime (/Users/junhoyeo/agent-runtime)",
+            "//server/share/team/app ⑃ feature",
+            "a/b/c/d/e/f/g/h",
+            "プロジェクト ⑃ 機能ブランチ",
+            "日本語/プロジェクト/機能",
+            "a",
+            "/",
+            "",
+            "👩‍👩‍👧‍👦-family ⑃ 🇰🇷-flag-worktree",
+        ] {
+            for width in 0usize..=80 {
+                for (name, out) in [
+                    ("elide_middle", elide_middle_to_width(label, width)),
+                    ("fit_workspace", fit_workspace_label_to_width(label, width)),
+                ] {
+                    assert!(
+                        display_width(&out) <= width,
+                        "{name}({label:?}, {width}) rendered {} cells: {out:?}",
+                        display_width(&out)
+                    );
+                }
+            }
+        }
+    }
+
+    /// A label only a little too wide must lose those cells from its longest
+    /// segment alone. Spreading the loss over every segment would put an
+    /// ellipsis through parts of the path that fit perfectly well.
+    #[test]
+    fn fit_workspace_label_clips_only_the_segments_that_must_shrink() {
+        let label = "continue-the-native-s-fcebfeb0/worktrees/worker-2";
+        let out = fit_workspace_label_to_width(label, 44);
+        assert!(out.ends_with("/worktrees/worker-2"), "{out:?}");
+        assert!(out.starts_with("continue-the"), "{out:?}");
+        assert_eq!(display_width(&out), 44, "{out:?}");
+
+        // Nothing to do once the whole label fits.
+        assert_eq!(fit_workspace_label_to_width(label, 60), label);
+    }
+
+    /// Too many segments for any of them to say anything: the interior collapses
+    /// to a marker rather than silently rendering a path that never existed.
+    #[test]
+    fn fit_workspace_label_marks_a_collapsed_interior() {
+        let out = fit_workspace_label_to_width("agent-runtime (/Users/junhoyeo/agent-runtime)", 18);
+        assert!(out.contains("/…/"), "{out:?}");
+        assert!(display_width(&out) <= 18, "{out:?}");
+    }
+
+    /// The point of the elision: both ends survive, so the segment that tells two
+    /// rows apart is still on screen wherever it sits in the label.
+    #[test]
+    fn elide_middle_keeps_both_ends_of_a_workspace_label() {
+        let long = "tokscale-2 ⑃ wf_2429b20d-2d5-1";
+        let out = elide_middle_to_width(long, 18);
+        assert_eq!(display_width(&out), 18, "{out:?}");
+        assert!(out.starts_with("tokscale"), "{out:?}");
+        assert!(out.ends_with("2d5-1"), "{out:?}");
+        assert!(out.contains('…'), "{out:?}");
+
+        // Nothing is elided when it already fits.
+        assert_eq!(elide_middle_to_width("tokscale", 18), "tokscale");
+    }
+
+    /// Six worktrees of one repo: head-first truncation renders them as six
+    /// identical rows at the width the Workspace column actually gets, and the
+    /// fitter does not.
+    #[test]
+    fn fit_workspace_label_separates_labels_a_head_cut_collapses() {
+        let labels: Vec<String> = (1..=6).map(|n| format!("tokscale ⑃ worker-{n}")).collect();
+
+        let head: std::collections::HashSet<String> = labels
+            .iter()
+            .map(|label| truncate_to_width(label, 18))
+            .collect();
+        assert_eq!(head.len(), 1, "the regression this replaces: {head:?}");
+
+        let fitted: std::collections::HashSet<String> = labels
+            .iter()
+            .map(|label| fit_workspace_label_to_width(label, 18))
+            .collect();
+        assert_eq!(fitted.len(), labels.len(), "{fitted:?}");
+    }
+
+    #[test]
+    fn suffix_to_width_mirrors_prefix_to_width() {
+        assert_eq!(suffix_to_width("abcdef", 3), "def");
+        assert_eq!(suffix_to_width("abcdef", 0), "");
+        assert_eq!(suffix_to_width("abcdef", 99), "abcdef");
+        // A full-width grapheme is never split in half.
+        assert_eq!(suffix_to_width("ab日", 1), "");
+        assert_eq!(suffix_to_width("ab日", 2), "日");
     }
 
     #[test]

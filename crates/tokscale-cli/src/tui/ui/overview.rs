@@ -2,7 +2,9 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation};
 
 use super::bar_chart::{render_stacked_bar_chart, ModelSegment, StackedBarData};
-use super::widgets::{format_tokens, truncate_to_width, viewport_scrollbar_state};
+use super::widgets::{
+    fit_workspace_label_to_width, format_tokens, truncate_to_width, viewport_scrollbar_state,
+};
 use crate::tui::app::{App, ChartGranularity};
 use tokscale_core::GroupBy;
 
@@ -307,7 +309,14 @@ fn render_top_models(frame: &mut Frame, app: &mut App, area: Rect, items_per_pag
         // `inner.width`, and a workspace path can hold full-width graphemes (a CJK
         // directory name), which a char count calls short at twice the cells it
         // occupies -- overflowing the row and pushing the cost percentage off it.
-        let name = truncate_to_width(&display_name, max_name_width);
+        let name = if group_by == GroupBy::WorkspaceModel {
+            // `workspace / model` is identified by both ends, so a head cut on a
+            // narrow panel leaves the shared path prefix and drops the model
+            // entirely. Same reasoning as the Workspace column in the table.
+            fit_workspace_label_to_width(&display_name, max_name_width)
+        } else {
+            truncate_to_width(&display_name, max_name_width)
+        };
         let percentage = if model.cost.is_finite() && total.is_finite() && total > 0.0 {
             (model.cost / total) * 100.0
         } else {
