@@ -7634,12 +7634,25 @@ mod tests {
         assert_eq!(retained.cost_source, sessions::CostSource::ProviderReported);
     }
 
-    /// Drive the retained/live collision through cold parse, compaction,
-    /// cross-file replay, and a warm cache hit. The retained copy is a stale
-    /// Haiku partial; the live copy is the completed Sonnet observation. The
-    /// caller controls file order so provenance authority cannot accidentally
-    /// depend on lexical discovery order.
-    fn assert_claude_retained_partial_merges_completed_live(second_file_name: &str) {
+    /// Drive a retained/live collision through cold parse, compaction,
+    /// cross-file replay, and a warm cache hit.
+    ///
+    /// The retained copy is seeded into cache from a transcript that is then
+    /// rewritten empty; the live copy arrives in a second transcript named by
+    /// the caller, so file order cannot quietly become the tiebreaker. Both
+    /// copies describe the same response, one observed mid-stream and one
+    /// completed, and they lead on different token fields — so any resolution
+    /// that keeps one whole message under-reports the other field.
+    ///
+    /// Every direction reconciles to the same row: input 500, output 999,
+    /// attributed to the live observation's Sonnet metadata and repriced from
+    /// the merged tokens. That is what makes the two directions comparable —
+    /// which side happened to be retained must not change the result.
+    fn assert_claude_retained_live_merge(
+        retained_record: &str,
+        live_record: &str,
+        live_file_name: &str,
+    ) {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
         let _cache_env = redirect_cache_home(cache_home.path());
@@ -7647,9 +7660,6 @@ mod tests {
         let claude_dir = client_scan_root(source_home.path(), ClientId::Claude).join("myproject");
         std::fs::create_dir_all(&claude_dir).unwrap();
         let retained_path = claude_dir.join("mmm-retained.jsonl");
-
-        let retained_partial = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_shared","provider":"bedrock","message":{"id":"msg_shared","model":"claude-3-5-haiku","provider":"bedrock","usage":{"input_tokens":500,"output_tokens":60}}}"#;
-        let live_completed = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:01.000Z","requestId":"req_shared","provider":"anthropic","message":{"id":"msg_shared","model":"claude-3-5-sonnet","provider":"anthropic","usage":{"input_tokens":200,"output_tokens":999}}}"#;
 
         let mut litellm = HashMap::new();
         litellm.insert(
@@ -7670,7 +7680,7 @@ mod tests {
         );
         let pricing = pricing::PricingService::new(litellm, HashMap::new());
 
-        std::fs::write(&retained_path, format!("{retained_partial}\n")).unwrap();
+        std::fs::write(&retained_path, format!("{retained_record}\n")).unwrap();
         let seeded = parse_all_messages_with_pricing_with_env_strategy(
             source_home.path().to_str().unwrap(),
             &["claude".to_string()],
@@ -7680,14 +7690,10 @@ mod tests {
         );
         assert_eq!(seeded.len(), 1, "cold scan must seed retained history");
 
-        // Claude rewrites the first transcript and the same response completes
-        // live in a fork/resume transcript.
+        // Claude rewrites the first transcript, and the same response shows up
+        // in a fork/resume transcript that is still on disk.
         std::fs::write(&retained_path, "").unwrap();
-        std::fs::write(
-            claude_dir.join(second_file_name),
-            format!("{live_completed}\n"),
-        )
-        .unwrap();
+        std::fs::write(claude_dir.join(live_file_name), format!("{live_record}\n")).unwrap();
 
         let assert_merged = |messages: &[UnifiedMessage]| {
             assert_eq!(
@@ -7696,14 +7702,11 @@ mod tests {
                 "the shared response must be counted once"
             );
             let merged = &messages[0];
-            assert_eq!(merged.tokens.input, 500, "retain the larger partial input");
-            assert_eq!(merged.tokens.output, 999, "take the completed live output");
+            assert_eq!(merged.tokens.input, 500, "take the larger input");
+            assert_eq!(merged.tokens.output, 999, "take the completed output");
             assert_eq!(merged.model_id, "claude-3-5-sonnet");
             assert_eq!(merged.provider_id, "anthropic");
-            assert_eq!(
-                merged.session_id,
-                second_file_name.trim_end_matches(".jsonl")
-            );
+            assert_eq!(merged.session_id, live_file_name.trim_end_matches(".jsonl"));
             assert_eq!(merged.workspace_key.as_deref(), Some("myproject"));
             assert_eq!(merged.workspace_label.as_deref(), Some("myproject"));
             assert_eq!(merged.cost_source, sessions::CostSource::Estimated);
@@ -7733,16 +7736,61 @@ mod tests {
         assert_merged(&warm);
     }
 
+    /// A partial observed before the transcript recorded the model the turn
+    /// billed against. Used as the retained copy, its stale Haiku attribution
+    /// must not outlive the live observation.
+    const CLAUDE_MERGE_PARTIAL_STALE_MODEL: &str = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_shared","provider":"bedrock","message":{"id":"msg_shared","model":"claude-3-5-haiku","provider":"bedrock","usage":{"input_tokens":500,"output_tokens":60}}}"#;
+    /// The same partial, already carrying the model the completed copy names.
+    /// Used as the live copy, where model attribution is not what is under
+    /// test and a divergence would only restate the pair above.
+    const CLAUDE_MERGE_PARTIAL: &str = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:00.000Z","requestId":"req_shared","provider":"anthropic","message":{"id":"msg_shared","model":"claude-3-5-sonnet","provider":"anthropic","usage":{"input_tokens":500,"output_tokens":60}}}"#;
+    /// The completed observation of that same response.
+    const CLAUDE_MERGE_COMPLETED: &str = r#"{"type":"assistant","timestamp":"2024-12-01T10:05:01.000Z","requestId":"req_shared","provider":"anthropic","message":{"id":"msg_shared","model":"claude-3-5-sonnet","provider":"anthropic","usage":{"input_tokens":200,"output_tokens":999}}}"#;
+
     #[test]
     #[serial_test::serial]
     fn test_claude_retained_partial_merges_completed_live_that_sorts_later() {
-        assert_claude_retained_partial_merges_completed_live("zzz-live.jsonl");
+        assert_claude_retained_live_merge(
+            CLAUDE_MERGE_PARTIAL_STALE_MODEL,
+            CLAUDE_MERGE_COMPLETED,
+            "zzz-live.jsonl",
+        );
     }
 
     #[test]
     #[serial_test::serial]
     fn test_claude_retained_partial_merges_completed_live_that_sorts_earlier() {
-        assert_claude_retained_partial_merges_completed_live("aaa-live.jsonl");
+        assert_claude_retained_live_merge(
+            CLAUDE_MERGE_PARTIAL_STALE_MODEL,
+            CLAUDE_MERGE_COMPLETED,
+            "aaa-live.jsonl",
+        );
+    }
+
+    /// The mirror direction: the *retained* copy is the completed observation
+    /// and the live transcript carries only the partial. Completeness has to
+    /// be monotonic here too — a merge that keeps whichever copy is live, or
+    /// whichever file sorts first, discards the completed output that only the
+    /// retained copy still holds.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_retained_completed_merges_live_partial_that_sorts_later() {
+        assert_claude_retained_live_merge(
+            CLAUDE_MERGE_COMPLETED,
+            CLAUDE_MERGE_PARTIAL,
+            "zzz-live.jsonl",
+        );
+    }
+
+    /// Mirror direction, opposite file order.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_retained_completed_merges_live_partial_that_sorts_earlier() {
+        assert_claude_retained_live_merge(
+            CLAUDE_MERGE_COMPLETED,
+            CLAUDE_MERGE_PARTIAL,
+            "aaa-live.jsonl",
+        );
     }
 
     /// A cache entry written before retention provenance existed carries the
