@@ -517,14 +517,36 @@ fn split_encoded_worktree(key: &str) -> Option<(String, String)> {
 ///
 /// Only path-shaped keys are handled: clients that store an opaque id (Warp's
 /// workspace UUID) have nothing to roll up and are returned untouched.
+///
+/// Nested worktrees resolve to the outermost repository, because the first
+/// marker in the path is the one the repo owns.
 pub fn workspace_repo_root(key: &str) -> Option<String> {
+    let key = normalize_workspace_key(key)?;
     for marker in WORKTREE_MARKERS {
-        if let Some(index) = key.find(marker) {
+        if let Some(index) = find_segment_marker(&key, marker) {
             let root = key[..index].trim_end_matches('/');
             if !root.is_empty() {
                 return Some(root.to_string());
             }
         }
+    }
+    None
+}
+
+/// Locate `marker` where it starts a path segment.
+///
+/// Substring matching is wrong here: a plain directory named `my.git` makes
+/// `/notes/my.git/worktrees/draft` contain `.git/worktrees/` even though nothing
+/// in it is a repository, and stripping there would roll the row up under a
+/// `/notes/my` that does not exist.
+fn find_segment_marker(key: &str, marker: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(offset) = key[from..].find(marker) {
+        let index = from + offset;
+        if index == 0 || key.as_bytes()[index - 1] == b'/' {
+            return Some(index);
+        }
+        from = index + 1;
     }
     None
 }
@@ -744,6 +766,43 @@ mod tests {
         assert_eq!(
             workspace_display_label("/Users/z/devpro/witness").as_deref(),
             Some("witness")
+        );
+    }
+
+    /// A directory that merely contains `.git` in its NAME is not a worktree.
+    /// Substring matching folded `/notes/my.git/worktrees/draft` into a `/notes/my`
+    /// that does not exist, which under `--merge-worktrees` invented a row.
+    #[test]
+    fn worktree_markers_only_match_whole_path_segments() {
+        assert_eq!(workspace_repo_root("/notes/my.git/worktrees/draft"), None);
+        assert_eq!(
+            workspace_repo_root("/notes/my.claude/worktrees/draft"),
+            None
+        );
+        assert_eq!(
+            workspace_display_label("/notes/my.git/worktrees/draft").as_deref(),
+            Some("draft")
+        );
+        // The real layout still resolves.
+        assert_eq!(
+            workspace_repo_root("/notes/my/.git/worktrees/draft").as_deref(),
+            Some("/notes/my")
+        );
+    }
+
+    /// A worktree checked out inside another worktree belongs to the repository
+    /// at the top, not to the intermediate worktree — the first marker in the
+    /// path is the one the repo owns.
+    #[test]
+    fn nested_worktrees_roll_up_to_the_outermost_repo() {
+        let nested = "/Users/z/devpro/witness/.claude/worktrees/outer/.claude/worktrees/inner";
+        assert_eq!(
+            workspace_repo_root(nested).as_deref(),
+            Some("/Users/z/devpro/witness")
+        );
+        assert_eq!(
+            workspace_display_label(nested).as_deref(),
+            Some("witness ⑃ inner")
         );
     }
 
