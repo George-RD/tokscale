@@ -933,9 +933,11 @@ define_clients!(
         parse_local: true,
         submit_default: true
     },
-    // DeepSeek Harness (DSH) writes one zstd-compressed JSONL transcript per
-    // session under `<DSH_HOME>/sessions/<encoded-cwd>/<session-id>/session.jsonl.zstd`
-    // (`DSH_HOME` defaults to `~/.dsh`). Each `assistant/message` event carries
+    // DeepSeek Harness (DSH) writes one JSONL transcript per session under
+    // `<DSH_HOME>/sessions/<encoded-cwd>/<session-id>/session.jsonl.zstd`
+    // (`DSH_HOME` defaults to `~/.dsh`); a backend configured with
+    // `compression: none` writes the same rows to `session.jsonl`, so the scan
+    // pattern accepts both spellings. Each `assistant/message` event carries
     // authoritative per-call usage (`inputTokens`/`outputTokens`/`cacheReadTokens`)
     // plus the model/provider it was served by; the `session` event supplies the
     // workspace (`cwd`) and session id. See `sessions::dsh`.
@@ -948,7 +950,7 @@ define_clients!(
             fallback_relative: ".dsh",
         },
         relative: "sessions",
-        pattern: "session.jsonl.zstd",
+        pattern: "dsh-session-log",
         headless: false,
         parse_local: true,
         submit_default: true
@@ -1487,6 +1489,44 @@ mod tests {
         assert_eq!(
             client.data().resolve_path("/tmp/home"),
             native_join(std::path::Path::new("/custom/kimchi-agent"), "sessions")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_dsh_defaults_to_home_sessions_without_env_override() {
+        let mut env = EnvGuard::capture(&["DSH_HOME"]);
+        env.remove("DSH_HOME");
+
+        let client = ClientId::from_str("dsh").expect("dsh client should be registered");
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            native_join(std::path::Path::new("/tmp/home"), ".dsh/sessions")
+        );
+        assert_eq!(client.data().pattern, "dsh-session-log");
+    }
+
+    #[test]
+    #[serial]
+    fn test_dsh_honors_dsh_home_env_override() {
+        // DSH resolves its single root as configured path, then `$DSH_HOME`,
+        // then `~/.dsh` (`util/home-paths/src/index.ts`, `resolveDshHome`), and
+        // the shipped base pins the session store to `<home>/sessions`.
+        let mut env = EnvGuard::capture(&["DSH_HOME"]);
+        env.set("DSH_HOME", "/custom/dsh-home");
+
+        let client = ClientId::from_str("dsh").expect("dsh client should be registered");
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            native_join(std::path::Path::new("/custom/dsh-home"), "sessions")
+        );
+
+        // Env roots disabled: fall back to the home-relative default.
+        assert_eq!(
+            client
+                .data()
+                .resolve_path_with_env_strategy("/tmp/home", false),
+            native_join(std::path::Path::new("/tmp/home"), ".dsh/sessions")
         );
     }
 
