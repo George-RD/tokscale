@@ -8,11 +8,13 @@
 //! Pi descendants reuse this record layout verbatim, so [`parse_pi_format_file`]
 //! is shared: see `sessions::senpi` for Senpi (OmO Native).
 
-use super::utils::file_modified_timestamp_ms;
+use super::utils::{file_modified_timestamp_ms, lossy_lines_with_bytes, LossyLine};
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::provider_identity::inferred_provider_from_model;
 use crate::TokenBreakdown;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
@@ -32,6 +34,127 @@ pub struct PiSessionHeader {
     pub rlm_depth: Option<u32>,
 }
 
+impl PiSessionHeader {
+    pub(crate) fn has_invalid_lineage(&self) -> bool {
+        let is_rlm_child = self.rlm_depth.unwrap_or(0) > 0;
+        is_rlm_child
+            && self
+                .parent_session
+                .as_deref()
+                .is_none_or(|parent| parent.trim().is_empty() || has_replacement_character(parent))
+    }
+}
+
+fn damaged_key_may_name(key: &str, expected: &str) -> bool {
+    if !has_replacement_character(key) {
+        return false;
+    }
+
+    let pattern: Vec<char> = key.chars().collect();
+    let expected: Vec<char> = expected.chars().collect();
+    let mut matches = vec![vec![false; expected.len() + 1]; pattern.len() + 1];
+    matches[0][0] = true;
+    for pattern_index in 0..pattern.len() {
+        for expected_index in 0..=expected.len() {
+            if !matches[pattern_index][expected_index] {
+                continue;
+            }
+            if pattern[pattern_index] == char::REPLACEMENT_CHARACTER {
+                // A replacement in the middle may represent either damaged
+                // bytes that replaced key characters or an undecodable byte
+                // inserted between otherwise intact characters. At an edge it
+                // must consume at least one expected character, so complete
+                // known keys with a damaged extension prefix/suffix are not
+                // mistaken for the known key itself.
+                let minimum = if pattern_index > 0 && pattern_index + 1 < pattern.len() {
+                    expected_index
+                } else {
+                    expected_index + 1
+                };
+                for matched in matches[pattern_index + 1].iter_mut().skip(minimum) {
+                    *matched = true;
+                }
+            } else if expected_index < expected.len()
+                && pattern[pattern_index] == expected[expected_index]
+            {
+                matches[pattern_index + 1][expected_index + 1] = true;
+            }
+        }
+    }
+    matches[pattern.len()][expected.len()]
+}
+
+const PRIME_LINEAGE_HEADER_KEYS: &[&str] = &["parentSession", "rlmDepth"];
+
+/// Inspect every top-level JSON key after JSON string decoding and reject a
+/// replacement-bearing spelling that may be a damaged Prime lineage key.
+///
+/// Valid U+FFFD characters are not inherently damage: unrelated extension
+/// keys, including `rlmDepth�`, remain valid. Invalid UTF-8 is tracked
+/// separately because a replacement immediately beside a complete structural
+/// key may have replaced rather than extended that key.
+pub(crate) fn raw_json_has_damaged_lineage_header_key(raw: &[u8]) -> bool {
+    let mut index = 0usize;
+    let mut depth = 0usize;
+    while index < raw.len() {
+        match raw[index] {
+            b'{' | b'[' => {
+                depth += 1;
+                index += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            b'"' => {
+                let quoted_start = index;
+                index += 1;
+                let mut escaped = false;
+                while index < raw.len() {
+                    let byte = raw[index];
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == b'"' {
+                        break;
+                    }
+                    index += 1;
+                }
+                if index >= raw.len() {
+                    return false;
+                }
+
+                let quoted = &raw[quoted_start..=index];
+                let key_bytes = &raw[quoted_start + 1..index];
+                let mut after = index + 1;
+                while after < raw.len() && raw[after].is_ascii_whitespace() {
+                    after += 1;
+                }
+                if depth == 1 && raw.get(after) == Some(&b':') {
+                    let key_had_invalid_utf8 = std::str::from_utf8(key_bytes).is_err();
+                    let lossy_quoted = String::from_utf8_lossy(quoted);
+                    if let Ok(decoded) = serde_json::from_str::<String>(&lossy_quoted) {
+                        let without_replacements: String = decoded
+                            .chars()
+                            .filter(|character| *character != char::REPLACEMENT_CHARACTER)
+                            .collect();
+                        if PRIME_LINEAGE_HEADER_KEYS.iter().any(|expected| {
+                            damaged_key_may_name(&decoded, expected)
+                                || (key_had_invalid_utf8 && without_replacements == *expected)
+                        }) {
+                            return true;
+                        }
+                    }
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    false
+}
+
 /// Loose type-only probe for a JSONL line, used to identify pre-session
 /// metadata records without requiring their full schema.
 #[derive(Debug, Deserialize)]
@@ -44,7 +167,18 @@ struct PiEntryTypeProbe {
 /// auto-generated-title record). The parser skips these while looking for
 /// `session` rather than discarding the whole file. Any other unrecognized
 /// type before `session` is still treated as a malformed file.
-const PRE_SESSION_METADATA_TYPES: &[&str] = &["title"];
+pub(crate) const PRE_SESSION_METADATA_TYPES: &[&str] = &["title"];
+
+/// A lossy pre-header line is skippable only when it could not be parsed for
+/// its record type. A replacement-bearing line that parses as a real type is
+/// still treated as a foreign/malformed file, keeping both Prime scans aligned.
+pub(crate) fn has_replacement_character(value: &str) -> bool {
+    value.contains(char::REPLACEMENT_CHARACTER)
+}
+
+pub(crate) fn pre_header_line_is_skippable(trimmed: &str, parsed_type: Option<&str>) -> bool {
+    parsed_type.is_none() && has_replacement_character(trimmed)
+}
 
 /// Pi session entry (subsequent lines of JSONL)
 #[derive(Debug, Deserialize)]
@@ -65,6 +199,21 @@ pub struct PiSessionEntry {
     pub child_usage: Option<PiUsage>,
     #[serde(rename = "aggregateUsage")]
     pub aggregate_usage: Option<PiUsage>,
+    #[serde(flatten)]
+    #[allow(dead_code)]
+    extra_fields: BTreeMap<String, serde_json::Value>,
+}
+
+impl PiSessionEntry {
+    fn has_damaged_timestamp(&self) -> bool {
+        self.timestamp
+            .as_deref()
+            .is_some_and(has_replacement_character)
+            || self
+                .extra_fields
+                .keys()
+                .any(|key| damaged_key_may_name(key, "timestamp"))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +239,27 @@ pub struct PiUsage {
     /// of the schema, but never summed: see the note at the emit site.
     #[allow(dead_code)]
     pub reasoning: Option<i64>,
+    #[serde(flatten)]
+    extra_fields: BTreeMap<String, serde_json::Value>,
+}
+
+impl PiUsage {
+    pub(crate) fn has_damaged_key(&self) -> bool {
+        const TOKEN_COUNTER_KEYS: &[&str] = &[
+            "input",
+            "output",
+            "cacheRead",
+            "cacheWrite",
+            "totalTokens",
+            "reasoning",
+        ];
+
+        self.extra_fields.keys().any(|key| {
+            TOKEN_COUNTER_KEYS
+                .iter()
+                .any(|expected| damaged_key_may_name(key, expected))
+        })
+    }
 }
 
 fn is_generated_id(value: &str) -> bool {
@@ -151,8 +321,7 @@ pub(crate) fn parse_pi_format_file(
         client,
         fallback_provider,
         None,
-        false,
-        false,
+        PiParseOptions::standard(),
         &mut observer,
     )
 }
@@ -171,8 +340,7 @@ pub(crate) fn parse_pi_format_file_with_dedup(
         client,
         fallback_provider,
         Some(client),
-        false,
-        false,
+        PiParseOptions::standard(),
         &mut observer,
     )
 }
@@ -192,12 +360,16 @@ struct NoopPiFormatObserver;
 
 impl PiFormatObserver for NoopPiFormatObserver {}
 
-/// Parse a Pi-format session whose `session_info.name` identifies an RLM
-/// subagent when the session header has `rlmDepth > 0`.
+/// Parse the Prime Agent Pi-compatible format whose `session_info.name`
+/// identifies an RLM subagent when the session header has `rlmDepth > 0`.
 ///
 /// Deduplication is intentionally cross-session: Prime Agent forks copy prior
 /// message entries into a file with a new session id. Provider response ids are
 /// preferred; the message id plus immutable event fields is the fallback.
+///
+/// Prime Agent's append-only JSONL may contain a UTF-8 BOM or undecodable
+/// records. Lossy line handling keeps malformed records local to their own
+/// line without changing the historical behavior of other Pi clients.
 pub(crate) fn parse_pi_format_rlm_file_with_observer(
     path: &Path,
     client: &str,
@@ -209,10 +381,103 @@ pub(crate) fn parse_pi_format_rlm_file_with_observer(
         client,
         fallback_provider,
         Some(client),
-        true,
-        true,
+        PiParseOptions::prime_agent(),
         observer,
     )
+}
+
+#[derive(Clone, Copy)]
+struct PiParseOptions {
+    rlm_session_name_as_agent: bool,
+    cross_session_dedup: bool,
+    lossy_line_reader: bool,
+}
+
+impl PiParseOptions {
+    /// Keep the historical byte-strict behavior for Pi, Senpi, and Kimchi.
+    /// Their cache namespaces are intentionally not invalidated by this
+    /// Prime-Agent-only migration; revisit this when those clients opt into
+    /// lossy decoding and receive their own parser-version bumps.
+    const fn standard() -> Self {
+        Self {
+            rlm_session_name_as_agent: false,
+            cross_session_dedup: false,
+            lossy_line_reader: false,
+        }
+    }
+
+    const fn prime_agent() -> Self {
+        Self {
+            rlm_session_name_as_agent: true,
+            cross_session_dedup: true,
+            lossy_line_reader: true,
+        }
+    }
+}
+
+enum PiLines {
+    Standard(std::io::Lines<BufReader<std::fs::File>>),
+    Lossy(super::utils::LossyLinesWithBytes<BufReader<std::fs::File>>),
+}
+
+enum PiLine {
+    Standard(String),
+    Lossy(LossyLine),
+}
+
+impl PiLine {
+    fn text(&self) -> &str {
+        match self {
+            Self::Standard(text) => text,
+            Self::Lossy(line) => &line.text,
+        }
+    }
+
+    fn raw_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Standard(_) => None,
+            Self::Lossy(line) => Some(&line.bytes),
+        }
+    }
+}
+
+impl Iterator for PiLines {
+    type Item = PiLine;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self {
+                Self::Standard(lines) => match lines.next() {
+                    Some(Ok(line)) => return Some(PiLine::Standard(line)),
+                    // `reader.lines()` historically skipped all unreadable
+                    // records and continued. In particular, an invalid-UTF-8
+                    // line must not truncate valid records that follow it.
+                    Some(Err(_)) => continue,
+                    None => return None,
+                },
+                Self::Lossy(lines) => return lines.next().map(PiLine::Lossy),
+            }
+        }
+    }
+}
+
+fn accepts_replacement_field(value: &str, lossy_line_reader: bool) -> bool {
+    !lossy_line_reader || !has_replacement_character(value)
+}
+
+fn damaged_cross_session_dedup_key(namespace: &str, raw_line: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    // Exact source bytes distinguish invalid UTF-8 sequences that lossy decode
+    // maps to the same U+FFFD while keeping copied fork records stable.
+    hasher.update(raw_line);
+    format!("{namespace}:damaged:{:x}", hasher.finalize())
+}
+
+fn damaged_session_placeholder(path: &Path) -> String {
+    let source_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(source_path.as_os_str().as_encoded_bytes());
+    format!("unknown:path:{:x}", hasher.finalize())
 }
 
 fn parse_pi_format_file_inner(
@@ -220,8 +485,7 @@ fn parse_pi_format_file_inner(
     client: &str,
     fallback_provider: &'static str,
     dedup_namespace: Option<&str>,
-    rlm_session_name_as_agent: bool,
-    cross_session_dedup: bool,
+    options: PiParseOptions,
     observer: &mut impl PiFormatObserver,
 ) -> Vec<UnifiedMessage> {
     let file = match std::fs::File::open(path) {
@@ -232,6 +496,11 @@ fn parse_pi_format_file_inner(
     let fallback_timestamp = file_modified_timestamp_ms(path);
 
     let reader = BufReader::new(file);
+    let lines = if options.lossy_line_reader {
+        PiLines::Lossy(lossy_lines_with_bytes(reader))
+    } else {
+        PiLines::Standard(reader.lines())
+    };
     let mut messages: Vec<UnifiedMessage> = Vec::with_capacity(64);
     let mut buffer = Vec::with_capacity(4096);
 
@@ -240,13 +509,8 @@ fn parse_pi_format_file_inner(
     let mut workspace_label: Option<String> = None;
     let mut agent: Option<String> = None;
     let mut is_rlm_subagent = false;
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-
-        let trimmed = line.trim();
+    for line in lines {
+        let trimmed = line.text().trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -256,6 +520,11 @@ fn parse_pi_format_file_inner(
             buffer.extend_from_slice(trimmed.as_bytes());
             let entry_type = match simd_json::from_slice::<PiEntryTypeProbe>(&mut buffer) {
                 Ok(probe) => probe.entry_type,
+                Err(_)
+                    if options.lossy_line_reader && pre_header_line_is_skippable(trimmed, None) =>
+                {
+                    continue;
+                }
                 Err(_) => return Vec::new(),
             };
 
@@ -272,10 +541,28 @@ fn parse_pi_format_file_inner(
                 Ok(h) => h,
                 Err(_) => return Vec::new(),
             };
+            let has_raw_damaged_lineage_key = line
+                .raw_bytes()
+                .is_some_and(raw_json_has_damaged_lineage_header_key);
+            if options.lossy_line_reader
+                && (header.has_invalid_lineage() || has_raw_damaged_lineage_key)
+            {
+                return Vec::new();
+            }
 
             observer.observe_header(&header);
-            session_id = Some(header.id.clone());
-            workspace_key = header.cwd.as_deref().and_then(normalize_workspace_key);
+            let clean_cwd = header
+                .cwd
+                .as_deref()
+                .filter(|cwd| accepts_replacement_field(cwd, options.lossy_line_reader));
+            session_id = Some(
+                if !accepts_replacement_field(&header.id, options.lossy_line_reader) {
+                    damaged_session_placeholder(path)
+                } else {
+                    header.id.clone()
+                },
+            );
+            workspace_key = clean_cwd.and_then(normalize_workspace_key);
             workspace_label = workspace_key.as_deref().and_then(workspace_label_from_key);
             is_rlm_subagent = header.rlm_depth.unwrap_or(0) > 0;
             continue;
@@ -289,14 +576,21 @@ fn parse_pi_format_file_inner(
         };
 
         if entry.entry_type == "session_info" {
-            agent = if rlm_session_name_as_agent && is_rlm_subagent {
+            agent = if options.rlm_session_name_as_agent && is_rlm_subagent {
                 entry
                     .name
                     .as_ref()
-                    .filter(|name| !name.trim().is_empty())
+                    .filter(|name| {
+                        !name.trim().is_empty()
+                            && accepts_replacement_field(name, options.lossy_line_reader)
+                    })
                     .cloned()
             } else {
-                entry.name.as_deref().and_then(pi_subagent_name)
+                entry
+                    .name
+                    .as_deref()
+                    .filter(|name| accepts_replacement_field(name, options.lossy_line_reader))
+                    .and_then(pi_subagent_name)
             };
             observer.observe_entry(&entry, None);
             continue;
@@ -317,14 +611,39 @@ fn parse_pi_format_file_inner(
             continue;
         }
 
+        // An RLM child's completion timestamp participates in matching its
+        // usage back to the parent attribution. Recovering a replacement-
+        // damaged value as "missing" would make that match impossible while
+        // still emitting the child, so the parent's aggregate and child would
+        // both be counted. Other Pi messages do not use this timestamp as a
+        // reconciliation join and remain recoverable.
+        if options.lossy_line_reader
+            && is_rlm_subagent
+            && (entry.has_damaged_timestamp()
+                || entry.timestamp.as_deref().is_some_and(|timestamp| {
+                    chrono::DateTime::parse_from_rfc3339(timestamp).is_err()
+                }))
+        {
+            observer.observe_entry(&entry, None);
+            continue;
+        }
+
         let Some(usage) = message.usage.as_ref() else {
             observer.observe_entry(&entry, None);
             continue;
         };
+        if options.lossy_line_reader && usage.has_damaged_key() {
+            continue;
+        }
 
-        let Some(model) = message.model.as_deref() else {
+        let Some(recorded_model) = message.model.as_deref() else {
             observer.observe_entry(&entry, None);
             continue;
+        };
+        let model = if !accepts_replacement_field(recorded_model, options.lossy_line_reader) {
+            "unknown"
+        } else {
+            recorded_model
         };
 
         // A missing/blank provider field is recoverable: infer it from the
@@ -333,7 +652,12 @@ fn parse_pi_format_file_inner(
         // identify the model, rather than dropping a message that carries
         // valid tokens.
         let provider = match message.provider.as_deref() {
-            Some(provider) if !provider.is_empty() => provider.to_string(),
+            Some(provider)
+                if !provider.is_empty()
+                    && accepts_replacement_field(provider, options.lossy_line_reader) =>
+            {
+                provider.to_string()
+            }
             _ => inferred_provider_from_model(model)
                 .unwrap_or(fallback_provider)
                 .to_string(),
@@ -368,30 +692,45 @@ fn parse_pi_format_file_inner(
             agent.clone(),
         );
         if let Some(namespace) = dedup_namespace {
-            if cross_session_dedup {
-                unified.dedup_key = message
+            if options.cross_session_dedup {
+                let clean_response_key = message
                     .response_id
                     .as_deref()
-                    .filter(|id| !id.trim().is_empty())
-                    .map(|id| format!("{namespace}:response:{id}"))
-                    .or_else(|| {
-                        entry
-                            .id
-                            .as_deref()
-                            .filter(|id| !id.trim().is_empty())
-                            .map(|id| {
-                                let stable_timestamp = recorded_timestamp
-                                    .map(|timestamp| timestamp.to_string())
-                                    .unwrap_or_else(|| "missing".to_string());
-                                format!(
-                                    "{namespace}:message:{id}:{stable_timestamp}:{provider}:{model}:{}:{}:{}:{}",
-                                    unified.tokens.input,
-                                    unified.tokens.output,
-                                    unified.tokens.cache_read,
-                                    unified.tokens.cache_write,
-                                )
-                            })
+                    .filter(|id| {
+                        !id.trim().is_empty()
+                            && accepts_replacement_field(id, options.lossy_line_reader)
+                    })
+                    .map(|id| format!("{namespace}:response:{id}"));
+                let clean_message_key = entry.id.as_deref().filter(|id| {
+                    !id.trim().is_empty()
+                        && accepts_replacement_field(id, options.lossy_line_reader)
+                });
+                unified.dedup_key = clean_response_key.or_else(|| {
+                    clean_message_key.map(|id| {
+                        let stable_timestamp = recorded_timestamp
+                            .map(|timestamp| timestamp.to_string())
+                            .unwrap_or_else(|| "missing".to_string());
+                        format!(
+                            "{namespace}:message:{id}:{stable_timestamp}:{provider}:{model}:{}:{}:{}:{}",
+                            unified.tokens.input,
+                            unified.tokens.output,
+                            unified.tokens.cache_read,
+                            unified.tokens.cache_write,
+                        )
+                    })
+                });
+                if unified.dedup_key.is_none() && options.lossy_line_reader {
+                    let has_damaged_id = entry.id.as_deref().is_some_and(|id| {
+                        !accepts_replacement_field(id, options.lossy_line_reader)
+                    }) || message.response_id.as_deref().is_some_and(|id| {
+                        !accepts_replacement_field(id, options.lossy_line_reader)
                     });
+                    if has_damaged_id {
+                        let raw_line = line.raw_bytes().unwrap_or_else(|| line.text().as_bytes());
+                        unified.dedup_key =
+                            Some(damaged_cross_session_dedup_key(namespace, raw_line));
+                    }
+                }
             } else if let Some(message_id) = entry.id.as_deref().filter(|id| !id.trim().is_empty())
             {
                 let session_id = session_id.as_deref().unwrap_or("unknown");
@@ -417,6 +756,146 @@ mod tests {
         file.write_all(content.as_bytes()).unwrap();
         file.flush().unwrap();
         file
+    }
+
+    fn parse_prime_test_file(path: &Path) -> Vec<UnifiedMessage> {
+        let mut observer = NoopPiFormatObserver;
+        parse_pi_format_rlm_file_with_observer(path, "prime-agent", "prime-agent", &mut observer)
+    }
+
+    #[test]
+    fn prime_rejects_replacement_mangled_usage_keys() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"{\"type\":\"session\",\"id\":\"root\",\"cwd\":\"/tmp/project\"}\n")
+            .unwrap();
+        file.write_all(
+            b"{\"type\":\"message\",\"id\":\"damaged-byte\",\"timestamp\":\"2026-08-08T00:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"in\xffput\":100,\"output\":5}}}\n",
+        )
+        .unwrap();
+        file.write_all(
+            "{\"type\":\"message\",\"id\":\"damaged-unicode\",\"timestamp\":\"2026-08-08T00:00:02Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"out�put\":7,\"input\":10}}}\n"
+                .as_bytes(),
+        )
+        .unwrap();
+        file.write_all(
+            b"{\"type\":\"message\",\"id\":\"clean\",\"timestamp\":\"2026-08-08T00:00:03Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"input\":20,\"output\":8}}}\n",
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let messages = parse_prime_test_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0]
+            .dedup_key
+            .as_deref()
+            .is_some_and(|key| key.starts_with("prime-agent:message:clean:")));
+        assert_eq!(messages[0].tokens.total(), 28);
+    }
+
+    #[test]
+    fn damaged_usage_extension_keys_do_not_hide_known_counters() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"{\"type\":\"session\",\"id\":\"root\"}\n")
+            .unwrap();
+        file.write_all(
+            b"{\"type\":\"message\",\"id\":\"kept\",\"timestamp\":\"2026-08-08T00:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"input\":20,\"output\":8,\"future-\xff-field\":999}}}\n",
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let messages = parse_prime_test_file(file.path());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.total(), 28);
+    }
+
+    #[test]
+    fn standard_pi_skips_invalid_utf8_line_and_reads_later_records() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"{\"type\":\"session\",\"id\":\"root\"}\n")
+            .unwrap();
+        file.write_all(b"invalid \xff record\n").unwrap();
+        file.write_all(
+            b"{\"type\":\"message\",\"id\":\"later\",\"timestamp\":\"2026-08-08T00:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"input\":20,\"output\":8}}}\n",
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let messages = parse_pi_file(file.path());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.total(), 28);
+    }
+
+    #[test]
+    fn prime_rejects_only_matching_critical_child_timestamps() {
+        for (depth, expected_ids) in [(1, vec!["clean"]), (0, vec!["damaged", "clean"])] {
+            let mut file = NamedTempFile::new().unwrap();
+            writeln!(
+                file,
+                "{{\"type\":\"session\",\"id\":\"root\",\"parentSession\":\"/tmp/parent.jsonl\",\"rlmDepth\":{depth}}}"
+            )
+            .unwrap();
+            file.write_all(
+                b"{\"type\":\"message\",\"id\":\"damaged\",\"timestamp\":\"2026-08-08T00:00:0\xffZ\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"input\":10}}}\n",
+            ).unwrap();
+            file.write_all(b"{\"type\":\"message\",\"id\":\"clean\",\"timestamp\":\"2026-08-08T00:00:02Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"input\":20}}}\n").unwrap();
+            file.flush().unwrap();
+
+            let messages = parse_prime_test_file(file.path());
+            let ids = messages
+                .iter()
+                .map(|message| {
+                    message
+                        .dedup_key
+                        .as_deref()
+                        .unwrap()
+                        .split(':')
+                        .nth(2)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(ids, expected_ids, "rlmDepth={depth}");
+        }
+    }
+
+    #[test]
+    fn prime_rejects_child_message_with_damaged_timestamp_key() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"{\"type\":\"session\",\"id\":\"child\",\"parentSession\":\"/tmp/parent.jsonl\",\"rlmDepth\":1}\n")
+            .unwrap();
+        file.write_all(b"{\"type\":\"message\",\"id\":\"damaged\",\"time\xffstamp\":\"2026-08-08T00:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"input\":10}}}\n").unwrap();
+        file.write_all(b"{\"type\":\"message\",\"id\":\"clean\",\"timestamp\":\"2026-08-08T00:00:02Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"input\":20}}}\n").unwrap();
+        file.flush().unwrap();
+
+        let messages = parse_prime_test_file(file.path());
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0]
+            .dedup_key
+            .as_deref()
+            .unwrap()
+            .contains(":clean:"));
+    }
+
+    #[test]
+    fn damaged_prime_session_placeholders_are_unique_by_source_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_dir = temp.path().join("first");
+        let second_dir = temp.path().join("second");
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::create_dir_all(&second_dir).unwrap();
+        let first = first_dir.join("session.jsonl");
+        let second = second_dir.join("session.jsonl");
+        let contents = b"{\"type\":\"session\",\"id\":\"root-\xff\",\"cwd\":\"/tmp/project\"}\n{\"type\":\"message\",\"id\":\"clean\",\"timestamp\":\"2026-08-08T00:00:03Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"input\":20,\"output\":8}}}\n";
+        std::fs::write(&first, contents).unwrap();
+        std::fs::write(&second, contents).unwrap();
+
+        let first_messages = parse_prime_test_file(&first);
+        let second_messages = parse_prime_test_file(&second);
+
+        assert_eq!(first_messages.len(), 1);
+        assert_eq!(second_messages.len(), 1);
+        assert!(first_messages[0].session_id.starts_with("unknown:path:"));
+        assert_ne!(first_messages[0].session_id, second_messages[0].session_id);
     }
 
     #[test]

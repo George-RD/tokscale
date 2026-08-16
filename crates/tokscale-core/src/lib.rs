@@ -13736,6 +13736,321 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn test_prime_agent_cold_and_warm_reject_damaged_nested_attribution_usage() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let sessions_dir = source_home.path().join(".prime/agent/sessions");
+        let child_dir = source_home
+            .path()
+            .join(".prime/agent/session-artifacts/root/sub-child");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&child_dir).unwrap();
+        let root_path = sessions_dir.join("root.jsonl");
+        std::fs::write(
+            &root_path,
+            r#"{"type":"session","version":3,"id":"root","timestamp":"2026-08-08T00:00:00.000Z","cwd":"/tmp/project","rlmDepth":0}
+{"type":"message","id":"parent","timestamp":"2026-08-08T00:00:01.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-opus-5","responseId":"parent-response","usage":{"input":100,"output":0}}}
+{"type":"child_usage_attributed","id":"usage-1","timestamp":"2026-08-08T00:00:02.000Z","targetId":"parent","childUsage":{"input":50,"out�put":999},"aggregateUsage":{"input":100,"output":0}}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            child_dir.join("child.jsonl"),
+            format!(
+                r#"{{"type":"session","version":3,"id":"child","timestamp":"2026-08-08T00:00:01.000Z","cwd":"/tmp/project","parentSession":{},"rlmDepth":1}}
+{{"type":"message","id":"child-message","timestamp":"2026-08-08T00:00:02.000Z","message":{{"role":"assistant","provider":"anthropic","model":"claude-opus-5","responseId":"child-response","usage":{{"input":50,"output":0}}}}}}
+"#,
+                paths::json_path_literal(&root_path)
+            ),
+        )
+        .unwrap();
+
+        let clients = ["prime-agent".to_string()];
+        sessions::prime_agent::reset_transcript_decode_call_counts(source_home.path());
+        let cold =
+            parse_all_messages_with_pricing(source_home.path().to_str().unwrap(), &clients, None);
+        let cold_decode_calls = sessions::prime_agent::transcript_decode_call_counts();
+        assert_eq!(cold_decode_calls, (2, 0));
+
+        let warm =
+            parse_all_messages_with_pricing(source_home.path().to_str().unwrap(), &clients, None);
+        assert_eq!(
+            sessions::prime_agent::transcript_decode_call_counts(),
+            cold_decode_calls,
+            "the unchanged warm scan must reuse the safely rejected accounting record"
+        );
+
+        for messages in [cold, warm] {
+            assert_eq!(messages.len(), 2);
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|message| message.tokens.input)
+                    .sum::<i64>(),
+                150,
+                "damaged child usage must not subtract the matching child from the parent"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_prime_agent_rejects_damaged_child_lineage_and_timestamp_cold_and_warm() {
+        for damage in ["parent-value", "timestamp-value"] {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let source_home = tempfile::TempDir::new().unwrap();
+            let _cache_env = redirect_cache_home(cache_home.path());
+            let sessions_dir = source_home.path().join(".prime/agent/sessions");
+            let child_dir = source_home
+                .path()
+                .join(".prime/agent/session-artifacts/root/sub-child");
+            std::fs::create_dir_all(&sessions_dir).unwrap();
+            std::fs::create_dir_all(&child_dir).unwrap();
+            let root_path = sessions_dir.join("root.jsonl");
+            std::fs::write(
+                &root_path,
+                r#"{"type":"session","version":3,"id":"root","cwd":"/tmp/project","rlmDepth":0}
+{"type":"message","id":"parent","timestamp":"2026-08-08T00:00:01.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-opus-5","responseId":"parent-response","usage":{"input":150,"output":0}}}
+{"type":"child_usage_attributed","id":"usage-1","timestamp":"2026-08-08T00:00:02.000Z","targetId":"parent","childUsage":{"input":50,"output":0},"aggregateUsage":{"input":150,"output":0}}
+"#,
+            )
+            .unwrap();
+
+            let child_path = child_dir.join(format!("{damage}.jsonl"));
+            let clean_parent = paths::json_path_literal(&root_path);
+            let mut child = Vec::new();
+            if damage == "parent-value" {
+                child.extend_from_slice(b"{\"type\":\"session\",\"version\":3,\"id\":\"child\",\"cwd\":\"/tmp/project\",\"parentSession\":");
+                child.extend_from_slice(
+                    clean_parent
+                        .as_bytes()
+                        .get(0..clean_parent.len() - 1)
+                        .unwrap(),
+                );
+                child.extend_from_slice(b"\xff\",\"rlmDepth\":1}\n");
+            } else {
+                child.extend_from_slice(format!("{{\"type\":\"session\",\"version\":3,\"id\":\"child\",\"cwd\":\"/tmp/project\",\"parentSession\":{clean_parent},\"rlmDepth\":1}}\n").as_bytes());
+            }
+            if damage == "timestamp-value" {
+                child.extend_from_slice(b"{\"type\":\"message\",\"id\":\"child-message\",\"timestamp\":\"2026-08-08T00:00:0\xffZ\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"input\":50,\"output\":0}}}\n");
+            } else {
+                child.extend_from_slice(b"{\"type\":\"message\",\"id\":\"child-message\",\"timestamp\":\"2026-08-08T00:00:02.000Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"input\":50,\"output\":0}}}\n");
+            }
+            std::fs::write(child_path, child).unwrap();
+
+            let clients = ["prime-agent".to_string()];
+            sessions::prime_agent::reset_transcript_decode_call_counts(source_home.path());
+            let cold = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                None,
+            );
+            let cold_calls = sessions::prime_agent::transcript_decode_call_counts();
+            assert_eq!(cold_calls, (2, 0), "{damage}");
+            let warm = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                None,
+            );
+            assert_eq!(
+                sessions::prime_agent::transcript_decode_call_counts(),
+                (3, 0),
+                "{damage}: warm scan may revalidate the intentionally empty child, but must reuse the parent"
+            );
+
+            for messages in [cold, warm] {
+                assert_eq!(messages.len(), 1, "{damage}");
+                assert_eq!(messages[0].tokens.input, 150, "{damage}");
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_prime_agent_escaped_replacement_lineage_key_is_safe_cold_and_warm() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let sessions_dir = source_home.path().join(".prime/agent/sessions");
+        let child_dir = source_home
+            .path()
+            .join(".prime/agent/session-artifacts/root/sub-child");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&child_dir).unwrap();
+        let root_path = sessions_dir.join("root.jsonl");
+        std::fs::write(
+            &root_path,
+            r#"{"type":"session","version":3,"id":"root","cwd":"/tmp/project","rlmDepth":0}
+{"type":"message","id":"parent","timestamp":"2026-08-08T00:00:01.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-opus-5","usage":{"input":150,"output":0}}}
+{"type":"child_usage_attributed","id":"usage-1","timestamp":"2026-08-08T00:00:02.000Z","targetId":"parent","childUsage":{"input":50,"output":0},"aggregateUsage":{"input":150,"output":0}}
+"#,
+        )
+        .unwrap();
+        let clean_parent = paths::json_path_literal(&root_path);
+        std::fs::write(
+            child_dir.join("child.jsonl"),
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"child\",\"cwd\":\"/tmp/project\",\"unrelated\\uD800\":true,\"parentSession\":{clean_parent},\"rlmDep\\uFFFDth\":1}}\n{{\"type\":\"message\",\"id\":\"child-message\",\"timestamp\":\"2026-08-08T00:00:02.000Z\",\"message\":{{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{{\"input\":50,\"output\":0}}}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let clients = ["prime-agent".to_string()];
+        sessions::prime_agent::reset_transcript_decode_call_counts(source_home.path());
+        let cold =
+            parse_all_messages_with_pricing(source_home.path().to_str().unwrap(), &clients, None);
+        assert_eq!(
+            sessions::prime_agent::transcript_decode_call_counts(),
+            (2, 0)
+        );
+        let warm =
+            parse_all_messages_with_pricing(source_home.path().to_str().unwrap(), &clients, None);
+        assert_eq!(
+            sessions::prime_agent::transcript_decode_call_counts(),
+            (3, 0),
+            "the rejected child may be revalidated, but the parent stays warm"
+        );
+        for messages in [cold, warm] {
+            assert_eq!(messages.len(), 1, "only the parent aggregate is emitted");
+            assert_eq!(messages[0].session_id, "root");
+            assert_eq!(messages[0].tokens.input, 150);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_prime_agent_dropped_damaged_usage_keeps_later_adjustment_aligned_cold_and_warm() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let sessions_dir = source_home.path().join(".prime/agent/sessions");
+        let child_dir = source_home
+            .path()
+            .join(".prime/agent/session-artifacts/root/sub-child");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&child_dir).unwrap();
+        let root_path = sessions_dir.join("root.jsonl");
+        std::fs::write(
+            &root_path,
+            r#"{"type":"session","version":3,"id":"root","timestamp":"2026-08-08T00:00:00.000Z","cwd":"/tmp/project","rlmDepth":0}
+{"type":"message","id":"damaged","timestamp":"2026-08-08T00:00:00.500Z","message":{"role":"assistant","provider":"anthropic","model":"damaged-model","responseId":"damaged-response","usage":{"in�put":999,"output":0}}}
+{"type":"message","id":"valid","timestamp":"2026-08-08T00:00:01.000Z","message":{"role":"assistant","provider":"anthropic","model":"valid-model","responseId":"valid-response","usage":{"input":20,"output":0}}}
+{"type":"child_usage_attributed","id":"usage-valid","timestamp":"2026-08-08T00:00:02.000Z","targetId":"valid","childUsage":{"input":3,"output":0},"aggregateUsage":{"input":20,"output":0}}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            child_dir.join("child.jsonl"),
+            format!(
+                r#"{{"type":"session","version":3,"id":"child","timestamp":"2026-08-08T00:00:01.500Z","cwd":"/tmp/project","parentSession":{},"rlmDepth":1}}
+{{"type":"message","id":"child-message","timestamp":"2026-08-08T00:00:02.000Z","message":{{"role":"assistant","provider":"anthropic","model":"child-model","responseId":"child-response","usage":{{"input":3,"output":0}}}}}}
+"#,
+                paths::json_path_literal(&root_path)
+            ),
+        )
+        .unwrap();
+
+        let clients = ["prime-agent".to_string()];
+        sessions::prime_agent::reset_transcript_decode_call_counts(source_home.path());
+        let cold =
+            parse_all_messages_with_pricing(source_home.path().to_str().unwrap(), &clients, None);
+        let cold_decode_calls = sessions::prime_agent::transcript_decode_call_counts();
+        assert_eq!(cold_decode_calls, (2, 0));
+        let warm =
+            parse_all_messages_with_pricing(source_home.path().to_str().unwrap(), &clients, None);
+        assert_eq!(
+            sessions::prime_agent::transcript_decode_call_counts(),
+            cold_decode_calls,
+            "the unchanged warm scan must reuse aligned messages and accounting"
+        );
+
+        for messages in [cold, warm] {
+            assert_eq!(messages.len(), 2);
+            assert!(!messages
+                .iter()
+                .any(|message| message.model_id == "damaged-model"));
+            assert_eq!(
+                messages
+                    .iter()
+                    .find(|message| message.model_id == "valid-model")
+                    .unwrap()
+                    .tokens
+                    .input,
+                17,
+                "the later valid parent must retain its child-usage adjustment"
+            );
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|message| message.tokens.input)
+                    .sum::<i64>(),
+                20
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_prime_agent_warm_cache_preserves_distinct_invalid_utf8_ids() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let sessions_dir = source_home.path().join(".prime/agent/sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let source_path = sessions_dir.join("damaged-ids.jsonl");
+        let mut source = std::fs::File::create(&source_path).unwrap();
+        use std::io::Write as _;
+        source
+            .write_all(
+                b"{\"type\":\"session\",\"version\":3,\"id\":\"root\",\"cwd\":\"/tmp/project\"}\n",
+            )
+            .unwrap();
+        source
+            .write_all(b"{\"type\":\"message\",\"id\":\"assistant-\xff\",\"timestamp\":\"2026-08-08T00:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"input\":10,\"output\":5}}}\n")
+            .unwrap();
+        source
+            .write_all(b"{\"type\":\"message\",\"id\":\"assistant-\xfe\",\"timestamp\":\"2026-08-08T00:00:01Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-opus-5\",\"usage\":{\"input\":10,\"output\":5}}}\n")
+            .unwrap();
+        source.flush().unwrap();
+        drop(source);
+
+        let clients = ["prime-agent".to_string()];
+        sessions::prime_agent::reset_transcript_decode_call_counts(source_home.path());
+        let cold =
+            parse_all_messages_with_pricing(source_home.path().to_str().unwrap(), &clients, None);
+        let cold_calls = sessions::prime_agent::transcript_decode_call_counts();
+        assert_eq!(cold_calls, (1, 0));
+
+        let warm =
+            parse_all_messages_with_pricing(source_home.path().to_str().unwrap(), &clients, None);
+        assert_eq!(
+            sessions::prime_agent::transcript_decode_call_counts(),
+            cold_calls,
+            "the warm scan must reuse the two distinct cached records"
+        );
+
+        for messages in [cold, warm] {
+            assert_eq!(messages.len(), 2);
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|message| message.tokens.input)
+                    .sum::<i64>(),
+                20
+            );
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|message| message.tokens.output)
+                    .sum::<i64>(),
+                10
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn test_prime_agent_warm_cache_hashes_unsampled_semantic_rewrite() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
