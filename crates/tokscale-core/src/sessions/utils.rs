@@ -1,10 +1,13 @@
 //! Shared parsing helpers for session logs.
 
+use crate::TokenBreakdown;
 use rusqlite::{Connection, OpenFlags};
+use serde::Deserialize;
 use serde_json::Value;
 use std::io::BufRead;
 use std::path::Path;
 use std::time::SystemTime;
+use tracing::warn;
 
 /// Iterate a reader line by line without letting one undecodable byte discard
 /// the rest of the stream.
@@ -51,11 +54,15 @@ pub(crate) struct LossyLines<R> {
     at_start: bool,
 }
 
-fn read_lossy_line<R: BufRead>(
+/// Read one line into `buf`, stripping the line terminator and a leading BOM.
+///
+/// Returns the offset in `buf` at which the line's payload starts, so callers
+/// can borrow it without allocating, or `None` at end of input.
+fn read_line_payload<R: BufRead>(
     reader: &mut R,
     buf: &mut Vec<u8>,
     at_start: &mut bool,
-) -> Option<String> {
+) -> Option<usize> {
     buf.clear();
     match reader.read_until(b'\n', buf) {
         Ok(0) => None,
@@ -67,13 +74,65 @@ fn read_lossy_line<R: BufRead>(
                 }
             }
 
-            let mut bytes = buf.as_slice();
-            if std::mem::take(at_start) {
-                bytes = bytes.strip_prefix("\u{feff}".as_bytes()).unwrap_or(bytes);
+            let bom = "\u{feff}".as_bytes();
+            if std::mem::take(at_start) && buf.starts_with(bom) {
+                Some(bom.len())
+            } else {
+                Some(0)
             }
-            Some(String::from_utf8_lossy(bytes).into_owned())
         }
+        // A hard I/O error (vanished mount, EIO) does not consume input, so
+        // retrying would spin on the same failing read forever. Stop instead.
         Err(_) => None,
+    }
+}
+
+fn read_lossy_line<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    at_start: &mut bool,
+) -> Option<String> {
+    let start = read_line_payload(reader, buf, at_start)?;
+    Some(String::from_utf8_lossy(&buf[start..]).into_owned())
+}
+
+/// Read `path` as line-delimited JSON, handing every non-blank, trimmed line to
+/// `sink` together with its zero-based physical line index.
+///
+/// A missing or unreadable file yields nothing, which is what every JSONL
+/// parser already did by hand.
+///
+/// This also fixes a silent-truncation bug wherever it replaces
+/// `BufReader::lines()`. That iterator ends on the first line that is not valid
+/// UTF-8, so a single stray byte discarded the entire rest of a transcript —
+/// #1031 measured ~2% of an 83 MB Grok `updates.jsonl` surviving. Decoding
+/// lossily per line keeps the damage to the line carrying the bad byte, and
+/// the index stays aligned with the physical file so callers that report line
+/// positions still agree with it.
+///
+/// The line is borrowed out of a reused buffer rather than allocated per line,
+/// so callers that need an owned value must clone it themselves.
+///
+/// `sink` is `&mut dyn FnMut` and not a generic `impl FnMut` on purpose: a type
+/// parameter would monomorphize this driver once per calling parser and grow
+/// the binary, which is what sharing it exists to avoid.
+pub(crate) fn for_each_json_line(path: &Path, sink: &mut dyn FnMut(usize, &str)) {
+    let Ok(file) = std::fs::File::open(path) else {
+        return;
+    };
+
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf = Vec::new();
+    let mut at_start = true;
+    let mut index = 0usize;
+
+    while let Some(start) = read_line_payload(&mut reader, &mut buf, &mut at_start) {
+        let text = String::from_utf8_lossy(&buf[start..]);
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            sink(index, trimmed);
+        }
+        index += 1;
     }
 }
 
@@ -238,6 +297,153 @@ pub(crate) fn open_readonly_sqlite_opt(path: &Path) -> Option<Connection> {
     open_readonly_sqlite(path).ok()
 }
 
+/// Which stage of a [`sqlite_for_each_row`] scan the driver reached.
+///
+/// A bare `bool` is not enough: parsers that keep an older query around as a
+/// fallback need "this database does not have that schema" (`prepare` failed,
+/// so try the next query) to be distinguishable from "the query ran", while
+/// parsers that degrade to a coarser data source need "rows were actually
+/// iterated".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqliteScan {
+    /// The statement prepared and its rows were iterated — possibly zero rows.
+    Ran,
+    /// The database could not be opened.
+    NotOpened,
+    /// `prepare` rejected the statement, normally a missing table or column.
+    NotPrepared,
+    /// The statement prepared but the query could not execute.
+    NotExecuted,
+}
+
+impl SqliteScan {
+    /// True only when rows were iterated.
+    pub(crate) fn ran(self) -> bool {
+        matches!(self, SqliteScan::Ran)
+    }
+
+    /// True unless `prepare` rejected the statement. Callers that fall back to
+    /// an older schema use this to stop at the first query the database
+    /// understands, even when executing it then failed — an execute failure
+    /// means the schema matched and something else went wrong, so retrying an
+    /// older query would silently read the wrong columns.
+    pub(crate) fn prepared(self) -> bool {
+        !matches!(self, SqliteScan::NotPrepared | SqliteScan::NotOpened)
+    }
+}
+
+/// Run `sql` on an already-open connection and hand every row to `sink`.
+///
+/// `what` labels the data being read (`"Goose session"`) in the warnings for
+/// prepare, execute and row-decode failures. `None` scans silently, which is
+/// what parsers probing an optional table want: a missing table there is the
+/// expected case, not a fault worth logging on every run.
+///
+/// A row that `sink` rejects is skipped and the scan continues, matching
+/// `query_map`'s behaviour where a per-row decode error does not end
+/// iteration. An error stepping the statement does end it, because SQLite
+/// closes the cursor at that point.
+///
+/// `sink` is `&mut dyn FnMut` and not a generic `impl FnMut` on purpose: a type
+/// parameter would monomorphize this driver once per calling parser and grow
+/// the binary, which is what sharing it exists to avoid.
+pub(crate) fn sqlite_for_each_row_on(
+    conn: &Connection,
+    db_path: &Path,
+    sql: &str,
+    what: Option<&str>,
+    sink: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<()>,
+) -> SqliteScan {
+    let mut stmt = match conn.prepare(sql) {
+        Ok(stmt) => stmt,
+        Err(err) => {
+            if let Some(what) = what {
+                warn!(
+                    db_path = %db_path.display(),
+                    what,
+                    error = %err,
+                    "Failed to prepare session query"
+                );
+            }
+            return SqliteScan::NotPrepared;
+        }
+    };
+
+    let mut rows = match stmt.query([]) {
+        Ok(rows) => rows,
+        Err(err) => {
+            if let Some(what) = what {
+                warn!(
+                    db_path = %db_path.display(),
+                    what,
+                    error = %err,
+                    "Failed to execute session query"
+                );
+            }
+            return SqliteScan::NotExecuted;
+        }
+    };
+
+    loop {
+        match rows.next() {
+            Ok(Some(row)) => {
+                if let Err(err) = sink(row) {
+                    if let Some(what) = what {
+                        warn!(
+                            db_path = %db_path.display(),
+                            what,
+                            error = %err,
+                            "Failed to decode session row"
+                        );
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(err) => {
+                if let Some(what) = what {
+                    warn!(
+                        db_path = %db_path.display(),
+                        what,
+                        error = %err,
+                        "Failed to decode session row"
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    SqliteScan::Ran
+}
+
+/// Open `db_path` read-only, run `sql`, and hand every row to `sink`.
+///
+/// The connection-owning half of [`sqlite_for_each_row_on`], for the common
+/// case of one query per database. Parsers that run several queries against
+/// one database should open once and call [`sqlite_for_each_row_on`].
+pub(crate) fn sqlite_for_each_row(
+    db_path: &Path,
+    sql: &str,
+    what: Option<&str>,
+    sink: &mut dyn FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<()>,
+) -> SqliteScan {
+    let conn = match open_readonly_sqlite(db_path) {
+        Ok(conn) => conn,
+        Err(err) => {
+            if let Some(what) = what {
+                warn!(
+                    db_path = %db_path.display(),
+                    what,
+                    error = %err,
+                    "Failed to open session database"
+                );
+            }
+            return SqliteScan::NotOpened;
+        }
+    };
+    sqlite_for_each_row_on(&conn, db_path, sql, what, sink)
+}
+
 /// Read a file into bytes, returning `None` on any I/O error instead of propagating.
 /// Used by parsers that treat missing/unreadable session files as "no data".
 pub(crate) fn read_file_or_none(path: &Path) -> Option<Vec<u8>> {
@@ -325,6 +531,83 @@ pub(crate) fn resolved_provider(
             crate::provider_identity::inferred_provider_from_model(model_id).map(str::to_string)
         })
         .unwrap_or_else(|| fallback.to_string())
+}
+
+/// The Anthropic Messages API `usage` block in its snake_case wire spelling.
+///
+/// Shared by the clients that persist Anthropic responses verbatim
+/// (`claudecode`, `augment`), which declared byte-identical copies of it.
+///
+/// Clients whose payload adds fields on top of this shape — a
+/// `reasoning_output_tokens`, a `cached_input_tokens`, a `total_tokens` — keep
+/// their own struct on purpose. Widening this one with aliases would make the
+/// clients above start counting fields they deliberately ignore today, and
+/// change reported totals.
+/// Public because `claudecode` re-exports it as its historical `ClaudeUsage`;
+/// `sessions::utils` itself is crate-private.
+#[derive(Debug, Deserialize)]
+pub struct AnthropicUsage {
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_input_tokens: Option<i64>,
+    pub cache_creation_input_tokens: Option<i64>,
+}
+
+impl AnthropicUsage {
+    /// Token breakdown with every field clamped at zero. This block carries no
+    /// reasoning bucket, so `reasoning` is always 0.
+    pub fn to_breakdown(&self) -> TokenBreakdown {
+        TokenBreakdown {
+            input: self.input_tokens.unwrap_or(0).max(0),
+            output: self.output_tokens.unwrap_or(0).max(0),
+            cache_read: self.cache_read_input_tokens.unwrap_or(0).max(0),
+            cache_write: self.cache_creation_input_tokens.unwrap_or(0).max(0),
+            reasoning: 0,
+        }
+    }
+}
+
+/// The camelCase `{input, output, cacheRead, cacheWrite, totalTokens}` usage
+/// block with an authoritative `cost.total` in USD, as written by `gjc` and
+/// `openclaw`. They declared the same struct twice, one spelling the rename
+/// with `rename_all` and the other with per-field `rename`, so the JSON both
+/// accept is identical.
+///
+/// `pi.rs` models the same wire shape with its own `PiUsage` (a flattened
+/// extras map it needs and this type does not) and is left alone.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CamelUsage {
+    pub(crate) input: Option<i64>,
+    pub(crate) output: Option<i64>,
+    pub(crate) cache_read: Option<i64>,
+    pub(crate) cache_write: Option<i64>,
+    /// Reported but unused: the breakdown is summed from the fields above, so
+    /// a disagreeing total must not silently override them.
+    #[allow(dead_code)]
+    pub(crate) total_tokens: Option<i64>,
+    pub(crate) cost: Option<CamelCost>,
+}
+
+impl CamelUsage {
+    /// Token breakdown with every field clamped at zero. This block carries no
+    /// reasoning bucket, so `reasoning` is always 0.
+    pub(crate) fn to_breakdown(&self) -> TokenBreakdown {
+        TokenBreakdown {
+            input: self.input.unwrap_or(0).max(0),
+            output: self.output.unwrap_or(0).max(0),
+            cache_read: self.cache_read.unwrap_or(0).max(0),
+            cache_write: self.cache_write.unwrap_or(0).max(0),
+            reasoning: 0,
+        }
+    }
+}
+
+/// The `cost` sibling of [`CamelUsage`].
+#[derive(Debug, Deserialize)]
+pub(crate) struct CamelCost {
+    /// Authoritative total cost in USD.
+    pub(crate) total: Option<f64>,
 }
 
 #[cfg(test)]
