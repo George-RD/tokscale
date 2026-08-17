@@ -416,7 +416,10 @@ impl PiParseOptions {
 }
 
 enum PiLines {
-    Standard(std::io::Lines<BufReader<std::fs::File>>),
+    Standard {
+        lines: std::io::Lines<BufReader<std::fs::File>>,
+        at_start: bool,
+    },
     Lossy(super::utils::LossyLinesWithBytes<BufReader<std::fs::File>>),
 }
 
@@ -447,12 +450,31 @@ impl Iterator for PiLines {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             match self {
-                Self::Standard(lines) => match lines.next() {
-                    Some(Ok(line)) => return Some(PiLine::Standard(line)),
+                Self::Standard { lines, at_start } => match lines.next() {
+                    Some(Ok(mut line)) => {
+                        // A UTF-8 BOM decodes cleanly, so it survives as U+FEFF
+                        // glued to the front of the first record, where
+                        // `str::trim` leaves it (U+FEFF is not White_Space) and
+                        // the header then fails to parse. A header that fails to
+                        // parse discards the whole transcript rather than one
+                        // record, so strip the marker here exactly as the lossy
+                        // reader already does for Prime Agent.
+                        if std::mem::take(at_start) {
+                            if let Some(stripped) = line.strip_prefix('\u{feff}') {
+                                line = stripped.to_string();
+                            }
+                        }
+                        return Some(PiLine::Standard(line));
+                    }
                     // `reader.lines()` historically skipped all unreadable
                     // records and continued. In particular, an invalid-UTF-8
                     // line must not truncate valid records that follow it.
-                    Some(Err(_)) => continue,
+                    Some(Err(_)) => {
+                        // The marker can only precede the first record, and that
+                        // record was just consumed.
+                        *at_start = false;
+                        continue;
+                    }
                     None => return None,
                 },
                 Self::Lossy(lines) => return lines.next().map(PiLine::Lossy),
@@ -480,6 +502,71 @@ fn damaged_session_placeholder(path: &Path) -> String {
     format!("unknown:path:{:x}", hasher.finalize())
 }
 
+/// One record, one decision: does this entry become a [`UnifiedMessage`]?
+///
+/// Two walks read the same transcript. [`parse_pi_format_file_inner`] streams it
+/// and builds messages; Prime Agent's accounting walk replays already-parsed
+/// messages positionally against the same records
+/// (`sessions::prime_agent::analyze_prime_agent_accounting`). A record that only
+/// one of them counts shifts every later index in the other, which silently
+/// re-targets Prime's usage reconciliation. Both therefore ask this function
+/// rather than restating the rules, so neither can drift from the other.
+struct PiEmittedRecord<'a> {
+    message: &'a PiMessage,
+    usage: &'a PiUsage,
+    recorded_model: &'a str,
+}
+
+fn pi_emitted_record<'a>(
+    entry: &'a PiSessionEntry,
+    options: PiParseOptions,
+    is_rlm_subagent: bool,
+) -> Option<PiEmittedRecord<'a>> {
+    if entry.entry_type != "message" {
+        return None;
+    }
+
+    let message = entry.message.as_ref()?;
+    if message.role.as_deref() != Some("assistant") {
+        return None;
+    }
+
+    // An RLM child's completion timestamp participates in matching its
+    // usage back to the parent attribution. Recovering a replacement-
+    // damaged value as "missing" would make that match impossible while
+    // still emitting the child, so the parent's aggregate and child would
+    // both be counted. Other Pi messages do not use this timestamp as a
+    // reconciliation join and remain recoverable.
+    if options.lossy_line_reader
+        && is_rlm_subagent
+        && (entry.has_damaged_timestamp()
+            || entry
+                .timestamp
+                .as_deref()
+                .is_some_and(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).is_err()))
+    {
+        return None;
+    }
+
+    let usage = message.usage.as_ref()?;
+    if options.lossy_line_reader && usage.has_damaged_key() {
+        return None;
+    }
+
+    let recorded_model = message.model.as_deref()?;
+    Some(PiEmittedRecord {
+        message,
+        usage,
+        recorded_model,
+    })
+}
+
+/// [`pi_emitted_record`] under the preset RLM transcripts are parsed with, as a
+/// yes/no answer for a walk that already holds the emitted messages.
+pub(crate) fn rlm_entry_emits_message(entry: &PiSessionEntry, is_rlm_subagent: bool) -> bool {
+    pi_emitted_record(entry, PiParseOptions::prime_agent(), is_rlm_subagent).is_some()
+}
+
 fn parse_pi_format_file_inner(
     path: &Path,
     client: &str,
@@ -499,7 +586,10 @@ fn parse_pi_format_file_inner(
     let lines = if options.lossy_line_reader {
         PiLines::Lossy(lossy_lines_with_bytes(reader))
     } else {
-        PiLines::Standard(reader.lines())
+        PiLines::Standard {
+            lines: reader.lines(),
+            at_start: true,
+        }
     };
     let mut messages: Vec<UnifiedMessage> = Vec::with_capacity(64);
     let mut buffer = Vec::with_capacity(4096);
@@ -596,50 +686,16 @@ fn parse_pi_format_file_inner(
             continue;
         }
 
-        if entry.entry_type != "message" {
-            observer.observe_entry(&entry, None);
-            continue;
-        }
-
-        let Some(message) = entry.message.as_ref() else {
-            observer.observe_entry(&entry, None);
-            continue;
-        };
-
-        if message.role.as_deref() != Some("assistant") {
-            observer.observe_entry(&entry, None);
-            continue;
-        }
-
-        // An RLM child's completion timestamp participates in matching its
-        // usage back to the parent attribution. Recovering a replacement-
-        // damaged value as "missing" would make that match impossible while
-        // still emitting the child, so the parent's aggregate and child would
-        // both be counted. Other Pi messages do not use this timestamp as a
-        // reconciliation join and remain recoverable.
-        if options.lossy_line_reader
-            && is_rlm_subagent
-            && (entry.has_damaged_timestamp()
-                || entry.timestamp.as_deref().is_some_and(|timestamp| {
-                    chrono::DateTime::parse_from_rfc3339(timestamp).is_err()
-                }))
-        {
-            observer.observe_entry(&entry, None);
-            continue;
-        }
-
-        let Some(usage) = message.usage.as_ref() else {
+        let Some(PiEmittedRecord {
+            message,
+            usage,
+            recorded_model,
+        }) = pi_emitted_record(&entry, options, is_rlm_subagent)
+        else {
             observer.observe_entry(&entry, None);
             continue;
         };
-        if options.lossy_line_reader && usage.has_damaged_key() {
-            continue;
-        }
 
-        let Some(recorded_model) = message.model.as_deref() else {
-            observer.observe_entry(&entry, None);
-            continue;
-        };
         let model = if !accepts_replacement_field(recorded_model, options.lossy_line_reader) {
             "unknown"
         } else {
@@ -823,6 +879,54 @@ mod tests {
 
         let messages = parse_pi_file(file.path());
         assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.total(), 28);
+    }
+
+    #[test]
+    fn utf8_bom_before_the_header_keeps_the_transcript() {
+        // A BOM decodes cleanly, so `str::trim` leaves U+FEFF glued to the
+        // front of the header (it is not White_Space) and the header fails to
+        // parse. That failure drops the entire transcript, not one record, so
+        // every Pi-format client has to strip it the way the lossy reader
+        // already does for Prime Agent.
+        let file = create_test_file(concat!(
+            "\u{feff}",
+            r#"{"type":"session","id":"session-with-bom","timestamp":"2026-08-08T00:00:00.000Z","cwd":"/tmp/project"}"#,
+            "\n",
+            r#"{"type":"message","id":"assistant-1","timestamp":"2026-08-08T00:00:01.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-opus-5","usage":{"input":20,"output":8}}}"#,
+            "\n",
+        ));
+
+        for messages in [
+            parse_pi_file(file.path()),
+            crate::sessions::senpi::parse_senpi_file(file.path()),
+            crate::sessions::kimchi::parse_kimchi_file(file.path()),
+            parse_prime_test_file(file.path()),
+        ] {
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].session_id, "session-with-bom");
+            assert_eq!(messages[0].tokens.total(), 28);
+        }
+    }
+
+    #[test]
+    fn a_marker_after_the_first_record_still_costs_only_its_own_record() {
+        // The strip is scoped to the file's first line, where a byte-order mark
+        // can actually appear. A U+FEFF anywhere else stays an ordinary
+        // malformed record, which the reader already loses alone.
+        let file = create_test_file(concat!(
+            r#"{"type":"session","id":"session-clean","timestamp":"2026-08-08T00:00:00.000Z","cwd":"/tmp/project"}"#,
+            "\n\u{feff}",
+            r#"{"type":"message","id":"assistant-1","timestamp":"2026-08-08T00:00:01.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-opus-5","usage":{"input":1,"output":1}}}"#,
+            "\n",
+            r#"{"type":"message","id":"assistant-2","timestamp":"2026-08-08T00:00:02.000Z","message":{"role":"assistant","provider":"anthropic","model":"claude-opus-5","usage":{"input":20,"output":8}}}"#,
+            "\n",
+        ));
+
+        let messages = parse_pi_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].session_id, "session-clean");
         assert_eq!(messages[0].tokens.total(), 28);
     }
 
