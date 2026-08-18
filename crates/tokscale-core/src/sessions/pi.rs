@@ -8,14 +8,14 @@
 //! Pi descendants reuse this record layout verbatim, so [`parse_pi_format_file`]
 //! is shared: see `sessions::senpi` for Senpi (OmO Native).
 
-use super::utils::{file_modified_timestamp_ms, lossy_lines_with_bytes, LossyLine};
+use super::utils::{file_modified_timestamp_ms, for_each_json_line_with_bytes, parse_json_line};
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::provider_identity::inferred_provider_from_model;
 use crate::TokenBreakdown;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
+use std::ops::ControlFlow;
 use std::path::Path;
 
 /// Pi session header (first line of JSONL)
@@ -226,6 +226,10 @@ pub struct PiMessage {
     pub response_id: Option<String>,
 }
 
+/// The camelCase usage block of a Pi record: `utils::CamelUsage`'s
+/// `{input, output, cacheRead, cacheWrite, totalTokens}` plus `reasoning` and
+/// a flattened map of every remaining key. See the note on `CamelUsage` for
+/// why the two shapes are not merged.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PiUsage {
@@ -235,8 +239,8 @@ pub struct PiUsage {
     pub cache_write: Option<i64>,
     #[allow(dead_code)]
     pub total_tokens: Option<i64>,
-    /// Parsed so the omission below is a real decision rather than an accident
-    /// of the schema, but never summed: see the note at the emit site.
+    /// Parsed so the omission in [`PiUsage::to_breakdown`] is a real decision
+    /// rather than an accident of the schema, but never summed.
     #[allow(dead_code)]
     pub reasoning: Option<i64>,
     #[serde(flatten)]
@@ -244,6 +248,24 @@ pub struct PiUsage {
 }
 
 impl PiUsage {
+    /// Token breakdown with every field clamped at zero, in the spelling
+    /// `utils::CamelUsage` uses for the same wire shape.
+    ///
+    /// `reasoning` is read but deliberately not mapped onto
+    /// `TokenBreakdown::reasoning`. In the Pi format reasoning tokens are a
+    /// subset of `output` (Pi's own `totalTokens` excludes them), whereas
+    /// tokscale totals `reasoning` as its own additive bucket. Mapping it
+    /// through would double count.
+    pub(crate) fn to_breakdown(&self) -> TokenBreakdown {
+        TokenBreakdown {
+            input: self.input.unwrap_or(0).max(0),
+            output: self.output.unwrap_or(0).max(0),
+            cache_read: self.cache_read.unwrap_or(0).max(0),
+            cache_write: self.cache_write.unwrap_or(0).max(0),
+            reasoning: 0,
+        }
+    }
+
     pub(crate) fn has_damaged_key(&self) -> bool {
         const TOKEN_COUNTER_KEYS: &[&str] = &[
             "input",
@@ -415,74 +437,6 @@ impl PiParseOptions {
     }
 }
 
-enum PiLines {
-    Standard {
-        lines: std::io::Lines<BufReader<std::fs::File>>,
-        at_start: bool,
-    },
-    Lossy(super::utils::LossyLinesWithBytes<BufReader<std::fs::File>>),
-}
-
-enum PiLine {
-    Standard(String),
-    Lossy(LossyLine),
-}
-
-impl PiLine {
-    fn text(&self) -> &str {
-        match self {
-            Self::Standard(text) => text,
-            Self::Lossy(line) => &line.text,
-        }
-    }
-
-    fn raw_bytes(&self) -> Option<&[u8]> {
-        match self {
-            Self::Standard(_) => None,
-            Self::Lossy(line) => Some(&line.bytes),
-        }
-    }
-}
-
-impl Iterator for PiLines {
-    type Item = PiLine;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            match self {
-                Self::Standard { lines, at_start } => match lines.next() {
-                    Some(Ok(mut line)) => {
-                        // A UTF-8 BOM decodes cleanly, so it survives as U+FEFF
-                        // glued to the front of the first record, where
-                        // `str::trim` leaves it (U+FEFF is not White_Space) and
-                        // the header then fails to parse. A header that fails to
-                        // parse discards the whole transcript rather than one
-                        // record, so strip the marker here exactly as the lossy
-                        // reader already does for Prime Agent.
-                        if std::mem::take(at_start) {
-                            if let Some(stripped) = line.strip_prefix('\u{feff}') {
-                                line = stripped.to_string();
-                            }
-                        }
-                        return Some(PiLine::Standard(line));
-                    }
-                    // `reader.lines()` historically skipped all unreadable
-                    // records and continued. In particular, an invalid-UTF-8
-                    // line must not truncate valid records that follow it.
-                    Some(Err(_)) => {
-                        // The marker can only precede the first record, and that
-                        // record was just consumed.
-                        *at_start = false;
-                        continue;
-                    }
-                    None => return None,
-                },
-                Self::Lossy(lines) => return lines.next().map(PiLine::Lossy),
-            }
-        }
-    }
-}
-
 fn accepts_replacement_field(value: &str, lossy_line_reader: bool) -> bool {
     !lossy_line_reader || !has_replacement_character(value)
 }
@@ -575,22 +529,8 @@ fn parse_pi_format_file_inner(
     options: PiParseOptions,
     observer: &mut impl PiFormatObserver,
 ) -> Vec<UnifiedMessage> {
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Vec::new(),
-    };
-
     let fallback_timestamp = file_modified_timestamp_ms(path);
 
-    let reader = BufReader::new(file);
-    let lines = if options.lossy_line_reader {
-        PiLines::Lossy(lossy_lines_with_bytes(reader))
-    } else {
-        PiLines::Standard {
-            lines: reader.lines(),
-            at_start: true,
-        }
-    };
     let mut messages: Vec<UnifiedMessage> = Vec::with_capacity(64);
     let mut buffer = Vec::with_capacity(4096);
 
@@ -599,45 +539,53 @@ fn parse_pi_format_file_inner(
     let mut workspace_label: Option<String> = None;
     let mut agent: Option<String> = None;
     let mut is_rlm_subagent = false;
-    for line in lines {
-        let trimmed = line.text().trim();
-        if trimmed.is_empty() {
-            continue;
+    // A header this parser rejects discards the whole transcript, not one
+    // record, so the sink stops the scan and nothing is returned.
+    let mut malformed_transcript = false;
+
+    for_each_json_line_with_bytes(path, &mut |line| {
+        // Pi, Senpi and Kimchi keep the byte-strict record skipping of
+        // `BufRead::lines()`: a record whose bytes are not valid UTF-8 is
+        // dropped rather than read through its replacement characters.
+        // Reading it lossily would make them emit messages they do not emit
+        // today, which is the opt-in `PiParseOptions::standard` defers.
+        if !options.lossy_line_reader && !line.valid_utf8 {
+            return ControlFlow::Continue(());
         }
+        let trimmed = line.trimmed;
 
         if session_id.is_none() {
-            buffer.clear();
-            buffer.extend_from_slice(trimmed.as_bytes());
-            let entry_type = match simd_json::from_slice::<PiEntryTypeProbe>(&mut buffer) {
-                Ok(probe) => probe.entry_type,
-                Err(_)
-                    if options.lossy_line_reader && pre_header_line_is_skippable(trimmed, None) =>
+            let entry_type = match parse_json_line::<PiEntryTypeProbe>(trimmed, &mut buffer) {
+                Some(probe) => probe.entry_type,
+                None if options.lossy_line_reader
+                    && pre_header_line_is_skippable(trimmed, None) =>
                 {
-                    continue;
+                    return ControlFlow::Continue(());
                 }
-                Err(_) => return Vec::new(),
+                None => {
+                    malformed_transcript = true;
+                    return ControlFlow::Break(());
+                }
             };
 
             if entry_type != "session" {
                 if PRE_SESSION_METADATA_TYPES.contains(&entry_type.as_str()) {
-                    continue;
+                    return ControlFlow::Continue(());
                 }
-                return Vec::new();
+                malformed_transcript = true;
+                return ControlFlow::Break(());
             }
 
-            buffer.clear();
-            buffer.extend_from_slice(trimmed.as_bytes());
-            let header = match simd_json::from_slice::<PiSessionHeader>(&mut buffer) {
-                Ok(h) => h,
-                Err(_) => return Vec::new(),
+            let Some(header) = parse_json_line::<PiSessionHeader>(trimmed, &mut buffer) else {
+                malformed_transcript = true;
+                return ControlFlow::Break(());
             };
-            let has_raw_damaged_lineage_key = line
-                .raw_bytes()
-                .is_some_and(raw_json_has_damaged_lineage_header_key);
             if options.lossy_line_reader
-                && (header.has_invalid_lineage() || has_raw_damaged_lineage_key)
+                && (header.has_invalid_lineage()
+                    || raw_json_has_damaged_lineage_header_key(line.bytes))
             {
-                return Vec::new();
+                malformed_transcript = true;
+                return ControlFlow::Break(());
             }
 
             observer.observe_header(&header);
@@ -655,14 +603,11 @@ fn parse_pi_format_file_inner(
             workspace_key = clean_cwd.and_then(normalize_workspace_key);
             workspace_label = workspace_key.as_deref().and_then(workspace_label_from_key);
             is_rlm_subagent = header.rlm_depth.unwrap_or(0) > 0;
-            continue;
+            return ControlFlow::Continue(());
         }
 
-        buffer.clear();
-        buffer.extend_from_slice(trimmed.as_bytes());
-        let entry = match simd_json::from_slice::<PiSessionEntry>(&mut buffer) {
-            Ok(e) => e,
-            Err(_) => continue,
+        let Some(entry) = parse_json_line::<PiSessionEntry>(trimmed, &mut buffer) else {
+            return ControlFlow::Continue(());
         };
 
         if entry.entry_type == "session_info" {
@@ -683,7 +628,7 @@ fn parse_pi_format_file_inner(
                     .and_then(pi_subagent_name)
             };
             observer.observe_entry(&entry, None);
-            continue;
+            return ControlFlow::Continue(());
         }
 
         let Some(PiEmittedRecord {
@@ -693,7 +638,7 @@ fn parse_pi_format_file_inner(
         }) = pi_emitted_record(&entry, options, is_rlm_subagent)
         else {
             observer.observe_entry(&entry, None);
-            continue;
+            return ControlFlow::Continue(());
         };
 
         let model = if !accepts_replacement_field(recorded_model, options.lossy_line_reader) {
@@ -726,24 +671,13 @@ fn parse_pi_format_file_inner(
             .map(|timestamp| timestamp.timestamp_millis());
         let timestamp = recorded_timestamp.unwrap_or(fallback_timestamp);
 
-        // `usage.reasoning` is read but deliberately not mapped onto
-        // `TokenBreakdown::reasoning`. In the Pi format reasoning tokens are a
-        // subset of `output` (Pi's own `totalTokens` excludes them), whereas
-        // tokscale totals `reasoning` as its own additive bucket. Mapping it
-        // through would double count.
         let mut unified = UnifiedMessage::new_with_agent(
             client,
             model,
             provider.as_str(),
             session_id.clone().unwrap_or_else(|| "unknown".to_string()),
             timestamp,
-            TokenBreakdown {
-                input: usage.input.unwrap_or(0).max(0),
-                output: usage.output.unwrap_or(0).max(0),
-                cache_read: usage.cache_read.unwrap_or(0).max(0),
-                cache_write: usage.cache_write.unwrap_or(0).max(0),
-                reasoning: 0,
-            },
+            usage.to_breakdown(),
             0.0,
             agent.clone(),
         );
@@ -782,9 +716,8 @@ fn parse_pi_format_file_inner(
                         !accepts_replacement_field(id, options.lossy_line_reader)
                     });
                     if has_damaged_id {
-                        let raw_line = line.raw_bytes().unwrap_or_else(|| line.text().as_bytes());
                         unified.dedup_key =
-                            Some(damaged_cross_session_dedup_key(namespace, raw_line));
+                            Some(damaged_cross_session_dedup_key(namespace, line.bytes));
                     }
                 }
             } else if let Some(message_id) = entry.id.as_deref().filter(|id| !id.trim().is_empty())
@@ -796,6 +729,11 @@ fn parse_pi_format_file_inner(
         unified.set_workspace(workspace_key.clone(), workspace_label.clone());
         observer.observe_entry(&entry, Some(&unified));
         messages.push(unified);
+        ControlFlow::Continue(())
+    });
+
+    if malformed_transcript {
+        return Vec::new();
     }
 
     messages

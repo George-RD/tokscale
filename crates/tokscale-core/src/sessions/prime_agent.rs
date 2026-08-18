@@ -11,14 +11,14 @@
 use super::pi::{
     has_replacement_character, parse_pi_format_rlm_file_with_observer,
     pre_header_line_is_skippable, raw_json_has_damaged_lineage_header_key, rlm_entry_emits_message,
-    PiFormatObserver, PiSessionEntry, PiSessionHeader, PiUsage, PRE_SESSION_METADATA_TYPES,
+    PiFormatObserver, PiSessionEntry, PiSessionHeader, PRE_SESSION_METADATA_TYPES,
 };
-use super::utils::{lossy_lines_with_bytes, parse_timestamp_str};
+use super::utils::{for_each_json_line_with_bytes, parse_json_line, parse_timestamp_str};
 use super::UnifiedMessage;
 use crate::TokenBreakdown;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::BufReader;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
@@ -249,8 +249,8 @@ impl PiFormatObserver for PrimeAccountingBuilder<'_> {
                     .push(PrimeAttribution {
                         id: id.clone(),
                         timestamp: entry_timestamp,
-                        child_usage: usage_breakdown(child_usage),
-                        aggregate_usage: usage_breakdown(aggregate_usage),
+                        child_usage: child_usage.to_breakdown(),
+                        aggregate_usage: aggregate_usage.to_breakdown(),
                     });
             }
             return;
@@ -303,16 +303,6 @@ pub(crate) fn transcript_decode_call_counts() -> (usize, usize) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     (counter.messages, counter.accounting)
-}
-
-fn usage_breakdown(usage: &PiUsage) -> TokenBreakdown {
-    TokenBreakdown {
-        input: usage.input.unwrap_or(0).max(0),
-        output: usage.output.unwrap_or(0).max(0),
-        cache_read: usage.cache_read.unwrap_or(0).max(0),
-        cache_write: usage.cache_write.unwrap_or(0).max(0),
-        reasoning: 0,
-    }
 }
 
 fn add_usage(total: &mut TokenBreakdown, usage: &TokenBreakdown) {
@@ -436,12 +426,6 @@ fn referenced_lineage_path(source_file: &Path, referenced: &Path) -> PathBuf {
     }
 }
 
-fn parse_pi_json_line<T: DeserializeOwned>(line: &str, buffer: &mut Vec<u8>) -> Option<T> {
-    buffer.clear();
-    buffer.extend_from_slice(line.as_bytes());
-    simd_json::from_slice(buffer).ok()
-}
-
 /// Read Prime-only accounting records that are intentionally absent from the
 /// shared Pi message representation. `messages` may come from the source cache;
 /// their stable order is used to associate target entry ids with emitted rows.
@@ -452,34 +436,32 @@ pub(crate) fn analyze_prime_agent_accounting(
     #[cfg(test)]
     record_transcript_decode(path, true);
 
-    let Ok(file) = std::fs::File::open(path) else {
-        return PrimeFileAccounting::default();
-    };
-
     let mut accounting = PrimeAccountingBuilder::new(path);
     let mut found_header = false;
     let mut message_index = 0usize;
     let mut buffer = Vec::with_capacity(4096);
-    for line in lossy_lines_with_bytes(BufReader::new(file)) {
-        let trimmed = line.text.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
+    // A header the shared parser rejects discards the whole transcript here
+    // too, so the sink stops the scan and no accounting is reported.
+    let mut malformed_transcript = false;
+
+    for_each_json_line_with_bytes(path, &mut |line| {
+        let trimmed = line.trimmed;
         if !found_header {
-            if let Some(header) = parse_pi_json_line::<PiSessionHeader>(trimmed, &mut buffer) {
+            if let Some(header) = parse_json_line::<PiSessionHeader>(trimmed, &mut buffer) {
                 if header.entry_type == "session" {
-                    let has_raw_damaged_lineage_key =
-                        raw_json_has_damaged_lineage_header_key(&line.bytes);
-                    if header.has_invalid_lineage() || has_raw_damaged_lineage_key {
-                        return PrimeFileAccounting::default();
+                    if header.has_invalid_lineage()
+                        || raw_json_has_damaged_lineage_header_key(line.bytes)
+                    {
+                        malformed_transcript = true;
+                        return ControlFlow::Break(());
                     }
                     found_header = true;
                     accounting.observe_header(&header);
-                    continue;
+                    return ControlFlow::Continue(());
                 }
             }
-            let parsed_type = parse_pi_json_line::<serde_json::Value>(trimmed, &mut buffer)
-                .and_then(|value| {
+            let parsed_type =
+                parse_json_line::<serde_json::Value>(trimmed, &mut buffer).and_then(|value| {
                     value
                         .get("type")
                         .and_then(|kind| kind.as_str())
@@ -491,13 +473,14 @@ pub(crate) fn analyze_prime_agent_accounting(
             if is_pre_session_metadata
                 || pre_header_line_is_skippable(trimmed, parsed_type.as_deref())
             {
-                continue;
+                return ControlFlow::Continue(());
             }
-            return PrimeFileAccounting::default();
+            malformed_transcript = true;
+            return ControlFlow::Break(());
         }
 
-        let Some(entry) = parse_pi_json_line::<PiSessionEntry>(trimmed, &mut buffer) else {
-            continue;
+        let Some(entry) = parse_json_line::<PiSessionEntry>(trimmed, &mut buffer) else {
+            return ControlFlow::Continue(());
         };
         // Which records became messages is the parser's decision, not a rule
         // restated here: a record counted on only one side shifts every later
@@ -510,6 +493,11 @@ pub(crate) fn analyze_prime_agent_accounting(
             })
             .flatten();
         accounting.observe_entry(&entry, emitted);
+        ControlFlow::Continue(())
+    });
+
+    if malformed_transcript {
+        return PrimeFileAccounting::default();
     }
 
     accounting.finish()
