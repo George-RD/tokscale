@@ -104,6 +104,7 @@
 | <img width="48px" src="https://github.com/augmentcode.png" alt="Augment Code" /> | [Augment Code](https://www.augmentcode.com/) (Auggie CLI) | `~/.augment/sessions/*.json` |
 | <img width="48px" src=".github/assets/client-synthetic.png" alt="Synthetic" /> | [Synthetic](https://synthetic.new/) | Re-attributed from other sources via `hf:` model prefix or `synthetic` provider (+ [Octofriend](https://github.com/synthetic-lab/octofriend): `~/.local/share/octofriend/sqlite.db`) |
 | <img width="48px" src="https://github.com/deepseek-ai.png" alt="DeepSeek Harness" /> | [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) | `~/.dsh/sessions/**/session.jsonl.zstd` (or `session.jsonl` when written uncompressed; override via `DSH_HOME`) |
+| <img width="48px" src="https://github.com/MiniMax-AI.png" alt="MiniMax Code" /> | [MiniMax Code](https://github.com/MiniMax-AI) | `~/.config/tokscale/headless/mcode/*.jsonl` (headless capture of `mcode exec --output-format stream-json`; override via `TOKSCALE_HEADLESS_DIR`) |
 
 Get real-time pricing calculations using [🚅 LiteLLM's pricing data](https://github.com/BerriAI/litellm), with support for tiered pricing models and cache token discounts.
 
@@ -1022,11 +1023,11 @@ TOKSCALE_API_TOKEN=tt_xxx tokscale submit
 
 ### Headless Mode
 
-Tokscale can aggregate token usage from **Codex CLI headless outputs** for automation, CI/CD pipelines, and batch processing.
+Tokscale can aggregate token usage from **Codex CLI and MiniMax Code headless outputs** for automation, CI/CD pipelines, and batch processing.
 
 **What is headless mode?**
 
-When you run Codex CLI with JSON output flags (e.g., `codex exec --json`), it outputs usage data to stdout instead of storing it in its regular session directories. Headless mode allows you to capture and track this usage.
+When you run Codex CLI or MiniMax Code with JSON output flags, the CLI writes usage data to stdout. Headless mode captures that stream and keeps it attributable to the originating CLI. MiniMax Code is intentionally read from Tokscale's capture directory rather than its shared Desktop/Runtime session store, whose records do not identify the originating surface.
 
 **Storage location:** `~/.config/tokscale/headless/`
 
@@ -1035,7 +1036,8 @@ On macOS, Tokscale also scans `~/Library/Application Support/tokscale/headless/`
 Tokscale automatically scans this directory structure:
 ```
 ~/.config/tokscale/headless/
-└── codex/       # Codex CLI JSONL outputs
+├── codex/       # Codex CLI JSONL outputs
+└── mcode/       # MiniMax Code stream-json outputs
 ```
 
 **Environment variable:** Set `TOKSCALE_HEADLESS_DIR` to customize the headless log directory:
@@ -1048,12 +1050,16 @@ export TOKSCALE_HEADLESS_DIR="$HOME/my-custom-logs"
 | Tool | Command Example |
 |------|-----------------|
 | **Codex CLI** | `tokscale headless codex exec -m gpt-5 "implement feature"` |
+| **MiniMax Code** | `tokscale headless mcode exec "implement feature"` |
 
 **Manual redirect (optional):**
 
 | Tool | Command Example |
 |------|-----------------|
 | **Codex CLI** | `codex exec --json "implement feature" > ~/.config/tokscale/headless/codex/ci-run.jsonl` |
+| **MiniMax Code** | `mcode exec --output-format stream-json "implement feature" > ~/.config/tokscale/headless/mcode/ci-run.jsonl` |
+
+MiniMax Code usage is counted only when the final `exec.result` includes `model.providerId` and `model.modelId`. Partial captures and older MiniMax Code releases that omit this identity are skipped instead of being priced against a guessed model.
 
 **Diagnostics:**
 
@@ -1078,7 +1084,7 @@ tokscale sources --json
   run: tokscale --json
 ```
 
-> **Note**: Headless capture is supported for Codex CLI only. If you run Codex directly, redirect stdout to the headless directory as shown above.
+> **Note**: Headless capture is supported for Codex CLI and MiniMax Code. If you run either CLI directly, redirect stdout to its matching headless directory as shown above.
 
 ## Frontend Visualization
 
@@ -1094,7 +1100,7 @@ The frontend provides a GitHub-style contribution graph visualization:
 - **Interactive tooltips**: Hover for detailed daily breakdowns
 - **Day breakdown panel**: Click to see per-source and per-model details
 - **Year filtering**: Navigate between years
-- **Source filtering**: Filter by platform (OpenCode, Claude, Codex, Copilot, Cursor, Gemini, Amp, Codebuff, Droid, OpenClaw, Hermes Agent, Pi, Prime Agent, Kimi, Qwen, Roo Code, Kilo, Mux, Kilo CLI, Crush, Goose, Antigravity, Antigravity CLI, Zed, Kiro, Trae, Warp, Cline, Gajae-Code, Grok Build, Jcode, MiMo Code, Command Code, Junie, ZCode, OpenCodeReview, CodeBuddy, WorkBuddy, Devin CLI, Devin Desktop, Augment Code, Synthetic, Cherry Studio)
+- **Source filtering**: Filter by platform (OpenCode, Claude, Codex, MiniMax Code, Copilot, Cursor, Gemini, Amp, Codebuff, Droid, OpenClaw, Hermes Agent, Pi, Prime Agent, Kimi, Qwen, Roo Code, Kilo, Mux, Kilo CLI, Crush, Goose, Antigravity, Antigravity CLI, Zed, Kiro, Trae, Warp, Cline, Gajae-Code, Grok Build, Jcode, MiMo Code, Command Code, Junie, ZCode, OpenCodeReview, CodeBuddy, WorkBuddy, Devin CLI, Devin Desktop, Augment Code, Synthetic, Cherry Studio)
 - **Stats panel**: Total cost, tokens, active days, streaks
 - **FOUC prevention**: Theme applied before React hydrates (no flash)
 
@@ -1512,6 +1518,7 @@ AI coding tools store their session data in cross-platform locations. Most tools
 | Devin Desktop | Linux: `~/.config/Devin/User/acp-events/`; macOS: `~/Library/Application Support/Devin/User/acp-events/` | `%APPDATA%\Devin\User\acp-events\` | Parses ACP usage events; the CLI database resolves matching session titles when present |
 | Augment Code | `~/.augment/sessions/` | `%USERPROFILE%\.augment\sessions\` | Parses Auggie CLI session JSON snapshots (`*.json`); join key is top-level `sessionId` |
 | Synthetic | Re-attributed from other sources | Re-attributed from other sources | Detects `hf:` model prefix + `synthetic` provider |
+| MiniMax Code | `~/.config/tokscale/headless/mcode/` | `%APPDATA%\tokscale\headless\mcode\` | Headless capture only; Tokscale reads its own capture directory rather than MiniMax Code's shared Desktop/Runtime store, which does not identify the originating surface. Override the root with `TOKSCALE_HEADLESS_DIR` |
 
 > **Devin Desktop agent support**: Local usage parsing works for ACP-connected agents (e.g. Cascade/Windsurf, claude-code, opencode) that emit `usage_update` events in the NDJSON stream. The default **devin-cloud** agent does not emit local `usage_update` events — its usage stays server-side and cannot be tracked by tokscale without an account-level API.
 
