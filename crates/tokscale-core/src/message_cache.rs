@@ -1039,6 +1039,11 @@ fn parser_version(client: ClientId) -> u32 {
         // recognizes user tool-result records as continuations instead of
         // beginning a new turn, so cached turns must be reparsed.
         ClientId::Cline => 3,
+        // v1->v2: cache-write now maps directly from `Input (w/ Cache Write)`
+        // instead of subtracting `Input (w/o Cache Write)`, and a numeric CSV
+        // `Cost` (including explicit zero) is retained as provider-reported so
+        // repricing no longer drops the Team/Enterprise Cursor Token Rate.
+        ClientId::Cursor => 2,
         // v1->v2: Kimchi's Pi-compatible messages now carry stable namespaced
         // deduplication keys.
         ClientId::Kimchi => 2,
@@ -3111,6 +3116,11 @@ mod tests {
     #[test]
     fn test_micode_parser_version_invalidates_rows_without_cost_provenance() {
         assert_eq!(parser_version(ClientId::MiMoCode), 3);
+    }
+
+    #[test]
+    fn test_cursor_parser_version_invalidates_incorrect_token_and_cost_rows() {
+        assert_eq!(parser_version(ClientId::Cursor), 2);
     }
 
     #[test]
