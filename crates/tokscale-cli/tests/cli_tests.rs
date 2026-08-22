@@ -494,6 +494,76 @@ fn headless_capture_descendant_holding_stdout_still_times_out() {
     );
 }
 
+/// Reaps the stdout holder `fake_codex` publishes to `TOKSCALE_FAKE_CODEX_PIDFILE`.
+///
+/// The holder deliberately outlives the direct child, so without this it would
+/// sit in the process table for the rest of its 120s sleep. Parallel and retried
+/// CI runs accumulate those, so teardown kills it rather than waiting it out.
+#[cfg(unix)]
+struct HolderReaper {
+    pidfile: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for HolderReaper {
+    fn drop(&mut self) {
+        let Ok(raw) = std::fs::read_to_string(&self.pidfile) else {
+            return;
+        };
+        let Ok(pid) = raw.trim().parse::<i32>() else {
+            return;
+        };
+        // Shelling out to kill(1) keeps this dependency-free -- tokscale-cli does
+        // not depend on libc, and pulling it in for one test teardown is not
+        // worth it. An already-exited pid just makes kill exit non-zero.
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+/// The other half of #1049: the direct child exits *successfully* before the
+/// deadline while a descendant keeps stdout open.
+///
+/// `try_wait` sees a normal exit, so `timed_out` stays false and the drain takes
+/// the non-timeout branch. That branch waited unboundedly -- both before #1166
+/// (an unconditional `join`) and after it -- so this hung forever with no
+/// deadline to rescue it. The timeout branch's `STDOUT_DRAIN_GRACE` does not
+/// apply here, which is exactly why this needs its own test.
+#[test]
+#[cfg(unix)]
+fn headless_capture_descendant_after_clean_exit_does_not_hang() {
+    let fake_bin = create_fake_codex_bin();
+    let output_path = fake_bin.path().join("descendant-exit.jsonl");
+    let pidfile = fake_bin.path().join("holder.pid");
+    let _reaper = HolderReaper {
+        pidfile: pidfile.clone(),
+    };
+
+    let started = Instant::now();
+    headless_capture_command(
+        fake_bin.path(),
+        &output_path,
+        "descendant-exit",
+        HEADLESS_SLOW_TIMEOUT_MS,
+    )
+    .env("TOKSCALE_FAKE_CODEX_PIDFILE", &pidfile)
+    .assert()
+    .failure();
+    let elapsed = started.elapsed();
+
+    // The bound is the assertion. The holder sleeps 120s, so anything that waits
+    // for EOF cannot return before then; finishing inside the 60s ceiling proves
+    // the wait is bounded rather than merely slow.
+    assert!(
+        elapsed < HEADLESS_SLOW_MAX_ELAPSED,
+        "a descendant holding stdout after a clean child exit must not hang: {elapsed:?}"
+    );
+}
+
 /// How far the measured deadline may sit from the configured one in
 /// `headless_capture_timeout_fires_near_its_deadline`.
 ///

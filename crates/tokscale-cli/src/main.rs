@@ -6517,9 +6517,35 @@ fn run_capture_command(
         // timeout, and the partial file is best-effort by definition.
         let _ = pump_done_rx.recv_timeout(STDOUT_DRAIN_GRACE);
     } else {
-        pump_done_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("Subprocess stdout reader thread panicked"))??;
+        // The child exited on its own, but that does NOT mean the pipe is closed:
+        // a descendant it spawned can still hold the write end, and then the pump
+        // never reaches EOF. This branch has no deadline behind it -- `timed_out`
+        // is false precisely because the deadline was never reached -- so an
+        // unbounded wait here hangs forever with nothing to rescue it. That was
+        // true of the original unconditional join too, and #1166 only bounded the
+        // timeout branch, so it survived both.
+        //
+        // Bound it by whatever is left of the caller's own deadline, plus the same
+        // drain grace. Total wall time therefore stays within the configured
+        // timeout plus the grace, whichever path is taken.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match pump_done_rx.recv_timeout(remaining + STDOUT_DRAIN_GRACE) {
+            Ok(pump_result) => pump_result?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Report rather than silently truncate: the child succeeded, so
+                // returning Ok here would present a capture file we cannot show
+                // is complete.
+                return Err(anyhow::anyhow!(
+                    "Subprocess '{}' exited but its stdout stayed open past the capture deadline, \
+                     which happens when it leaves a background process holding the pipe. \
+                     The output file may be incomplete.",
+                    command
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(anyhow::anyhow!("Subprocess stdout reader thread panicked"));
+            }
+        }
     }
 
     Ok(CaptureCommandOutcome {
