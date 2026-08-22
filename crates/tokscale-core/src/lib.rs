@@ -23,6 +23,7 @@ pub mod wiki;
 pub use aggregator::*;
 pub use bucket_tz::BucketTimezone;
 pub use clients::{ClientCounts, ClientDef, ClientId, PathRoot};
+pub use message_cache::parser_generation;
 pub use model_alias::ModelAliasMap;
 pub use parser::*;
 pub use scanner::*;

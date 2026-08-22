@@ -942,6 +942,36 @@ impl CacheIdentity {
     }
 }
 
+/// One value identifying the parser generation of every client at once.
+///
+/// Derived caches store this so a `parser_version` bump invalidates them too.
+/// The source cache versions each client independently, but anything folded on
+/// top of it -- the TUI aggregate cache -- mixes all clients into one set of
+/// totals, so it cannot say which client a given number came from and has to
+/// rebuild whenever any of them changes.
+///
+/// Deliberately covers `ClientId::ALL` rather than only the enabled set. A
+/// derived cache that reads this is rebuilt in the background anyway (see
+/// `decide_initial_data`), so an unnecessary rebuild costs one first paint,
+/// while a missed one shows numbers we already know are wrong. Reordering
+/// `define_clients!` also changes the value; that is the same cheap trade.
+///
+/// FNV-1a rather than `DefaultHasher`: this value is persisted, and
+/// `DefaultHasher`'s output is explicitly not stable across Rust releases.
+pub fn parser_generation() -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut acc = FNV_OFFSET_BASIS;
+    for client in ClientId::ALL {
+        for byte in parser_version(client).to_le_bytes() {
+            acc ^= u64::from(byte);
+            acc = acc.wrapping_mul(FNV_PRIME);
+        }
+    }
+    acc
+}
+
 fn parser_version(client: ClientId) -> u32 {
     match client {
         // These clients accumulated parser-only invalidations under the old
