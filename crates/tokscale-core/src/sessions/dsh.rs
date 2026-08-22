@@ -224,12 +224,32 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
                 // key: a sanitized or otherwise non-unique id then still
                 // separates calls that differ in time, routing or usage
                 // instead of silently folding them into one.
+                // Falling back to the session id breaks the very case the
+                // paragraph above describes. A `compaction/summary` carries no
+                // `message.id`, so a fork that lost its `seedLength` copies the
+                // summary into a file with a *different* session id, the two
+                // keys differ, and the cross-file pass -- which only collapses
+                // identical keys -- bills the summarize call twice.
+                //
+                // `seq` is the other field a fork copies verbatim (see the
+                // boundary check above), so it stands in for the missing id and
+                // stays identical across the copy. It is unique within a file,
+                // and pairing it with the timestamp, routing and buckets already
+                // in the key means an accidental merge would need two unrelated
+                // sessions to agree on all of them at millisecond resolution.
                 let identity = value
                     .pointer("/data/message/id")
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|id| !id.is_empty())
-                    .map_or_else(|| format!("sid:{sid}"), |id| format!("msg:{id}"));
+                    .map(|id| format!("msg:{id}"))
+                    .or_else(|| {
+                        value
+                            .get("seq")
+                            .and_then(Value::as_i64)
+                            .map(|seq| format!("seq:{seq}"))
+                    })
+                    .unwrap_or_else(|| format!("sid:{sid}"));
                 // Namespace the summary so it can never collapse against a loop
                 // step: a summary carries no `message.id` of its own, so both
                 // fall back to `sid:` and a summary that happened to match a
@@ -345,11 +365,16 @@ mod tests {
         assert!(first.is_turn_start);
         assert_eq!(first.workspace_key.as_deref(), Some("E:/repo/proj"));
         assert_eq!(first.workspace_label.as_deref(), Some("proj"));
-        assert!(first
-            .dedup_key
-            .as_deref()
-            .unwrap()
-            .starts_with("dsh:sid:session-abc:"));
+        // This row carries no `message.id`, so the key falls back to `seq`
+        // rather than the session id: a fork copies `seq` verbatim, so the key
+        // survives the copy and the cross-file pass can collapse the two.
+        // This row carries no `message.id`, so the key falls back to `seq`
+        // rather than the session id: a fork copies `seq` verbatim, so the key
+        // survives the copy and the cross-file pass can still collapse the two.
+        assert_eq!(
+            first.dedup_key.as_deref(),
+            Some("dsh:seq:301:1786669454772:irix:deepseek-v4-flash:130:159:13824:0:0")
+        );
 
         // Same turn, later step: not a turn start.
         assert!(!messages[1].is_turn_start);
@@ -595,6 +620,44 @@ mod tests {
         assert_eq!(child_messages.len(), 1);
         assert_eq!(child_messages[0].timestamp, 1786358035361);
         assert_eq!(child_messages[0].tokens.input, 97);
+    }
+
+    #[test]
+    fn a_copied_summary_shares_its_key_across_a_fork_that_lost_seedlength() {
+        // The sibling test above covers the same shape for an assistant row,
+        // which survives on its `message.id`. A `compaction/summary` has none,
+        // so before the `seq` fallback the two files produced
+        // `dsh:summary:sid:parent...` and `dsh:summary:sid:child...`; the
+        // cross-file pass only collapses identical keys, so the summarize call
+        // was billed twice.
+        let row = r#"{"type":"compaction/summary","seq":4,"time":1786669450002,"data":{"message":{"source":{"provider":"p","model":"m"}},"usage":{"inputTokens":10,"outputTokens":20}}}"#;
+        let parent = write_zstd_session(&[
+            r#"{"type":"session","id":"96cf59c9-b347-48b9-b234-a5200913ad05","createdAt":1,"cwd":"/work"}"#,
+            row,
+        ]);
+        // No `seedLength`, so the seq boundary never fires and the copy is parsed.
+        let child = write_zstd_session(&[
+            r#"{"type":"session","id":"ada8966c-9fa3-441b-8721-37ff1e795e6a","createdAt":2,"cwd":"/work","parentSession":"96cf59c9-b347-48b9-b234-a5200913ad05"}"#,
+            row,
+        ]);
+
+        let parent_messages = parse_dsh_file(parent.path());
+        let child_messages = parse_dsh_file(child.path());
+
+        assert_eq!(parent_messages.len(), 1);
+        assert_eq!(child_messages.len(), 1);
+        assert_ne!(
+            parent_messages[0].session_id, child_messages[0].session_id,
+            "the two files must be distinct sessions for this to test anything"
+        );
+        assert_eq!(
+            parent_messages[0].dedup_key.as_deref(),
+            Some("dsh:summary:seq:4:1786669450002:p:m:10:20:0:0:0")
+        );
+        assert_eq!(
+            parent_messages[0].dedup_key, child_messages[0].dedup_key,
+            "a copied summary must collapse across the fork, or its cost is counted twice"
+        );
     }
 
     #[test]

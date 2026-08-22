@@ -1124,7 +1124,11 @@ fn parser_version(client: ClientId) -> u32 {
         // entries undercount every session that compacted (#1152). DSH has not
         // shipped in a release, so this only rebuilds caches written by builds
         // from main.
-        ClientId::Dsh => 2,
+        // v2->v3: idless rows (which is every summary) fell back to a
+        // session-scoped dedup key, so a fork without `seedLength` counted the
+        // copied summary twice. The key now falls back to `seq`, so v2 entries
+        // carry keys that no longer match and must be reparsed.
+        ClientId::Dsh => 3,
         // First version of the fx (vercel-labs) usage-v2.json parser. Entries
         // are versioned from the start so later parser changes have an
         // obvious local counter to bump, like every other client here.
