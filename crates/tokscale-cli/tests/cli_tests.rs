@@ -4814,6 +4814,22 @@ fn test_submit_excludes_unpriced_usage_and_keeps_the_rest() {
         "the warning must say covered usage remains: {stdout}"
     );
     assert!(
+        stdout.contains("Hint: excluded models stay unsubmitted until priced"),
+        "the exclusion must be followed by a fix hint: {stdout}"
+    );
+    assert!(
+        stdout.contains("custom-pricing.json"),
+        "the hint must name the custom pricing file: {stdout}"
+    );
+    assert!(
+        stdout.contains("keyed by the model id alone"),
+        "the hint must state the key format, since the warning above prints provider/model but CustomPricing::lookup keys on the model id: {stdout}"
+    );
+    assert!(
+        stdout.contains("submit --dry-run"),
+        "the hint must point at the verification command: {stdout}"
+    );
+    assert!(
         stdout.contains("Dry run - not submitting data."),
         "dry-run must complete without submitting: {stdout}"
     );
