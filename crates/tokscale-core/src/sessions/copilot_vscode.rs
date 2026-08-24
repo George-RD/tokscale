@@ -40,13 +40,28 @@ fn parse_file(path: &Path) -> Vec<UnifiedMessage> {
                     requests.extend(arr.iter().cloned());
                 }
             }
+            1 => {
+                if let Some(k) = obj.get("k").and_then(Value::as_array) {
+                    if k.first().and_then(Value::as_str) == Some("requests") {
+                        if let Some(index) = k.get(1).and_then(|v| v.as_u64()).map(|u| u as usize) {
+                            // Dropping out-of-range updates is intentional: padding placeholders would mint timestamp-0 messages.
+                            if let Some(req) = requests.get_mut(index) {
+                                if let Some(value) = obj.get("v") {
+                                    apply_update(req, &k[2..], value.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             2 => {
                 if let Some(k) = obj.get("k").and_then(Value::as_array) {
-                    let is_requests = k
-                        .first()
-                        .and_then(Value::as_str)
-                        .map(|s| s == "requests")
-                        .unwrap_or(false);
+                    // Only top-level `["requests"]` appends grow the requests
+                    // vec. Nested appends like `["requests", 0, "response"]`
+                    // carry no token data, and letting them extend the vec
+                    // would shift the positions that kind-1 updates address.
+                    let is_requests =
+                        k.len() == 1 && k.first().and_then(Value::as_str) == Some("requests");
                     if is_requests {
                         if let Some(arr) = obj.get("v").and_then(Value::as_array) {
                             requests.extend(arr.iter().cloned());
@@ -62,6 +77,76 @@ fn parse_file(path: &Path) -> Vec<UnifiedMessage> {
         .iter()
         .filter_map(|req| request_to_message(req, &session_id, &workspace))
         .collect()
+}
+
+/// Upper bound for numeric indexes in an update path. A corrupted line with a
+/// huge index would otherwise drive the padding loops below into an unbounded
+/// allocation.
+const MAX_PATH_ARRAY_INDEX: usize = 4096;
+
+fn apply_update(target: &mut Value, path: &[Value], value: Value) {
+    if path.is_empty() {
+        *target = value;
+        return;
+    }
+
+    let mut current = target;
+    for i in 0..path.len() {
+        let key = &path[i];
+        let is_last = i == path.len() - 1;
+
+        if let Some(k_str) = key.as_str() {
+            if !current.is_object() {
+                *current = serde_json::Value::Object(serde_json::Map::new());
+            }
+            if is_last {
+                current
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(k_str.to_string(), value.clone());
+            } else {
+                let obj = current.as_object_mut().unwrap();
+                if !obj.contains_key(k_str) {
+                    obj.insert(
+                        k_str.to_string(),
+                        serde_json::Value::Object(serde_json::Map::new()),
+                    );
+                }
+            }
+            if !is_last {
+                current = current.get_mut(k_str).unwrap();
+            }
+        } else if let Some(k_idx) = key.as_u64() {
+            if k_idx > MAX_PATH_ARRAY_INDEX as u64 {
+                return;
+            }
+            let idx = k_idx as usize;
+            if !current.is_array() {
+                *current = serde_json::Value::Array(Vec::new());
+            }
+            if is_last {
+                let arr = current.as_array_mut().unwrap();
+                if idx < arr.len() {
+                    arr[idx] = value.clone();
+                } else {
+                    while arr.len() < idx {
+                        arr.push(serde_json::Value::Null);
+                    }
+                    arr.push(value.clone());
+                }
+            } else {
+                let arr = current.as_array_mut().unwrap();
+                while arr.len() <= idx {
+                    arr.push(serde_json::Value::Null);
+                }
+            }
+            if !is_last {
+                current = current.get_mut(idx).unwrap();
+            }
+        } else {
+            return;
+        }
+    }
 }
 
 fn request_to_message(
@@ -355,5 +440,75 @@ mod tests {
         );
 
         assert!(parse_copilot_vscode_sessions(&[path]).is_empty());
+    }
+    #[test]
+    fn parse_kind1_path_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("chatSessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let uuid = "750e8400-e29b-41d4-a716-446655440002";
+        let path = sessions_dir.join(format!("{}.jsonl", uuid));
+
+        write_jsonl(
+            &path,
+            &[
+                r#"{"kind":0,"v":{"requests":[{"requestId":"r3","timestamp":1783918320000,"agent":{"id":"github.copilot"}}]}}"#,
+                r#"{"kind":1,"k":["requests",0,"promptTokens"],"v":18561}"#,
+                r#"{"kind":1,"k":["requests",0,"completionTokens"],"v":143}"#,
+                r#"{"kind":1,"k":["requests",0,"result"],"v":{"metadata":{"promptTokens":18561,"outputTokens":143,"resolvedModel":"gpt-5.6-luna"}}}"#,
+            ],
+        );
+
+        let messages = parse_copilot_vscode_sessions(&[path]);
+        assert_eq!(messages.len(), 1);
+        let m = &messages[0];
+        assert_eq!(m.model_id, "gpt-5.6-luna");
+        assert_eq!(m.tokens.input, 18561);
+        assert_eq!(m.tokens.output, 143);
+    }
+
+    #[test]
+    fn nested_kind2_appends_do_not_shift_kind1_request_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("chatSessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let uuid = "850e8400-e29b-41d4-a716-446655440003";
+        let path = sessions_dir.join(format!("{}.jsonl", uuid));
+
+        // Mirrors a real multi-request session: placeholder requests arrive
+        // without token data, kind-1 updates fill them in by position, and
+        // response parts stream in as nested kind-2 appends in between. If
+        // the nested append leaked into the top-level requests vec, the
+        // kind-1 updates for index 1 would land on a response part instead
+        // of r1, minting a timestamp-0 message with r1's tokens.
+        write_jsonl(
+            &path,
+            &[
+                r#"{"kind":0,"v":{"requests":[{"requestId":"r0","timestamp":1783918330000,"agent":{"id":"github.copilot"}}]}}"#,
+                r#"{"kind":1,"k":["requests",0,"promptTokens"],"v":12000}"#,
+                r#"{"kind":1,"k":["requests",0,"completionTokens"],"v":120}"#,
+                r#"{"kind":1,"k":["requests",0,"result"],"v":{"metadata":{"promptTokens":12000,"outputTokens":120,"resolvedModel":"gpt-5.3-codex"}}}"#,
+                r#"{"kind":2,"k":["requests",0,"response"],"v":[{"kind":"markdownContent","value":"part1"},{"kind":"markdownContent","value":"part2"},{"kind":"toolInvocationSerialized"}]}"#,
+                r#"{"kind":2,"k":["requests"],"v":[{"requestId":"r1","timestamp":1783918340000,"agent":{"id":"github.copilot"}}]}"#,
+                r#"{"kind":1,"k":["requests",1,"promptTokens"],"v":15000}"#,
+                r#"{"kind":1,"k":["requests",1,"completionTokens"],"v":250}"#,
+                r#"{"kind":1,"k":["requests",1,"result"],"v":{"metadata":{"promptTokens":15000,"outputTokens":250,"resolvedModel":"gpt-5.6-luna"}}}"#,
+            ],
+        );
+
+        let messages = parse_copilot_vscode_sessions(&[path]);
+        assert_eq!(messages.len(), 2);
+
+        let m0 = &messages[0];
+        assert_eq!(m0.timestamp, 1783918330000);
+        assert_eq!(m0.model_id, "gpt-5.3-codex");
+        assert_eq!(m0.tokens.input, 12000);
+        assert_eq!(m0.tokens.output, 120);
+
+        let m1 = &messages[1];
+        assert_eq!(m1.timestamp, 1783918340000);
+        assert_eq!(m1.model_id, "gpt-5.6-luna");
+        assert_eq!(m1.tokens.input, 15000);
+        assert_eq!(m1.tokens.output, 250);
     }
 }
