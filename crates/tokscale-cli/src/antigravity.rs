@@ -15,8 +15,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const MAX_RPC_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_IDENTITY_PROBE_BYTES: usize = 4096;
 const ANTIGRAVITY_MANIFEST_VERSION: i32 = 1;
+
+#[cfg(not(target_os = "windows"))]
 static HTTPS_RPC_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+#[cfg(not(target_os = "windows"))]
 static HTTPS_RPC_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
 static RPC_TRANSPORT: OnceLock<Mutex<HashMap<u16, RpcTransport>>> = OnceLock::new();
 
 /// Which transport an Antigravity RPC port has already answered on.
@@ -1134,6 +1139,7 @@ fn is_antigravity_process(command: &str) -> bool {
         || lower.contains("\\antigravity\\")
 }
 
+#[cfg(not(target_os = "windows"))]
 fn process_executable_path(pid: u32) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
@@ -1261,6 +1267,7 @@ fn parse_port_from_windows_address(address: &str) -> Option<u16> {
     port.parse::<u16>().ok()
 }
 
+#[cfg(not(target_os = "windows"))]
 fn run_port_query(program: &str, warning_label: &str, args: &[&str]) -> Result<Vec<u16>> {
     match run_command(program, args) {
         Ok(output) => Ok(parse_ports(&output)),
@@ -1283,6 +1290,7 @@ fn is_command_not_found(err: &anyhow::Error) -> bool {
     })
 }
 
+#[cfg(not(target_os = "windows"))]
 fn parse_ports(output: &str) -> Vec<u16> {
     let mut ports = Vec::new();
     for line in output.lines() {
@@ -1293,6 +1301,7 @@ fn parse_ports(output: &str) -> Vec<u16> {
     ports
 }
 
+#[cfg(not(target_os = "windows"))]
 fn parse_port_from_line(line: &str) -> Option<u16> {
     for token in line.split_whitespace() {
         if let Some(port) = token
@@ -1598,6 +1607,7 @@ fn contains_antigravity_marker(value: &Value) -> bool {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn run_command(program: &str, args: &[&str]) -> Result<String> {
     let output = run_command_output(program, args)?;
 
@@ -1938,6 +1948,129 @@ fn https_rpc_request(
     method: &str,
     body: &Value,
 ) -> Result<Value> {
+    // On Windows, the reqwest (rustls) request to the local DesktopAgent
+    // stalls until the timeout, while the in-box curl.exe (SChannel) completes
+    // the same request instantly (#1129). The mechanism is unverified, so the
+    // request is handed to curl.exe instead of guessing at a rustls-side fix.
+    // `--http1.1` is a defensive pin: unlike this workspace's reqwest build
+    // (no `http2` feature), curl can negotiate h2 via ALPN.
+    #[cfg(target_os = "windows")]
+    {
+        // curl config-file values are enclosed in double quotes, inside which
+        // backslashes and double quotes must be backslash-escaped.
+        fn curl_config_quote(value: &str) -> String {
+            let mut quoted = String::with_capacity(value.len() + 2);
+            quoted.push('"');
+            for ch in value.chars() {
+                if matches!(ch, '\\' | '"') {
+                    quoted.push('\\');
+                }
+                quoted.push(ch);
+            }
+            quoted.push('"');
+            quoted
+        }
+
+        let url = format!(
+            "https://127.0.0.1:{}/exa.language_server_pb.LanguageServerService/{}",
+            connection.port, method
+        );
+        let body_str = serde_json::to_string(body)?;
+
+        // Resolve curl.exe by absolute path: a PATH lookup can be shadowed by
+        // a user-writable directory, handing the CSRF token to an impostor.
+        let system32_curl = std::env::var_os("SystemRoot")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("C:\\Windows"))
+            .join("System32\\curl.exe");
+
+        let mut child = std::process::Command::new(&system32_curl)
+            .args([
+                "-k",
+                "-sS",
+                "--http1.1",
+                "--max-time",
+                "10",
+                "-X",
+                "POST",
+                &url,
+                "-H",
+                "Content-Type: application/json",
+                "-H",
+                "Connect-Protocol-Version: 1",
+                "-K",
+                "-",
+                "--write-out",
+                "\\n%{http_code}",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .with_context(|| "Failed to execute curl.exe for Windows RPC fallback")?;
+
+        // The CSRF token and body ride stdin (`-K -`) rather than argv, which
+        // any same-user process can read.
+        let config = format!(
+            "header = {}\ndata = {}\n",
+            curl_config_quote(&format!("X-Codeium-Csrf-Token: {}", connection.csrf_token)),
+            curl_config_quote(&body_str),
+        );
+        child
+            .stdin
+            .take()
+            .context("curl.exe stdin unavailable for Windows RPC fallback")?
+            .write_all(config.as_bytes())
+            .context("Failed to write curl.exe config for Windows RPC fallback")?;
+
+        let output = child
+            .wait_with_output()
+            .with_context(|| "Failed to execute curl.exe for Windows RPC fallback")?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "Windows curl.exe RPC fallback failed (exit code {}): {}",
+                output
+                    .status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        if output.stdout.len() > MAX_RPC_BODY_BYTES {
+            anyhow::bail!(
+                "Antigravity RPC body of {} bytes exceeds {MAX_RPC_BODY_BYTES} cap",
+                output.stdout.len()
+            );
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (response_body, status_line) = stdout.rsplit_once('\n').with_context(|| {
+            format!("curl.exe returned no HTTP status for Antigravity RPC {method}")
+        })?;
+        let status: u16 = status_line.trim().parse().with_context(|| {
+            format!(
+                "curl.exe returned unparseable HTTP status {:?} for Antigravity RPC {method}",
+                status_line.trim()
+            )
+        })?;
+        if !(200..300).contains(&status) {
+            anyhow::bail!(
+                "Antigravity HTTPS RPC {} failed with status {}: {}",
+                method,
+                status,
+                response_body
+            );
+        }
+
+        serde_json::from_str(response_body).with_context(|| {
+            format!("Failed to parse Antigravity RPC {method} response from curl.exe")
+        })
+    }
+
+    #[cfg(not(target_os = "windows"))]
     antigravity_https_runtime().block_on(async {
         let url = format!(
             "https://127.0.0.1:{}/exa.language_server_pb.LanguageServerService/{}",
@@ -1965,6 +2098,7 @@ fn https_rpc_request(
     })
 }
 
+#[cfg(not(target_os = "windows"))]
 fn antigravity_https_runtime() -> &'static tokio::runtime::Runtime {
     HTTPS_RPC_RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_current_thread()
@@ -1974,6 +2108,7 @@ fn antigravity_https_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+#[cfg(not(target_os = "windows"))]
 fn antigravity_https_client() -> &'static reqwest::Client {
     HTTPS_RPC_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
@@ -1994,6 +2129,7 @@ fn antigravity_https_client() -> &'static reqwest::Client {
     })
 }
 
+#[cfg(not(target_os = "windows"))]
 async fn read_reqwest_response_with_cap(
     mut response: reqwest::Response,
     max_body_bytes: usize,
@@ -2714,6 +2850,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn parse_port_from_line_reads_lsof_output() {
         assert_eq!(
             parse_port_from_line("proc 123 user 12u IPv4 0x0 0t0 TCP 127.0.0.1:41234 (LISTEN)"),
@@ -2974,6 +3111,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn run_port_query_treats_missing_lsof_as_empty() {
         let ports = run_port_query(
             "__tokscale_missing_lsof__",
