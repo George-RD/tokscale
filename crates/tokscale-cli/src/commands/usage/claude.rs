@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use anyhow::Result;
 use serde::Deserialize;
 
@@ -6,6 +8,57 @@ use super::{UsageMetric, UsageOutput};
 
 const BETA_HEADER: &str = "oauth-2025-04-20";
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+
+// Unix-epoch second; 0 = no cooldown.
+static COOLDOWN_UNTIL: AtomicU64 = AtomicU64::new(0);
+
+/// Longest cooldown a `Retry-After` header can impose. A misbehaving proxy
+/// that emits milliseconds instead of seconds (or a far-future date) must not
+/// park the fetcher for hours.
+const MAX_RETRY_AFTER_SECS: u64 = 3600;
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn set_cooldown(retry_after_secs: u64) {
+    let deadline = now_epoch_secs().saturating_add(retry_after_secs);
+    COOLDOWN_UNTIL.store(deadline, Ordering::Release);
+}
+
+/// RFC 9110 allows `Retry-After` as delta-seconds or as an HTTP-date; a date
+/// already in the past counts as zero. Both forms are clamped to
+/// [`MAX_RETRY_AFTER_SECS`].
+fn parse_retry_after(value: &str) -> Option<u64> {
+    let secs = value.parse::<u64>().ok().or_else(|| {
+        chrono::DateTime::parse_from_rfc2822(value)
+            .ok()
+            .map(|d| (d.timestamp() - chrono::Utc::now().timestamp()).max(0) as u64)
+    })?;
+    Some(secs.min(MAX_RETRY_AFTER_SECS))
+}
+
+fn cooldown_remaining() -> Option<u64> {
+    let deadline = COOLDOWN_UNTIL.load(Ordering::Acquire);
+    if deadline == 0 {
+        return None;
+    }
+    let now = now_epoch_secs();
+    if now >= deadline {
+        COOLDOWN_UNTIL.store(0, Ordering::Release);
+        None
+    } else {
+        Some(deadline - now)
+    }
+}
+
+#[cfg(test)]
+fn clear_cooldown() {
+    COOLDOWN_UNTIL.store(0, Ordering::Release);
+}
 
 // `~/.claude/.credentials.json` belongs to Claude Code, and this module is a
 // quota viewer: it reads that file and never writes it. Tokscale used to
@@ -165,6 +218,16 @@ async fn fetch_usage(
             "Claude usage unavailable: stored access token was rejected (HTTP {status}). \
              Run 'claude' so Claude Code can refresh its own login, then retry."
         );
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let wait = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_after)
+            .unwrap_or(5);
+        set_cooldown(wait);
+        anyhow::bail!("Claude usage rate-limited (HTTP 429), cooling down for {wait}s");
     }
     if !status.is_success() {
         anyhow::bail!("Claude usage request failed (HTTP {status})");
@@ -336,6 +399,10 @@ fn usage_metrics(resp: &UsageResponse) -> Vec<UsageMetric> {
 /// this orchestration, so it is the layer the tests must enter; [`fetch`] is one
 /// call with the production values and holds no logic that could diverge.
 fn fetch_blocking(usage_url: &str, read: CredentialReader) -> Result<UsageOutput> {
+    if let Some(remaining) = cooldown_remaining() {
+        anyhow::bail!("Claude usage rate-limited — retry in {remaining}s.");
+    }
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -559,6 +626,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn rejected_token_leaves_claude_credentials_untouched() {
+        clear_cooldown();
         let home = HomeGuard::new("401");
         home.write_fixture();
         let before = std::fs::read(home.credentials()).expect("read before");
@@ -585,6 +653,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn forbidden_response_leaves_claude_credentials_untouched() {
+        clear_cooldown();
         let home = HomeGuard::new("403");
         home.write_fixture();
         let before = std::fs::read(home.credentials()).expect("read before");
@@ -608,6 +677,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn rejected_token_does_not_create_a_credential_file() {
+        clear_cooldown();
         let home = HomeGuard::new("nofile");
         let (usage_url, log) = spawn_usage_server(401);
 
@@ -624,6 +694,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn successful_usage_fetch_leaves_claude_credentials_untouched() {
+        clear_cooldown();
         let home = HomeGuard::new("200");
         home.write_fixture();
         let before = std::fs::read(home.credentials()).expect("read before");
@@ -1122,5 +1193,88 @@ mod tests {
             !debug.contains("claude-code-owned-refresh-token"),
             "Oauth still models a refresh token: {debug}"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cooldown_is_inactive_by_default() {
+        clear_cooldown();
+        assert!(cooldown_remaining().is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn set_cooldown_activates_and_expires() {
+        clear_cooldown();
+        set_cooldown(1);
+        assert!(cooldown_remaining().is_some());
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(cooldown_remaining().is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cooldown_blocks_fetch_blocking() {
+        clear_cooldown();
+        set_cooldown(60);
+        let (usage_url, _log) = spawn_usage_server(200);
+        let result = fetch_blocking(&usage_url, keychain_credentials);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("rate-limited"),
+            "expected cooldown error, got: {err}"
+        );
+        clear_cooldown();
+    }
+
+    /// A proxy that emits `Retry-After` in milliseconds -- or any absurdly
+    /// large value -- must not impose an hours-long cooldown.
+    #[test]
+    fn huge_retry_after_clamps_to_the_max() {
+        assert_eq!(
+            parse_retry_after("999999999999"),
+            Some(MAX_RETRY_AFTER_SECS)
+        );
+        assert_eq!(
+            parse_retry_after(&u64::MAX.to_string()),
+            Some(MAX_RETRY_AFTER_SECS)
+        );
+    }
+
+    /// The deadline arithmetic must not overflow even if a huge wait reaches
+    /// `set_cooldown` directly.
+    #[test]
+    #[serial_test::serial]
+    fn set_cooldown_saturates_instead_of_overflowing() {
+        clear_cooldown();
+        set_cooldown(u64::MAX);
+        assert!(cooldown_remaining().is_some());
+        clear_cooldown();
+    }
+
+    /// RFC 9110 also allows `Retry-After` as an HTTP-date. That form must
+    /// yield the actual wait, not fall through to the 5s default and re-hammer
+    /// the endpoint; a date in the past waits for nothing, and a far-future
+    /// date clamps like a huge delta-seconds value does.
+    #[test]
+    fn http_date_retry_after_is_honored() {
+        let http_date =
+            |d: chrono::DateTime<chrono::Utc>| d.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+
+        let soon = http_date(chrono::Utc::now() + chrono::Duration::seconds(120));
+        let wait = parse_retry_after(&soon).expect("HTTP-date Retry-After parses");
+        assert!(
+            (110..=120).contains(&wait),
+            "expected ~120s from {soon}, got {wait}"
+        );
+
+        let past = http_date(chrono::Utc::now() - chrono::Duration::seconds(120));
+        assert_eq!(parse_retry_after(&past), Some(0));
+
+        let far = http_date(chrono::Utc::now() + chrono::Duration::days(30));
+        assert_eq!(parse_retry_after(&far), Some(MAX_RETRY_AFTER_SECS));
+
+        assert_eq!(parse_retry_after("not-a-date"), None);
     }
 }
