@@ -106,11 +106,17 @@ async function fetchUserEmbedStats(
     // Both the rank and the "of N" denominator count rankable users only, so a
     // hidden account neither holds a position nor inflates the total. A hidden
     // user is absent from the CTE, so this returns no row and rank stays null.
+    //
+    // The finite window ranks the way the leaderboard's period tab does —
+    // sequential ROW_NUMBER with the same tie-breakers — so two users on the
+    // same total read the same distinct positions on both surfaces. The
+    // lifetime window keeps shared RANK to match the all-time tab.
     const rankResult = dateRange
       ? await db.execute<{ rank: number; total: number }>(sql`
           WITH rankable AS (
             SELECT
               s.user_id,
+              u.username,
               SUM(d.tokens) AS total_tokens,
               SUM(CAST(d.cost AS DECIMAL(18,4))) AS total_cost
             FROM daily_breakdown d
@@ -119,18 +125,18 @@ async function fetchUserEmbedStats(
             WHERE u.leaderboard_hidden = false
               AND d.date >= ${dateRange.start}
               AND d.date <= ${dateRange.end}
-            GROUP BY s.user_id
+            GROUP BY s.user_id, u.username
           ),
           ranked AS (
             SELECT
               user_id,
-              RANK() OVER (
+              ROW_NUMBER() OVER (
                 ORDER BY
                   ${
                     sortBy === "cost"
-                      ? sql`total_cost DESC`
-                      : sql`total_tokens DESC`
-                  }
+                      ? sql`total_cost DESC, total_tokens DESC`
+                      : sql`total_tokens DESC, total_cost DESC`
+                  }, LOWER(username) ASC, user_id ASC
               ) AS rank
             FROM rankable
           )
@@ -164,9 +170,9 @@ async function fetchUserEmbedStats(
     const rankRow = (
       rankResult as unknown as { rank: number; total: number }[]
     )[0];
-    // Coerced because RANK() is a Postgres bigint, which postgres-js hands
-    // back as a string. Number(undefined) is NaN and falls through to null, so
-    // a missing row behaves as before.
+    // Coerced because RANK()/ROW_NUMBER() are Postgres bigints, which
+    // postgres-js hands back as strings. Number(undefined) is NaN and falls
+    // through to null, so a missing row behaves as before.
     rank = Number(rankRow?.rank) || null;
     rankTotal = Number(rankRow?.total) || null;
   }
