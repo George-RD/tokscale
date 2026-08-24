@@ -435,10 +435,25 @@ pub fn fetch_all_report_with_intent(intent: UsageFetchIntent) -> UsageFetchRepor
 }
 
 fn fetch_all_report_with_codex(codex_fetch: fn() -> UsageFetchReport) -> UsageFetchReport {
-    let active: Vec<_> = usage_providers(Fetch::Multi(codex::fetch_all))
-        .into_iter()
-        .filter(|(_, has, _)| has())
-        .collect();
+    let mut active: Vec<UsageProvider> = Vec::new();
+    // Observability (#947): when a provider is filtered out for lack of
+    // credentials, log what was probed so a missing quota card can be traced
+    // to credential detection rather than the fetch path.
+    for (provider, has, fetch) in usage_providers(Fetch::Multi(codex::fetch_all)) {
+        if has() {
+            active.push((provider, has, fetch));
+        } else {
+            tracing::debug!(
+                provider,
+                probes = ?if provider == "Copilot" {
+                    copilot::credential_probe()
+                } else {
+                    Vec::<String>::new()
+                },
+                "usage provider filtered out: no credentials detected"
+            );
+        }
+    }
 
     if active.is_empty() {
         return UsageFetchReport::default();
@@ -550,7 +565,15 @@ fn render_light(output: &UsageOutput) {
     println!("╰{}╯", "─".repeat(CARD_WIDTH));
 }
 
-pub fn run(json: bool, _light: bool) -> Result<()> {
+pub fn run(json: bool, _light: bool, debug: bool) -> Result<()> {
+    if debug {
+        // Log to stderr so `--json` stdout stays pure JSON for downstream
+        // consumers (see the note in the json branch below).
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("debug")
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
     let report = fetch_all_report_with_intent(UsageFetchIntent::CliReadOnly);
     if json {
         // Keep stdout pure JSON: do NOT emit provider warnings here, since they
