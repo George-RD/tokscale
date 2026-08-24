@@ -1,6 +1,24 @@
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 
+static CURSOR_PRICING_ALIASES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
+    let mut aliases = HashMap::new();
+    for tier in [
+        "cursor-grok-4.6-high",
+        "cursor-grok-4.6-high-fast",
+        "cursor-grok-4.6-low",
+        "cursor-grok-4.6-low-fast",
+        "cursor-grok-4.6-medium",
+        "cursor-grok-4.6-medium-fast",
+        "cursor-grok-4.6-xhigh",
+    ] {
+        aliases.insert(tier, "grok-4.6");
+    }
+    aliases.insert("grok-composer-2.5", "composer-2.5");
+    aliases.insert("grok-composer-2.5-fast", "composer-2.5-fast");
+    aliases
+});
+
 static MODEL_ALIASES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     let mut m = HashMap::new();
     m.insert("big-pickle", "glm-4.7");
@@ -18,6 +36,10 @@ static MODEL_ALIASES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     m.insert("kimi-for-coding", "kimi-k2.7-code");
     m.insert("kimi-for-coding-highspeed", "kimi-k2.7-code-highspeed");
     m.insert("k3", "kimi-k3");
+    // models.dev also publishes `kimi-for-coding/k3-256k` at $0.00, so the
+    // long-context spelling must resolve to the same real moonshotai row as
+    // bare `k3` instead of landing on the zero-priced subscription namespace.
+    m.insert("k3-256k", "kimi-k3");
     // Kimi Work (the Kimi desktop app's agent mode) embeds the same kimi-code
     // kernel and writes the same wire protocol, but reports its own ids.
     // Unaliased they fuzzy-match badly: `k2d6-agent` landed on
@@ -141,8 +163,6 @@ static MODEL_ALIASES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     m.insert("gemini-3-flash", "gemini-3-flash-preview");
     m.insert("gemini-3-flash-c", "gemini-3-flash-preview");
     m.insert("gemini-3-flash-a", "gemini-3.5-flash-high");
-    m.insert("grok-composer-2.5", "composer-2.5");
-    m.insert("grok-composer-2.5-fast", "composer-2.5-fast");
     // OpenAI documents the API spelling below as a moving alias for
     // `gpt-5.6-sol`; Codex records the same alias with its `gpt-` prefix.
     // Keep the API, Codex, and provider-qualified spellings pinned to the
@@ -168,6 +188,9 @@ pub fn resolve_alias(model_id: &str) -> Option<&'static str> {
     if let Some(target) = MODEL_ALIASES.get(lowered.as_str()) {
         return Some(target);
     }
+    if let Some(target) = CURSOR_PRICING_ALIASES.get(lowered.as_str()) {
+        return Some(target);
+    }
     // kimi-code reports some rows as `kimi-code/<id>`. The Kimi parser strips
     // that prefix before pricing, but any other path reaching pricing with the
     // qualified form would otherwise miss every alias above and fall through to
@@ -177,9 +200,13 @@ pub fn resolve_alias(model_id: &str) -> Option<&'static str> {
     MODEL_ALIASES.get(bare).copied()
 }
 
+pub fn uses_cursor_pricing(model_id: &str) -> bool {
+    CURSOR_PRICING_ALIASES.contains_key(model_id.to_lowercase().as_str())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::resolve_alias;
+    use super::{resolve_alias, uses_cursor_pricing};
     use std::collections::HashMap;
 
     #[test]
@@ -233,6 +260,10 @@ mod tests {
             Some("kimi-k2.7-code-highspeed")
         );
         assert_eq!(resolve_alias("k3"), Some("kimi-k3"));
+        // The long-context spelling has its own zero-priced
+        // `kimi-for-coding/k3-256k` row on models.dev, so it must resolve to
+        // the same real moonshotai row as bare `k3`.
+        assert_eq!(resolve_alias("k3-256k"), Some("kimi-k3"));
     }
 
     #[test]
@@ -256,6 +287,35 @@ mod tests {
             resolve_alias("kimi-for-coding-highspeed"),
             Some("kimi-k2.7-code-highspeed")
         );
+    }
+
+    #[test]
+    fn cursor_grok_reasoning_tiers_resolve_to_the_base_model() {
+        for tier in [
+            "cursor-grok-4.6-high",
+            "cursor-grok-4.6-high-fast",
+            "cursor-grok-4.6-low",
+            "cursor-grok-4.6-low-fast",
+            "cursor-grok-4.6-medium",
+            "cursor-grok-4.6-medium-fast",
+            "cursor-grok-4.6-xhigh",
+        ] {
+            assert_eq!(resolve_alias(tier), Some("grok-4.6"), "tier: {tier}");
+            assert!(uses_cursor_pricing(tier), "tier: {tier}");
+        }
+    }
+
+    #[test]
+    fn cursor_pricing_alias_keys_stay_disjoint_from_model_aliases() {
+        // `resolve_alias` consults MODEL_ALIASES first, so a key present in
+        // both maps would resolve through MODEL_ALIASES while
+        // `uses_cursor_pricing` still forced the Cursor catalog for it.
+        for key in super::CURSOR_PRICING_ALIASES.keys() {
+            assert!(
+                !super::MODEL_ALIASES.contains_key(key),
+                "{key} is in both CURSOR_PRICING_ALIASES and MODEL_ALIASES"
+            );
+        }
     }
 
     #[test]
