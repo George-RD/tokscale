@@ -21,7 +21,23 @@
 //! - `gen_metadata.#1`            → chatModel message
 //!   - `#19` (string, optional)  → responseModel (e.g. `gemini-3-flash-a`)
 //!   - `#21` (string, optional)  → model display label (`Gemini 3.6 Flash (High)`)
-//!   - `#9.#4` = `{#1: seconds, #2: nanos}` → per-generation wall-clock time
+//!   - `#9` (message)            → per-generation wall-clock time. Two layouts
+//!     exist depending on the agy version, both handled by
+//!     [`generation_timestamp_ms`]:
+//!     - agy ≤ 1.1.17: `#9.#4` = `{#1: seconds, #2: nanos}` Timestamp.
+//!     - agy 1.1.18: `#4` is gone. `#9` instead carries `#2` = `u64::MAX` (an
+//!       `int64` -1 "unset" sentinel, never a time) and a new `#10` holding 8
+//!       length-delimited bytes. Unlike every other field number here, `#10`'s
+//!       encoding was *not* read off a real database — it is inferred from a
+//!       field dump in issue #1184 — so each candidate reading is range-checked
+//!       *and* pinned to the lifetime of the session that contains it before it
+//!       is accepted. An absolute "is this a believable date" window is not a
+//!       meaningful test for eight opaque bytes: read as a nanosecond count it
+//!       alone covers roughly 2% of the `u64` range, so trying both byte orders
+//!       leaves an arbitrary payload (an id, a hash, a duration) a few percent
+//!       chance of passing as a date. Constraining it to the session's own span
+//!       cuts that by orders of magnitude, because a turn cannot happen before
+//!       the conversation it belongs to nor after the moment we read the file.
 //!   - `#4`                      → usage message
 //!     - `#1` (varint, const)    → fixed system-prompt tokens (≈1132)
 //!     - `#2` (varint)           → newly-processed (non-cached) input tokens
@@ -46,6 +62,7 @@ use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::{pricing, provider_identity, TokenBreakdown};
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
+use std::ops::RangeInclusive;
 use std::path::Path;
 
 pub fn parse_antigravity_cli_file(path: &Path) -> Vec<UnifiedMessage> {
@@ -261,16 +278,16 @@ fn parse_gen_metadata(
     let chat_model = message_field(blob, 1)?;
     let usage = message_field(chat_model, 4)?;
 
-    // Per-generation wall-clock time: `chatModel.#9.#4` is an absolute
-    // `{#1: seconds, #2: nanos}` Timestamp for this turn (same shape as the
-    // session-created stamp), so each turn is dated when it actually happened
-    // rather than at conversation start. Fall back to the session-created
-    // `session_timestamp` when the field is absent or zero (older databases or
-    // malformed rows).
+    // Per-generation wall-clock time for this turn, so each turn is dated when
+    // it actually happened rather than at conversation start. Falls back to the
+    // session-created `session_timestamp` when `chatModel.#9` is absent or no
+    // candidate field in it decodes to a believable time (older databases,
+    // malformed rows, or a `#9` layout this module does not recognise).
+    // `session_timestamp` doubles as the anchor the inferred 1.1.18 reading is
+    // range-checked against, so a turn can only be re-dated to somewhere inside
+    // its own session's lifetime.
     let timestamp = message_field(chat_model, 9)
-        .and_then(|gen| message_field(gen, 4))
-        .and_then(proto_timestamp_ms)
-        .filter(|&ms| ms > 0)
+        .and_then(|gen| generation_timestamp_ms(gen, session_timestamp))
         .unwrap_or(session_timestamp);
 
     // input = fixed system prompt (#1) + newly-processed input (#2). The
@@ -340,8 +357,8 @@ fn parse_gen_metadata(
 /// Read the session-level created-at timestamp and workspace from the single
 /// `trajectory_metadata_blob` row. This timestamp dates the conversation as a
 /// whole and is the per-row fallback for any `gen_metadata` row missing its own
-/// `#9.#4` wall-clock stamp. Falls back to the file mtime when the blob is
-/// absent or undecodable.
+/// per-generation `#9` wall-clock stamp. Falls back to the file mtime when the
+/// blob is absent or undecodable.
 fn read_trajectory_meta(conn: &Connection, path: &Path) -> (i64, Option<String>, Option<String>) {
     let blob: Option<Vec<u8>> = conn
         .query_row(
@@ -374,8 +391,207 @@ fn session_created_ms(blob: &[u8]) -> Option<i64> {
     proto_timestamp_ms(message_field(blob, 2)?)
 }
 
+/// Per-generation wall-clock time from the `chatModel.#9` sub-message.
+///
+/// agy ≤ 1.1.17 writes an explicit `{#1: seconds, #2: nanos}` Timestamp at
+/// `#9.#4`. agy 1.1.18 dropped that field: a decode of a live 1.1.18
+/// `gen_metadata` row (issue #1184) shows `#9` carrying `#2` = `u64::MAX` — an
+/// `int64` -1, i.e. an "unset" sentinel and never a time — plus a new `#10`
+/// holding 8 length-delimited bytes.
+///
+/// No agy 1.1.18 database was available to decode `#10` against, so its layout
+/// is inferred from the byte count rather than observed. Three shapes are
+/// plausible for 8 length-delimited bytes and all three are attempted,
+/// most-structured first (see [`inferred_epoch_ms`]).
+///
+/// Every inferred reading is unit-detected, range-checked, *and* required to
+/// land inside the containing session's own lifetime — `session_timestamp` is
+/// the session-created stamp (or, failing that, the file's mtime). The extra
+/// constraint is what makes the inference safe to act on: a believability
+/// window spanning 2020 to five years out accepts a few percent of arbitrary
+/// eight-byte payloads once both byte orders and all four time units are tried,
+/// which is far too loose for bytes whose meaning is unconfirmed. A turn,
+/// however, cannot predate the conversation that contains it and cannot happen
+/// after we read the file, and that pair of bounds is usually hours or days
+/// wide rather than a decade.
+///
+/// The direction of the trade matters: discarding a real stamp costs only the
+/// conservative known-wrong behaviour of dating the turn at session start,
+/// whereas accepting a wrong one silently corrupts day buckets and the
+/// server-side monotonic ratchet, which has no correction path. When there is
+/// no trustworthy anchor (`session_timestamp` is not positive) no inferred
+/// reading is accepted at all.
+fn generation_timestamp_ms(gen: &[u8], session_timestamp: i64) -> Option<i64> {
+    // agy <= 1.1.17. Tried first and kept on its original `ms > 0` filter, with
+    // no session bound: existing databases and older installs still write it,
+    // and it is an explicitly typed Timestamp read off real databases rather
+    // than an inferred one, so it needs no corroboration to be trusted.
+    if let Some(ms) = message_field(gen, 4)
+        .and_then(proto_timestamp_ms)
+        .filter(|&ms| ms > 0)
+    {
+        return Some(ms);
+    }
+    // agy 1.1.18. `#9.#2` is deliberately never consulted: the only value ever
+    // observed there is the unset sentinel, and `epoch_scalar_to_ms` rejects
+    // that value outright should it reach any other candidate path.
+    message_field(gen, 10).and_then(|payload| inferred_epoch_ms(payload, session_timestamp))
+}
+
+/// Decode the agy 1.1.18 `chatModel.#9.#10` payload as an epoch time.
+///
+/// Candidates, in order:
+///
+/// 1. a nested `{#1: seconds, #2: nanos}` Timestamp — the shape `#4` used, and
+///    the one a schema change would most likely re-home;
+/// 2. a nested message holding the epoch scalar in field 1, as a varint or as a
+///    `fixed64`;
+/// 3. the payload itself as 8 raw `fixed64`-style bytes, little-endian first
+///    (protobuf's own byte order) then big-endian.
+///
+/// A raw IEEE-754 `f64` reading of the same 8 bytes is deliberately *not*
+/// attempted. It is the one candidate whose false-positive rate against a
+/// non-timestamp payload is non-trivial (any double in the 2^30-ish exponent
+/// range decodes to a plausible epoch-second count), and nothing in the field
+/// dump points at it.
+///
+/// The order is deliberate and must be preserved: eight arbitrary bytes are far
+/// likelier to look like an integer than to parse as a well-formed nested
+/// message, so the structurally validated readings are tried before the raw
+/// ones and win whenever both would match.
+///
+/// Every candidate must clear both gates — the absolute
+/// [`plausible_epoch_ms`] check *and* the session window from
+/// [`session_window_ms`] — and each is judged independently, so a reading that
+/// is a believable date but not a believable date *for this session* is
+/// discarded rather than allowed to mask a later candidate. A payload with no
+/// trustworthy session anchor is declined outright.
+fn inferred_epoch_ms(payload: &[u8], session_timestamp: i64) -> Option<i64> {
+    // Sampled once so every candidate for this payload is judged against the
+    // same window, and so a missing anchor short-circuits before any decode.
+    let window = session_window_ms(session_timestamp)?;
+    let accepted = |ms: i64| window.contains(&ms);
+
+    if let Some(ms) =
+        proto_timestamp_ms(payload).filter(|&ms| plausible_epoch_ms(ms) && accepted(ms))
+    {
+        return Some(ms);
+    }
+    if let Some(ms) = varint_field(payload, 1)
+        .and_then(epoch_scalar_to_ms)
+        .filter(|&ms| accepted(ms))
+    {
+        return Some(ms);
+    }
+    if let Some(ms) = fixed64_field(payload, 1)
+        .and_then(epoch_scalar_to_ms)
+        .filter(|&ms| accepted(ms))
+    {
+        return Some(ms);
+    }
+    let raw: [u8; 8] = payload.try_into().ok()?;
+    [u64::from_le_bytes(raw), u64::from_be_bytes(raw)]
+        .into_iter()
+        .filter_map(epoch_scalar_to_ms)
+        .find(|&ms| accepted(ms))
+}
+
+/// agy's "unset" marker for the `#9.#2` int64: -1, which reaches this wire
+/// reader as `u64::MAX`. It is a sentinel, never a time, so it is rejected
+/// before any unit detection can promote it into a date.
+const UNSET_TIME_SENTINEL: u64 = u64::MAX;
+
+/// Interpret a bare integer as an epoch time, detecting its unit by magnitude.
+///
+/// Over the plausible window the four unit ranges are disjoint — 1.7e9 is a
+/// believable second count but an absurd millisecond count, 1.7e12 the reverse,
+/// and so on — so at most one unit can produce an in-window result and the
+/// magnitude names the unit unambiguously. Returns `None` when no unit does,
+/// which is what makes an unrelated 8-byte field (an id, a hash) fall through
+/// to the session-created stamp instead of becoming a wrong date.
+fn epoch_scalar_to_ms(value: u64) -> Option<i64> {
+    if value == UNSET_TIME_SENTINEL {
+        return None;
+    }
+    let value = i64::try_from(value).ok()?;
+    [
+        value.checked_mul(1_000), // seconds
+        Some(value),              // milliseconds
+        Some(value / 1_000),      // microseconds
+        Some(value / 1_000_000),  // nanoseconds
+    ]
+    .into_iter()
+    .flatten()
+    .find(|&ms| plausible_epoch_ms(ms))
+}
+
+/// Whether an epoch-ms value is believable as an Antigravity CLI generation
+/// time: no earlier than 2020-01-01 (the CLI did not exist) and no further than
+/// five years ahead of now (that is clock skew or a misread field, not a turn).
+fn plausible_epoch_ms(ms: i64) -> bool {
+    /// 2020-01-01T00:00:00Z in epoch ms.
+    const MIN_MS: i64 = 1_577_836_800_000;
+    const FIVE_YEARS_MS: i64 = 5 * 365 * 24 * 60 * 60 * 1_000;
+
+    let max_ms = chrono::Utc::now()
+        .timestamp_millis()
+        .saturating_add(FIVE_YEARS_MS);
+    (MIN_MS..=max_ms).contains(&ms)
+}
+
+/// How far *before* the session-created stamp an inferred generation time may
+/// still be accepted.
+///
+/// The session stamp and the generation stamp are written by the same process
+/// on the same machine, so an honest gap in this direction is sub-second; an
+/// hour absorbs a clock adjustment, or a session record flushed a beat after
+/// the first turn was already in flight. It is kept deliberately tight because
+/// the cost is asymmetric: rejecting a real stamp only restores the session-
+/// start dating this module already falls back to, while accepting a wrong one
+/// is uncorrectable downstream. Widening this to days would start handing back
+/// the integer space the session window exists to take away.
+const SESSION_START_TOLERANCE_MS: i64 = 60 * 60 * 1_000;
+
+/// How far *after* the present moment an inferred generation time may still be
+/// accepted.
+///
+/// A turn that has already been written to disk cannot be in the future, so the
+/// only legitimate overshoot is clock skew — and since `now` is read from the
+/// same clock that wrote the file, that too is normally zero. An hour covers a
+/// database copied from a machine whose clock ran ahead, and nothing more:
+/// anything further out is a misread field, not a turn.
+const FUTURE_TOLERANCE_MS: i64 = 60 * 60 * 1_000;
+
+/// The epoch-ms window an *inferred* generation time has to land in to be
+/// believable for this particular session: no earlier than the session began
+/// and no later than the moment the file is being read, each with a small
+/// tolerance.
+///
+/// Returns `None` when `session_timestamp` is not positive — with no anchor
+/// there is nothing to corroborate an inferred reading against, and guessing is
+/// worse than the caller's fallback. If the anchor is itself in the future the
+/// range comes out empty, which rejects every candidate for the same reason.
+///
+/// One consequence is deliberate: when the anchor came from the mtime fallback
+/// rather than `trajectory_metadata_blob` it marks the *last* write to the file,
+/// so every genuine turn sits below it and the inferred reading is declined for
+/// that database. Those rows keep the dating they had before 1.1.18 support
+/// existed, which is the correct outcome — an anchor that is not a session
+/// start cannot vouch for anything.
+fn session_window_ms(session_timestamp: i64) -> Option<RangeInclusive<i64>> {
+    if session_timestamp <= 0 {
+        return None;
+    }
+    let earliest = session_timestamp.saturating_sub(SESSION_START_TOLERANCE_MS);
+    let latest = chrono::Utc::now()
+        .timestamp_millis()
+        .saturating_add(FUTURE_TOLERANCE_MS);
+    Some(earliest..=latest)
+}
+
 /// Decode a protobuf `{#1: seconds, #2: nanos}` Timestamp message to epoch ms.
-/// Shared by the session-created stamp and the per-generation `#9.#4` stamp.
+/// Shared by the session-created stamp, the per-generation `#9.#4` stamp, and
+/// the nested-Timestamp reading of the agy 1.1.18 `#9.#10` payload.
 ///
 /// `seconds` is an unbounded wire varint, so a malformed blob can carry a value
 /// whose `* 1000` overflows `i64` and panics in debug builds. Use checked
@@ -464,7 +680,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 enum Wire<'a> {
     Varint(u64),
     Len(&'a [u8]),
-    Fixed64,
+    Fixed64(u64),
     Fixed32,
 }
 
@@ -507,8 +723,10 @@ impl<'a> ProtoReader<'a> {
         let wire = match tag & 0x7 {
             0 => Wire::Varint(self.read_varint()?),
             1 => {
-                self.pos = self.pos.checked_add(8).filter(|&p| p <= self.buf.len())?;
-                Wire::Fixed64
+                let end = self.pos.checked_add(8).filter(|&p| p <= self.buf.len())?;
+                let bytes: [u8; 8] = self.buf[self.pos..end].try_into().ok()?;
+                self.pos = end;
+                Wire::Fixed64(u64::from_le_bytes(bytes))
             }
             2 => {
                 let len = self.read_varint()? as usize;
@@ -546,6 +764,20 @@ fn varint_field(buf: &[u8], field: u64) -> Option<u64> {
     while let Some((found, wire)) = reader.next_field() {
         if found == field {
             if let Wire::Varint(value) = wire {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+/// First `fixed64` value for `field`, decoded little-endian as protobuf
+/// specifies. Only the inferred agy 1.1.18 timestamp payload reads one.
+fn fixed64_field(buf: &[u8], field: u64) -> Option<u64> {
+    let mut reader = ProtoReader::new(buf);
+    while let Some((found, wire)) = reader.next_field() {
+        if found == field {
+            if let Wire::Fixed64(value) = wire {
                 return Some(value);
             }
         }
@@ -597,6 +829,48 @@ mod tests {
             }
         }
         out
+    }
+
+    fn enc_fixed64(field: u64, value: u64) -> Vec<u8> {
+        let mut out = encode_varint((field << 3) | 1);
+        out.extend_from_slice(&value.to_le_bytes());
+        out
+    }
+
+    /// A believable "just now" instant. Derived from the clock rather than
+    /// pinned to a fixed date so the plausibility window these tests exercise
+    /// cannot drift out from under them.
+    fn recent_epoch_seconds() -> i64 {
+        chrono::Utc::now().timestamp() - 3_600
+    }
+
+    /// One `gen_metadata` blob whose `chatModel.#9` sub-message is exactly
+    /// `gen9`, so a test can drive the timestamp layout directly.
+    fn build_row_with_gen9(gen9: &[u8], response_id: &str) -> Vec<u8> {
+        let mut usage = Vec::new();
+        usage.extend(enc_varint(2, 500)); // input
+        usage.extend(enc_varint(9, 300)); // output
+        usage.extend(enc_len(11, response_id.as_bytes())); // responseId
+
+        let mut chat_model = Vec::new();
+        chat_model.extend(enc_len(4, &usage));
+        chat_model.extend(enc_len(9, gen9));
+        chat_model.extend(enc_len(19, b"gemini-3-flash-a"));
+        enc_len(1, &chat_model)
+    }
+
+    /// Timestamp parsed out of a row carrying `gen9`, with `session_fallback`
+    /// standing in for the session-created stamp.
+    fn gen9_timestamp(gen9: &[u8], session_fallback: i64) -> i64 {
+        let mut seen = HashSet::new();
+        parse_isolated_row(
+            &build_row_with_gen9(gen9, "resp"),
+            "s",
+            session_fallback,
+            &mut seen,
+        )
+        .expect("row parses")
+        .timestamp
     }
 
     /// Parse one row with no conversation-level attribution available, i.e. as
@@ -1038,6 +1312,391 @@ mod tests {
         assert_eq!(
             fallback_msg.timestamp, session_fallback,
             "a row without #9.#4 must use the session-created fallback"
+        );
+    }
+
+    /// agy 1.1.18 replaced `chatModel.#9.#4` with `#2` = `u64::MAX` plus `#10`
+    /// (8 length-delimited bytes). `#10`'s encoding is inferred rather than
+    /// observed, so every shape the parser is willing to accept must yield the
+    /// same per-generation stamp — and none of them may be disturbed by the
+    /// sentinel sitting next to it.
+    #[test]
+    fn agy_1_1_18_gen9_field_10_dates_the_turn() {
+        let session_fallback = 1_781_502_653_000_i64;
+        let seconds = recent_epoch_seconds();
+        let expected_ms = seconds * 1_000;
+        let sentinel = enc_varint(2, u64::MAX);
+
+        // (1) nested {#1: seconds, #2: nanos} Timestamp.
+        let mut nested_ts = Vec::new();
+        nested_ts.extend(enc_varint(1, seconds as u64));
+        nested_ts.extend(enc_varint(2, 250_000_000)); // -> +250ms
+        let mut gen9 = sentinel.clone();
+        gen9.extend(enc_len(10, &nested_ts));
+        assert_eq!(
+            gen9_timestamp(&gen9, session_fallback),
+            expected_ms + 250,
+            "a nested Timestamp in #9.#10 must date the turn"
+        );
+
+        for (unit, scalar) in [
+            ("seconds", seconds as u64),
+            ("millis", (seconds * 1_000) as u64),
+            ("micros", (seconds * 1_000_000) as u64),
+            ("nanos", (seconds * 1_000_000_000) as u64),
+        ] {
+            // (2) nested message holding the scalar in field 1, as a varint...
+            let mut gen9 = sentinel.clone();
+            gen9.extend(enc_len(10, &enc_varint(1, scalar)));
+            assert_eq!(
+                gen9_timestamp(&gen9, session_fallback),
+                expected_ms,
+                "nested varint {unit} must date the turn"
+            );
+
+            // ... and as a fixed64.
+            let mut gen9 = sentinel.clone();
+            gen9.extend(enc_len(10, &enc_fixed64(1, scalar)));
+            assert_eq!(
+                gen9_timestamp(&gen9, session_fallback),
+                expected_ms,
+                "nested fixed64 {unit} must date the turn"
+            );
+
+            // (3) the payload itself as 8 raw fixed64-style bytes.
+            for (order, raw) in [
+                ("little-endian", scalar.to_le_bytes()),
+                ("big-endian", scalar.to_be_bytes()),
+            ] {
+                let mut gen9 = sentinel.clone();
+                gen9.extend(enc_len(10, &raw));
+                assert_eq!(
+                    gen9_timestamp(&gen9, session_fallback),
+                    expected_ms,
+                    "raw {order} {unit} must date the turn"
+                );
+            }
+        }
+    }
+
+    /// Nothing that is not a believable time may become one. Mis-dating a turn
+    /// silently corrupts day buckets and the server-side monotonic ratchet,
+    /// which is worse than the known-wrong session-start stamp this falls back
+    /// to.
+    #[test]
+    fn unrecognised_gen9_payloads_fall_back_to_the_session_timestamp() {
+        let session_fallback = 1_781_502_653_000_i64;
+        let seconds = recent_epoch_seconds();
+
+        // The unset sentinel alone, exactly as agy 1.1.18 writes `#9.#2`.
+        assert_eq!(
+            gen9_timestamp(&enc_varint(2, u64::MAX), session_fallback),
+            session_fallback,
+            "the #9.#2 unset sentinel must never be read as a time"
+        );
+
+        // The same value arriving through the `#10` payload instead.
+        let mut sentinel_payload = enc_varint(2, u64::MAX);
+        sentinel_payload.extend(enc_len(10, &u64::MAX.to_le_bytes()));
+        assert_eq!(
+            gen9_timestamp(&sentinel_payload, session_fallback),
+            session_fallback,
+            "u64::MAX in the #10 payload must never be read as a time"
+        );
+        assert_eq!(epoch_scalar_to_ms(u64::MAX), None);
+
+        // An 8-byte `#10` that is not a timestamp at all (an id, a hash).
+        let opaque = [0x9a, 0x3f, 0x00, 0x11, 0xc4, 0x7e, 0x5d, 0x02];
+        assert_eq!(
+            gen9_timestamp(&enc_len(10, &opaque), session_fallback),
+            session_fallback,
+            "an opaque 8-byte #10 must fall back rather than produce a date"
+        );
+
+        // Right shape, wrong window — in both directions.
+        let stale = 631_152_000_u64; // 1990-01-01, before the CLI existed
+        let far_future = (seconds + 10 * 365 * 24 * 60 * 60) as u64;
+        for bogus in [stale, far_future] {
+            assert_eq!(
+                gen9_timestamp(&enc_len(10, &bogus.to_le_bytes()), session_fallback),
+                session_fallback,
+                "raw out-of-range {bogus} must fall back to the session stamp"
+            );
+            assert_eq!(
+                gen9_timestamp(&enc_len(10, &enc_varint(1, bogus)), session_fallback),
+                session_fallback,
+                "nested out-of-range {bogus} must fall back to the session stamp"
+            );
+        }
+    }
+
+    /// Regression guard for every pre-1.1.18 database: the explicit `#9.#4`
+    /// Timestamp still dates the row, and outranks the inferred `#9.#10`
+    /// reading if a row ever carries both.
+    #[test]
+    fn explicit_field_4_timestamp_outranks_the_inferred_field_10_reading() {
+        let session_fallback = 1_781_502_653_000_i64;
+        let seconds = recent_epoch_seconds();
+
+        let mut explicit = Vec::new();
+        explicit.extend(enc_varint(1, seconds as u64));
+        explicit.extend(enc_varint(2, 500_000_000)); // -> +500ms
+        let mut gen9 = enc_len(4, &explicit);
+
+        // A different but equally believable #10 value that must be ignored.
+        let other = ((seconds - 7_200) * 1_000_000) as u64;
+        gen9.extend(enc_len(10, &other.to_le_bytes()));
+
+        assert_eq!(
+            gen9_timestamp(&gen9, session_fallback),
+            seconds * 1_000 + 500,
+            "the explicit #9.#4 Timestamp must keep priority over #9.#10"
+        );
+    }
+
+    /// The `#9.#4` path is a confirmed representation read off real
+    /// pre-1.1.18 databases, so it is trusted on its own and is deliberately
+    /// *not* bounded by the session window the inferred `#9.#10` readings must
+    /// satisfy. A database whose session-created stamp is missing or wrong must
+    /// not lose the stamp it actually recorded.
+    #[test]
+    fn explicit_field_4_timestamp_is_not_bounded_by_the_session_window() {
+        let session_start = chrono::Utc::now().timestamp_millis() - 3 * 24 * 60 * 60 * 1_000;
+        let long_before_session = 1_609_459_200_i64; // 2021-01-01, years before
+
+        let mut explicit = Vec::new();
+        explicit.extend(enc_varint(1, long_before_session as u64));
+        explicit.extend(enc_varint(2, 0));
+        let gen9 = enc_len(4, &explicit);
+
+        assert_eq!(
+            gen9_timestamp(&gen9, session_start),
+            long_before_session * 1_000,
+            "the explicit #9.#4 Timestamp must stay unbounded by the session window"
+        );
+    }
+
+    /// The inferred `#9.#10` readings only mean anything relative to the
+    /// session that contains them: a turn cannot predate its own conversation
+    /// and cannot happen after the file was read. Both bounds carry a one-hour
+    /// tolerance for clock skew, and both are exercised here from inside and
+    /// outside.
+    #[test]
+    fn inferred_gen9_timestamps_must_land_inside_the_session_window() {
+        const HOUR_MS: i64 = 60 * 60 * 1_000;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let session_start = now_ms - 3 * 24 * 60 * 60 * 1_000;
+
+        // A raw millisecond payload, the shape the parser is likeliest to meet.
+        let payload = |ms: i64| enc_len(10, &(ms as u64).to_le_bytes());
+
+        // Inside: a turn an hour into a three-day-old session.
+        let genuine = session_start + HOUR_MS;
+        assert_eq!(
+            gen9_timestamp(&payload(genuine), session_start),
+            genuine,
+            "a turn inside its own session must still date the row"
+        );
+
+        // Inside: the most recent turn of a session still being written.
+        let latest = now_ms - HOUR_MS;
+        assert_eq!(
+            gen9_timestamp(&payload(latest), session_start),
+            latest,
+            "a turn from minutes ago must still date the row"
+        );
+
+        // Inside the lower tolerance: half an hour before the session stamp is
+        // clock skew, not a different session.
+        let slightly_early = session_start - HOUR_MS / 2;
+        assert_eq!(
+            gen9_timestamp(&payload(slightly_early), session_start),
+            slightly_early,
+            "the one-hour skew allowance below the session stamp must be honoured"
+        );
+
+        // Outside, below: two hours predates the session by more than skew.
+        let before_tolerance = session_start - 2 * HOUR_MS;
+        assert!(
+            plausible_epoch_ms(before_tolerance),
+            "the rejection must come from the session window, not the absolute one"
+        );
+        assert_eq!(
+            gen9_timestamp(&payload(before_tolerance), session_start),
+            session_start,
+            "a stamp beyond the skew allowance below the session start must fall back"
+        );
+
+        // Outside, below: a full day before the session began.
+        let before_session = session_start - 24 * HOUR_MS;
+        assert!(plausible_epoch_ms(before_session));
+        assert_eq!(
+            gen9_timestamp(&payload(before_session), session_start),
+            session_start,
+            "a stamp predating the session must fall back to the session stamp"
+        );
+
+        // Outside, above: believable as a date, impossible as a recorded turn.
+        let far_future = now_ms + 2 * 365 * 24 * HOUR_MS;
+        assert!(
+            plausible_epoch_ms(far_future),
+            "the absolute window still accepts two years out, so only the \
+             session window can reject this"
+        );
+        assert_eq!(
+            gen9_timestamp(&payload(far_future), session_start),
+            session_start,
+            "a stamp in the future must fall back to the session stamp"
+        );
+    }
+
+    /// The reason the session window exists. Eight opaque bytes read as a
+    /// nanosecond count cover ~2% of the `u64` range within the absolute
+    /// window alone, so an id or a hash has a few percent chance of passing as
+    /// a date once both byte orders are tried. This payload is one of them: it
+    /// clears the absolute check outright, and only the session window keeps it
+    /// from silently re-dating a turn to 2023.
+    #[test]
+    fn an_opaque_payload_that_reads_as_a_plausible_date_is_still_rejected() {
+        let session_start = chrono::Utc::now().timestamp_millis() - 3 * 24 * 60 * 60 * 1_000;
+        let opaque = [0x37, 0xa9, 0x5c, 0xd3, 0x1e, 0x4b, 0x62, 0x17];
+
+        // What the absolute gate on its own makes of it: a valid 2023 date.
+        let absolute = epoch_scalar_to_ms(u64::from_le_bytes(opaque))
+            .expect("these bytes do decode under the absolute plausibility window");
+        assert_eq!(
+            absolute, 1_684_991_806_357,
+            "2023-05-25, read as nanoseconds"
+        );
+        assert!(plausible_epoch_ms(absolute));
+
+        // What the session window makes of it: not a turn of this session.
+        assert_eq!(
+            gen9_timestamp(&enc_len(10, &opaque), session_start),
+            session_start,
+            "a payload that only looks like a date must not re-date the turn"
+        );
+    }
+
+    /// No anchor, no inference. When the session-created stamp is missing and
+    /// the mtime fallback produced nothing either, there is nothing to
+    /// corroborate an inferred reading against, so every candidate is declined
+    /// and the caller falls back exactly as it did before the 1.1.18 layout was
+    /// handled at all.
+    #[test]
+    fn a_missing_session_anchor_declines_every_inferred_reading() {
+        let seconds = recent_epoch_seconds();
+        let sentinel = enc_varint(2, u64::MAX);
+
+        for anchor in [0_i64, -1] {
+            // A nested Timestamp...
+            let mut nested_ts = Vec::new();
+            nested_ts.extend(enc_varint(1, seconds as u64));
+            nested_ts.extend(enc_varint(2, 0));
+            let mut gen9 = sentinel.clone();
+            gen9.extend(enc_len(10, &nested_ts));
+            assert_eq!(
+                gen9_timestamp(&gen9, anchor),
+                anchor,
+                "a nested Timestamp must be declined without a session anchor"
+            );
+
+            // ... a nested scalar...
+            let mut gen9 = sentinel.clone();
+            gen9.extend(enc_len(10, &enc_varint(1, seconds as u64)));
+            assert_eq!(
+                gen9_timestamp(&gen9, anchor),
+                anchor,
+                "a nested scalar must be declined without a session anchor"
+            );
+
+            // ... and the raw eight bytes.
+            let mut gen9 = sentinel.clone();
+            gen9.extend(enc_len(10, &(seconds as u64).to_le_bytes()));
+            assert_eq!(
+                gen9_timestamp(&gen9, anchor),
+                anchor,
+                "a raw payload must be declined without a session anchor"
+            );
+        }
+
+        assert!(session_window_ms(0).is_none());
+        assert!(session_window_ms(-1).is_none());
+        assert!(session_window_ms(1).is_some());
+    }
+
+    /// Unit detection is by magnitude, which is only sound because the four
+    /// unit windows do not overlap anywhere in the plausible range.
+    #[test]
+    fn epoch_scalar_unit_detection_is_unambiguous() {
+        let seconds = recent_epoch_seconds();
+        let expected = seconds * 1_000;
+
+        assert_eq!(epoch_scalar_to_ms(seconds as u64), Some(expected));
+        assert_eq!(epoch_scalar_to_ms((seconds * 1_000) as u64), Some(expected));
+        assert_eq!(
+            epoch_scalar_to_ms((seconds * 1_000_000) as u64),
+            Some(expected)
+        );
+        assert_eq!(
+            epoch_scalar_to_ms((seconds * 1_000_000_000) as u64),
+            Some(expected)
+        );
+
+        assert_eq!(epoch_scalar_to_ms(0), None);
+        assert_eq!(epoch_scalar_to_ms(u64::MAX), None);
+    }
+
+    /// The reported failure, end to end: a long-running session whose rows all
+    /// use the 1.1.18 layout must date each row to its own turn instead of
+    /// collapsing every turn onto the session-created date, which is what left
+    /// `--today` empty.
+    #[test]
+    fn agy_1_1_18_rows_are_dated_per_turn_not_at_session_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session-1118.db");
+
+        let session_created_ms = 1_781_502_653_000_i64; // build_trajectory_meta
+        let two_days_ago = recent_epoch_seconds() - 2 * 24 * 60 * 60;
+        let now_ish = recent_epoch_seconds();
+
+        let row = |seconds: i64, id: &str| {
+            let mut gen9 = enc_varint(2, u64::MAX); // the unset sentinel
+            gen9.extend(enc_len(10, &((seconds * 1_000_000) as u64).to_le_bytes()));
+            build_row_with_gen9(&gen9, id)
+        };
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE gen_metadata (idx integer, data blob, size integer);
+                 CREATE TABLE trajectory_metadata_blob (id text, data blob);",
+            )
+            .unwrap();
+            for (idx, blob) in [row(two_days_ago, "turn-1"), row(now_ish, "turn-2")]
+                .iter()
+                .enumerate()
+            {
+                conn.execute(
+                    "INSERT INTO gen_metadata (idx, data, size) VALUES (?1, ?2, 0)",
+                    params![idx as i64, blob],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?1)",
+                params![build_trajectory_meta()],
+            )
+            .unwrap();
+        }
+
+        let messages = parse_antigravity_cli_file(&path);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].timestamp, two_days_ago * 1_000);
+        assert_eq!(messages[1].timestamp, now_ish * 1_000);
+        assert!(
+            messages.iter().all(|m| m.timestamp != session_created_ms),
+            "no row may keep the session-created stamp once #9.#10 decodes"
         );
     }
 
