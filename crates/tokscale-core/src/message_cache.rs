@@ -1248,7 +1248,12 @@ fn parser_version(client: ClientId) -> u32 {
         // First version of the fx (vercel-labs) usage-v2.json parser. Entries
         // are versioned from the start so later parser changes have an
         // obvious local counter to bump, like every other client here.
-        ClientId::Fx => 1,
+        // v1->v2: `total_cost` is optional at both the per-model and the
+        // snapshot level, and its absence is no longer defaulted to an
+        // authoritative $0.00. A snapshot that never carried a cost is
+        // byte-identical before and after, so only this bump discards the v1
+        // rows still holding a provider-reported zero.
+        ClientId::Fx => 2,
         // omp delegates to the shared pi-format parser, so any pi.rs parse
         // change that bumps ClientId::Pi must be evaluated for Omp (and Senpi)
         // too — the shared code path changes what byte-identical omp files
@@ -3629,7 +3634,9 @@ mod tests {
         // related files at all, and the count mismatch alone retires them on
         // the first scan. That is why widening the identity needs no
         // parser_version bump: nothing byte-identical parses differently, and
-        // every pre-existing entry is already rebuilt exactly once.
+        // every pre-existing entry is already rebuilt exactly once. The counter
+        // below reads 2 for an unrelated reason -- the cost-provenance change
+        // in `test_fx_parser_version_invalidates_rows_without_cost_provenance`.
         let legacy = SourceFingerprint {
             related_files: Vec::new(),
             ..moved
@@ -3638,7 +3645,16 @@ mod tests {
             SourceFingerprint::check_fx_path_samples_only(&usage_path, Some(&legacy)),
             Some(FingerprintStatus::Changed(_))
         ));
-        assert_eq!(parser_version(ClientId::Fx), 1);
+        assert_eq!(parser_version(ClientId::Fx), 2);
+    }
+
+    #[test]
+    fn test_fx_parser_version_invalidates_rows_without_cost_provenance() {
+        // A `usage-v2.json` that never carried `total_cost` is byte-identical
+        // before and after the parser stopped stamping its absence as a
+        // provider-reported $0.00, so the fingerprint keeps matching and only
+        // this bump discards the v1 rows still holding the authoritative zero.
+        assert_eq!(parser_version(ClientId::Fx), 2);
     }
 
     #[test]
