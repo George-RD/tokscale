@@ -1986,6 +1986,41 @@ fn windows_curl_rpc_args(url: &str) -> Vec<&str> {
     ]
 }
 
+/// Read at most `max_bytes + 1` bytes out of `reader`.
+///
+/// The ceiling is applied while the bytes are being read rather than to the
+/// finished buffer, so a writer that keeps producing can never make this
+/// allocate past the cap. The one byte of headroom is what separates a
+/// response that exactly fills the cap from one that runs past it: the caller
+/// rejects anything longer than `max_bytes`.
+#[cfg(any(target_os = "windows", test))]
+fn read_curl_stdout_with_cap<R: Read>(reader: R, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    reader.take(max_bytes as u64 + 1).read_to_end(&mut body)?;
+    Ok(body)
+}
+
+/// Keep the first `max_bytes` of `reader`, then read the remainder to EOF and
+/// throw it away.
+///
+/// Both halves are load-bearing. The buffer is bounded because this text only
+/// ever reaches a diagnostic message, so a child that talks forever must not
+/// be able to grow it. The drain is unconditional because a pipe nobody reads
+/// fills up and blocks its writer: with the caller reading the child's stdout
+/// to EOF, a child parked on a full stderr buffer would leave both pipes stuck
+/// for good. Read errors are swallowed on purpose — whatever was captured
+/// before the error is still the most useful thing to report.
+#[cfg(any(target_os = "windows", test))]
+fn drain_curl_stderr_with_cap<R: Read>(mut reader: R, max_bytes: usize) -> Vec<u8> {
+    let mut kept = Vec::new();
+    let _ = reader
+        .by_ref()
+        .take(max_bytes as u64)
+        .read_to_end(&mut kept);
+    let _ = std::io::copy(&mut reader, &mut std::io::sink());
+    kept
+}
+
 fn https_rpc_request(
     connection: &AntigravityConnection,
     method: &str,
@@ -2036,6 +2071,10 @@ fn https_rpc_request(
             .unwrap_or_else(|| std::path::PathBuf::from("C:\\Windows"))
             .join("System32\\curl.exe");
 
+        // curl.exe stderr only ever carries a short diagnostic (`-sS` drops the
+        // progress meter but keeps errors), so this is already generous.
+        const MAX_CURL_STDERR_BYTES: usize = 64 * 1024;
+
         let mut child = std::process::Command::new(&system32_curl)
             .args(windows_curl_rpc_args(&url))
             .stdin(std::process::Stdio::piped())
@@ -2043,6 +2082,27 @@ fn https_rpc_request(
             .stderr(std::process::Stdio::piped())
             .spawn()
             .with_context(|| "Failed to execute curl.exe for Windows RPC fallback")?;
+
+        let child_stdout = child
+            .stdout
+            .take()
+            .context("curl.exe stdout unavailable for Windows RPC fallback")?;
+        let child_stderr = child
+            .stderr
+            .take()
+            .context("curl.exe stderr unavailable for Windows RPC fallback")?;
+
+        // stderr gets its own thread, started before anything is written to
+        // stdin, and that thread reads it to EOF. Reading one pipe to EOF on
+        // this thread while the child sits blocked on a full buffer in the
+        // other is the classic two-pipe deadlock, so neither pipe is ever left
+        // unattended: stdout is read here, stderr is read there, and both keep
+        // moving no matter what the child does with the other one. Only the
+        // first MAX_CURL_STDERR_BYTES are retained; the rest is discarded as
+        // it arrives instead of being buffered.
+        let stderr_drain = std::thread::spawn(move || {
+            drain_curl_stderr_with_cap(child_stderr, MAX_CURL_STDERR_BYTES)
+        });
 
         // The CSRF token and body ride stdin (`-K -`) rather than argv, which
         // any same-user process can read.
@@ -2058,30 +2118,49 @@ fn https_rpc_request(
             .write_all(config.as_bytes())
             .context("Failed to write curl.exe config for Windows RPC fallback")?;
 
-        let output = child
-            .wait_with_output()
-            .with_context(|| "Failed to execute curl.exe for Windows RPC fallback")?;
+        // The cap is enforced while curl is still transferring, not once the
+        // whole response is already in memory: at most MAX_RPC_BODY_BYTES + 1
+        // bytes are ever held. Loopback is fast and `--max-time` leaves a 10s
+        // window, so a DesktopAgent that streams far more than the cap would
+        // otherwise be allowed to allocate all of it and only then be
+        // rejected. Here it is cut off at the ceiling instead.
+        let stdout_bytes = match read_curl_stdout_with_cap(child_stdout, MAX_RPC_BODY_BYTES) {
+            Ok(bytes) if bytes.len() <= MAX_RPC_BODY_BYTES => bytes,
+            outcome => {
+                // Either the ceiling was blown or the pipe read failed. Both
+                // end the transfer: kill curl so it stops streaming into a
+                // pipe nobody is reading, reap it, and only then join the
+                // drain thread, which ends as soon as the child's stderr
+                // handle is gone.
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_drain.join();
+                let bytes =
+                    outcome.context("Failed to read curl.exe response for Windows RPC fallback")?;
+                anyhow::bail!(
+                    "Antigravity RPC body of {} bytes exceeds {MAX_RPC_BODY_BYTES} cap",
+                    bytes.len()
+                );
+            }
+        };
 
-        if !output.status.success() {
+        let status = child
+            .wait()
+            .with_context(|| "Failed to execute curl.exe for Windows RPC fallback")?;
+        let stderr_bytes = stderr_drain.join().unwrap_or_default();
+
+        if !status.success() {
             anyhow::bail!(
                 "Windows curl.exe RPC fallback failed (exit code {}): {}",
-                output
-                    .status
+                status
                     .code()
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "unknown".into()),
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&stderr_bytes)
             );
         }
 
-        if output.stdout.len() > MAX_RPC_BODY_BYTES {
-            anyhow::bail!(
-                "Antigravity RPC body of {} bytes exceeds {MAX_RPC_BODY_BYTES} cap",
-                output.stdout.len()
-            );
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
         let (response_body, status_line) = stdout.rsplit_once('\n').with_context(|| {
             format!("curl.exe returned no HTTP status for Antigravity RPC {method}")
         })?;
@@ -4325,5 +4404,55 @@ mod tests {
         assert_eq!(args.get(max_time + 1).copied(), Some("10"));
         assert!(args.contains(&"\\n%{http_code}"), "{args:?}");
         assert!(args.contains(&url), "{args:?}");
+    }
+
+    /// The Windows fallback itself is compiled out on this host, but the two
+    /// readers that give it its memory bound are not: both are built on every
+    /// target under `cfg(test)`, so the properties that matter are checked
+    /// here instead of only by the Windows CI job.
+    #[test]
+    fn curl_stdout_cap_stops_the_read_instead_of_measuring_the_result() {
+        // `io::repeat` never ends. Anything that buffered the response first
+        // and compared its length afterwards would run until it exhausted
+        // memory; stopping at the ceiling is the only way this returns at all.
+        let body = read_curl_stdout_with_cap(std::io::repeat(b'x'), 64).unwrap();
+        assert_eq!(
+            body.len(),
+            65,
+            "the read must stop one byte past the cap, not at whatever the writer sends"
+        );
+        assert!(
+            body.len() > 64,
+            "that extra byte is what the caller tests to reject an over-cap response"
+        );
+    }
+
+    #[test]
+    fn curl_stdout_exactly_at_the_cap_survives_intact() {
+        // The headroom byte must not turn a response that merely fills the cap
+        // into a rejected one.
+        let source = vec![b'x'; 64];
+        let body = read_curl_stdout_with_cap(source.as_slice(), 64).unwrap();
+        assert_eq!(
+            body, source,
+            "a response at the cap is passed through whole"
+        );
+        assert!(body.len() <= 64, "and is not seen as over the cap");
+    }
+
+    #[test]
+    fn curl_stderr_keeps_a_prefix_but_still_consumes_everything() {
+        let mut source = std::io::Cursor::new(vec![b'e'; 4096]);
+        let kept = drain_curl_stderr_with_cap(&mut source, 128);
+        assert_eq!(
+            kept.len(),
+            128,
+            "only the prefix is buffered for diagnostics"
+        );
+        assert_eq!(
+            source.position(),
+            4096,
+            "the remainder is still consumed; bytes left in the pipe are what block the child"
+        );
     }
 }
