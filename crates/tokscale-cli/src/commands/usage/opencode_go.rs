@@ -1,10 +1,28 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 use super::{UsageMetric, UsageOutput};
 
 const USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
+
+/// Byte ceiling for the usage response body.
+///
+/// The 30s request timeout bounds how long the endpoint may take, not how much
+/// it may send inside that window, and both `Response::text` and
+/// `Response::json` buffer the whole body before anything looks at it. A faulty
+/// endpoint or an intermediary that keeps streaming could therefore allocate
+/// without limit — and usage providers run in a joined scoped-thread fan-out,
+/// so that does not fail one provider, it takes the whole `tokscale usage`
+/// report down with it.
+///
+/// A full snapshot is three window objects and stays well under a kilobyte; the
+/// error shape the server returns on 401/403 is smaller still, and the generic
+/// failure path only ever shows the first 200 characters of a body anyway. 1
+/// MiB leaves three orders of magnitude of headroom for new fields or for an
+/// HTML error page from a CDN, while keeping the worst case this provider can
+/// contribute to the fan-out at a single megabyte.
+const MAX_USAGE_BODY_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct ApiResponse {
@@ -154,9 +172,66 @@ pub fn has_credentials() -> bool {
             .unwrap_or(false)
 }
 
+/// Reads at most `max_body_bytes` of the usage response.
+///
+/// `Content-Length` is consulted first so an oversized body is refused before a
+/// single byte of it is read, but it is never the only check: the header is
+/// optional, and a server is free to understate it. The loop below therefore
+/// enforces the same ceiling on what actually arrives, aborting at the chunk
+/// that would cross it instead of reading to the end and measuring afterwards.
+///
+/// `reqwest` is built here with `default-features = false`, so `bytes_stream()`
+/// (feature `stream`) does not exist. `Response::chunk` is ungated and is the
+/// same primitive `cursor::read_cursor_csv_with_cap` and
+/// `antigravity::read_reqwest_response_with_cap` already use for this job.
+///
+/// Bytes rather than a `String`: the success path deserializes JSON straight
+/// out of this buffer, and the error path decodes with `from_utf8_lossy`, which
+/// is what `Response::text` does without the `charset` feature.
+async fn read_usage_body_with_cap(
+    mut response: reqwest::Response,
+    max_body_bytes: usize,
+) -> Result<Vec<u8>> {
+    if let Some(advertised) = response.content_length() {
+        if advertised > max_body_bytes as u64 {
+            anyhow::bail!(
+                "OpenCode Go usage response is {advertised} bytes, over the {max_body_bytes} byte limit"
+            );
+        }
+    }
+
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("Failed to read the OpenCode Go usage response")?
+    {
+        let read_so_far = body.len().saturating_add(chunk.len());
+        if read_so_far > max_body_bytes {
+            anyhow::bail!(
+                "OpenCode Go usage response exceeds the {max_body_bytes} byte limit (aborted at {read_so_far} bytes)"
+            );
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body)
+}
+
 /// Injected URL and auth path so tests can point at a local server and a
 /// temp credential file without touching the real filesystem or network.
 fn fetch_blocking(usage_url: &str, auth_path: &Path) -> Result<Vec<UsageOutput>> {
+    fetch_blocking_with_cap(usage_url, auth_path, MAX_USAGE_BODY_BYTES)
+}
+
+/// Split from [`fetch_blocking`] so the body-ceiling tests can drive a cap small
+/// enough to reach over a socket, instead of having to move
+/// [`MAX_USAGE_BODY_BYTES`] to prove the ceiling holds.
+fn fetch_blocking_with_cap(
+    usage_url: &str,
+    auth_path: &Path,
+    max_body_bytes: usize,
+) -> Result<Vec<UsageOutput>> {
     let api_key = read_api_key_at(auth_path)?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -174,8 +249,17 @@ fn fetch_blocking(usage_url: &str, auth_path: &Path) -> Result<Vec<UsageOutput>>
             .await?;
 
         let status = resp.status();
+        let body = read_usage_body_with_cap(resp, max_body_bytes).await;
+
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            // A body that could not be read — or that ran past the ceiling —
+            // must not replace the status with a read error: the HTTP code is
+            // the actionable part, which is why the previous
+            // `resp.text().await.unwrap_or_default()` tolerated a failed read
+            // here too. The ceiling still held while those bytes arrived.
+            let body = body
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
             let server_msg = extract_error_message(&body);
 
             if status == reqwest::StatusCode::UNAUTHORIZED {
@@ -198,7 +282,9 @@ fn fetch_blocking(usage_url: &str, auth_path: &Path) -> Result<Vec<UsageOutput>>
             );
         }
 
-        let body: ApiResponse = resp.json().await?;
+        let body = body?;
+        let body: ApiResponse = serde_json::from_slice(&body)
+            .context("Failed to parse the OpenCode Go usage response")?;
         let metrics = usage_metrics(&body);
 
         Ok(vec![UsageOutput {
@@ -224,7 +310,7 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    use crate::commands::usage::test_server::{spawn_server, Seen};
+    use crate::commands::usage::test_server::{spawn_raw_server, spawn_server, Seen};
 
     #[test]
     fn parses_api_key_from_auth_document() {
@@ -675,6 +761,110 @@ mod tests {
             before, after,
             "tokscale must never rewrite OpenCode's auth.json"
         );
+    }
+
+    /// Byte ceiling the body-cap tests run against. Small on purpose: the
+    /// production [`MAX_USAGE_BODY_BYTES`] would have to be moved over a socket
+    /// to reach it, which is exactly the allocation these tests exist to prove
+    /// never happens.
+    const TEST_BODY_CAP: usize = 64 * 1024;
+
+    #[test]
+    #[serial_test::serial]
+    fn oversized_advertised_content_length_is_rejected_before_reading() {
+        // Headers only: the server promises half a gigabyte and then sends
+        // nothing at all. Touching the body would fail as a truncated response,
+        // so surfacing the ceiling error proves the read never started.
+        const ADVERTISED: usize = 512 * 1024 * 1024;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = write_auth(tmp.path(), "sk-test");
+        let _guard = EnvVarGuard::remove("OPENCODE_API_KEY");
+        let base = spawn_raw_server(|_path| {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {ADVERTISED}\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes()
+        });
+
+        let err = fetch_blocking_with_cap(&format!("{base}{USAGE_PATH}"), &auth, TEST_BODY_CAP)
+            .expect_err("an oversized advertised length must be refused up front");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains(&ADVERTISED.to_string())
+                && message.contains(&TEST_BODY_CAP.to_string()),
+            "the error must name both the advertised size and the limit: {message}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn oversized_streamed_body_is_aborted_at_the_ceiling() {
+        // The regression this guards: the body used to be read to the end with
+        // `Response::json` / `Response::text`, so an endpoint streaming inside
+        // the 30s request timeout grew process memory unbounded — and because
+        // usage providers are joined in a scoped-thread fan-out, that took the
+        // whole report down rather than producing one provider error.
+        const SENT: usize = 2 * 1024 * 1024;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = write_auth(tmp.path(), "sk-test");
+        let _guard = EnvVarGuard::remove("OPENCODE_API_KEY");
+        // No Content-Length: HTTP/1.1 reads a `Connection: close` response to
+        // EOF, so the ceiling has to hold on what actually arrives.
+        let base = spawn_raw_server(|_path| {
+            let mut response =
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                    .to_vec();
+            response.extend(std::iter::repeat_n(b'a', SENT));
+            response
+        });
+
+        let err = fetch_blocking_with_cap(&format!("{base}{USAGE_PATH}"), &auth, TEST_BODY_CAP)
+            .expect_err("a body past the ceiling must not be buffered");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains(&TEST_BODY_CAP.to_string()),
+            "the error must name the limit: {message}"
+        );
+        let aborted_at: usize = message
+            .split("aborted at ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|count| count.parse().ok())
+            .unwrap_or_else(|| panic!("the error must report where it stopped: {message}"));
+        assert!(
+            aborted_at < SENT / 2,
+            "the read must stop near the {TEST_BODY_CAP} byte ceiling rather than buffer all \
+             {SENT} bytes, but it held {aborted_at}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn normal_response_under_the_cap_parses_identically() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = write_auth(tmp.path(), "sk-test");
+        let _guard = EnvVarGuard::remove("OPENCODE_API_KEY");
+        let (url, _log) = spawn_usage_server(200, FULL_USAGE_BODY);
+
+        // Production ceiling, so a normal payload is proven to survive the
+        // bounded read exactly as the unbounded one delivered it.
+        let outputs = fetch_blocking_with_cap(&url, &auth, MAX_USAGE_BODY_BYTES)
+            .expect("a normal usage response must still parse");
+        let direct = usage_metrics(&serde_json::from_str::<ApiResponse>(FULL_USAGE_BODY).unwrap());
+
+        assert_eq!(outputs.len(), 1);
+        let metrics = &outputs[0].metrics;
+        assert_eq!(metrics.len(), direct.len());
+        for (from_socket, from_string) in metrics.iter().zip(direct.iter()) {
+            assert_eq!(from_socket.label, from_string.label);
+            assert_eq!(from_socket.used_percent, from_string.used_percent);
+            assert_eq!(from_socket.remaining_percent, from_string.remaining_percent);
+            assert_eq!(from_socket.resets_at, from_string.resets_at);
+            assert_eq!(from_socket.remaining_label, from_string.remaining_label);
+        }
     }
 
     struct EnvVarGuard {
