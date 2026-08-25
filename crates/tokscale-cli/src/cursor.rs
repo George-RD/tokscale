@@ -21,6 +21,24 @@ const CURSOR_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 /// user asked for the sync, so waiting longer beats failing fast.
 const CURSOR_EXPLICIT_SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Ceiling on the usage-CSV response body, enforced *while* the body is read
+/// rather than after it has all arrived. Without it the download buffers
+/// whatever the server sends for as long as the transfer is allowed to run,
+/// and [`CURSOR_EXPLICIT_SYNC_TIMEOUT`] deliberately widens that window to
+/// 120s — so a malformed or runaway response can grow process memory for two
+/// minutes before anything checks that it even looks like CSV.
+///
+/// 64 MiB is generous for a real export and still bounded. The widest row in a
+/// real account export measures 128 bytes including its newline (a fully
+/// quoted `Date,Kind,Model,Max Mode,…` row carrying a long model name), and
+/// the average is ~99 bytes, so the cap admits roughly 524,000 events at
+/// worst-case width and ~680,000 at the average — against 5,038 events
+/// (497 KB) for a heavy personal account with two years of history. That is a
+/// ~130x margin over the largest export actually observed, which leaves room
+/// for a large team account, while holding peak memory for the download to a
+/// fraction of a developer machine's RAM.
+const CURSOR_MAX_CSV_BYTES: usize = 64 * 1024 * 1024;
+
 /// Skip implicit pre-report sync when every expected Cursor account cache file
 /// was modified within this window. Prevents `tokscale models` (and its
 /// siblings) from issuing a Cursor API call on every invocation. The manual
@@ -1020,10 +1038,26 @@ pub async fn fetch_cursor_usage_csv(
     session_token: &str,
     timeout_override: Option<Duration>,
 ) -> Result<String> {
+    fetch_cursor_usage_csv_from(
+        USAGE_CSV_ENDPOINT,
+        session_token,
+        timeout_override,
+        CURSOR_MAX_CSV_BYTES,
+    )
+    .await
+}
+
+/// Body of [`fetch_cursor_usage_csv`] with the endpoint and the byte ceiling
+/// injected, so tests can drive the real path against a local server without
+/// having to move [`CURSOR_MAX_CSV_BYTES`] of data to reach the cap.
+async fn fetch_cursor_usage_csv_from(
+    url: &str,
+    session_token: &str,
+    timeout_override: Option<Duration>,
+    max_body_bytes: usize,
+) -> Result<String> {
     let client = build_cursor_http_client()?;
-    let mut req = client
-        .get(USAGE_CSV_ENDPOINT)
-        .headers(build_cursor_headers(session_token));
+    let mut req = client.get(url).headers(build_cursor_headers(session_token));
 
     if let Some(timeout) = timeout_override {
         req = req.timeout(timeout);
@@ -1043,13 +1077,58 @@ pub async fn fetch_cursor_usage_csv(
         anyhow::bail!("Cursor API returned status {}", response.status());
     }
 
-    let text = response.text().await?;
+    let text = read_cursor_csv_with_cap(response, max_body_bytes).await?;
 
     if !text.starts_with("Date,") {
         anyhow::bail!("Invalid response from Cursor API - expected CSV format");
     }
 
     Ok(text)
+}
+
+/// Reads the usage-CSV body, never holding more than `max_body_bytes` of it.
+///
+/// `Content-Length` is consulted first so an oversized body is refused before a
+/// single byte of it is read, but it is never the only check: the header is
+/// optional, and a server is free to understate it. The loop below therefore
+/// enforces the same ceiling on what actually arrives, aborting at the chunk
+/// that would cross it instead of reading to the end and measuring afterwards.
+///
+/// `reqwest` is built here with `default-features = false`, so `bytes_stream()`
+/// (feature `stream`) does not exist. `Response::chunk` is ungated and is the
+/// same primitive `antigravity::read_reqwest_response_with_cap` uses for this
+/// job. Decoding stays `from_utf8_lossy` because that is what `Response::text`
+/// does without the `charset` feature — the bytes a valid export produces are
+/// unchanged, and a malformed one still degrades the way it always did rather
+/// than turning into a new error.
+async fn read_cursor_csv_with_cap(
+    mut response: reqwest::Response,
+    max_body_bytes: usize,
+) -> Result<String> {
+    if let Some(advertised) = response.content_length() {
+        if advertised > max_body_bytes as u64 {
+            anyhow::bail!(
+                "Cursor usage CSV is {advertised} bytes, over the {max_body_bytes} byte limit"
+            );
+        }
+    }
+
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("Failed to read the Cursor usage CSV response")?
+    {
+        let read_so_far = body.len().saturating_add(chunk.len());
+        if read_so_far > max_body_bytes {
+            anyhow::bail!(
+                "Cursor usage CSV exceeds the {max_body_bytes} byte limit (aborted at {read_so_far} bytes)"
+            );
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 async fn sync_cursor_cache_with_fetcher<F, Fut>(fetch_usage_csv: F) -> SyncCursorResult
@@ -1694,6 +1773,137 @@ mod tests {
     fn test_csv_timeout_override_only_for_explicit_sync() {
         assert_eq!(csv_timeout_override(true), Some(Duration::from_secs(120)));
         assert_eq!(csv_timeout_override(false), None);
+    }
+
+    /// Byte ceiling the usage-CSV download tests run against. Small on purpose:
+    /// the production [`CURSOR_MAX_CSV_BYTES`] would have to be moved over a
+    /// socket to reach it, which is exactly the allocation these tests exist to
+    /// prove never happens.
+    const TEST_CSV_CAP: usize = 64 * 1024;
+
+    /// Minimal one-shot HTTP/1.1 server for the usage-CSV download.
+    ///
+    /// `headers_extra` is written verbatim after the status line so a test can
+    /// advertise a `Content-Length` independently of what it actually sends —
+    /// or omit the header entirely. The thread lingers briefly before dropping
+    /// the socket so a client that rejects a response on its headers alone is
+    /// not racing a FIN, and it ignores write errors: a client that aborts
+    /// mid-transfer resets the connection, which is the behaviour under test.
+    fn serve_csv_once(headers_extra: String, body: Vec<u8>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut request);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\n{headers_extra}Connection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&body);
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        format!("http://{addr}/api/dashboard/export-usage-events-csv")
+    }
+
+    #[test]
+    fn test_usage_csv_over_the_cap_is_rejected_while_streaming() {
+        // The regression this guards: the body used to be read to the end with
+        // `response.text()`, so a runaway export grew process memory for the
+        // whole (now 120s) explicit-sync window before anything looked at it.
+        let mut body = b"Date,Model,Tokens\n".to_vec();
+        while body.len() < 4 * 1024 * 1024 {
+            body.extend_from_slice(b"2026-01-01T00:00:00.000Z,gpt-5,1000\n");
+        }
+        let sent = body.len();
+        // No Content-Length: the ceiling has to hold on what actually arrives.
+        let url = serve_csv_once(String::new(), body);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let err = runtime
+            .block_on(fetch_cursor_usage_csv_from(
+                &url,
+                "session-token",
+                None,
+                TEST_CSV_CAP,
+            ))
+            .expect_err("a body past the ceiling must not be buffered");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains(&TEST_CSV_CAP.to_string()),
+            "the error must name the limit: {message}"
+        );
+        let aborted_at: usize = message
+            .split("aborted at ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|count| count.parse().ok())
+            .unwrap_or_else(|| panic!("the error must report where it stopped: {message}"));
+        assert!(
+            aborted_at < sent / 2,
+            "the read must stop near the {TEST_CSV_CAP} byte ceiling rather than buffer all \
+             {sent} bytes, but it held {aborted_at}"
+        );
+    }
+
+    #[test]
+    fn test_usage_csv_over_advertised_content_length_is_rejected_before_reading() {
+        // Headers only: the server promises half a gigabyte and then sends
+        // nothing at all. Touching the body would fail as a truncated
+        // response, so surfacing the ceiling error proves the read never
+        // started.
+        const ADVERTISED: usize = 512 * 1024 * 1024;
+        let url = serve_csv_once(format!("Content-Length: {ADVERTISED}\r\n"), Vec::new());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let err = runtime
+            .block_on(fetch_cursor_usage_csv_from(
+                &url,
+                "session-token",
+                None,
+                TEST_CSV_CAP,
+            ))
+            .expect_err("an oversized advertised length must be refused up front");
+        let message = format!("{err:#}");
+
+        assert!(
+            message.contains(&ADVERTISED.to_string())
+                && message.contains(&TEST_CSV_CAP.to_string()),
+            "the error must name both the advertised size and the limit: {message}"
+        );
+    }
+
+    #[test]
+    fn test_usage_csv_under_the_cap_is_returned_unchanged() {
+        let csv = concat!(
+            "Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),",
+            "Cache Read,Output Tokens,Total Tokens,Cost\n",
+            "\"2026-01-01T00:00:00.000Z\",\"Included\",\"claude-4.5-opus\",\"No\",\"862\",",
+            "\"8\",\"37204\",\"662\",\"38736\",\"0.04\"\n",
+            "\"2026-01-02T00:00:00.000Z\",\"Included\",\"gpt-5\",\"Yes\",\"12\",",
+            "\"3\",\"400\",\"55\",\"470\",\"0.01\"\n",
+        );
+        let url = serve_csv_once(
+            format!("Content-Length: {}\r\n", csv.len()),
+            csv.as_bytes().to_vec(),
+        );
+
+        // Production configuration: the real ceiling and the explicit-sync
+        // timeout, so a normal export is proven to survive the bounded read.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let text = runtime
+            .block_on(fetch_cursor_usage_csv_from(
+                &url,
+                "session-token",
+                csv_timeout_override(true),
+                CURSOR_MAX_CSV_BYTES,
+            ))
+            .expect("a normal export must still sync");
+
+        assert_eq!(text, csv, "the bounded read must return the body verbatim");
+        assert_eq!(count_cursor_csv_rows(&text), 2);
     }
 
     #[test]
