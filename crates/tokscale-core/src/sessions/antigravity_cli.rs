@@ -31,10 +31,12 @@
 //!       encoding was *not* read off a real database — it is inferred from a
 //!       field dump in issue #1184 — so each candidate reading is range-checked
 //!       *and* pinned to the lifetime of the session that contains it before it
-//!       is accepted. An absolute "is this a believable date" window is not a
-//!       meaningful test for eight opaque bytes: read as a nanosecond count it
-//!       alone covers roughly 2% of the `u64` range, so trying both byte orders
-//!       leaves an arbitrary payload (an id, a hash, a duration) a few percent
+//!       is accepted, and is declined outright when that lifetime is unknown —
+//!       i.e. `trajectory_metadata_blob` held no decodable created-at. An
+//!       absolute "is this a believable date" window is not a meaningful test
+//!       for eight opaque bytes: read as a nanosecond count it alone covers
+//!       roughly 2% of the `u64` range, so trying both byte orders leaves an
+//!       arbitrary payload (an id, a hash, a duration) a few percent
 //!       chance of passing as a date. Constraining it to the session's own span
 //!       cuts that by orders of magnitude, because a turn cannot happen before
 //!       the conversation it belongs to nor after the moment we read the file.
@@ -76,7 +78,7 @@ pub fn parse_antigravity_cli_file(path: &Path) -> Vec<UnifiedMessage> {
         .unwrap_or("unknown")
         .to_string();
 
-    let (timestamp, workspace_key, workspace_label) = read_trajectory_meta(&conn, path);
+    let meta = read_trajectory_meta(&conn, path);
 
     // Buffered rather than streamed so a row missing its own `#19` can borrow
     // attribution from anywhere in the conversation, not just from rows that
@@ -100,17 +102,20 @@ pub fn parse_antigravity_cli_file(path: &Path) -> Vec<UnifiedMessage> {
     let mut messages = Vec::new();
     let mut seen_response_ids: HashSet<String> = HashSet::new();
     for blob in &blobs {
-        // `timestamp` is the session-created fallback; each row prefers its own
-        // per-generation wall-clock stamp (see `parse_gen_metadata`).
+        // `fallback_ms` is the per-row timestamp fallback; each row prefers its
+        // own per-generation wall-clock stamp (see `parse_gen_metadata`).
+        // `created_ms` travels separately because only a genuinely decoded
+        // session created-at may anchor the inferred 1.1.18 reading.
         if let Some(mut message) = parse_gen_metadata(
             blob,
             &session_id,
-            timestamp,
+            meta.fallback_ms,
+            meta.created_ms,
             &session_models,
             &mut seen_response_ids,
         ) {
-            if workspace_key.is_some() {
-                message.set_workspace(workspace_key.clone(), workspace_label.clone());
+            if meta.workspace_key.is_some() {
+                message.set_workspace(meta.workspace_key.clone(), meta.workspace_label.clone());
             }
             messages.push(message);
         }
@@ -272,6 +277,7 @@ fn parse_gen_metadata(
     blob: &[u8],
     session_id: &str,
     session_timestamp: i64,
+    session_anchor: Option<i64>,
     session_models: &SessionModels,
     seen_response_ids: &mut HashSet<String>,
 ) -> Option<UnifiedMessage> {
@@ -279,15 +285,19 @@ fn parse_gen_metadata(
     let usage = message_field(chat_model, 4)?;
 
     // Per-generation wall-clock time for this turn, so each turn is dated when
-    // it actually happened rather than at conversation start. Falls back to the
-    // session-created `session_timestamp` when `chatModel.#9` is absent or no
-    // candidate field in it decodes to a believable time (older databases,
-    // malformed rows, or a `#9` layout this module does not recognise).
-    // `session_timestamp` doubles as the anchor the inferred 1.1.18 reading is
-    // range-checked against, so a turn can only be re-dated to somewhere inside
-    // its own session's lifetime.
+    // it actually happened rather than at conversation start. Falls back to
+    // `session_timestamp` when `chatModel.#9` is absent or no candidate field
+    // in it decodes to a believable time (older databases, malformed rows, or a
+    // `#9` layout this module does not recognise).
+    //
+    // `session_anchor` is the created-at actually decoded from
+    // `trajectory_metadata_blob`, and it alone bounds the inferred 1.1.18
+    // reading, so a turn can only be re-dated to somewhere inside its own
+    // session's lifetime. It is deliberately not `session_timestamp`: that one
+    // degrades to the file mtime, which dates the last write to the database
+    // rather than the start of the conversation and so vouches for nothing.
     let timestamp = message_field(chat_model, 9)
-        .and_then(|gen| generation_timestamp_ms(gen, session_timestamp))
+        .and_then(|gen| generation_timestamp_ms(gen, session_anchor))
         .unwrap_or(session_timestamp);
 
     // input = fixed system prompt (#1) + newly-processed input (#2). The
@@ -354,12 +364,35 @@ fn parse_gen_metadata(
     ))
 }
 
+/// Session-level facts read from the single `trajectory_metadata_blob` row.
+///
+/// `created_ms` and `fallback_ms` are deliberately kept apart. The decoded
+/// created-at is the only value that dates the *start of the conversation*, and
+/// so the only one allowed to anchor the inferred agy 1.1.18 reading;
+/// `fallback_ms` merely has to produce some timestamp for a row that carries
+/// none, and degrades to the file mtime to do it. Collapsing the two into one
+/// number hands that mtime to the anchor as though it were a session start,
+/// which it is not — it marks the last write to the file, is always positive,
+/// and would therefore pass any "do we have an anchor?" test while corroborating
+/// nothing.
+struct TrajectoryMeta {
+    /// `trajectory_metadata_blob.#2` as epoch ms, or `None` when the table/row
+    /// is absent or the blob does not decode to a positive created-at.
+    created_ms: Option<i64>,
+    /// Per-row timestamp fallback: the created-at when it decoded, else the
+    /// file mtime.
+    fallback_ms: i64,
+    workspace_key: Option<String>,
+    workspace_label: Option<String>,
+}
+
 /// Read the session-level created-at timestamp and workspace from the single
-/// `trajectory_metadata_blob` row. This timestamp dates the conversation as a
-/// whole and is the per-row fallback for any `gen_metadata` row missing its own
-/// per-generation `#9` wall-clock stamp. Falls back to the file mtime when the
-/// blob is absent or undecodable.
-fn read_trajectory_meta(conn: &Connection, path: &Path) -> (i64, Option<String>, Option<String>) {
+/// `trajectory_metadata_blob` row. The created-at dates the conversation as a
+/// whole; the per-row fallback for any `gen_metadata` row missing its own
+/// per-generation `#9` wall-clock stamp drops to the file mtime when the blob
+/// is absent or undecodable. See [`TrajectoryMeta`] for why the two are
+/// reported separately.
+fn read_trajectory_meta(conn: &Connection, path: &Path) -> TrajectoryMeta {
     let blob: Option<Vec<u8>> = conn
         .query_row(
             "SELECT data FROM trajectory_metadata_blob LIMIT 1",
@@ -368,12 +401,12 @@ fn read_trajectory_meta(conn: &Connection, path: &Path) -> (i64, Option<String>,
         )
         .ok();
 
-    let mut timestamp = None;
+    let mut created_ms = None;
     let mut workspace_key = None;
     let mut workspace_label = None;
 
     if let Some(blob) = &blob {
-        timestamp = session_created_ms(blob).filter(|&ms| ms > 0);
+        created_ms = session_created_ms(blob).filter(|&ms| ms > 0);
 
         if let Some(uri) = message_field(blob, 1).and_then(|folder| string_field(folder, 1)) {
             if let Some(path_str) = file_uri_to_path(uri) {
@@ -383,8 +416,12 @@ fn read_trajectory_meta(conn: &Connection, path: &Path) -> (i64, Option<String>,
         }
     }
 
-    let timestamp = timestamp.unwrap_or_else(|| file_modified_ms(path));
-    (timestamp, workspace_key, workspace_label)
+    TrajectoryMeta {
+        created_ms,
+        fallback_ms: created_ms.unwrap_or_else(|| file_modified_ms(path)),
+        workspace_key,
+        workspace_label,
+    }
 }
 
 fn session_created_ms(blob: &[u8]) -> Option<i64> {
@@ -405,9 +442,9 @@ fn session_created_ms(blob: &[u8]) -> Option<i64> {
 /// most-structured first (see [`inferred_epoch_ms`]).
 ///
 /// Every inferred reading is unit-detected, range-checked, *and* required to
-/// land inside the containing session's own lifetime — `session_timestamp` is
-/// the session-created stamp (or, failing that, the file's mtime). The extra
-/// constraint is what makes the inference safe to act on: a believability
+/// land inside the containing session's own lifetime — `session_anchor` is the
+/// created-at decoded from `trajectory_metadata_blob`, and nothing else. The
+/// extra constraint is what makes the inference safe to act on: a believability
 /// window spanning 2020 to five years out accepts a few percent of arbitrary
 /// eight-byte payloads once both byte orders and all four time units are tried,
 /// which is far too loose for bytes whose meaning is unconfirmed. A turn,
@@ -419,9 +456,11 @@ fn session_created_ms(blob: &[u8]) -> Option<i64> {
 /// conservative known-wrong behaviour of dating the turn at session start,
 /// whereas accepting a wrong one silently corrupts day buckets and the
 /// server-side monotonic ratchet, which has no correction path. When there is
-/// no trustworthy anchor (`session_timestamp` is not positive) no inferred
-/// reading is accepted at all.
-fn generation_timestamp_ms(gen: &[u8], session_timestamp: i64) -> Option<i64> {
+/// no trustworthy anchor — `session_anchor` is `None` because the blob was
+/// missing or would not decode, or the value it did decode to is not positive —
+/// no inferred reading is accepted at all, and the row keeps whatever dating it
+/// had before the 1.1.18 layout was handled, mtime fallback included.
+fn generation_timestamp_ms(gen: &[u8], session_anchor: Option<i64>) -> Option<i64> {
     // agy <= 1.1.17. Tried first and kept on its original `ms > 0` filter, with
     // no session bound: existing databases and older installs still write it,
     // and it is an explicitly typed Timestamp read off real databases rather
@@ -435,7 +474,7 @@ fn generation_timestamp_ms(gen: &[u8], session_timestamp: i64) -> Option<i64> {
     // agy 1.1.18. `#9.#2` is deliberately never consulted: the only value ever
     // observed there is the unset sentinel, and `epoch_scalar_to_ms` rejects
     // that value outright should it reach any other candidate path.
-    message_field(gen, 10).and_then(|payload| inferred_epoch_ms(payload, session_timestamp))
+    message_field(gen, 10).and_then(|payload| inferred_epoch_ms(payload, session_anchor))
 }
 
 /// Decode the agy 1.1.18 `chatModel.#9.#10` payload as an epoch time.
@@ -466,10 +505,10 @@ fn generation_timestamp_ms(gen: &[u8], session_timestamp: i64) -> Option<i64> {
 /// is a believable date but not a believable date *for this session* is
 /// discarded rather than allowed to mask a later candidate. A payload with no
 /// trustworthy session anchor is declined outright.
-fn inferred_epoch_ms(payload: &[u8], session_timestamp: i64) -> Option<i64> {
+fn inferred_epoch_ms(payload: &[u8], session_anchor: Option<i64>) -> Option<i64> {
     // Sampled once so every candidate for this payload is judged against the
     // same window, and so a missing anchor short-circuits before any decode.
-    let window = session_window_ms(session_timestamp)?;
+    let window = session_window_ms(session_anchor?)?;
     let accepted = |ms: i64| window.contains(&ms);
 
     if let Some(ms) =
@@ -567,22 +606,24 @@ const FUTURE_TOLERANCE_MS: i64 = 60 * 60 * 1_000;
 /// and no later than the moment the file is being read, each with a small
 /// tolerance.
 ///
-/// Returns `None` when `session_timestamp` is not positive — with no anchor
-/// there is nothing to corroborate an inferred reading against, and guessing is
-/// worse than the caller's fallback. If the anchor is itself in the future the
-/// range comes out empty, which rejects every candidate for the same reason.
+/// The only value that ever reaches here is a created-at decoded from
+/// `trajectory_metadata_blob`. A database whose blob is missing or undecodable
+/// is turned away by the caller instead, because the row fallback it would
+/// otherwise offer is the file mtime — the *last* write to the file, not the
+/// start of the conversation. Building a window on that would both admit an
+/// opaque payload that happens to decode near the mtime and reject a genuine
+/// older turn for sitting below it; those rows keep the dating they had before
+/// 1.1.18 support existed, which is the correct outcome.
 ///
-/// One consequence is deliberate: when the anchor came from the mtime fallback
-/// rather than `trajectory_metadata_blob` it marks the *last* write to the file,
-/// so every genuine turn sits below it and the inferred reading is declined for
-/// that database. Those rows keep the dating they had before 1.1.18 support
-/// existed, which is the correct outcome — an anchor that is not a session
-/// start cannot vouch for anything.
-fn session_window_ms(session_timestamp: i64) -> Option<RangeInclusive<i64>> {
-    if session_timestamp <= 0 {
+/// Returns `None` when `session_created` is not positive — a decoded stamp of
+/// zero is no more of an anchor than a missing one. If the anchor is itself in
+/// the future the range comes out empty, which rejects every candidate for the
+/// same reason.
+fn session_window_ms(session_created: i64) -> Option<RangeInclusive<i64>> {
+    if session_created <= 0 {
         return None;
     }
-    let earliest = session_timestamp.saturating_sub(SESSION_START_TOLERANCE_MS);
+    let earliest = session_created.saturating_sub(SESSION_START_TOLERANCE_MS);
     let latest = chrono::Utc::now()
         .timestamp_millis()
         .saturating_add(FUTURE_TOLERANCE_MS);
@@ -860,13 +901,23 @@ mod tests {
     }
 
     /// Timestamp parsed out of a row carrying `gen9`, with `session_fallback`
-    /// standing in for the session-created stamp.
+    /// standing in for a decoded session-created stamp — i.e. serving as both
+    /// the row fallback and the inference anchor.
     fn gen9_timestamp(gen9: &[u8], session_fallback: i64) -> i64 {
+        gen9_timestamp_anchored(gen9, session_fallback, Some(session_fallback))
+    }
+
+    /// The same, with the inference anchor supplied independently of the row
+    /// fallback, so a test can model a database whose `trajectory_metadata_blob`
+    /// never yielded a created-at while the row fallback is still positive.
+    fn gen9_timestamp_anchored(gen9: &[u8], session_fallback: i64, anchor: Option<i64>) -> i64 {
         let mut seen = HashSet::new();
-        parse_isolated_row(
+        parse_gen_metadata(
             &build_row_with_gen9(gen9, "resp"),
             "s",
             session_fallback,
+            anchor,
+            &SessionModels::default(),
             &mut seen,
         )
         .expect("row parses")
@@ -886,6 +937,7 @@ mod tests {
             blob,
             session_id,
             session_timestamp,
+            Some(session_timestamp),
             &SessionModels::default(),
             seen_response_ids,
         )
@@ -1578,17 +1630,22 @@ mod tests {
         );
     }
 
-    /// No anchor, no inference. When the session-created stamp is missing and
-    /// the mtime fallback produced nothing either, there is nothing to
-    /// corroborate an inferred reading against, so every candidate is declined
-    /// and the caller falls back exactly as it did before the 1.1.18 layout was
-    /// handled at all.
+    /// No anchor, no inference. Without a session-created stamp there is
+    /// nothing to corroborate an inferred reading against, so every candidate is
+    /// declined and the row falls back exactly as it did before the 1.1.18
+    /// layout was handled at all.
+    ///
+    /// The row fallback is held positive throughout, because that is the case
+    /// that matters: `None` here is a database whose `trajectory_metadata_blob`
+    /// did not decode, and its fallback is then the file mtime — positive, but
+    /// no more of an anchor for that.
     #[test]
     fn a_missing_session_anchor_declines_every_inferred_reading() {
         let seconds = recent_epoch_seconds();
         let sentinel = enc_varint(2, u64::MAX);
+        let fallback = 1_781_502_653_000_i64;
 
-        for anchor in [0_i64, -1] {
+        for anchor in [None, Some(0_i64), Some(-1)] {
             // A nested Timestamp...
             let mut nested_ts = Vec::new();
             nested_ts.extend(enc_varint(1, seconds as u64));
@@ -1596,8 +1653,8 @@ mod tests {
             let mut gen9 = sentinel.clone();
             gen9.extend(enc_len(10, &nested_ts));
             assert_eq!(
-                gen9_timestamp(&gen9, anchor),
-                anchor,
+                gen9_timestamp_anchored(&gen9, fallback, anchor),
+                fallback,
                 "a nested Timestamp must be declined without a session anchor"
             );
 
@@ -1605,8 +1662,8 @@ mod tests {
             let mut gen9 = sentinel.clone();
             gen9.extend(enc_len(10, &enc_varint(1, seconds as u64)));
             assert_eq!(
-                gen9_timestamp(&gen9, anchor),
-                anchor,
+                gen9_timestamp_anchored(&gen9, fallback, anchor),
+                fallback,
                 "a nested scalar must be declined without a session anchor"
             );
 
@@ -1614,8 +1671,8 @@ mod tests {
             let mut gen9 = sentinel.clone();
             gen9.extend(enc_len(10, &(seconds as u64).to_le_bytes()));
             assert_eq!(
-                gen9_timestamp(&gen9, anchor),
-                anchor,
+                gen9_timestamp_anchored(&gen9, fallback, anchor),
+                fallback,
                 "a raw payload must be declined without a session anchor"
             );
         }
@@ -1623,6 +1680,75 @@ mod tests {
         assert!(session_window_ms(0).is_none());
         assert!(session_window_ms(-1).is_none());
         assert!(session_window_ms(1).is_some());
+    }
+
+    /// The anchor has to come from `trajectory_metadata_blob`, never from the
+    /// file mtime the row fallback degrades to. An mtime dates the *last write*
+    /// to the database, so a `#9.#10` payload landing anywhere near it sails
+    /// through a window built on it while proving nothing about when the turn
+    /// happened — and a genuinely older turn gets rejected for sitting below it.
+    /// Driven end to end through the real SQLite path, because the mtime only
+    /// enters the picture there. Both shapes that yield no created-at are
+    /// covered: the table missing outright, and a blob present but carrying no
+    /// `#2`.
+    #[test]
+    fn an_mtime_only_session_anchors_no_inference() {
+        const HOUR_MS: i64 = 60 * 60 * 1_000;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Half an hour before the file was written: comfortably inside the
+        // window an mtime anchor would have produced, and inside the absolute
+        // plausibility window too, so only the provenance of the anchor can
+        // reject it.
+        let would_pass_under_mtime = chrono::Utc::now().timestamp_millis() - HOUR_MS / 2;
+        let mut gen9 = enc_varint(2, u64::MAX); // the 1.1.18 unset sentinel
+        gen9.extend(enc_len(10, &(would_pass_under_mtime as u64).to_le_bytes()));
+        let row = build_row_with_gen9(&gen9, "turn-1");
+
+        // (a) `trajectory_metadata_blob` absent entirely.
+        let no_table = dir.path().join("no-meta-table.db");
+        write_conversation(&no_table, std::slice::from_ref(&row));
+
+        // (b) the table and its row present, but the blob carries no created-at.
+        // The workspace still decodes, so this is undecodable only in the one
+        // respect that matters here.
+        let no_created = dir.path().join("no-created-at.db");
+        write_conversation(&no_created, std::slice::from_ref(&row));
+        {
+            let conn = Connection::open(&no_created).unwrap();
+            conn.execute_batch("CREATE TABLE trajectory_metadata_blob (id text, data blob);")
+                .unwrap();
+            let workspace = enc_len(1, b"file:///home/frank/vault");
+            conn.execute(
+                "INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?1)",
+                params![enc_len(1, &workspace)],
+            )
+            .unwrap();
+        }
+
+        for path in [&no_table, &no_created] {
+            let messages = parse_antigravity_cli_file(path);
+            assert_eq!(messages.len(), 1, "{}", path.display());
+
+            let mtime = file_modified_ms(path);
+            assert!(mtime > 0, "the fixture must have a positive mtime");
+            assert!(
+                session_window_ms(mtime)
+                    .expect("a positive mtime does build a window")
+                    .contains(&would_pass_under_mtime),
+                "the payload has to be one an mtime-anchored window would have \
+                 accepted, or this test proves nothing"
+            );
+
+            assert_ne!(
+                messages[0].timestamp, would_pass_under_mtime,
+                "an mtime is not a session start and must not anchor inference"
+            );
+            assert_eq!(
+                messages[0].timestamp, mtime,
+                "with no decoded created-at the row keeps its fallback dating"
+            );
+        }
     }
 
     /// Unit detection is by magnitude, which is only sound because the four
@@ -1650,7 +1776,10 @@ mod tests {
     /// The reported failure, end to end: a long-running session whose rows all
     /// use the 1.1.18 layout must date each row to its own turn instead of
     /// collapsing every turn onto the session-created date, which is what left
-    /// `--today` empty.
+    /// `--today` empty. This is also the positive half of the anchor contract —
+    /// `trajectory_metadata_blob` here does decode a created-at, so inference
+    /// runs; see `an_mtime_only_session_anchors_no_inference` for the case where
+    /// it does not.
     #[test]
     fn agy_1_1_18_rows_are_dated_per_turn_not_at_session_start() {
         let dir = tempfile::tempdir().unwrap();
