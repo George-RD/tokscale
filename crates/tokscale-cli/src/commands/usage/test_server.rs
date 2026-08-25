@@ -77,3 +77,48 @@ where
     });
     (format!("http://{addr}"), log)
 }
+
+/// Starts a local server whose response bytes the caller writes verbatim.
+///
+/// [`spawn_server`] always emits a `Content-Length` that matches the body it
+/// was handed, which is exactly the assumption a body-ceiling test must not
+/// make: the header is optional, and a server is free to advertise a size it
+/// never sends. The handler here returns the whole response — status line,
+/// headers and body — so a test can promise half a gigabyte and send nothing,
+/// or omit the header and stream past the ceiling.
+///
+/// Write errors are ignored on purpose: a client that aborts mid-transfer
+/// resets the connection, and that is the behaviour under test. The thread
+/// lingers briefly before dropping the socket so a client that rejects a
+/// response on its headers alone is not racing a FIN.
+pub(super) fn spawn_raw_server<F>(handler: F) -> String
+where
+    F: FnMut(&str) -> Vec<u8> + Send + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind raw test server");
+    let addr = listener.local_addr().expect("raw test server addr");
+    std::thread::spawn(move || {
+        let mut handler = handler;
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while let Ok(n) = stream.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&buf).to_string();
+            let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+            let response = handler(&path);
+            let _ = stream.write_all(&response);
+            let _ = stream.flush();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    });
+    format!("http://{addr}")
+}
