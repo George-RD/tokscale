@@ -4041,6 +4041,96 @@ fn test_pricing_command_success() {
         .stdout(predicate::str::contains("Output: $15.00 / 1M tokens"));
 }
 
+/// Sub-cent prices have to survive all the way to the terminal, not just
+/// through the formatter. Both keys below are real LiteLLM rows.
+#[test]
+fn test_pricing_command_renders_sub_cent_prices() {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs();
+    let payload = serde_json::to_string(&serde_json::json!({
+        "timestamp": now,
+        "data": {
+            // Ordinary input and output, cache read at $0.003625 / 1M. Two
+            // decimals blanked only the cache line, so the zero read as a real
+            // price sitting next to two believable ones.
+            "tencent/deepseek-v4-pro": {
+                "input_cost_per_token": 0.000000435,
+                "output_cost_per_token": 0.00000087,
+                "cache_read_input_token_cost": 0.000000003625,
+            },
+            // Cache read is exactly $0.005 / 1M, which two decimals rounded up
+            // to twice the real price rather than down to zero.
+            "gpt-5-nano": {
+                "input_cost_per_token": 0.00000005,
+                "output_cost_per_token": 0.0000004,
+                "cache_read_input_token_cost": 0.000000005,
+            },
+        },
+    }))
+    .unwrap();
+    let empty = format!(r#"{{"timestamp":{now},"data":{{}}}}"#);
+    write_canonical_pricing_cache_files(tmp.path(), &payload, &payload, &empty);
+
+    cmd_with_home(tmp.path())
+        .args(["pricing", "tencent/deepseek-v4-pro", "--no-spinner"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Input:  $0.435 / 1M tokens"))
+        .stdout(predicate::str::contains("Output: $0.87 / 1M tokens"))
+        .stdout(predicate::str::contains(
+            "Cache Read:  $0.003625 / 1M tokens",
+        ));
+
+    cmd_with_home(tmp.path())
+        .args(["pricing", "gpt-5-nano", "--no-spinner"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Input:  $0.05 / 1M tokens"))
+        .stdout(predicate::str::contains("Cache Read:  $0.005 / 1M tokens"));
+}
+
+#[test]
+fn test_pricing_list_overrides_renders_sub_cent_prices() {
+    // `pricing list-overrides` reads per-1M values straight out of
+    // custom-pricing.json without scaling, so it shares the lookup path's
+    // formatter but not its arithmetic. Exercise it end to end: a cache-read
+    // override below a cent used to print $0.00, which is indistinguishable
+    // from an override the user never set.
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let config_dir = sandbox_config_dir(tmp.path());
+    fs::create_dir_all(&config_dir).expect("failed to create config dir");
+    fs::write(
+        config_dir.join("custom-pricing.json"),
+        serde_json::to_string(&serde_json::json!({
+            "models": {
+                "acme/sub-cent": {
+                    "input_cost_per_million_tokens": 0.435,
+                    "output_cost_per_million_tokens": 0.87,
+                    "cache_read_input_token_cost_per_million_tokens": 0.003625,
+                    "cache_creation_input_token_cost_per_million_tokens": 0.005,
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .expect("failed to write custom-pricing.json");
+
+    cmd_with_home(tmp.path())
+        .args(["pricing", "list-overrides", "--no-spinner"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("acme/sub-cent"))
+        .stdout(predicate::str::contains("Input:  $0.435 / 1M tokens"))
+        .stdout(predicate::str::contains("Output: $0.87 / 1M tokens"))
+        .stdout(predicate::str::contains(
+            "Cache Read:  $0.003625 / 1M tokens",
+        ))
+        .stdout(predicate::str::contains("Cache Write: $0.005 / 1M tokens"));
+}
+
 #[test]
 fn test_pricing_command_json() {
     let tmp = TempDir::new().expect("failed to create temp dir");

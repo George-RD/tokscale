@@ -3784,18 +3784,24 @@ fn run_pricing_lookup(
                 println!();
                 let input = pricing.pricing.input_cost_per_token.unwrap_or(0.0);
                 let output = pricing.pricing.output_cost_per_token.unwrap_or(0.0);
-                println!("  Input:  ${:.2} / 1M tokens", input * 1_000_000.0);
-                println!("  Output: ${:.2} / 1M tokens", output * 1_000_000.0);
+                println!(
+                    "  Input:  ${} / 1M tokens",
+                    format_per_million(input * 1_000_000.0)
+                );
+                println!(
+                    "  Output: ${} / 1M tokens",
+                    format_per_million(output * 1_000_000.0)
+                );
                 if let Some(cache_read) = pricing.pricing.cache_read_input_token_cost {
                     println!(
-                        "  Cache Read:  ${:.2} / 1M tokens",
-                        cache_read * 1_000_000.0
+                        "  Cache Read:  ${} / 1M tokens",
+                        format_per_million(cache_read * 1_000_000.0)
                     );
                 }
                 if let Some(cache_write) = pricing.pricing.cache_creation_input_token_cost {
                     println!(
-                        "  Cache Write: ${:.2} / 1M tokens",
-                        cache_write * 1_000_000.0
+                        "  Cache Write: ${} / 1M tokens",
+                        format_per_million(cache_write * 1_000_000.0)
                     );
                 }
                 println!();
@@ -3892,21 +3898,80 @@ fn run_pricing_list_overrides(json: bool) -> Result<()> {
     for entry in entries {
         println!("  {}", entry.model_id.bold());
         if let Some(input) = entry.input_cost_per_million_tokens {
-            println!("    Input:  ${:.2} / 1M tokens", input);
+            println!("    Input:  ${} / 1M tokens", format_per_million(input));
         }
         if let Some(output) = entry.output_cost_per_million_tokens {
-            println!("    Output: ${:.2} / 1M tokens", output);
+            println!("    Output: ${} / 1M tokens", format_per_million(output));
         }
         if let Some(cache_read) = entry.cache_read_input_token_cost_per_million_tokens {
-            println!("    Cache Read:  ${:.2} / 1M tokens", cache_read);
+            println!(
+                "    Cache Read:  ${} / 1M tokens",
+                format_per_million(cache_read)
+            );
         }
         if let Some(cache_write) = entry.cache_creation_input_token_cost_per_million_tokens {
-            println!("    Cache Write: ${:.2} / 1M tokens", cache_write);
+            println!(
+                "    Cache Write: ${} / 1M tokens",
+                format_per_million(cache_write)
+            );
         }
     }
     println!();
 
     Ok(())
+}
+
+/// Decimal places `format_per_million` may add past the first significant
+/// digit while looking for a rendering that round-trips back to the value.
+const PER_MILLION_EXTRA_DECIMALS: usize = 8;
+
+/// Render a dollar amount that is already scaled to one million tokens.
+///
+/// Two decimals is $0.01 resolution, and a lot of the pricing sheets live
+/// below that: anything under half a cent per 1M tokens collapses to `$0.00`
+/// and reads as "this model is free" rather than "this price is too small to
+/// show". So precision starts at whatever it takes to keep the first
+/// significant digit — which is what makes a real price impossible to render
+/// as `$0.00` — and escalates from there until the text round-trips.
+///
+/// Two decimals stay the floor in both directions. A genuine zero still
+/// renders `0.00`, so free models keep reading as free, and ordinary prices
+/// keep their cent column instead of being trimmed down to `$0.2`.
+fn format_per_million(amount: f64) -> String {
+    if !amount.is_finite() || amount == 0.0 {
+        return format!("{:.2}", amount);
+    }
+
+    // Leading zeros between the point and the first significant digit, so
+    // `min_decimals` always renders at least one nonzero digit.
+    let leading_zeros = (-amount.abs().log10().floor()).max(0.0) as usize;
+    let min_decimals = leading_zeros.saturating_add(1).max(2);
+    let max_decimals = min_decimals.saturating_add(PER_MILLION_EXTRA_DECIMALS);
+
+    for decimals in min_decimals..=max_decimals {
+        let rendered = format!("{:.*}", decimals, amount);
+        let Ok(parsed) = rendered.parse::<f64>() else {
+            continue;
+        };
+        // Sheet values carry the noise of their own decimal-to-binary
+        // conversion (a $0.10 price arrives as 0.09999999999999999), so accept
+        // the shortest rendering that is within representation error of the
+        // value rather than demanding an exact round-trip.
+        if (parsed - amount).abs() > f64::EPSILON * amount.abs().max(1.0) {
+            continue;
+        }
+        // Escalation overshoots on values that stop early ($0.0028 is reached
+        // at five decimals and renders "0.00280"), so drop the zeros it added.
+        // The decimal point stops the trim, so this cannot eat the integer
+        // part of a round number like "100.00".
+        let trimmed_zeros = rendered.len() - rendered.trim_end_matches('0').len();
+        let kept = decimals.saturating_sub(trimmed_zeros).max(2);
+        return format!("{:.*}", kept, amount);
+    }
+
+    // Smaller than the ceiling can round-trip. `max_decimals` still clears
+    // `leading_zeros`, so the price is visible even here.
+    format!("{:.*}", max_decimals, amount)
 }
 
 fn format_currency(n: f64) -> String {
@@ -6718,6 +6783,72 @@ mod tests {
         calculate_summary, calculate_years, ClientContribution, DailyContribution, DailyTotals,
         GraphMeta, GraphResult, TokenBreakdown,
     };
+
+    /// The overwhelming majority of the pricing sheet is at or above a cent
+    /// per 1M tokens, and that output must not move.
+    #[test]
+    fn format_per_million_keeps_two_decimals_for_ordinary_prices() {
+        // claude-sonnet-4 input/output, as `tokscale pricing` scales them.
+        assert_eq!(format_per_million(0.000003 * 1_000_000.0), "3.00");
+        assert_eq!(format_per_million(0.000015 * 1_000_000.0), "15.00");
+        // Its cache read: $0.30, stored as a value that is not exactly 0.3 in
+        // binary. The cent column has to survive that.
+        assert_eq!(format_per_million(0.0000003 * 1_000_000.0), "0.30");
+        assert_eq!(format_per_million(0.00000375 * 1_000_000.0), "3.75");
+        assert_eq!(format_per_million(0.06), "0.06");
+        assert_eq!(format_per_million(100.0), "100.00");
+    }
+
+    /// A model with no price is a different fact than a model with a small
+    /// one, and `$0.00` belongs to the first.
+    #[test]
+    fn format_per_million_renders_absent_price_as_zero() {
+        assert_eq!(format_per_million(0.0), "0.00");
+    }
+
+    /// The bug: below half a cent per 1M tokens, `{:.2}` rendered a real price
+    /// as free. Values are the ones LiteLLM actually publishes.
+    #[test]
+    fn format_per_million_never_renders_a_real_price_as_free() {
+        // perplexity/pplx-embed-v1-0.6b input.
+        assert_eq!(format_per_million(0.000000004 * 1_000_000.0), "0.004");
+        // fireworks_ai SSD-1B input, the cheapest key on the sheet.
+        assert_eq!(format_per_million(0.00000000013 * 1_000_000.0), "0.00013");
+        // tencent/deepseek-v4-pro cache read, whose input and output stay
+        // visible — so a zero here reads as a real price, not a lost digit.
+        assert_eq!(format_per_million(0.000000003625 * 1_000_000.0), "0.003625");
+        // tencent/deepseek-v4-flash cache read.
+        assert_eq!(format_per_million(0.0000000028 * 1_000_000.0), "0.0028");
+        // meta/muse-spark-1.2-contributor cache read.
+        assert_eq!(format_per_million(0.000000002 * 1_000_000.0), "0.002");
+        // Its input and output are ordinary and must not change alongside.
+        assert_eq!(format_per_million(0.000000435 * 1_000_000.0), "0.435");
+    }
+
+    /// gpt-5-nano and its four siblings sit at exactly $0.005 cache read.
+    /// `5e-9 * 1e6` lands a hair above the rounding boundary in binary, so two
+    /// decimals reported double the real price rather than half of it.
+    #[test]
+    fn format_per_million_shows_exact_half_cent_rather_than_doubling_it() {
+        let rendered = format_per_million(0.000000005 * 1_000_000.0);
+        assert_eq!(rendered, "0.005");
+        assert_ne!(rendered, "0.01");
+    }
+
+    /// The property worth holding across the whole sheet, not just the keys
+    /// that happen to break today: a nonzero price never reads as free.
+    #[test]
+    fn format_per_million_keeps_every_nonzero_price_visible() {
+        let mut cost_per_token = 0.5;
+        for _ in 0..40 {
+            cost_per_token /= 10.0;
+            let rendered = format_per_million(cost_per_token * 1_000_000.0);
+            assert!(
+                rendered.chars().any(|c| ('1'..='9').contains(&c)),
+                "{cost_per_token:e} per token rendered as ${rendered}"
+            );
+        }
+    }
 
     #[test]
     fn mcode_headless_args_inject_stream_json_immediately_after_exec() {
