@@ -2589,30 +2589,68 @@ fn key_root_matches_hint(key: &str, hint_tags: &[String]) -> bool {
         .any(|tag| hint_tags.iter().any(|hint| hint == tag))
 }
 
+fn normalized_key_root(value: &str) -> String {
+    value
+        .trim()
+        .trim_end_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_lowercase()
+        .replace('-', "_")
+}
+
 /// Whether provider-tag folding makes the key root and hint match despite
 /// naming different billing endpoints. The alias keeps fallback rows reachable,
 /// but neither endpoint's root is the other endpoint's own top-level row.
 fn key_root_is_cross_provider_alias(key: &str, provider_id: &str) -> bool {
-    let normalize_root = |value: &str| {
-        value
-            .trim()
-            .trim_end_matches('/')
-            .split('/')
-            .next()
-            .unwrap_or_default()
-            .to_lowercase()
-            .replace('-', "_")
-    };
-    let root = normalize_root(key);
-    let hint = normalize_root(provider_id);
+    let root = normalized_key_root(key);
+    let hint = normalized_key_root(provider_id);
 
     let is_claude_endpoint = |value: &str| matches!(value, "anthropic" | "vertex" | "vertex_ai");
     root != hint && is_claude_endpoint(&root) && is_claude_endpoint(&hint)
 }
 
+// @keep: these roots look like providers and are not, which is the whole point.
+/// Dataset key roots that name a SUBSCRIPTION PLAN, not a billing endpoint.
+///
+/// Models.dev publishes every row under `kimi-for-coding/` with explicit
+/// 0.0/0.0 rates because a Kimi coding subscription is billed by the plan, not
+/// by the token. Rows like these are not a price sheet for anything.
+///
+/// Underscore-normalized to compare with `normalized_key_root`.
+const ZERO_PRICED_SUBSCRIPTION_NAMESPACES: &[&str] = &["kimi_for_coding"];
+
+/// Whether the key is rooted at a subscription namespace whose rows are
+/// published at $0.00, and so cannot prove a billing identity.
+///
+/// Same shape and same reason as `key_root_is_cross_provider_alias`: provider
+/// tag folding makes the root and the hint compare equal even though the root
+/// does not name the hinted billing endpoint. `kimi_for_coding` canonicalizes
+/// to `moonshotai` so a Kimi client's provider hint reaches the real
+/// `moonshotai/*` rates, and that direction of the fold is correct. The
+/// reverse is not: an exact model-part hit on a `kimi-for-coding/*` row says
+/// only that the plan lists the model, so promoting it to `ProviderScoped`
+/// would make `covers_usage` accept the explicit zero buckets and publish real
+/// usage to the leaderboard at $0.00. The row stays reachable as the weaker
+/// estimate it was, carrying `UnverifiedProviderIdentity`.
+///
+/// Unlike the claude-endpoint exception this ignores the hint spelling. A
+/// subscription namespace does not become a billing endpoint because the
+/// client happens to report its provider with the same word.
+///
+/// `pricing::aliases` redirects each known `kimi-for-coding` model id away from
+/// this namespace, but that table is a whitelist extended one id at a time;
+/// this covers the ids nobody has enumerated yet.
+fn key_root_is_zero_priced_subscription_namespace(key: &str) -> bool {
+    ZERO_PRICED_SUBSCRIPTION_NAMESPACES.contains(&normalized_key_root(key).as_str())
+}
+
 fn key_root_matches_provider_hint(key: &str, provider_id: &str) -> bool {
     let hint_tags = provider_identity::provider_tags(provider_id);
-    key_root_matches_hint(key, &hint_tags) && !key_root_is_cross_provider_alias(key, provider_id)
+    key_root_matches_hint(key, &hint_tags)
+        && !key_root_is_cross_provider_alias(key, provider_id)
+        && !key_root_is_zero_priced_subscription_namespace(key)
 }
 
 fn is_reseller_provider(key: &str) -> bool {
@@ -2765,6 +2803,7 @@ fn select_best_match(
             let by_root = candidates.iter().find(|k| {
                 key_root_matches_hint(k, &hint_tags)
                     && !provider_id.is_some_and(|hint| key_root_is_cross_provider_alias(k, hint))
+                    && !key_root_is_zero_priced_subscription_namespace(k)
             });
             let by_spelling = provider_id.and_then(|hint| {
                 let spelled: Vec<&&String> = candidates
@@ -4398,6 +4437,126 @@ mod tests {
             );
             assert!(result.evidence.alias_applied, "hint: {hint}");
             assert!(result.evidence.is_submission_safe(), "hint: {hint}");
+        }
+    }
+
+    /// `pricing::aliases` redirects every `kimi-for-coding` model id anybody has
+    /// noticed so far onto a real `moonshotai/*` row, so the zero-priced
+    /// subscription namespace is normally never reached. That whitelist is the
+    /// only thing standing between an id nobody has enumerated yet and a
+    /// leaderboard submission at $0.00: an exact model-part hit on a
+    /// `kimi-for-coding/*` row must stay the estimate it is, while the same
+    /// hint against Moonshot's own row still verifies.
+    #[test]
+    fn kimi_subscription_namespace_row_is_not_provider_scoped_evidence() {
+        let models_dev = HashMap::from([
+            (
+                "kimi-for-coding/k3-flash".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.0),
+                    output_cost_per_token: Some(0.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "moonshotai/k3-pro".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(1e-6),
+                    output_cost_per_token: Some(2e-6),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        for hint in ["kimi_for_coding", "kimi-for-coding", "moonshot"] {
+            let subscription = lookup
+                .lookup_with_provider("k3-flash", Some(hint))
+                .expect("the subscription row stays reachable as an estimate");
+            assert_eq!(
+                subscription.matched_key, "kimi-for-coding/k3-flash",
+                "hint: {hint}"
+            );
+            assert_eq!(
+                subscription.evidence.kind,
+                ResolutionKind::ModelPart,
+                "hint: {hint}"
+            );
+            assert_eq!(
+                subscription.evidence.submission_safety_gap(),
+                Some(SubmissionSafetyGap::UnverifiedProviderIdentity),
+                "hint: {hint}"
+            );
+            assert!(!subscription.evidence.is_submission_safe(), "hint: {hint}");
+
+            let moonshot = lookup
+                .lookup_with_provider("k3-pro", Some(hint))
+                .expect("Moonshot's own row must still price");
+            assert_eq!(moonshot.matched_key, "moonshotai/k3-pro", "hint: {hint}");
+            assert_eq!(
+                moonshot.evidence.kind,
+                ResolutionKind::ProviderScoped,
+                "hint: {hint}"
+            );
+            assert!(moonshot.evidence.is_submission_safe(), "hint: {hint}");
+        }
+    }
+
+    /// When a model part exists in both places, the zero-priced subscription
+    /// row must also lose the candidate ranking, not merely the evidence
+    /// upgrade. Otherwise the reported cost for real usage is still $0.00; the
+    /// row is only kept out of the leaderboard.
+    #[test]
+    fn real_moonshot_row_outranks_the_zero_priced_subscription_row() {
+        let models_dev = HashMap::from([
+            (
+                "kimi-for-coding/k3-flash".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.0),
+                    output_cost_per_token: Some(0.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "moonshotai/k3-flash".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(1e-6),
+                    output_cost_per_token: Some(2e-6),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        for hint in ["kimi_for_coding", "kimi-for-coding", "moonshot"] {
+            let result = lookup
+                .lookup_with_provider("k3-flash", Some(hint))
+                .expect("the hinted lookup must price");
+            assert_eq!(result.matched_key, "moonshotai/k3-flash", "hint: {hint}");
+            assert_eq!(
+                result.pricing.input_cost_per_token,
+                Some(1e-6),
+                "hint: {hint}"
+            );
+            // The two rows publish different rates, so the selected row is a
+            // reported estimate rather than a publishable price.
+            assert_eq!(
+                result.evidence.submission_safety_gap(),
+                Some(SubmissionSafetyGap::PriceDisagreement),
+                "hint: {hint}"
+            );
         }
     }
 
