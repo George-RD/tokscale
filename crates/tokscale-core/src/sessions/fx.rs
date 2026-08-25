@@ -25,6 +25,10 @@
 //! other session's entry. Its title is resolved after the cache instead, by
 //! [`apply_session_titles`], which reads the index once per scan and writes the
 //! title onto freshly parsed and cache-served messages alike.
+//!
+//! Cost provenance. `total_cost` is optional on the wire at both levels, so its
+//! presence is preserved rather than defaulted: a snapshot that never carried a
+//! cost must not be submitted as an authoritative $0.00. See [`reported_cost`].
 
 use super::utils::{file_modified_timestamp_ms, read_file_or_none};
 use super::{normalize_workspace_key, workspace_label_from_key, CostSource, UnifiedMessage};
@@ -56,8 +60,11 @@ struct FxSnapshot {
     // Top-level session aggregates (session_usage.zig `Snapshot`) always
     // accompany `models`; the per-model entries are the breakdown of these
     // totals. They back the synthetic fallback below.
+    //
+    // `Option` so an omitted field and an explicit `null` stay distinguishable
+    // from a recorded `0`; see [`reported_cost`].
     #[serde(default)]
-    total_cost: f64,
+    total_cost: Option<f64>,
     #[serde(default)]
     input_tokens: i64,
     #[serde(default)]
@@ -78,8 +85,10 @@ struct FxSnapshot {
 struct FxModelUsage {
     #[serde(default)]
     model: Option<String>,
+    /// `Option` so an omitted field and an explicit `null` stay distinguishable
+    /// from a recorded `0`; see [`reported_cost`].
     #[serde(default)]
-    total_cost: f64,
+    total_cost: Option<f64>,
     #[serde(default)]
     input_tokens: i64,
     #[serde(default)]
@@ -112,6 +121,29 @@ struct FxSessionMeta {
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     let bytes = read_file_or_none(path)?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// Reuse a recorded `total_cost` (USD) only when it is present, finite and
+/// non-negative; otherwise report `0.0` with [`CostSource::Unknown`] so the
+/// dispatch pricing guard prices the message or excludes it as unpriced.
+///
+/// Both `total_cost` fields are optional on the wire. Defaulting them to `0.0`
+/// threw the presence away, and stamping [`CostSource::ProviderReported`] on
+/// the result then submitted a cost the snapshot never carried as an
+/// authoritative $0.00 — indistinguishable from a session fx really did bill
+/// nothing for.
+///
+/// A negative total is treated as unreported rather than clamped into an
+/// authoritative zero. `cost` still lands on `0.0`, exactly what the previous
+/// `.max(0.0)` produced, but the provenance stays [`CostSource::Unknown`]:
+/// a negative aggregate is a value fx cannot have meant as a bill, so it must
+/// not lock the message out of repricing. Same rule as `gjc::embedded_cost` and
+/// `cursor::parse_finite_cost`.
+fn reported_cost(total: Option<f64>) -> (f64, CostSource) {
+    match total {
+        Some(total) if total.is_finite() && total >= 0.0 => (total, CostSource::ProviderReported),
+        _ => (0.0, CostSource::Unknown),
+    }
 }
 
 /// The sibling `session.json` a snapshot's parse reads for the workspace root
@@ -272,6 +304,7 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
             .unwrap_or_else(|| "zai".to_string());
 
         let dedup_key = format!("fx:{session_id}:{model_id}");
+        let (cost, cost_source) = reported_cost(model_usage.total_cost);
 
         messages.push(UnifiedMessage {
             client: CLIENT_ID.to_string(),
@@ -283,8 +316,8 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
             timestamp,
             date: String::new(),
             tokens,
-            cost: model_usage.total_cost.max(0.0),
-            cost_source: CostSource::ProviderReported,
+            cost,
+            cost_source,
             duration_ms: None,
             message_count: model_usage.request_count.unwrap_or(0).max(0) as i32,
             agent: None,
@@ -311,7 +344,7 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
             reasoning: snapshot.reasoning_tokens.unwrap_or(0).max(0),
         };
         let request_count = snapshot.request_count.unwrap_or(0).max(0);
-        let cost = snapshot.total_cost.max(0.0);
+        let (cost, cost_source) = reported_cost(snapshot.total_cost);
         if tokens.total() > 0 || request_count > 0 || cost > 0.0 {
             messages.push(UnifiedMessage {
                 client: CLIENT_ID.to_string(),
@@ -324,7 +357,7 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
                 date: String::new(),
                 tokens,
                 cost,
-                cost_source: CostSource::ProviderReported,
+                cost_source,
                 duration_ms: None,
                 message_count: request_count as i32,
                 agent: None,
@@ -648,6 +681,121 @@ mod tests {
             .collect();
         titles.sort();
         assert_eq!(titles, vec![Some("First"), Some("Second")]);
+    }
+
+    /// Parse a one-model snapshot whose model entry carries `cost_field`
+    /// verbatim (`""` for an omitted field) and return the single message.
+    fn model_cost_message(cost_field: &str) -> UnifiedMessage {
+        let (_dir, session) = fixture();
+        let usage = write_file(
+            &session,
+            "usage-v2.json",
+            &format!(
+                r#"{{"schema_version":1,"session_id":"sess-123","snapshot":{{"models":[{{"model":"zai/glm-5.2",{cost_field}"input_tokens":10,"output_tokens":5}}]}}}}"#
+            ),
+        );
+        let mut messages = parse_fx_file(&usage);
+        assert_eq!(messages.len(), 1, "cost field {cost_field:?}");
+        messages.remove(0)
+    }
+
+    /// Same, for the snapshot-level aggregate fallback: `models` is empty, so
+    /// the synthetic `fx-unknown` message carries the top-level totals.
+    fn snapshot_cost_message(cost_field: &str) -> UnifiedMessage {
+        let (_dir, session) = fixture();
+        let usage = write_file(
+            &session,
+            "usage-v2.json",
+            &format!(
+                r#"{{"schema_version":1,"session_id":"sess-123","snapshot":{{{cost_field}"input_tokens":10,"output_tokens":5,"request_count":1,"models":[]}}}}"#
+            ),
+        );
+        let mut messages = parse_fx_file(&usage);
+        assert_eq!(messages.len(), 1, "cost field {cost_field:?}");
+        messages.remove(0)
+    }
+
+    /// Every way a snapshot can fail to state a cost, spelled the way fx
+    /// writes it: the field omitted, an explicit `null`, and a negative
+    /// aggregate. A non-finite value has no JSON spelling that reaches the
+    /// parser — serde_json rejects an out-of-range literal like `1e400` and
+    /// the whole file is dropped before any cost is read — so that branch is
+    /// pinned on [`reported_cost`] directly in
+    /// `a_non_finite_cost_is_never_provider_reported`.
+    const UNREPORTED_COST_FIELDS: [&str; 3] =
+        ["", r#""total_cost":null,"#, r#""total_cost":-0.5,"#];
+
+    #[test]
+    fn a_non_finite_cost_is_never_provider_reported() {
+        for total in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                reported_cost(Some(total)),
+                (0.0, CostSource::Unknown),
+                "{total} is not a cost fx can have meant"
+            );
+        }
+        assert_eq!(reported_cost(None), (0.0, CostSource::Unknown));
+        assert_eq!(reported_cost(Some(-0.5)), (0.0, CostSource::Unknown));
+        assert_eq!(
+            reported_cost(Some(0.0)),
+            (0.0, CostSource::ProviderReported)
+        );
+        assert_eq!(
+            reported_cost(Some(0.25)),
+            (0.25, CostSource::ProviderReported)
+        );
+    }
+
+    #[test]
+    fn an_unreported_model_cost_is_not_submitted_as_an_authoritative_zero() {
+        // `total_cost` is optional at both levels. Defaulting it to 0.0 and
+        // stamping ProviderReported made "the snapshot did not say" look
+        // exactly like "fx billed nothing", which locks the message out of
+        // repricing and submits real usage at $0.00.
+        for cost_field in UNREPORTED_COST_FIELDS {
+            let msg = model_cost_message(cost_field);
+            assert_eq!(msg.cost, 0.0, "cost field {cost_field:?}");
+            assert_eq!(
+                msg.cost_source,
+                CostSource::Unknown,
+                "cost field {cost_field:?} must stay repriceable"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreported_snapshot_cost_is_not_submitted_as_an_authoritative_zero() {
+        for cost_field in UNREPORTED_COST_FIELDS {
+            let msg = snapshot_cost_message(cost_field);
+            assert_eq!(msg.model_id, UNKNOWN_MODEL);
+            assert_eq!(msg.cost, 0.0, "cost field {cost_field:?}");
+            assert_eq!(
+                msg.cost_source,
+                CostSource::Unknown,
+                "cost field {cost_field:?} must stay repriceable"
+            );
+        }
+    }
+
+    #[test]
+    fn a_recorded_zero_cost_stays_provider_reported() {
+        // The other half of the rule: a snapshot that really did state `0` is
+        // authoritative and must not be repriced.
+        let msg = model_cost_message(r#""total_cost":0,"#);
+        assert_eq!(msg.cost, 0.0);
+        assert_eq!(msg.cost_source, CostSource::ProviderReported);
+
+        let msg = model_cost_message(r#""total_cost":0.004,"#);
+        assert!((msg.cost - 0.004).abs() < 1e-9);
+        assert_eq!(msg.cost_source, CostSource::ProviderReported);
+
+        let msg = snapshot_cost_message(r#""total_cost":0,"#);
+        assert_eq!(msg.cost, 0.0);
+        assert_eq!(msg.cost_source, CostSource::ProviderReported);
+
+        let msg = snapshot_cost_message(r#""total_cost":0.004,"#);
+        assert!((msg.cost - 0.004).abs() < 1e-9);
+        assert_eq!(msg.cost_source, CostSource::ProviderReported);
     }
 
     #[test]
