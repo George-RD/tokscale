@@ -493,6 +493,9 @@ impl PricingService {
                     // to disclose: the matched key is not the requested id.
                     normalized: result.normalized,
                     stripped: false,
+                    // A custom entry is the user stating a rate for their own
+                    // id, not a dataset namespace being read as a price sheet.
+                    subscription_namespace: false,
                 },
             })
     }
@@ -609,6 +612,109 @@ mod tests {
         let cost =
             service.calculate_cost_with_provider("nemotron-free-fixture", Some("kenari"), &usage);
         assert_eq!(cost, 0.0, "an all-zero row must price at exactly zero");
+    }
+
+    // Regression: the provider-hint guard only covers the model-part promotion
+    // path. An unaliased `kimi-for-coding/<model>` id IS its own dataset key,
+    // so it resolves through the full-key exact branch and was handed
+    // `ResolutionKind::Exact`, which is submission-safe by construction. The
+    // row publishes explicit 0.0 rates, so `covers_usage` accepted every
+    // bucket and real usage submitted to the leaderboard at $0.00. Runs
+    // through `PricingService` because the lookup helper alone does not show
+    // what submission validation actually asks.
+    //
+    // The plan rate stays visible for reporting; only its publishability
+    // changes. A qualified `moonshotai/*` key in the same dataset must keep
+    // its submission-safe exact evidence, so the rule cannot be "the key is
+    // qualified" or "the rates are zero".
+    #[test]
+    fn an_unaliased_kimi_subscription_key_is_not_submission_safe() {
+        let models_dev = HashMap::from([
+            (
+                "kimi-for-coding/k3-unlisted-fixture".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.0),
+                    output_cost_per_token: Some(0.0),
+                    cache_read_input_token_cost: Some(0.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "moonshotai/k3-metered-fixture".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(1e-6),
+                    output_cost_per_token: Some(2e-6),
+                    cache_read_input_token_cost: Some(1e-7),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let service = PricingService::new_with_custom_and_models_dev(
+            CustomPricing::default(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+        let usage = cache_read_usage();
+
+        for hint in [Some("kimi_for_coding"), Some("moonshot"), None] {
+            let subscription = service
+                .resolve_for_usage_with_provider(
+                    "kimi-for-coding/k3-unlisted-fixture",
+                    hint,
+                    &usage,
+                )
+                .expect("the plan rate stays visible for reporting");
+            assert_eq!(
+                subscription.matched_key, "kimi-for-coding/k3-unlisted-fixture",
+                "hint: {hint:?}"
+            );
+            assert_eq!(
+                subscription.evidence.submission_safety_gap(),
+                Some(lookup::SubmissionSafetyGap::UnverifiedProviderIdentity),
+                "hint: {hint:?}"
+            );
+            assert!(
+                !subscription.evidence.is_submission_safe(),
+                "hint: {hint:?}"
+            );
+            assert!(
+                !service.covers_usage_with_provider(
+                    "kimi-for-coding/k3-unlisted-fixture",
+                    hint,
+                    &usage
+                ),
+                "a subscription-plan row must not authorize a submission, hint: {hint:?}"
+            );
+            // Reporting keeps the plan rate. The row is excluded from the
+            // leaderboard, not dropped from the user's own cost view.
+            assert_eq!(
+                service.calculate_cost_with_provider(
+                    "kimi-for-coding/k3-unlisted-fixture",
+                    hint,
+                    &usage
+                ),
+                0.0,
+                "hint: {hint:?}"
+            );
+
+            let metered = service
+                .resolve_for_usage_with_provider("moonshotai/k3-metered-fixture", hint, &usage)
+                .expect("Moonshot's own metered row must still price");
+            assert_eq!(
+                metered.matched_key, "moonshotai/k3-metered-fixture",
+                "hint: {hint:?}"
+            );
+            assert_eq!(
+                metered.evidence.submission_safety_gap(),
+                None,
+                "hint: {hint:?}"
+            );
+            assert!(
+                service.covers_usage_with_provider("moonshotai/k3-metered-fixture", hint, &usage),
+                "hint: {hint:?}"
+            );
+        }
     }
 
     #[test]

@@ -184,6 +184,17 @@ pub struct ResolutionEvidence {
     pub alias_applied: bool,
     pub normalized: bool,
     pub stripped: bool,
+    /// Whether the matched key is rooted at a subscription namespace whose
+    /// rows publish a plan, not a tariff (see
+    /// `ZERO_PRICED_SUBSCRIPTION_NAMESPACES`).
+    ///
+    /// Independent of `kind`, because the namespace disqualifies the row no
+    /// matter how it was reached. `kind` records how strong the match was, and
+    /// a `kimi-for-coding/<model>` id is genuinely an exact hit on its own
+    /// dataset key — the key just is not a price sheet. Encoding this as a
+    /// weaker `kind` would misreport the match and would still leave every
+    /// future resolution path free to hand the row a strong kind again.
+    pub subscription_namespace: bool,
 }
 
 impl ResolutionEvidence {
@@ -196,6 +207,7 @@ impl ResolutionEvidence {
             alias_applied: false,
             normalized: false,
             stripped: false,
+            subscription_namespace: false,
         }
     }
 
@@ -207,6 +219,14 @@ impl ResolutionEvidence {
     /// that decides safety is what keeps a diagnostic from claiming candidates
     /// disagreed when the lookup only ever saw one.
     pub fn submission_safety_gap(&self) -> Option<SubmissionSafetyGap> {
+        // Checked ahead of `kind` because it disqualifies every kind. A
+        // subscription namespace prices the plan rather than the request, so
+        // the strongest possible match on one of its rows still proves only
+        // that the plan lists the model — never that the request was billed at
+        // the rate the row publishes.
+        if self.subscription_namespace {
+            return Some(SubmissionSafetyGap::UnverifiedProviderIdentity);
+        }
         match self.kind {
             // These fallbacks start from a bare id and add or borrow a
             // provider-qualified row. Matching the model spelling alone does
@@ -255,6 +275,11 @@ impl ResolutionEvidence {
             alias_applied: self.alias_applied || donor.alias_applied,
             normalized: self.normalized || donor.normalized,
             stripped: self.stripped || donor.stripped,
+            // Either side taints the composed row: the filled row is quoted
+            // under its own key, and it quotes the donor's rates. `kind` alone
+            // does not carry this, because a subscription-namespace donor can
+            // hold a perfectly strong kind.
+            subscription_namespace: self.subscription_namespace || donor.subscription_namespace,
         }
     }
 }
@@ -299,6 +324,23 @@ impl LookupResult {
 
     fn with_stripping(mut self) -> Self {
         self.evidence.stripped = true;
+        self
+    }
+
+    /// Record whether the selected key is rooted at a zero-priced subscription
+    /// namespace.
+    ///
+    /// Read off the key at the end of resolution rather than stamped at each
+    /// construction site: resolution has many terminal branches (full-key
+    /// exact, model-part, provider-scoped, stripped prefix or suffix, forced
+    /// source, generic-prefix retry), every one of them can land on such a
+    /// row, and only some of them ever consult a provider hint.
+    /// `key_root_matches_provider_hint` guards the hint-driven promotion; this
+    /// covers the rest, including the id that IS the qualified key and so
+    /// takes the full-key exact branch without a hint being involved at all.
+    fn with_subscription_namespace_check(mut self) -> Self {
+        self.evidence.subscription_namespace =
+            key_root_is_zero_priced_subscription_namespace(&self.matched_key);
         self
     }
 }
@@ -505,7 +547,31 @@ impl PricingLookup {
         self.lookup_with_source_and_provider(model_id, force_source, None)
     }
 
+    /// Resolve a model id, then judge the selected key's namespace.
+    ///
+    /// The namespace check runs here, on the way out, because this is the one
+    /// place every dataset resolution passes through. `resolve_with_source`
+    /// below has a dozen terminal `return`s across the alias, exact,
+    /// model-part, provider-scoped, prefix-strip and suffix-strip branches;
+    /// stamping the flag on each of them would leave the next branch anybody
+    /// adds unguarded, which is exactly how the full-key exact branch came to
+    /// hand a `kimi-for-coding/*` row submission-safe `Exact` evidence while
+    /// the promotion path was already refusing it.
+    ///
+    /// Custom pricing is resolved by `PricingService` and never reaches here,
+    /// which is deliberate: an entry in `custom-pricing.json` is the user
+    /// asserting a rate for their own id, not a dataset row being read as one.
     pub fn lookup_with_source_and_provider(
+        &self,
+        model_id: &str,
+        force_source: Option<&str>,
+        provider_id: Option<&str>,
+    ) -> Option<LookupResult> {
+        self.resolve_with_source_and_provider(model_id, force_source, provider_id)
+            .map(LookupResult::with_subscription_namespace_check)
+    }
+
+    fn resolve_with_source_and_provider(
         &self,
         model_id: &str,
         force_source: Option<&str>,
@@ -2642,6 +2708,14 @@ const ZERO_PRICED_SUBSCRIPTION_NAMESPACES: &[&str] = &["kimi_for_coding"];
 /// `pricing::aliases` redirects each known `kimi-for-coding` model id away from
 /// this namespace, but that table is a whitelist extended one id at a time;
 /// this covers the ids nobody has enumerated yet.
+///
+/// Two callers, because refusing the promotion is not the whole rule.
+/// `key_root_matches_provider_hint` keeps a hinted model-part hit from being
+/// upgraded, and `LookupResult::with_subscription_namespace_check` marks
+/// whichever resolution finally wins. Only the second covers a lookup whose id
+/// IS the qualified key: that takes the full-key exact branch, which asks
+/// nothing about a provider and so was handed submission-safe `Exact`
+/// evidence with the promotion guard already in place.
 fn key_root_is_zero_priced_subscription_namespace(key: &str) -> bool {
     ZERO_PRICED_SUBSCRIPTION_NAMESPACES.contains(&normalized_key_root(key).as_str())
 }
@@ -2836,6 +2910,7 @@ fn select_best_match(
                     alias_applied: false,
                     normalized: false,
                     stripped: false,
+                    subscription_namespace: false,
                 },
             })
         })
