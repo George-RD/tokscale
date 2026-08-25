@@ -2503,7 +2503,10 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     // could keep a session on the wrong day. Titles come from the shared
     // `sessions/index.json` and are applied below instead of being fingerprinted
     // — one index backs every session, so watching it would make each new
-    // session invalidate all the others.
+    // session invalidate all the others. Each path stays paired with the
+    // messages it produced so the title lookup can key on the sessions
+    // directory too: fx session ids only have to be unique within one tree, and
+    // a second configured scan root can repeat one.
     let fx_paths = scan_result.get(ClientId::Fx);
     let fx_outcomes: Vec<CachedParseOutcome> = fx_paths
         .par_iter()
@@ -2518,15 +2521,17 @@ fn parse_all_messages_with_pricing_with_cache_policy(
             )
         })
         .collect();
-    let mut fx_messages: Vec<UnifiedMessage> = Vec::new();
-    for outcome in fx_outcomes {
-        fx_messages.extend(outcome.messages);
+    let mut fx_lane: Vec<(PathBuf, Vec<UnifiedMessage>)> = Vec::with_capacity(fx_outcomes.len());
+    for (path, outcome) in fx_paths.iter().zip(fx_outcomes) {
+        fx_lane.push((path.clone(), outcome.messages));
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         }
     }
-    sessions::fx::apply_session_titles(fx_paths, &mut fx_messages);
-    all_messages.extend(fx_messages);
+    sessions::fx::apply_session_titles(&mut fx_lane);
+    for (_, messages) in fx_lane {
+        all_messages.extend(messages);
+    }
 
     // Kilo CLI: SQLite database
     if let Some(db_path) = &scan_result.kilo_db {
