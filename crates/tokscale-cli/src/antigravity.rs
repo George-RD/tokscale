@@ -1943,6 +1943,49 @@ fn rpc_request(connection: &AntigravityConnection, method: &str, body: &Value) -
     }
 }
 
+/// Argument vector for the Windows `curl.exe` RPC fallback.
+///
+/// Split out of the `cfg(windows)` caller so the two ordering rules it has to
+/// satisfy are covered by the test suite on every host instead of only by the
+/// Windows CI job.
+///
+/// `-q` has to be the first argument: curl applies `%USERPROFILE%\_curlrc`
+/// (`~/.curlrc`) before it parses anything that comes later, so `-q` anywhere
+/// else no longer suppresses it. An explicit `-K` is still honored after `-q`,
+/// which is what keeps the CSRF header and the body on stdin.
+///
+/// `--noproxy "*"` bypasses proxy resolution for every host, including the
+/// `HTTPS_PROXY` / `ALL_PROXY` environment variables curl would otherwise
+/// obey. Without it a request aimed at the DesktopAgent on loopback can be
+/// handed to a configured remote proxy together with the CSRF token and the
+/// RPC body. The non-Windows path gets the same guarantee from `reqwest`'s
+/// `.no_proxy()`.
+#[cfg(any(target_os = "windows", test))]
+fn windows_curl_rpc_args(url: &str) -> Vec<&str> {
+    vec![
+        // Must stay first, see above.
+        "-q",
+        "--noproxy",
+        "*",
+        "-k",
+        "-sS",
+        "--http1.1",
+        "--max-time",
+        "10",
+        "-X",
+        "POST",
+        url,
+        "-H",
+        "Content-Type: application/json",
+        "-H",
+        "Connect-Protocol-Version: 1",
+        "-K",
+        "-",
+        "--write-out",
+        "\\n%{http_code}",
+    ]
+}
+
 fn https_rpc_request(
     connection: &AntigravityConnection,
     method: &str,
@@ -1977,32 +2020,24 @@ fn https_rpc_request(
         );
         let body_str = serde_json::to_string(body)?;
 
-        // Resolve curl.exe by absolute path: a PATH lookup can be shadowed by
-        // a user-writable directory, handing the CSRF token to an impostor.
+        // curl.exe is invoked by absolute path so a PATH lookup cannot be
+        // shadowed by a user-writable directory earlier in the search order.
+        // That is the whole of what the absolute path buys. The root still
+        // comes from the inherited `SystemRoot`, so a parent process that
+        // controls this process' environment can still point
+        // `System32\curl.exe` at a binary of its choosing, which then
+        // receives the CSRF token and the RPC body on stdin. Dropping that
+        // assumption means resolving the system directory through
+        // `GetSystemDirectoryW`, which needs a Win32 binding this workspace
+        // does not depend on; until then the environment tokscale is launched
+        // with is trusted.
         let system32_curl = std::env::var_os("SystemRoot")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from("C:\\Windows"))
             .join("System32\\curl.exe");
 
         let mut child = std::process::Command::new(&system32_curl)
-            .args([
-                "-k",
-                "-sS",
-                "--http1.1",
-                "--max-time",
-                "10",
-                "-X",
-                "POST",
-                &url,
-                "-H",
-                "Content-Type: application/json",
-                "-H",
-                "Connect-Protocol-Version: 1",
-                "-K",
-                "-",
-                "--write-out",
-                "\\n%{http_code}",
-            ])
+            .args(windows_curl_rpc_args(&url))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -4244,5 +4279,51 @@ mod tests {
         );
         assert!(cache_dir.join("manifest.json").exists());
         assert!(cache_dir.join("sync.lock").exists());
+    }
+
+    /// The Windows fallback is compiled out on this host, but the argument
+    /// vector is not: `windows_curl_rpc_args` is built on every target under
+    /// `cfg(test)` so the two rules that make it safe are actually checked.
+    #[test]
+    fn windows_curl_rpc_args_ignore_curlrc_and_every_proxy() {
+        let url = "https://127.0.0.1:4321/exa.language_server_pb.LanguageServerService/GetUsage";
+        let args = windows_curl_rpc_args(url);
+
+        // curl only honors `-q` in the first position; anywhere later and the
+        // user's curlrc has already been applied by the time it is parsed.
+        assert_eq!(
+            args.first().copied(),
+            Some("-q"),
+            "-q must be the first argument, got: {args:?}"
+        );
+
+        // The loopback RPC carries the CSRF token, so it must never be routed
+        // through HTTPS_PROXY / ALL_PROXY / a curlrc proxy directive.
+        let noproxy = args
+            .iter()
+            .position(|arg| *arg == "--noproxy")
+            .expect("--noproxy is missing from the curl.exe fallback arguments");
+        assert_eq!(
+            args.get(noproxy + 1).copied(),
+            Some("*"),
+            "--noproxy must bypass every host, got: {args:?}"
+        );
+
+        // The hardening must not have displaced the rest of the invocation:
+        // the config (and with it the CSRF header and the body) still arrives
+        // on stdin, the timeout is still set, and the status code is still
+        // appended to the response.
+        let config = args
+            .iter()
+            .position(|arg| *arg == "-K")
+            .expect("-K is missing from the curl.exe fallback arguments");
+        assert_eq!(args.get(config + 1).copied(), Some("-"));
+        let max_time = args
+            .iter()
+            .position(|arg| *arg == "--max-time")
+            .expect("--max-time is missing from the curl.exe fallback arguments");
+        assert_eq!(args.get(max_time + 1).copied(), Some("10"));
+        assert!(args.contains(&"\\n%{http_code}"), "{args:?}");
+        assert!(args.contains(&url), "{args:?}");
     }
 }
