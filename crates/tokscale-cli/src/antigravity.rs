@@ -10,11 +10,19 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_RPC_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_IDENTITY_PROBE_BYTES: usize = 4096;
 const ANTIGRAVITY_MANIFEST_VERSION: i32 = 1;
+
+/// Wall clock one `sync` may waste on failed trajectory-enrichment RPCs before
+/// it stops attempting them at all. See [`TrajectoryEnrichmentBudget`].
+const TRAJECTORY_ENRICHMENT_BUDGET: Duration = Duration::from_secs(60);
+
+/// Consecutive enrichment failures on one connection before that connection is
+/// written off for the rest of the sync. See [`TrajectoryEnrichmentBudget`].
+const TRAJECTORY_ENRICHMENT_FAILURE_THRESHOLD: u32 = 2;
 
 #[cfg(not(target_os = "windows"))]
 static HTTPS_RPC_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -226,9 +234,14 @@ pub fn run_antigravity_sync() -> Result<()> {
         sessions: Vec::new(),
     };
 
+    // One budget for the whole sync: the enrichment RPCs it bounds all run
+    // under the exclusive cache lock acquired above.
+    let mut enrichment = TrajectoryEnrichmentBudget::new();
+
     for candidate in &export_candidates {
         if let Some(summary) = find_summary_for_candidate(&summaries, &candidate.session_id) {
-            if let Some(artifact) = fetch_session_artifact(summary, &connections)? {
+            if let Some(artifact) = fetch_session_artifact(summary, &connections, &mut enrichment)?
+            {
                 let path = write_session_artifact(&summary.session_id, &artifact.contents)?;
                 let relative_path = to_relative_artifact_path(&path)?;
 
@@ -244,9 +257,12 @@ pub fn run_antigravity_sync() -> Result<()> {
             }
         }
 
-        if let Some(entry) =
-            fetch_historical_session_artifact(&candidate.session_id, &connections, candidate)?
-        {
+        if let Some(entry) = fetch_historical_session_artifact(
+            &candidate.session_id,
+            &connections,
+            candidate,
+            &mut enrichment,
+        )? {
             next_manifest.sessions.push(entry);
             continue;
         }
@@ -1890,6 +1906,7 @@ fn fetch_historical_session_artifact(
     session_id: &str,
     connections: &[AntigravityConnection],
     candidate: &SessionCandidate,
+    budget: &mut TrajectoryEnrichmentBudget,
 ) -> Result<Option<ManifestSessionEntry>> {
     let fallback_summary = TrajectorySummary {
         session_id: session_id.to_string(),
@@ -1901,7 +1918,7 @@ fn fetch_historical_session_artifact(
             .unwrap_or_default(),
     };
 
-    if let Some(artifact) = fetch_session_artifact(&fallback_summary, connections)? {
+    if let Some(artifact) = fetch_session_artifact(&fallback_summary, connections, budget)? {
         let path = write_session_artifact(session_id, &artifact.contents)?;
         return Ok(Some(ManifestSessionEntry {
             session_id: session_id.to_string(),
@@ -2480,6 +2497,7 @@ fn normalize_trajectory_summaries(response: &Value, fingerprint: &str) -> Vec<Tr
 fn fetch_session_artifact(
     summary: &TrajectorySummary,
     connections: &[AntigravityConnection],
+    budget: &mut TrajectoryEnrichmentBudget,
 ) -> Result<Option<SessionArtifact>> {
     let preferred = connections
         .iter()
@@ -2496,7 +2514,7 @@ fn fetch_session_artifact(
     );
 
     for connection in ordered {
-        if let Some(artifact) = try_fetch_session_artifact(summary, connection)? {
+        if let Some(artifact) = try_fetch_session_artifact(summary, connection, budget)? {
             return Ok(Some(artifact));
         }
     }
@@ -2504,9 +2522,128 @@ fn fetch_session_artifact(
     Ok(None)
 }
 
+/// Budget and per-connection circuit breaker for the OPTIONAL
+/// `GetCascadeTrajectory` enrichment.
+///
+/// `sync` holds its exclusive cache lock while it walks every session, and each
+/// session whose metadata carries usage without timestamps costs one extra
+/// synchronous RPC. That call is best-effort: when it fails the session simply
+/// keeps its metadata-derived timestamp, which is what
+/// [`try_fetch_session_artifact`] has always done per session. But "fails"
+/// means the full 10s transport timeout when the endpoint stalls rather than
+/// refuses, and only after that timeout is the error discarded. With metadata
+/// still answering, a few hundred affected sessions therefore turn a sync into
+/// tens of minutes while the held lock blocks every other sync and purge.
+///
+/// Two limits bound that, and both only ever count *wasted* time. A healthy
+/// enrichment over loopback finishes in milliseconds and is never charged, so a
+/// large well-behaved history keeps all of its timestamps no matter how many
+/// sessions it has — degrading enrichment must never be the normal outcome, and
+/// must never fail the sync.
+///
+/// - Per connection, [`TRAJECTORY_ENRICHMENT_FAILURE_THRESHOLD`] consecutive
+///   failures write that connection off for the remainder of the sync. One
+///   failure is indistinguishable from a session whose trajectory genuinely is
+///   not available, so tripping on the first would give up enrichment for an
+///   entire history because of one bad session. Two in a row on the same
+///   connection means the endpoint is the problem, not the session; the extra
+///   attempt costs at most one more transport timeout per connection.
+/// - Across the whole sync, [`TRAJECTORY_ENRICHMENT_BUDGET`] of accumulated
+///   failure time stops enrichment outright. At the 10s transport timeout that
+///   is six stalled requests for the entire run, so the worst case this
+///   optional work can add to a sync is about a minute regardless of how many
+///   sessions or connections are involved. It is the backstop for what the
+///   per-connection breaker cannot bound on its own: many connections, or one
+///   that alternates between answering and stalling so its consecutive-failure
+///   count keeps resetting.
+#[derive(Debug)]
+struct TrajectoryEnrichmentBudget {
+    budget: Duration,
+    failure_threshold: u32,
+    wasted: Duration,
+    consecutive_failures: HashMap<String, u32>,
+}
+
+impl TrajectoryEnrichmentBudget {
+    fn new() -> Self {
+        Self::with_limits(
+            TRAJECTORY_ENRICHMENT_BUDGET,
+            TRAJECTORY_ENRICHMENT_FAILURE_THRESHOLD,
+        )
+    }
+
+    /// Split out so the budget decision is exercisable without spending real
+    /// wall clock on stalled sockets.
+    fn with_limits(budget: Duration, failure_threshold: u32) -> Self {
+        Self {
+            budget,
+            failure_threshold,
+            wasted: Duration::ZERO,
+            consecutive_failures: HashMap::new(),
+        }
+    }
+
+    fn should_attempt(&self, fingerprint: &str) -> bool {
+        if self.wasted >= self.budget {
+            return false;
+        }
+        self.consecutive_failures
+            .get(fingerprint)
+            .copied()
+            .unwrap_or(0)
+            < self.failure_threshold
+    }
+
+    /// A connection that answers is given its full allowance back: a single
+    /// blip must not accumulate across an otherwise healthy sync.
+    fn record_success(&mut self, fingerprint: &str) {
+        self.consecutive_failures.remove(fingerprint);
+    }
+
+    fn record_failure(&mut self, fingerprint: &str, elapsed: Duration) {
+        self.wasted = self.wasted.saturating_add(elapsed);
+        *self
+            .consecutive_failures
+            .entry(fingerprint.to_string())
+            .or_insert(0) += 1;
+    }
+}
+
+/// Best-effort timestamps for sessions whose metadata does not carry its own.
+///
+/// Every failure mode ends in an empty map rather than an error: the caller
+/// falls back to the metadata-derived timestamp, which is the same outcome a
+/// failed RPC produced before this was bounded.
+fn fetch_usage_timestamps(
+    summary: &TrajectorySummary,
+    connection: &AntigravityConnection,
+    budget: &mut TrajectoryEnrichmentBudget,
+) -> HashMap<String, i64> {
+    if !budget.should_attempt(&connection.fingerprint) {
+        return HashMap::new();
+    }
+
+    let started = Instant::now();
+    match rpc_request(
+        connection,
+        "GetCascadeTrajectory",
+        &serde_json::json!({ "cascadeId": summary.session_id }),
+    ) {
+        Ok(trajectory) => {
+            budget.record_success(&connection.fingerprint);
+            usage_timestamps_from_trajectory(&trajectory)
+        }
+        Err(_) => {
+            budget.record_failure(&connection.fingerprint, started.elapsed());
+            HashMap::new()
+        }
+    }
+}
+
 fn try_fetch_session_artifact(
     summary: &TrajectorySummary,
     connection: &AntigravityConnection,
+    budget: &mut TrajectoryEnrichmentBudget,
 ) -> Result<Option<SessionArtifact>> {
     let response = match rpc_request(
         connection,
@@ -2527,13 +2664,7 @@ fn try_fetch_session_artifact(
     }
 
     let usage_timestamps = if session_metadata_needs_trajectory_timestamps(&metadata) {
-        rpc_request(
-            connection,
-            "GetCascadeTrajectory",
-            &serde_json::json!({ "cascadeId": summary.session_id }),
-        )
-        .map(|trajectory| usage_timestamps_from_trajectory(&trajectory))
-        .unwrap_or_default()
+        fetch_usage_timestamps(summary, connection, budget)
     } else {
         HashMap::new()
     };
@@ -3894,6 +4025,258 @@ mod tests {
             cached_rpc_transport(port),
             Some(RpcTransport::PlainHttp),
             "a working plaintext port must be remembered, so the TLS leg is not tried later"
+        );
+    }
+
+    /// Local Antigravity RPC listener whose answer per method a test controls.
+    ///
+    /// The handler receives the RPC method name and returns the JSON body to
+    /// send, or `None` to close without answering — which is how a broken
+    /// endpoint reaches `rpc_request` as an error without a test having to
+    /// spend the 10s transport timeout to get there. Connections that do not
+    /// open with a plaintext POST are the HTTPS fallback leg probing the same
+    /// port; dropping them makes that leg fail immediately too.
+    fn serve_rpc_methods<F>(handler: F) -> (u16, Arc<Mutex<Vec<String>>>)
+    where
+        F: Fn(&str) -> Option<String> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&methods);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                let mut buf = [0_u8; 4096];
+                let Ok(read) = std::io::Read::read(&mut stream, &mut buf) else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                if !request.starts_with("POST ") {
+                    continue;
+                }
+                let method = request
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|path| path.rsplit('/').next())
+                    .unwrap_or_default()
+                    .to_string();
+                if let Ok(mut log) = seen.lock() {
+                    log.push(method.clone());
+                }
+                let Some(body) = handler(&method) else {
+                    continue;
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (port, methods)
+    }
+
+    /// Metadata carrying usage with no timestamp anywhere, which is the only
+    /// shape that asks for the optional trajectory enrichment.
+    fn metadata_needing_enrichment() -> String {
+        serde_json::json!({
+            "generatorMetadata": [{
+                "chatModel": {
+                    "responseModel": "gemini-3.7-flash",
+                    "retryInfos": [{
+                        "usage": {
+                            "inputTokens": 10,
+                            "outputTokens": 5,
+                            "responseId": "response-1",
+                            "messageId": "message-1"
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string()
+    }
+
+    fn enrichment_test_connection(port: u16) -> AntigravityConnection {
+        AntigravityConnection {
+            pid: 1,
+            port,
+            csrf_token: "abcdef0123456789abcdef0123456789".to_string(),
+            fingerprint: format!("pid:1:port:{port}"),
+        }
+    }
+
+    #[test]
+    fn trajectory_enrichment_stops_after_a_connection_keeps_failing() {
+        // The regression this guards: `sync` walks every session under its
+        // exclusive cache lock, and each session whose metadata lacks usage
+        // timestamps used to issue a `GetCascadeTrajectory` whose error was
+        // only discarded after it returned. With metadata still answering and
+        // the trajectory endpoint stalling, that is one full transport timeout
+        // per session with the lock held.
+        let metadata = metadata_needing_enrichment();
+        let (port, seen) = serve_rpc_methods(move |method| match method {
+            "GetCascadeTrajectoryGeneratorMetadata" => Some(metadata.clone()),
+            _ => None,
+        });
+        // The transport cache is keyed by port and outlives individual tests,
+        // so pin it rather than depend on which leg a recycled port last used.
+        remember_rpc_transport(port, RpcTransport::PlainHttp);
+        let connection = enrichment_test_connection(port);
+        let mut budget = TrajectoryEnrichmentBudget::new();
+
+        const SESSIONS: usize = 5;
+        for index in 0..SESSIONS {
+            let summary = TrajectorySummary {
+                session_id: format!("session-{index}"),
+                last_modified_ms: Some(1),
+                step_count: Some(1),
+                connection_fingerprint: connection.fingerprint.clone(),
+            };
+            let artifact = try_fetch_session_artifact(&summary, &connection, &mut budget)
+                .expect("a failed enrichment must never fail the sync")
+                .expect("the session must still be written from its metadata");
+            assert!(
+                artifact.contents.contains(&format!("session-{index}")),
+                "the metadata-derived artifact is the documented fallback: {}",
+                artifact.contents
+            );
+        }
+
+        let methods = seen.lock().unwrap();
+        let metadata_calls = methods
+            .iter()
+            .filter(|method| *method == "GetCascadeTrajectoryGeneratorMetadata")
+            .count();
+        let trajectory_calls = methods
+            .iter()
+            .filter(|method| *method == "GetCascadeTrajectory")
+            .count();
+
+        assert_eq!(
+            metadata_calls, SESSIONS,
+            "metadata is not the optional part and must still be fetched per session"
+        );
+        assert_eq!(
+            trajectory_calls, TRAJECTORY_ENRICHMENT_FAILURE_THRESHOLD as usize,
+            "the breaker must write the connection off after \
+             {TRAJECTORY_ENRICHMENT_FAILURE_THRESHOLD} consecutive failures instead of paying \
+             for every one of the {SESSIONS} sessions"
+        );
+    }
+
+    #[test]
+    fn trajectory_enrichment_keeps_running_while_the_endpoint_answers() {
+        // The breaker must not cost a healthy history its timestamps.
+        let metadata = metadata_needing_enrichment();
+        let trajectory = serde_json::json!({
+            "trajectory": {
+                "steps": [{
+                    "metadata": {
+                        "createdAt": "2026-08-19T06:34:26.163405500Z",
+                        "modelUsage": { "responseId": "response-1", "messageId": "message-1" }
+                    }
+                }]
+            }
+        })
+        .to_string();
+        let (port, seen) = serve_rpc_methods(move |method| match method {
+            "GetCascadeTrajectoryGeneratorMetadata" => Some(metadata.clone()),
+            "GetCascadeTrajectory" => Some(trajectory.clone()),
+            _ => None,
+        });
+        remember_rpc_transport(port, RpcTransport::PlainHttp);
+        let connection = enrichment_test_connection(port);
+        let mut budget = TrajectoryEnrichmentBudget::new();
+
+        const SESSIONS: usize = 5;
+        for index in 0..SESSIONS {
+            let summary = TrajectorySummary {
+                session_id: format!("session-{index}"),
+                last_modified_ms: Some(1),
+                step_count: Some(1),
+                connection_fingerprint: connection.fingerprint.clone(),
+            };
+            let artifact = try_fetch_session_artifact(&summary, &connection, &mut budget)
+                .unwrap()
+                .expect("the session must be written");
+            let usage: Value = artifact
+                .contents
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|value| value.get("type").and_then(Value::as_str) == Some("usage"))
+                .expect("the artifact must carry a usage line");
+            assert_eq!(
+                usage.get("timestamp").and_then(Value::as_i64),
+                parse_timestamp_value(&serde_json::json!("2026-08-19T06:34:26.163405500Z")),
+                "an answering endpoint must keep enriching every session"
+            );
+        }
+
+        let trajectory_calls = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|method| *method == "GetCascadeTrajectory")
+            .count();
+        assert_eq!(
+            trajectory_calls, SESSIONS,
+            "a working endpoint must not be rate limited by the breaker"
+        );
+    }
+
+    #[test]
+    fn enrichment_budget_trips_only_on_consecutive_failures() {
+        let mut budget = TrajectoryEnrichmentBudget::with_limits(Duration::from_secs(60), 2);
+
+        assert!(budget.should_attempt("a"));
+        budget.record_failure("a", Duration::from_millis(1));
+        assert!(
+            budget.should_attempt("a"),
+            "one failure is indistinguishable from a session with no trajectory"
+        );
+
+        budget.record_success("a");
+        budget.record_failure("a", Duration::from_millis(1));
+        assert!(
+            budget.should_attempt("a"),
+            "an answering connection gets its full allowance back"
+        );
+
+        budget.record_failure("a", Duration::from_millis(1));
+        assert!(
+            !budget.should_attempt("a"),
+            "two failures in a row mean the endpoint, not the session, is broken"
+        );
+        assert!(
+            budget.should_attempt("b"),
+            "the breaker is per connection, not global"
+        );
+    }
+
+    #[test]
+    fn enrichment_budget_stops_every_connection_once_it_is_spent() {
+        // Simulated elapsed time: the real path charges what a stalled RPC
+        // actually took, and no test should spend a transport timeout to prove
+        // the arithmetic.
+        let mut budget = TrajectoryEnrichmentBudget::with_limits(Duration::from_secs(60), 2);
+
+        for index in 0..6 {
+            let fingerprint = format!("connection-{index}");
+            assert!(
+                budget.should_attempt(&fingerprint),
+                "a fresh connection is attempted while budget remains"
+            );
+            budget.record_failure(&fingerprint, Duration::from_secs(10));
+        }
+
+        assert!(
+            !budget.should_attempt("connection-6"),
+            "six stalled requests at the 10s transport timeout spend the whole sync budget, \
+             so a seventh connection must not be attempted either"
         );
     }
 
