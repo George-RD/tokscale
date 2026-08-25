@@ -188,6 +188,11 @@ function serializeSqlCalls(): string[] {
   });
 }
 
+/** Whitespace-insensitive view of a query, for asserting on a whole clause. */
+function collapseSql(text: string | undefined): string {
+  return (text ?? "").replace(/\s+/g, " ").trim();
+}
+
 beforeAll(async () => {
   const routeModule = await import("../../src/app/api/users/[username]/route");
   GET = routeModule.GET;
@@ -1037,7 +1042,7 @@ describe("GET /api/users/[username]", () => {
       sqlTexts.some(
         (text) =>
           text.includes("FROM daily_breakdown d") &&
-          text.includes("RANK() OVER") &&
+          text.includes("ROW_NUMBER() OVER") &&
           text.includes("d.date >= 2026-07-18") &&
           text.includes("d.date <= 2026-07-24"),
       ),
@@ -1218,7 +1223,7 @@ describe("GET /api/users/[username]", () => {
       sqlTexts.some(
         (text) =>
           text.includes("FROM daily_breakdown d") &&
-          text.includes("RANK() OVER") &&
+          text.includes("ROW_NUMBER() OVER") &&
           text.includes(`d.date >= ${start}`) &&
           text.includes("d.date <= 2026-06-28"),
       ),
@@ -1255,6 +1260,138 @@ describe("GET /api/users/[username]", () => {
     "recalculates profile overview stats and rank for the $period period",
     assertRollingProfilePeriod,
   );
+
+  it("ranks the profile period window the way the leaderboard's period tab does", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-28T12:00:00.000Z"));
+
+    mockState.pushSelectResult([
+      {
+        id: "user-1",
+        username: "alice",
+        displayName: "Alice",
+        avatarUrl: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        totalTokens: 300,
+        totalCost: 3,
+        inputTokens: 180,
+        outputTokens: 120,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        reasoningTokens: 0,
+        submissionCount: 1,
+        earliestDate: "2026-06-28",
+        latestDate: "2026-06-28",
+        sessionCount: 1,
+      },
+    ]);
+    mockState.pushSelectResult([]);
+    mockState.pushSelectResult([
+      {
+        date: "2026-06-28",
+        timestampMs: 100,
+        tokens: 300,
+        cost: "3.0000",
+        inputTokens: 180,
+        outputTokens: 120,
+        sourceBreakdown: null,
+      },
+    ]);
+    // postgres-js hands a bigint rank back as a string.
+    mockState.pushExecuteResult([{ rank: "2" }]);
+
+    const response = await GET(
+      new Request("http://localhost:3000/api/users/alice?period=week"),
+      { params: Promise.resolve({ username: "alice" }) },
+    );
+    const body = await response.json();
+    const sqlTexts = serializeSqlCalls();
+    const periodRankSql = sqlTexts.find((text) =>
+      text.includes("ROW_NUMBER() OVER"),
+    );
+
+    expect(response.status).toBe(200);
+    expect(body.user.rank).toBe(2);
+    // Two users on the same token total have to read the same two distinct
+    // positions here and on the leaderboard's period tab, so the window clause
+    // has to match it term for term.
+    expect(periodRankSql).toBeDefined();
+    expect(collapseSql(periodRankSql)).toContain(
+      "ROW_NUMBER() OVER (ORDER BY total_tokens DESC, total_cost DESC, LOWER(username) ASC, user_id ASC) as rank",
+    );
+    // Shared RANK is what this window used to emit, and it is what made a tie
+    // read one number on the profile and another on the leaderboard.
+    expect(sqlTexts.some((text) => text.includes("RANK() OVER"))).toBe(false);
+    // Only the ordering within a tie changed: the same rows are ranked.
+    expect(collapseSql(periodRankSql)).toContain(
+      "WHERE u.leaderboard_hidden = false AND d.date >= 2026-06-22 AND d.date <= 2026-06-28",
+    );
+    expect(collapseSql(periodRankSql)).toContain(
+      "GROUP BY s.user_id, u.username",
+    );
+    expect(unstableCacheMock).toHaveBeenCalledWith(
+      expect.any(Function),
+      ["profile-period-rank", "user-1", "2026-06-22", "2026-06-28"],
+      {
+        revalidate: 60,
+        tags: ["leaderboard", "user:alice"],
+      },
+    );
+  });
+
+  it("keeps the lifetime profile rank on shared RANK", async () => {
+    mockState.pushSelectResult([
+      {
+        id: "user-1",
+        username: "alice",
+        displayName: "Alice",
+        avatarUrl: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        totalTokens: 1000,
+        totalCost: 10,
+        inputTokens: 600,
+        outputTokens: 400,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        reasoningTokens: 0,
+        submissionCount: 1,
+        earliestDate: "2026-01-01",
+        latestDate: "2026-06-28",
+        sessionCount: 1,
+      },
+    ]);
+    mockState.pushSelectResult([]);
+    mockState.pushSelectResult([]);
+    mockState.pushExecuteResult([{ rank: "3" }]);
+
+    const response = await GET(
+      new Request("http://localhost:3000/api/users/alice"),
+      { params: Promise.resolve({ username: "alice" }) },
+    );
+    const body = await response.json();
+    const sqlTexts = serializeSqlCalls();
+
+    expect(response.status).toBe(200);
+    expect(body.user.rank).toBe(3);
+    // The leaderboard's all-time tab shares one position between tied users.
+    // Ranking this window sequentially would be the same divergence mirrored.
+    expect(
+      sqlTexts.some((text) =>
+        collapseSql(text).includes(
+          "RANK() OVER (ORDER BY total_tokens DESC) as rank",
+        ),
+      ),
+    ).toBe(true);
+    expect(sqlTexts.some((text) => text.includes("ROW_NUMBER"))).toBe(false);
+  });
 
   it("skips the period rank scan when the user has no daily rows in the window", async () => {
     vi.useFakeTimers();

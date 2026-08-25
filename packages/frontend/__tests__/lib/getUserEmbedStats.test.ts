@@ -142,16 +142,39 @@ type ModuleExports = typeof import("../../src/lib/embed/getUserEmbedStats");
 let getUserEmbedStats: ModuleExports["getUserEmbedStats"];
 let getUserEmbedContributions: ModuleExports["getUserEmbedContributions"];
 
+/**
+ * A conditional `ORDER BY` is interpolated as a nested `sql` fragment, so a
+ * plain `String(...)` would flatten it to `[object Object]` and hide the very
+ * clause these tests are about. Recurse into fragments instead, so a single
+ * assertion can read a whole window clause.
+ */
+function serializeSqlValue(value: unknown): string {
+  const fragment = value as { strings?: unknown; values?: unknown[] };
+  if (!value || typeof value !== "object" || !Array.isArray(fragment.strings)) {
+    return String(value);
+  }
+
+  const parts = fragment.strings as string[];
+  const values = fragment.values ?? [];
+
+  return parts.reduce(
+    (text, part, index) =>
+      `${text}${part}${index < values.length ? serializeSqlValue(values[index]) : ""}`,
+    "",
+  );
+}
+
 function serializeSqlCalls(): string[] {
   return mockState.sql.mock.calls.map((call) => {
     const [strings, ...values] = call as [TemplateStringsArray, ...unknown[]];
-    const textParts = Array.from(strings);
 
-    return textParts.reduce((text, part, index) => {
-      const nextValue = index < values.length ? String(values[index]) : "";
-      return `${text}${part}${nextValue}`;
-    }, "");
+    return serializeSqlValue({ strings: Array.from(strings), values });
   });
+}
+
+/** Whitespace-insensitive view of a query, for asserting on a whole clause. */
+function collapseSql(text: string | undefined): string {
+  return (text ?? "").replace(/\s+/g, " ").trim();
 }
 
 beforeAll(async () => {
@@ -165,7 +188,10 @@ beforeEach(() => {
 });
 
 describe("user embed data", () => {
-  it("keeps embed tie-breakers out of the rank window", async () => {
+  // The lifetime card has to agree with the leaderboard's all-time tab, which
+  // shares one position between tied users. Only the finite windows below rank
+  // sequentially.
+  it("keeps the lifetime embed rank on shared RANK with no tie-breakers", async () => {
     mockState.pushAwaitedResult([
       {
         id: "user-alice",
@@ -185,6 +211,9 @@ describe("user embed data", () => {
 
     expect(tokenSqlTexts.some((text) => text.includes("RANK() OVER"))).toBe(
       true,
+    );
+    expect(tokenSqlTexts.some((text) => text.includes("ROW_NUMBER"))).toBe(
+      false,
     );
     expect(
       tokenSqlTexts.some((text) =>
@@ -215,6 +244,7 @@ describe("user embed data", () => {
     expect(costSqlTexts.some((text) => text.includes("RANK() OVER"))).toBe(
       true,
     );
+    expect(costSqlTexts.some((text) => text.includes("ROW_NUMBER"))).toBe(false);
     expect(
       costSqlTexts.some((text) =>
         /CAST\(total_cost AS DECIMAL\(\d+,4\)\) DESC, total_tokens DESC/.test(
@@ -223,6 +253,75 @@ describe("user embed data", () => {
       ),
     ).toBe(false);
   });
+
+  it.each([
+    {
+      sortBy: "tokens" as const,
+      metricOrder: "total_tokens DESC, total_cost DESC",
+    },
+    {
+      sortBy: "cost" as const,
+      metricOrder: "total_cost DESC, total_tokens DESC",
+    },
+  ])(
+    "ranks the finite embed window the way the leaderboard's period tab ranks $sortBy",
+    async ({ sortBy, metricOrder }) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-03-12T12:00:00.000Z"));
+
+      try {
+        mockState.pushAwaitedResult([
+          {
+            id: "user-alice",
+            username: "alice",
+            displayName: "Alice",
+            avatarUrl: null,
+            totalTokens: 3000,
+            totalCost: 40,
+            submissionCount: 3,
+            latestDate: "2026-03-14",
+            updatedAt: new Date("2026-03-14T09:00:00.000Z"),
+          },
+        ]);
+        mockState.pushExecuteResult([{ totalTokens: 700, totalCost: 7 }]);
+        // postgres-js hands a bigint rank back as a string.
+        mockState.pushExecuteResult([{ rank: "2", total: 10 }]);
+
+        const stats = await getUserEmbedStats("alice", sortBy, "week");
+        const sqlTexts = serializeSqlCalls();
+        const periodRankSql = sqlTexts.find((text) =>
+          text.includes("ROW_NUMBER() OVER"),
+        );
+
+        // Two users on the same total have to read the same two distinct
+        // positions here and on the leaderboard's period tab, so the window
+        // clause has to match it term for term.
+        expect(periodRankSql).toBeDefined();
+        expect(collapseSql(periodRankSql)).toContain(
+          `ROW_NUMBER() OVER ( ORDER BY ${metricOrder}, LOWER(username) ASC, user_id ASC ) AS rank`,
+        );
+        // Shared RANK is what the profile and embed period windows used to
+        // emit, and it is what made a tie read differently per surface.
+        expect(sqlTexts.some((text) => text.includes("RANK() OVER"))).toBe(
+          false,
+        );
+        // Only the ordering within a tie changed: the same rows are counted,
+        // and the "of N" denominator still counts them all.
+        expect(collapseSql(periodRankSql)).toContain(
+          "WHERE u.leaderboard_hidden = false AND d.date >= 2026-03-08 AND d.date <= 2026-03-14",
+        );
+        expect(collapseSql(periodRankSql)).toContain(
+          "GROUP BY s.user_id, u.username",
+        );
+        expect(collapseSql(periodRankSql)).toContain(
+          "SELECT COUNT(*)::int FROM rankable",
+        );
+        expect(stats?.stats).toMatchObject({ rank: 2, rankTotal: 10 });
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("casts total_cost at full column precision for cost-sorted embed stats", async () => {
     mockState.pushAwaitedResult([
@@ -330,7 +429,7 @@ describe("user embed data", () => {
           (text) =>
             text.includes("WITH rankable AS") &&
             text.includes("FROM daily_breakdown d") &&
-            text.includes("RANK() OVER") &&
+            text.includes("ROW_NUMBER() OVER") &&
             text.includes("d.date >= 2026-03-08") &&
             text.includes("d.date <= 2026-03-14"),
         ),

@@ -228,6 +228,9 @@ export async function getPublicProfileResponse(
         // A finite rank needs the anchored profile range, which is only known
         // after the stats query returns the newest submitted date. Keep the
         // lifetime rank concurrent and defer only finite-period ranking.
+        //
+        // Shared RANK here on purpose: the leaderboard's all-time tab ranks
+        // the same way, so tied users read the same number on both surfaces.
         period === "all"
           ? db.execute<{ rank: number }>(sql`
               WITH user_totals AS (
@@ -280,6 +283,12 @@ export async function getPublicProfileResponse(
     // finite query uses the exact same anchored window as the visible profile
     // totals and chart.
     //
+    // The two windows deliberately differ, because the two leaderboard tabs
+    // they have to agree with do: the finite query mirrors the leaderboard's
+    // period path (sequential ROW_NUMBER with the same tie-breakers, so tied
+    // users get distinct positions in the same order), and the lifetime query
+    // mirrors the all-time path (shared RANK, so tied users share a position).
+    //
     // The scan ranks every rankable user's daily rows, so it is cached for a
     // minute per user and window instead of running on every request. A user
     // with no daily rows in the window has no row in the CTE either, so the
@@ -297,19 +306,21 @@ export async function getPublicProfileResponse(
                 WITH user_totals AS (
                   SELECT
                     s.user_id,
-                    SUM(d.tokens) as total_tokens
+                    u.username,
+                    SUM(d.tokens) as total_tokens,
+                    SUM(CAST(d.cost AS DECIMAL(18,4))) as total_cost
                   FROM daily_breakdown d
                   INNER JOIN submissions s ON d.submission_id = s.id
                   INNER JOIN users u ON u.id = s.user_id
                   WHERE u.leaderboard_hidden = false
                     AND d.date >= ${periodRange.start}
                     AND d.date <= ${periodRange.end}
-                  GROUP BY s.user_id
+                  GROUP BY s.user_id, u.username
                 ),
                 ranked AS (
                   SELECT
                     user_id,
-                    RANK() OVER (ORDER BY total_tokens DESC) as rank
+                    ROW_NUMBER() OVER (ORDER BY total_tokens DESC, total_cost DESC, LOWER(username) ASC, user_id ASC) as rank
                   FROM user_totals
                 )
                 SELECT rank FROM ranked WHERE user_id = ${user.id}
