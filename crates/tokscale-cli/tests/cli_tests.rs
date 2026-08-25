@@ -4093,6 +4093,45 @@ fn test_pricing_command_renders_sub_cent_prices() {
 }
 
 #[test]
+fn test_pricing_list_overrides_renders_sub_cent_prices() {
+    // `pricing list-overrides` reads per-1M values straight out of
+    // custom-pricing.json without scaling, so it shares the lookup path's
+    // formatter but not its arithmetic. Exercise it end to end: a cache-read
+    // override below a cent used to print $0.00, which is indistinguishable
+    // from an override the user never set.
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let config_dir = sandbox_config_dir(tmp.path());
+    fs::create_dir_all(&config_dir).expect("failed to create config dir");
+    fs::write(
+        config_dir.join("custom-pricing.json"),
+        serde_json::to_string(&serde_json::json!({
+            "models": {
+                "acme/sub-cent": {
+                    "input_cost_per_million_tokens": 0.435,
+                    "output_cost_per_million_tokens": 0.87,
+                    "cache_read_input_token_cost_per_million_tokens": 0.003625,
+                    "cache_creation_input_token_cost_per_million_tokens": 0.005,
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .expect("failed to write custom-pricing.json");
+
+    cmd_with_home(tmp.path())
+        .args(["pricing", "list-overrides", "--no-spinner"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("acme/sub-cent"))
+        .stdout(predicate::str::contains("Input:  $0.435 / 1M tokens"))
+        .stdout(predicate::str::contains("Output: $0.87 / 1M tokens"))
+        .stdout(predicate::str::contains(
+            "Cache Read:  $0.003625 / 1M tokens",
+        ))
+        .stdout(predicate::str::contains("Cache Write: $0.005 / 1M tokens"));
+}
+
+#[test]
 fn test_pricing_command_json() {
     let tmp = TempDir::new().expect("failed to create temp dir");
     prime_canonical_sonnet_pricing_cache(tmp.path(), "claude-sonnet-4-20250514");
