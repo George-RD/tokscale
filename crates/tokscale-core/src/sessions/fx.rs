@@ -15,12 +15,23 @@
 //! The global `~/.fx/usage.jsonl` stream also exists (one `generation` record
 //! per request) but carries no session id or workspace, so it is intentionally
 //! not scanned here.
+//!
+//! Cache split. The two sidecars are read back differently because they sit at
+//! different scopes. `session.json` is per-session, so it is a related file of
+//! the snapshot's cache fingerprint ([`fx_session_meta_path`]) and a
+//! sidecar-only edit invalidates exactly that one entry. `index.json` is one
+//! file shared by every session, so it is deliberately *not* in any
+//! fingerprint — appending a new session to it would otherwise invalidate every
+//! other session's entry. Its title is resolved after the cache instead, by
+//! [`apply_session_titles`], which reads the index once per scan and writes the
+//! title onto freshly parsed and cache-served messages alike.
 
 use super::utils::{file_modified_timestamp_ms, read_file_or_none};
 use super::{normalize_workspace_key, workspace_label_from_key, CostSource, UnifiedMessage};
 use crate::{provider_identity, TokenBreakdown};
 use serde::Deserialize;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 const CLIENT_ID: &str = "fx";
 // `fx-unknown` follows the `<client>-unknown` convention (trae.rs) for
@@ -103,25 +114,84 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Resolve a session's human-readable title from `~/.fx/sessions/index.json`,
-/// which maps `id -> { title, ... }`. Missing/unreadable index or title simply
-/// degrades to `None` (the Sessions tab then shows the session id).
-fn load_index_title(sessions_dir: Option<&Path>, session_id: &str) -> Option<String> {
-    let dir = sessions_dir?;
-    let value: serde_json::Value = read_json(&dir.join("index.json"))?;
-    let sessions = value.get("sessions")?.as_array()?;
+/// The sibling `session.json` a snapshot's parse reads for the workspace root
+/// and the authoritative timestamps.
+///
+/// Always returns a path, including for a session that has no `session.json`
+/// yet: the cache records the absence so a later creation still invalidates the
+/// entry instead of freezing the mtime fallback timestamp forever.
+pub(crate) fn fx_session_meta_path(usage_path: &Path) -> PathBuf {
+    usage_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("session.json")
+}
+
+/// Read `<sessions>/index.json` (`{"sessions":[{"id","title",...}]}`) into
+/// `id -> title`. A missing, unreadable or malformed index contributes nothing;
+/// the Sessions tab then shows the session id.
+fn collect_index_titles(sessions_dir: &Path, titles: &mut HashMap<String, String>) {
+    let Some(value) = read_json::<serde_json::Value>(&sessions_dir.join("index.json")) else {
+        return;
+    };
+    let Some(sessions) = value.get("sessions").and_then(|s| s.as_array()) else {
+        return;
+    };
     for entry in sessions {
-        if entry.get("id").and_then(|id| id.as_str()) == Some(session_id) {
-            let title = entry.get("title").and_then(|t| t.as_str()).unwrap_or("");
-            let trimmed = title.trim();
-            return if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            };
+        let Some(id) = entry.get("id").and_then(|id| id.as_str()) else {
+            continue;
+        };
+        let title = entry
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .trim();
+        if title.is_empty() {
+            continue;
         }
+        titles.insert(id.to_string(), title.to_string());
     }
-    None
+}
+
+/// Attach human-readable session titles to an fx lane's messages.
+///
+/// Runs after the source-message cache, not inside [`parse_fx_file`], because
+/// `index.json` is shared by every fx session: making it part of a per-session
+/// cache fingerprint would let one new session invalidate every other session's
+/// entry. Resolving it here keeps a title-only edit free — nothing is
+/// invalidated, the index is parsed once per scan rather than once per session,
+/// and a cache-served message still gets the current title.
+///
+/// The title is assigned, not filled in: a message restored from the cache
+/// carries whatever title the index held when it was written, so an edited or
+/// removed title has to be able to overwrite it back to `None`.
+///
+/// `usage_paths` are the scanned `usage-v2.json` paths; their grandparent is
+/// the sessions directory holding the index. Only fx messages are touched, so
+/// passing a wider slice cannot clear another client's titles.
+pub fn apply_session_titles(usage_paths: &[PathBuf], messages: &mut [UnifiedMessage]) {
+    if messages.is_empty() {
+        return;
+    }
+
+    let mut titles: HashMap<String, String> = HashMap::new();
+    let mut seen_dirs: HashSet<&Path> = HashSet::new();
+    for path in usage_paths {
+        let Some(sessions_dir) = path.parent().and_then(Path::parent) else {
+            continue;
+        };
+        if !seen_dirs.insert(sessions_dir) {
+            continue;
+        }
+        collect_index_titles(sessions_dir, &mut titles);
+    }
+
+    for message in messages {
+        if message.client != CLIENT_ID {
+            continue;
+        }
+        message.session_title = titles.get(&message.session_id).cloned();
+    }
 }
 
 /// Split a provider-prefixed fx model id (`zai/glm-5.2`) into `(provider,
@@ -153,7 +223,6 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
     };
 
     let session_dir = path.parent();
-    let sessions_dir = session_dir.and_then(Path::parent);
 
     let session_id = file
         .session_id
@@ -168,7 +237,7 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
 
     // Sibling `session.json` carries the workspace root and authoritative
     // timestamps; fall back to the usage file's mtime when absent.
-    let meta: Option<FxSessionMeta> = session_dir.and_then(|d| read_json(&d.join("session.json")));
+    let meta: Option<FxSessionMeta> = read_json(&fx_session_meta_path(path));
     let workspace_root = meta.as_ref().and_then(|m| m.workspace_root.clone());
     let timestamp_ms = meta
         .as_ref()
@@ -178,7 +247,6 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
 
     let workspace_key = workspace_root.as_deref().and_then(normalize_workspace_key);
     let workspace_label = workspace_key.as_deref().and_then(workspace_label_from_key);
-    let session_title = load_index_title(sessions_dir, &session_id);
 
     let mut messages = Vec::new();
     for model_usage in &snapshot.models {
@@ -221,7 +289,9 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
             message_count: model_usage.request_count.unwrap_or(0).max(0) as i32,
             agent: None,
             dedup_key: Some(dedup_key),
-            session_title: session_title.clone(),
+            // Resolved after the cache by `apply_session_titles`; see the
+            // module docs for why the shared index stays out of the parse.
+            session_title: None,
             is_turn_start: false,
             model_attribution_conflicted: false,
         });
@@ -259,7 +329,7 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
                 message_count: request_count as i32,
                 agent: None,
                 dedup_key: Some(format!("fx:{session_id}:{UNKNOWN_MODEL}")),
-                session_title: session_title.clone(),
+                session_title: None,
                 is_turn_start: false,
                 model_attribution_conflicted: false,
             });
@@ -315,7 +385,11 @@ mod tests {
             }"#,
         );
 
-        let messages = parse_fx_file(&usage);
+        let mut messages = parse_fx_file(&usage);
+        // The parse leaves the title unset; the lane resolves it from the
+        // shared index once per scan, after the cache.
+        assert_eq!(messages[0].session_title, None);
+        apply_session_titles(std::slice::from_ref(&usage), &mut messages);
         assert_eq!(messages.len(), 1);
         let msg = &messages[0];
         assert_eq!(msg.client, "fx");
@@ -384,7 +458,8 @@ mod tests {
             }"#,
         );
 
-        let messages = parse_fx_file(&usage);
+        let mut messages = parse_fx_file(&usage);
+        apply_session_titles(std::slice::from_ref(&usage), &mut messages);
         assert_eq!(messages.len(), 1);
         let msg = &messages[0];
         assert_eq!(msg.client, "fx");
@@ -469,10 +544,116 @@ mod tests {
             "usage-v2.json",
             r#"{"schema_version":1,"session_id":"s2","snapshot":{"models":[{"model":"glm-5.2","input_tokens":10,"output_tokens":5}]}}"#,
         );
-        let messages = parse_fx_file(&usage);
+        let mut messages = parse_fx_file(&usage);
+        apply_session_titles(std::slice::from_ref(&usage), &mut messages);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].provider_id, "zai");
         assert_eq!(messages[0].workspace_key, None);
         assert_eq!(messages[0].session_title, None);
+    }
+
+    #[test]
+    fn apply_session_titles_overwrites_a_cache_served_title() {
+        // A message restored from the source-message cache carries the title
+        // the index held when the entry was written. A later rename must be
+        // able to replace it, and a removed title must be able to clear it --
+        // hence assignment rather than fill-if-empty.
+        let (dir, session) = fixture();
+        let sessions = dir.path().join("sessions");
+        write_file(
+            &sessions,
+            "index.json",
+            r#"{"schema_version":3,"sessions":[{"id":"sess-123","title":"Renamed later"}]}"#,
+        );
+        let usage = write_file(
+            &session,
+            "usage-v2.json",
+            r#"{"schema_version":1,"session_id":"sess-123","snapshot":{"models":[{"model":"zai/glm-5.2","input_tokens":10,"output_tokens":5}]}}"#,
+        );
+
+        let mut messages = parse_fx_file(&usage);
+        messages[0].session_title = Some("Stale cached title".to_string());
+        apply_session_titles(std::slice::from_ref(&usage), &mut messages);
+        assert_eq!(messages[0].session_title.as_deref(), Some("Renamed later"));
+
+        write_file(
+            &sessions,
+            "index.json",
+            r#"{"schema_version":3,"sessions":[{"id":"sess-123","title":"   "}]}"#,
+        );
+        apply_session_titles(std::slice::from_ref(&usage), &mut messages);
+        assert_eq!(
+            messages[0].session_title, None,
+            "a blank title must clear the cached one, not leave it standing"
+        );
+    }
+
+    #[test]
+    fn apply_session_titles_leaves_other_clients_alone() {
+        let (dir, session) = fixture();
+        write_file(
+            &dir.path().join("sessions"),
+            "index.json",
+            r#"{"schema_version":3,"sessions":[{"id":"sess-123","title":"Setup CI"}]}"#,
+        );
+        let usage = write_file(
+            &session,
+            "usage-v2.json",
+            r#"{"schema_version":1,"session_id":"sess-123","snapshot":{"models":[{"model":"zai/glm-5.2","input_tokens":10,"output_tokens":5}]}}"#,
+        );
+
+        let mut messages = parse_fx_file(&usage);
+        let mut foreign = messages[0].clone();
+        foreign.client = "codex".to_string();
+        foreign.session_title = Some("Someone else's title".to_string());
+        messages.push(foreign);
+
+        apply_session_titles(std::slice::from_ref(&usage), &mut messages);
+        assert_eq!(messages[0].session_title.as_deref(), Some("Setup CI"));
+        assert_eq!(
+            messages[1].session_title.as_deref(),
+            Some("Someone else's title")
+        );
+    }
+
+    #[test]
+    fn apply_session_titles_covers_every_session_under_one_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let mut usage_paths = Vec::new();
+        let mut messages = Vec::new();
+        for id in ["sess-a", "sess-b"] {
+            let session = sessions.join(id);
+            std::fs::create_dir_all(&session).unwrap();
+            let usage = write_file(
+                &session,
+                "usage-v2.json",
+                &format!(
+                    r#"{{"schema_version":1,"session_id":"{id}","snapshot":{{"models":[{{"model":"zai/glm-5.2","input_tokens":10,"output_tokens":5}}]}}}}"#
+                ),
+            );
+            messages.extend(parse_fx_file(&usage));
+            usage_paths.push(usage);
+        }
+        write_file(
+            &sessions,
+            "index.json",
+            r#"{"schema_version":3,"sessions":[{"id":"sess-a","title":"First"},{"id":"sess-b","title":"Second"}]}"#,
+        );
+
+        apply_session_titles(&usage_paths, &mut messages);
+        let mut titles: Vec<Option<&str>> = messages
+            .iter()
+            .map(|m| m.session_title.as_deref())
+            .collect();
+        titles.sort();
+        assert_eq!(titles, vec![Some("First"), Some("Second")]);
+    }
+
+    #[test]
+    fn fx_session_meta_path_points_at_the_sibling_metadata() {
+        let (_dir, session) = fixture();
+        let usage = session.join("usage-v2.json");
+        assert_eq!(fx_session_meta_path(&usage), session.join("session.json"));
     }
 }

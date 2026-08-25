@@ -2497,15 +2497,36 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     );
 
     // fx (vercel-labs/fx) per-session usage snapshots
-    // (`~/.fx/sessions/<id>/usage-v2.json`).
-    parse_cached_lane(
-        &scan_result,
-        &mut source_cache,
-        pricing,
-        &mut all_messages,
-        ClientId::Fx,
-        sessions::fx::parse_fx_file,
-    );
+    // (`~/.fx/sessions/<id>/usage-v2.json`). The parse also reads the sibling
+    // `session.json`, so the fingerprint watches it: it carries the workspace
+    // root and the authoritative timestamps, and a cached parse that ignored it
+    // could keep a session on the wrong day. Titles come from the shared
+    // `sessions/index.json` and are applied below instead of being fingerprinted
+    // — one index backs every session, so watching it would make each new
+    // session invalidate all the others.
+    let fx_paths = scan_result.get(ClientId::Fx);
+    let fx_outcomes: Vec<CachedParseOutcome> = fx_paths
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source_with_fingerprint(
+                message_cache::CacheIdentity::for_client(ClientId::Fx),
+                path,
+                &source_cache,
+                pricing,
+                message_cache::SourceFingerprint::check_fx_path_samples_only,
+                sessions::fx::parse_fx_file,
+            )
+        })
+        .collect();
+    let mut fx_messages: Vec<UnifiedMessage> = Vec::new();
+    for outcome in fx_outcomes {
+        fx_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+    sessions::fx::apply_session_titles(fx_paths, &mut fx_messages);
+    all_messages.extend(fx_messages);
 
     // Kilo CLI: SQLite database
     if let Some(db_path) = &scan_result.kilo_db {
