@@ -1209,6 +1209,11 @@ fn parser_version(client: ClientId) -> u32 {
         // too — the shared code path changes what byte-identical omp files
         // parse to even though omp's own module did not change.
         ClientId::Omp => 1,
+        // v1 -> v2: the OpenCode parser now prefers `session_v2` metadata over
+        // the legacy `session` join for workspace and title. A database that
+        // carries both tables is byte-identical before and after, so only the
+        // version bump discards entries still holding the old attribution.
+        ClientId::OpenCode => 2,
         _ => 1,
     }
 }
@@ -3233,6 +3238,14 @@ mod tests {
         // fingerprint forever, so only the version bump discards the truncated
         // v6 parse and forces a cold reparse.
         assert_eq!(parser_version(ClientId::Grok), 7);
+    }
+
+    #[test]
+    fn test_opencode_session_v2_metadata_parser_version_invalidates_v1_entries() {
+        // A database holding both `session` and `session_v2` does not change on
+        // disk when the parser starts preferring the newer table, so the
+        // fingerprint keeps matching and only this bump forces the reparse.
+        assert_eq!(parser_version(ClientId::OpenCode), 2);
     }
 
     #[test]
