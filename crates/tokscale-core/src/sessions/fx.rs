@@ -24,7 +24,9 @@
 //! fingerprint — appending a new session to it would otherwise invalidate every
 //! other session's entry. Its title is resolved after the cache instead, by
 //! [`apply_session_titles`], which reads the index once per scan and writes the
-//! title onto freshly parsed and cache-served messages alike.
+//! title onto freshly parsed and cache-served messages alike. Titles are
+//! collected per sessions directory, because an fx session id is only unique
+//! within one `sessions/` tree.
 //!
 //! Cost provenance. `total_cost` is optional on the wire at both levels, so its
 //! presence is preserved rather than defaulted: a snapshot that never carried a
@@ -34,7 +36,7 @@ use super::utils::{file_modified_timestamp_ms, read_file_or_none};
 use super::{normalize_workspace_key, workspace_label_from_key, CostSource, UnifiedMessage};
 use crate::{provider_identity, TokenBreakdown};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 const CLIENT_ID: &str = "fx";
@@ -198,31 +200,47 @@ fn collect_index_titles(sessions_dir: &Path, titles: &mut HashMap<String, String
 /// carries whatever title the index held when it was written, so an edited or
 /// removed title has to be able to overwrite it back to `None`.
 ///
-/// `usage_paths` are the scanned `usage-v2.json` paths; their grandparent is
-/// the sessions directory holding the index. Only fx messages are touched, so
-/// passing a wider slice cannot clear another client's titles.
-pub fn apply_session_titles(usage_paths: &[PathBuf], messages: &mut [UnifiedMessage]) {
-    if messages.is_empty() {
-        return;
-    }
-
-    let mut titles: HashMap<String, String> = HashMap::new();
-    let mut seen_dirs: HashSet<&Path> = HashSet::new();
-    for path in usage_paths {
+/// `sources` pairs each scanned `usage-v2.json` path with the messages that
+/// path produced, freshly parsed or restored from the cache. That pairing is
+/// the provenance the lookup needs: an fx session id is only unique inside one
+/// `sessions/` tree, and a second configured scan root (`extra_scan_paths`)
+/// holding the same id used to hand its title to the first root's session,
+/// because the map was keyed by id alone. Titles are collected per sessions
+/// directory — the usage path's grandparent — and each message is resolved
+/// under the directory it actually came from.
+///
+/// Only fx messages are touched, so a group that also carries another client's
+/// messages cannot have their titles cleared.
+pub fn apply_session_titles(sources: &mut [(PathBuf, Vec<UnifiedMessage>)]) {
+    let mut titles: HashMap<PathBuf, HashMap<String, String>> = HashMap::new();
+    for (path, messages) in sources.iter() {
+        if messages.is_empty() {
+            continue;
+        }
         let Some(sessions_dir) = path.parent().and_then(Path::parent) else {
             continue;
         };
-        if !seen_dirs.insert(sessions_dir) {
+        if titles.contains_key(sessions_dir) {
             continue;
         }
-        collect_index_titles(sessions_dir, &mut titles);
+        let mut per_root: HashMap<String, String> = HashMap::new();
+        collect_index_titles(sessions_dir, &mut per_root);
+        titles.insert(sessions_dir.to_path_buf(), per_root);
     }
 
-    for message in messages {
-        if message.client != CLIENT_ID {
-            continue;
+    for (path, messages) in sources.iter_mut() {
+        let per_root = path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(|sessions_dir| titles.get(sessions_dir));
+        for message in messages.iter_mut() {
+            if message.client != CLIENT_ID {
+                continue;
+            }
+            message.session_title = per_root
+                .and_then(|per_root| per_root.get(&message.session_id))
+                .cloned();
         }
-        message.session_title = titles.get(&message.session_id).cloned();
     }
 }
 
@@ -390,6 +408,14 @@ mod tests {
         (dir, session)
     }
 
+    /// Resolve titles for messages that all came from one `usage-v2.json`,
+    /// the shape the lane builds when a scan turns up a single source.
+    fn apply_titles_from(usage: &std::path::Path, messages: &mut Vec<UnifiedMessage>) {
+        let mut sources = vec![(usage.to_path_buf(), std::mem::take(messages))];
+        apply_session_titles(&mut sources);
+        *messages = sources.remove(0).1;
+    }
+
     #[test]
     fn parses_provider_prefixed_model_into_one_message() {
         let (dir, session) = fixture();
@@ -422,7 +448,7 @@ mod tests {
         // The parse leaves the title unset; the lane resolves it from the
         // shared index once per scan, after the cache.
         assert_eq!(messages[0].session_title, None);
-        apply_session_titles(std::slice::from_ref(&usage), &mut messages);
+        apply_titles_from(&usage, &mut messages);
         assert_eq!(messages.len(), 1);
         let msg = &messages[0];
         assert_eq!(msg.client, "fx");
@@ -492,7 +518,7 @@ mod tests {
         );
 
         let mut messages = parse_fx_file(&usage);
-        apply_session_titles(std::slice::from_ref(&usage), &mut messages);
+        apply_titles_from(&usage, &mut messages);
         assert_eq!(messages.len(), 1);
         let msg = &messages[0];
         assert_eq!(msg.client, "fx");
@@ -578,7 +604,7 @@ mod tests {
             r#"{"schema_version":1,"session_id":"s2","snapshot":{"models":[{"model":"glm-5.2","input_tokens":10,"output_tokens":5}]}}"#,
         );
         let mut messages = parse_fx_file(&usage);
-        apply_session_titles(std::slice::from_ref(&usage), &mut messages);
+        apply_titles_from(&usage, &mut messages);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].provider_id, "zai");
         assert_eq!(messages[0].workspace_key, None);
@@ -606,7 +632,7 @@ mod tests {
 
         let mut messages = parse_fx_file(&usage);
         messages[0].session_title = Some("Stale cached title".to_string());
-        apply_session_titles(std::slice::from_ref(&usage), &mut messages);
+        apply_titles_from(&usage, &mut messages);
         assert_eq!(messages[0].session_title.as_deref(), Some("Renamed later"));
 
         write_file(
@@ -614,7 +640,7 @@ mod tests {
             "index.json",
             r#"{"schema_version":3,"sessions":[{"id":"sess-123","title":"   "}]}"#,
         );
-        apply_session_titles(std::slice::from_ref(&usage), &mut messages);
+        apply_titles_from(&usage, &mut messages);
         assert_eq!(
             messages[0].session_title, None,
             "a blank title must clear the cached one, not leave it standing"
@@ -641,7 +667,7 @@ mod tests {
         foreign.session_title = Some("Someone else's title".to_string());
         messages.push(foreign);
 
-        apply_session_titles(std::slice::from_ref(&usage), &mut messages);
+        apply_titles_from(&usage, &mut messages);
         assert_eq!(messages[0].session_title.as_deref(), Some("Setup CI"));
         assert_eq!(
             messages[1].session_title.as_deref(),
@@ -653,8 +679,7 @@ mod tests {
     fn apply_session_titles_covers_every_session_under_one_index() {
         let dir = tempfile::tempdir().unwrap();
         let sessions = dir.path().join("sessions");
-        let mut usage_paths = Vec::new();
-        let mut messages = Vec::new();
+        let mut sources = Vec::new();
         for id in ["sess-a", "sess-b"] {
             let session = sessions.join(id);
             std::fs::create_dir_all(&session).unwrap();
@@ -665,8 +690,7 @@ mod tests {
                     r#"{{"schema_version":1,"session_id":"{id}","snapshot":{{"models":[{{"model":"zai/glm-5.2","input_tokens":10,"output_tokens":5}}]}}}}"#
                 ),
             );
-            messages.extend(parse_fx_file(&usage));
-            usage_paths.push(usage);
+            sources.push((usage.clone(), parse_fx_file(&usage)));
         }
         write_file(
             &sessions,
@@ -674,9 +698,10 @@ mod tests {
             r#"{"schema_version":3,"sessions":[{"id":"sess-a","title":"First"},{"id":"sess-b","title":"Second"}]}"#,
         );
 
-        apply_session_titles(&usage_paths, &mut messages);
-        let mut titles: Vec<Option<&str>> = messages
+        apply_session_titles(&mut sources);
+        let mut titles: Vec<Option<&str>> = sources
             .iter()
+            .flat_map(|(_, messages)| messages.iter())
             .map(|m| m.session_title.as_deref())
             .collect();
         titles.sort();
@@ -796,6 +821,45 @@ mod tests {
         let msg = snapshot_cost_message(r#""total_cost":0.004,"#);
         assert!((msg.cost - 0.004).abs() < 1e-9);
         assert_eq!(msg.cost_source, CostSource::ProviderReported);
+    }
+
+    #[test]
+    fn two_roots_sharing_a_session_id_keep_their_own_titles() {
+        // fx session ids are only unique within one `sessions/` tree, and
+        // `extra_scan_paths` lets a second tree be scanned in the same lane.
+        // Keyed by id alone, whichever index was read last won for both.
+        let dir = tempfile::tempdir().unwrap();
+        let mut sources = Vec::new();
+        for (root, title) in [("root-a", "Ship the parser"), ("root-b", "Fix the cache")] {
+            let sessions = dir.path().join(root).join("sessions");
+            let session = sessions.join("sess-shared");
+            std::fs::create_dir_all(&session).unwrap();
+            write_file(
+                &sessions,
+                "index.json",
+                &format!(
+                    r#"{{"schema_version":3,"sessions":[{{"id":"sess-shared","title":"{title}"}}]}}"#
+                ),
+            );
+            let usage = write_file(
+                &session,
+                "usage-v2.json",
+                r#"{"schema_version":1,"session_id":"sess-shared","snapshot":{"models":[{"model":"zai/glm-5.2","input_tokens":10,"output_tokens":5}]}}"#,
+            );
+            sources.push((usage.clone(), parse_fx_file(&usage)));
+        }
+
+        apply_session_titles(&mut sources);
+
+        assert_eq!(
+            sources[0].1[0].session_title.as_deref(),
+            Some("Ship the parser")
+        );
+        assert_eq!(
+            sources[1].1[0].session_title.as_deref(),
+            Some("Fix the cache")
+        );
+        assert_eq!(sources[0].1[0].session_id, sources[1].1[0].session_id);
     }
 
     #[test]
