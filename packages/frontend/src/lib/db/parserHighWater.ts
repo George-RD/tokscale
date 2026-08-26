@@ -20,7 +20,15 @@ import { createSafeRecord, ownValue } from "../safeRecord";
  * the generation every CLI already declares: its shapes differ in *where*
  * tokens land, never in the lifetime total, so no generation needs freezing —
  * bounding every Droid submission by the lifetime high-water is what makes a
- * re-attribution contribute nothing. Antigravity CLI is registered at
+ * re-attribution contribute nothing.
+ *
+ * Both Antigravity clients are registered at generation 1, the generation every
+ * CLI already declares. Their parsers stopped dating usage at the session's
+ * start: `antigravity-cli` reads a per-generation stamp out of `gen_metadata`,
+ * and `antigravity` correlates standalone rows to trajectory steps. A rescan
+ * therefore moves unchanged usage off the session-start day and onto the days
+ * the work actually happened, which is precisely the shape the per-day guard
+ * turns into permanent inflation. Antigravity CLI is registered at
  * generation 1 for the same reason: its turns used to be dated at the session
  * start and are now dated by the timestamp of the generation that produced
  * them, so a rescan spreads an unchanged session across the days it actually
@@ -30,6 +38,7 @@ export const SUPPORTED_VERSIONED_PARSERS: Readonly<Record<string, number>> = {
   copilot: 2,
   droid: 1,
   "antigravity-cli": 1,
+  antigravity: 1,
 };
 
 const TOKEN_FIELDS = [

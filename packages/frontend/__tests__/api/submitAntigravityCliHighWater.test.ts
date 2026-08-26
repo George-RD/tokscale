@@ -563,3 +563,47 @@ describe("POST /api/submit antigravity-cli re-attribution high-water", () => {
     ).toBe(true);
   });
 });
+
+describe("POST /api/submit antigravity (IDE) re-attribution high-water", () => {
+  // The IDE-backed client shares the sync that writes the artifacts, and #1151
+  // stopped standalone usage rows falling back to the session-created date:
+  // they are now correlated to trajectory-step timestamps. That is the same
+  // re-attribution shape as the CLI client, on a different client id, so it
+  // needs the same lifetime bound. The harness above is client-id agnostic,
+  // so these reuse it directly.
+  it("registers antigravity at the generation the CLI declares", () => {
+    expect(SUPPORTED_VERSIONED_PARSERS.antigravity).toBe(1);
+  });
+
+  it("does not raise the stored total when standalone rows are re-dated", async () => {
+    const { store, firstJson, secondJson } = await submitOldThenNew(
+      "antigravity",
+    );
+
+    expect(firstJson.metrics.totalTokens).toBe(240_000);
+    expect(secondJson.metrics.totalTokens).toBe(240_000);
+    expect(storedTokens(store)).toBe(240_000);
+    expect(store.days.map((day) => day.date)).toEqual(["2026-08-07"]);
+    expect(store.device.parserVersions.antigravity).toBe(1);
+  });
+
+  it("still credits genuinely new antigravity usage after the re-dating", async () => {
+    const { store } = await submitOldThenNew("antigravity");
+
+    installTx(store);
+    const grown = submissionBody("antigravity", [
+      ...PER_GENERATION_DATING,
+      { date: "2026-08-10", tokens: 55_000, messages: 3 },
+    ]);
+    mockSubmit(grown);
+    const response = await post(grown);
+    expect(response.status).toBe(200);
+    const json = await response.json();
+
+    expect(json.metrics.totalTokens).toBe(295_000);
+    expect(
+      store.days.find((day) => day.date === "2026-08-10")?.sourceBreakdown
+        .antigravity.tokens,
+    ).toBe(55_000);
+  });
+});
