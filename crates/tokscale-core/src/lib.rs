@@ -3910,28 +3910,218 @@ async fn generate_graph_with_loaded_pricing(
         clients
     });
 
-    let all_messages = parse_all_messages_with_pricing_with_env_strategy(
+    let bucket_timezone =
+        bucket_tz::BucketTimezone::from_scanner_settings(&options.scanner_settings);
+
+    // Fold straight out of the parse. Collecting here and filtering afterwards
+    // is what made this path hold every message at once (#1209); the sink
+    // applies the same date filters per message and drops each one after it
+    // has landed in the day map and produced its session span.
+    let mut sink = GraphSink::new(Some(&options), pricing, pricing_requirement);
+    parse_all_messages_streaming_with_env_strategy(
         &home_dir,
         &clients,
         pricing,
         options.use_env_roots,
         &options.scanner_settings,
+        &mut sink,
     );
 
-    let filtered = filter_messages_for_report(all_messages, &options);
-
-    let bucket_timezone =
-        bucket_tz::BucketTimezone::from_scanner_settings(&options.scanner_settings);
-
-    build_graph_from_messages(
-        filtered,
-        pricing,
-        pricing_requirement,
-        start,
-        &bucket_timezone,
-    )
+    sink.finish(start, &bucket_timezone)
 }
 
+/// Messages buffered before a batch is folded away.
+///
+/// Batching lets the sink reuse `exclude_unpriced_submission_messages` and
+/// `validate_priced_messages` verbatim rather than reimplementing their pricing
+/// rules, which is the part that would quietly diverge. Peak cost is one batch,
+/// not the corpus.
+const GRAPH_SINK_BATCH: usize = 65_536;
+
+/// Folds a graph report as messages arrive instead of collecting them.
+///
+/// The submit path made three passes over every message -- unpriced exclusion,
+/// sessionization, daily aggregation -- and so had to keep ~1M of them alive at
+/// once (#1209). All three are per message, so each runs as the message
+/// arrives and the message is dropped: what survives is the day map, an
+/// 80-byte [`sessionize::SessionSpan`] per message, and a few counters.
+struct GraphSink<'a> {
+    /// `Some` when the sink is fed straight from the parse and must apply the
+    /// report's date filters itself; `None` when the caller already filtered.
+    filter: Option<&'a ReportOptions>,
+    pricing: Option<&'a pricing::PricingService>,
+    requirement: GraphPricingRequirement,
+    buffer: Vec<UnifiedMessage>,
+    daily: aggregator::DailyFold,
+    interner: sessionize::SpanInterner,
+    spans: Vec<sessionize::SessionSpan>,
+    /// Merged across batches by (provider, model); counts and tokens add.
+    exclusions: HashMap<(String, String), (usize, i64, &'static str)>,
+    /// First batch error, surfaced from `finish` so the outcome matches the
+    /// whole-corpus path's `?` on the first failure.
+    failure: Option<String>,
+}
+
+impl<'a> GraphSink<'a> {
+    fn new(
+        filter: Option<&'a ReportOptions>,
+        pricing: Option<&'a pricing::PricingService>,
+        requirement: GraphPricingRequirement,
+    ) -> Self {
+        Self {
+            filter,
+            pricing,
+            requirement,
+            buffer: Vec::new(),
+            daily: aggregator::DailyFold::default(),
+            interner: sessionize::SpanInterner::default(),
+            spans: Vec::new(),
+            exclusions: HashMap::new(),
+            failure: None,
+        }
+    }
+
+    fn drain_batch(&mut self) {
+        if self.buffer.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(&mut self.buffer);
+
+        let batch = match self.requirement {
+            GraphPricingRequirement::Lenient => batch,
+            GraphPricingRequirement::Submission => {
+                let (submitted, exclusions) =
+                    exclude_unpriced_submission_messages(batch, self.pricing);
+                for exclusion in exclusions {
+                    let entry = self
+                        .exclusions
+                        .entry((exclusion.provider_id, exclusion.model_id))
+                        .or_insert((0, 0, exclusion.reason));
+                    entry.0 += exclusion.message_count;
+                    entry.1 = entry.1.saturating_add(exclusion.total_tokens);
+                }
+                if self.failure.is_none() {
+                    if let Err(error) = validate_priced_messages(&submitted, self.pricing) {
+                        self.failure = Some(error);
+                    }
+                }
+                submitted
+            }
+        };
+
+        for message in &batch {
+            self.daily.add(message);
+            if message.timestamp > 0 {
+                self.spans.push(sessionize::SessionSpan::from_message(
+                    message,
+                    &mut self.interner,
+                ));
+            }
+        }
+    }
+
+    fn finish(
+        mut self,
+        start: Instant,
+        bucket_timezone: &bucket_tz::BucketTimezone,
+    ) -> Result<GraphResult, String> {
+        self.drain_batch();
+
+        let mut unpriced_submission_exclusions: Vec<UnpricedSubmissionExclusion> = self
+            .exclusions
+            .into_iter()
+            .map(
+                |((provider_id, model_id), (message_count, total_tokens, reason))| {
+                    UnpricedSubmissionExclusion {
+                        provider_id,
+                        model_id,
+                        message_count,
+                        total_tokens,
+                        reason,
+                    }
+                },
+            )
+            .collect();
+        // `exclude_unpriced_submission_messages` emits these from a BTreeMap
+        // keyed the same way, so sorting here keeps the reported order stable.
+        unpriced_submission_exclusions
+            .sort_by(|a, b| (&a.provider_id, &a.model_id).cmp(&(&b.provider_id, &b.model_id)));
+
+        require_trustworthy_exclusions(self.pricing, &unpriced_submission_exclusions)?;
+        if let Some(failure) = self.failure {
+            return Err(failure);
+        }
+
+        let intervals = sessionize::sessionize_spans(
+            &self.spans,
+            &self.interner,
+            sessionize::DEFAULT_IDLE_GAP_MS,
+        );
+        let time_metrics =
+            sessionize::compute_time_metrics(&intervals, sessionize::DEFAULT_IDLE_GAP_MS);
+
+        // Keyed by the same zone the messages were rebucketed into. Active time
+        // is joined onto contributions by date below, so a mismatch here
+        // silently drops a day's active time rather than misplacing it.
+        let daily_active_time =
+            sessionize::compute_daily_active_time_in(&intervals, bucket_timezone);
+        let contributions = self.daily.finish();
+
+        let processing_time_ms = start.elapsed().as_millis() as u32;
+        let mut result = aggregator::generate_graph_result(contributions, processing_time_ms);
+        result.time_metrics = Some(time_metrics);
+        result.unpriced_submission_exclusions = unpriced_submission_exclusions;
+
+        for contribution in &mut result.contributions {
+            if let Some(&ms) = daily_active_time.get(&contribution.date) {
+                contribution.active_time_ms = Some(ms);
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+impl MessageSink for GraphSink<'_> {
+    fn accept(&mut self, message: UnifiedMessage) {
+        if let Some(options) = self.filter {
+            if !message_passes_report_filter(&message, options) {
+                return;
+            }
+        }
+        self.buffer.push(message);
+        if self.buffer.len() >= GRAPH_SINK_BATCH {
+            self.drain_batch();
+        }
+    }
+}
+
+fn parse_all_messages_streaming_with_env_strategy<S: MessageSink>(
+    home_dir: &str,
+    clients: &[String],
+    pricing: Option<&pricing::PricingService>,
+    use_env_roots: bool,
+    scanner_settings: &scanner::ScannerSettings,
+    sink: &mut S,
+) {
+    parse_all_messages_streaming(
+        home_dir,
+        clients,
+        pricing,
+        use_env_roots,
+        scanner_settings,
+        SourceCachePolicy::Persistent,
+        sink,
+    );
+}
+
+/// Collecting form of the submit-report build, retained as the test surface for
+/// [`GraphSink`]: it feeds an already-filtered `Vec` through the same sink the
+/// streaming path uses, so the sink's folding, exclusion-merging and ordering
+/// behaviour stay under test without a full parse. Production callers stream
+/// into [`GraphSink`] directly and never collect, which is why this is
+/// `#[cfg(test)]` rather than dead code.
+#[cfg(test)]
 fn build_graph_from_messages(
     filtered: Vec<UnifiedMessage>,
     pricing: Option<&pricing::PricingService>,
@@ -3939,38 +4129,15 @@ fn build_graph_from_messages(
     start: Instant,
     bucket_timezone: &bucket_tz::BucketTimezone,
 ) -> Result<GraphResult, String> {
-    let (filtered, unpriced_submission_exclusions) = match pricing_requirement {
-        GraphPricingRequirement::Lenient => (filtered, Vec::new()),
-        GraphPricingRequirement::Submission => {
-            let (submitted, exclusions) = exclude_unpriced_submission_messages(filtered, pricing);
-            require_trustworthy_exclusions(pricing, &exclusions)?;
-            validate_priced_messages(&submitted, pricing)?;
-            (submitted, exclusions)
-        }
-    };
-
-    let intervals = sessionize::sessionize(&filtered, sessionize::DEFAULT_IDLE_GAP_MS);
-    let time_metrics =
-        sessionize::compute_time_metrics(&intervals, sessionize::DEFAULT_IDLE_GAP_MS);
-
-    // Keyed by the same zone the messages were rebucketed into. Active time is
-    // joined onto contributions by date below, so a mismatch here silently
-    // drops a day's active time rather than misplacing it.
-    let daily_active_time = sessionize::compute_daily_active_time_in(&intervals, bucket_timezone);
-    let contributions = aggregator::aggregate_by_date(filtered);
-
-    let processing_time_ms = start.elapsed().as_millis() as u32;
-    let mut result = aggregator::generate_graph_result(contributions, processing_time_ms);
-    result.time_metrics = Some(time_metrics);
-    result.unpriced_submission_exclusions = unpriced_submission_exclusions;
-
-    for contribution in &mut result.contributions {
-        if let Some(&ms) = daily_active_time.get(&contribution.date) {
-            contribution.active_time_ms = Some(ms);
-        }
+    // `filtered` has already been through the report's date filters, so the
+    // sink applies none of its own. Delegating rather than duplicating keeps
+    // this path and the streaming one on identical aggregation code, and lets
+    // this function's tests stand as the sink's correctness proof.
+    let mut sink = GraphSink::new(None, pricing, pricing_requirement);
+    for message in filtered {
+        sink.accept(message);
     }
-
-    Ok(result)
+    sink.finish(start, bucket_timezone)
 }
 
 const ROUTING_LABEL_UNPRICED_REASON: &str =
@@ -4259,24 +4426,39 @@ fn validate_priced_messages(
     ))
 }
 
+/// Per-message form of [`filter_messages_for_report`].
+///
+/// The report filters are three stateless predicates on `date`, so a streaming
+/// caller can drop a message on arrival instead of materializing the whole
+/// corpus and then retaining over it.
+fn message_passes_report_filter(message: &UnifiedMessage, options: &ReportOptions) -> bool {
+    if let Some(year) = &options.year {
+        if !message.date.starts_with(&format!("{}-", year)) {
+            return false;
+        }
+    }
+
+    if let Some(since) = &options.since {
+        if message.date.as_str() < since.as_str() {
+            return false;
+        }
+    }
+
+    if let Some(until) = &options.until {
+        if message.date.as_str() > until.as_str() {
+            return false;
+        }
+    }
+
+    true
+}
+
 fn filter_messages_for_report(
     messages: Vec<UnifiedMessage>,
     options: &ReportOptions,
 ) -> Vec<UnifiedMessage> {
     let mut filtered = messages;
-
-    if let Some(year) = &options.year {
-        let year_prefix = format!("{}-", year);
-        filtered.retain(|m| m.date.starts_with(&year_prefix));
-    }
-
-    if let Some(since) = &options.since {
-        filtered.retain(|m| m.date.as_str() >= since.as_str());
-    }
-
-    if let Some(until) = &options.until {
-        filtered.retain(|m| m.date.as_str() <= until.as_str());
-    }
+    filtered.retain(|message| message_passes_report_filter(message, options));
     filtered
 }
 
