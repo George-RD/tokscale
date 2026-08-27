@@ -41,6 +41,41 @@ const CACHE_LOCK_FILENAME: &str = "source-message-cache.lock";
 const LEGACY_MONOLITH_CACHE_FILENAME: &str = "source-message-cache.bin";
 const CACHE_SHARD_COUNT: usize = 256;
 const MAX_CACHE_SHARD_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Ceiling on the *uncompressed* entry payload inside a shard.
+///
+/// [`MAX_CACHE_SHARD_BYTES`] bounds what lands on disk. Since the payload is
+/// zstd-compressed the two are no longer the same number: real shards compress
+/// about 5.6x, so holding the serialize limit at the on-disk cap would refuse
+/// payloads that fit on disk several times over and send a heavy source back to
+/// re-parsing every scan. This bounds the pre-compression side on its own.
+const MAX_CACHE_SHARD_PAYLOAD_BYTES: u64 = 4 * MAX_CACHE_SHARD_BYTES;
+
+/// zstd frame magic (little-endian `0xFD2FB528`).
+///
+/// Shards written before compression hold a bare bincode payload, so the reader
+/// sniffs this rather than relying on a format bump: an old cache stays readable
+/// and is rewritten compressed on the next save, instead of being invalidated
+/// and forcing exactly the full re-parse this is meant to avoid.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Compression level for shard payloads. Level 3 is zstd's default: on a real
+/// 83 MB shard it takes ~0.08s to write and ~0.05s to read back, against the
+/// tens of seconds a re-parse of the same source costs.
+const SHARD_COMPRESSION_LEVEL: i32 = 3;
+
+fn compress_shard_payload(payload: &[u8]) -> std::io::Result<Vec<u8>> {
+    zstd::stream::encode_all(payload, SHARD_COMPRESSION_LEVEL)
+}
+
+/// Decompress a payload written by [`compress_shard_payload`], passing through
+/// an uncompressed payload from a pre-compression shard unchanged.
+fn decompress_shard_payload(payload: Vec<u8>) -> std::io::Result<Vec<u8>> {
+    if payload.len() < ZSTD_MAGIC.len() || payload[..ZSTD_MAGIC.len()] != ZSTD_MAGIC {
+        return Ok(payload);
+    }
+    zstd::stream::decode_all(payload.as_slice())
+}
 const FINGERPRINT_SAMPLE_BYTES: usize = 4096;
 const FINGERPRINT_SAMPLE_POINTS: usize = 5;
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
@@ -2224,10 +2259,15 @@ fn read_shard_with_limit(
         return ShardReadStatus::Stale;
     }
 
+    let payload = match decompress_shard_payload(envelope.payload) {
+        Ok(payload) => payload,
+        Err(error) => return ShardReadStatus::Invalid(error.to_string()),
+    };
+
     if envelope.format_version == LEGACY_CACHE_FORMAT_VERSION {
         return match bincode::options()
-            .with_limit(max_shard_bytes)
-            .deserialize::<Vec<LegacyCachedSourceEntryV4>>(&envelope.payload)
+            .with_limit(MAX_CACHE_SHARD_PAYLOAD_BYTES)
+            .deserialize::<Vec<LegacyCachedSourceEntryV4>>(&payload)
         {
             Ok(entries) => ShardReadStatus::Migrated(
                 entries.into_iter().map(CachedSourceEntry::from).collect(),
@@ -2240,8 +2280,8 @@ fn read_shard_with_limit(
     }
 
     match bincode::options()
-        .with_limit(max_shard_bytes)
-        .deserialize(&envelope.payload)
+        .with_limit(MAX_CACHE_SHARD_PAYLOAD_BYTES)
+        .deserialize(&payload)
     {
         Ok(entries) => ShardReadStatus::Loaded(entries),
         Err(error) => ShardReadStatus::Invalid(error.to_string()),
@@ -2255,9 +2295,10 @@ fn write_shard_with_limit(
     max_shard_bytes: u64,
 ) -> std::io::Result<()> {
     let payload = bincode::options()
-        .with_limit(max_shard_bytes)
+        .with_limit(MAX_CACHE_SHARD_PAYLOAD_BYTES)
         .serialize(entries)
         .map_err(std::io::Error::other)?;
+    let payload = compress_shard_payload(&payload)?;
     let envelope = CachedShardEnvelope {
         format_version: CACHE_FORMAT_VERSION,
         parser_namespace: identity.namespace.to_string(),
@@ -2534,6 +2575,49 @@ pub(crate) fn codex_cache_entry_matches_fingerprint(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn shard_payload_round_trips_through_compression() {
+        let raw = b"opencode".repeat(4096).to_vec();
+        let compressed = compress_shard_payload(&raw).expect("compress");
+        assert!(
+            compressed.len() < raw.len(),
+            "a repetitive payload must get smaller, got {} from {}",
+            compressed.len(),
+            raw.len()
+        );
+        assert_eq!(compressed[..ZSTD_MAGIC.len()], ZSTD_MAGIC);
+        assert_eq!(
+            decompress_shard_payload(compressed).expect("decompress"),
+            raw
+        );
+    }
+
+    #[test]
+    fn an_uncompressed_payload_from_an_older_shard_is_passed_through() {
+        // Shards written before compression hold bare bincode. They must stay
+        // readable: invalidating them would force the full re-parse that
+        // compression exists to keep avoiding.
+        let bare = bincode::options()
+            .serialize(&vec![1_u32, 2, 3])
+            .expect("serialize");
+        assert_ne!(bare[..ZSTD_MAGIC.len().min(bare.len())], ZSTD_MAGIC);
+        assert_eq!(
+            decompress_shard_payload(bare.clone()).expect("passthrough"),
+            bare
+        );
+    }
+
+    #[test]
+    fn a_short_payload_is_not_mistaken_for_a_zstd_frame() {
+        for len in 0..ZSTD_MAGIC.len() {
+            let short = vec![0x28_u8; len];
+            assert_eq!(
+                decompress_shard_payload(short.clone()).expect("passthrough"),
+                short
+            );
+        }
+    }
     use super::*;
     use crate::paths::json_path_literal;
     use crate::TokenBreakdown;
@@ -4225,6 +4309,21 @@ mod tests {
         assert!(loaded.get(identity, &path_two).is_some());
     }
 
+    /// `len` bytes of printable ASCII with no exploitable structure, so zstd
+    /// cannot shrink it. A plain `char::repeat` compresses to near zero and
+    /// stops a size-sensitive test from measuring what it means to measure.
+    fn incompressible_text(len: usize, seed: u64) -> String {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                char::from(b'!' + (state % 90) as u8)
+            })
+            .collect()
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_aggregate_cache_can_exceed_individual_shard_limit() {
@@ -4236,10 +4335,14 @@ mod tests {
         let identity = CacheIdentity::for_client(ClientId::Claude);
         let (path_one, path_two) = write_sources_in_distinct_shards(&source_dir, identity);
 
+        // Payloads are compressed, so a run of one repeated byte would shrink to
+        // almost nothing and both shards would fit under the limit together --
+        // which is the opposite of what this test is about. Use high-entropy
+        // content so each shard stays a real fraction of the cap.
         let mut entry_one = test_entry(identity, &path_one, "session-1");
-        entry_one.messages[0].model_id = "a".repeat(20 * 1024);
+        entry_one.messages[0].model_id = incompressible_text(20 * 1024, 1);
         let mut entry_two = test_entry(identity, &path_two, "session-2");
-        entry_two.messages[0].model_id = "b".repeat(20 * 1024);
+        entry_two.messages[0].model_id = incompressible_text(20 * 1024, 2);
 
         let mut cache = SourceMessageCache::default();
         cache.insert(entry_one);
