@@ -16,13 +16,15 @@
 //! generics would monomorphize per client and *grow* the binary, which is the
 //! opposite of the point.
 
-use super::utils::{open_readonly_sqlite_opt, sqlite_for_each_row_on};
+use super::utils::{
+    open_readonly_sqlite_opt, sqlite_for_each_row_on, sqlite_for_each_row_on_with_params,
+};
 use super::{
     normalize_opencode_agent_name, normalize_workspace_key, workspace_label_from_key,
     UnifiedMessage,
 };
 use crate::{provider_identity, TokenBreakdown};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -242,6 +244,10 @@ pub(crate) struct OpenCodeSchemaConfig {
     pub namespace_rowid_dedup_key: bool,
     /// How duplicate rows collapse.
     pub dedup: DedupMode,
+    /// Incremental-scan support, one entry per `query_groups` entry and in the
+    /// same order. `None` leaves the client on full scans only, which is what
+    /// every client whose tables carry no `time_updated` column must do.
+    pub incremental_groups: Option<&'static [OpenCodeIncrementalGroup]>,
 }
 
 impl OpenCodeSchemaConfig {
@@ -265,6 +271,7 @@ impl OpenCodeSchemaConfig {
             capture_workspace: true,
             namespace_rowid_dedup_key: false,
             dedup: DedupMode::MergeUnlessIdConflict,
+            incremental_groups: None,
         }
     }
 
@@ -272,6 +279,7 @@ impl OpenCodeSchemaConfig {
         Self {
             query_groups: OPENCODE_QUERY_GROUPS,
             dual_schema: true,
+            incremental_groups: Some(OPENCODE_INCREMENTAL_GROUPS),
             ..Self::base("opencode")
         }
     }
@@ -401,6 +409,184 @@ const OPENCODE_V1_QUERIES: &[&str] = &[
 /// tables exist contribute rows, and the fingerprint dedup collapses any
 /// overlap between them.
 const OPENCODE_QUERY_GROUPS: &[&[&str]] = &[OPENCODE_V2_QUERIES, OPENCODE_V1_QUERIES];
+
+/// Incremental spelling of [`OPENCODE_V2_QUERIES`], one variant per full
+/// variant and in the same order.
+///
+/// The only difference is the leading `time_updated` bound. SQLite evaluates
+/// the conjuncts left to right, so an unchanged row is rejected on an integer
+/// comparison and its `data` payload is never parsed -- and parsing every
+/// payload is what the full scan spends its time on. `>=` and not `>`: a row
+/// written in the same millisecond the mark was taken must not be skipped,
+/// and re-reading the boundary rows costs nothing because the merge replaces
+/// by message id.
+const OPENCODE_V2_INCREMENTAL_QUERIES: &[&str] = &[
+    r#"
+        SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root, s.title AS session_title
+        FROM session_message sm
+        LEFT JOIN session_v2 s ON s.id = sm.session_id
+        WHERE sm.time_updated >= ?1
+          AND sm.type = 'assistant'
+          AND json_extract(sm.data, '$.tokens') IS NOT NULL
+        ORDER BY sm.id, sm.session_id
+    "#,
+    r#"
+        SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root, NULL AS session_title
+        FROM session_message sm
+        LEFT JOIN session_v2 s ON s.id = sm.session_id
+        WHERE sm.time_updated >= ?1
+          AND sm.type = 'assistant'
+          AND json_extract(sm.data, '$.tokens') IS NOT NULL
+        ORDER BY sm.id, sm.session_id
+    "#,
+    r#"
+        SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root, s.title AS session_title
+        FROM session_message sm
+        LEFT JOIN session s ON s.id = sm.session_id
+        WHERE sm.time_updated >= ?1
+          AND sm.type = 'assistant'
+          AND json_extract(sm.data, '$.tokens') IS NOT NULL
+        ORDER BY sm.id, sm.session_id
+    "#,
+    r#"
+        SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root, NULL AS session_title
+        FROM session_message sm
+        LEFT JOIN session s ON s.id = sm.session_id
+        WHERE sm.time_updated >= ?1
+          AND sm.type = 'assistant'
+          AND json_extract(sm.data, '$.tokens') IS NOT NULL
+        ORDER BY sm.id, sm.session_id
+    "#,
+    r#"
+        SELECT sm.id, sm.session_id, sm.data, NULL AS workspace_root, NULL AS session_title
+        FROM session_message sm
+        WHERE sm.time_updated >= ?1
+          AND sm.type = 'assistant'
+          AND json_extract(sm.data, '$.tokens') IS NOT NULL
+        ORDER BY sm.id, sm.session_id
+    "#,
+];
+
+/// Incremental spelling of [`OPENCODE_V1_QUERIES`]; see
+/// [`OPENCODE_V2_INCREMENTAL_QUERIES`] for why the bound leads and why it is
+/// inclusive.
+const OPENCODE_V1_INCREMENTAL_QUERIES: &[&str] = &[
+    r#"
+        SELECT m.id, m.session_id, m.data, NULLIF(s.directory, '') AS workspace_root, s.title AS session_title
+        FROM message m
+        LEFT JOIN session s ON s.id = m.session_id
+        WHERE m.time_updated >= ?1
+          AND json_extract(m.data, '$.role') = 'assistant'
+          AND json_extract(m.data, '$.tokens') IS NOT NULL
+        ORDER BY m.id, m.session_id
+    "#,
+    r#"
+        SELECT m.id, m.session_id, m.data, NULLIF(s.directory, '') AS workspace_root, NULL AS session_title
+        FROM message m
+        LEFT JOIN session s ON s.id = m.session_id
+        WHERE m.time_updated >= ?1
+          AND json_extract(m.data, '$.role') = 'assistant'
+          AND json_extract(m.data, '$.tokens') IS NOT NULL
+        ORDER BY m.id, m.session_id
+    "#,
+    r#"
+        SELECT m.id, m.session_id, m.data, NULL AS workspace_root, NULL AS session_title
+        FROM message m
+        WHERE m.time_updated >= ?1
+          AND json_extract(m.data, '$.role') = 'assistant'
+          AND json_extract(m.data, '$.tokens') IS NOT NULL
+        ORDER BY m.id, m.session_id
+    "#,
+];
+
+/// The cheap invariants one query group's table exposes, read in a single
+/// pass that never touches the `data` column.
+///
+/// `?1` is the `time_created` high-water the cached scan recorded, so the last
+/// aggregate counts exactly the rows inserted since. That is what lets the row
+/// count tell an insert apart from a delete: an incremental scan sees new rows
+/// but cannot see removed ones, and OpenCode drops a session's messages with
+/// `ON DELETE CASCADE`.
+const OPENCODE_V2_STATS_QUERY: &str = r#"
+    SELECT COUNT(*),
+           MAX(time_created),
+           MAX(time_updated),
+           COUNT(CASE WHEN time_created > ?1 THEN 1 END)
+    FROM session_message
+"#;
+
+const OPENCODE_V1_STATS_QUERY: &str = r#"
+    SELECT COUNT(*),
+           MAX(time_created),
+           MAX(time_updated),
+           COUNT(CASE WHEN time_created > ?1 THEN 1 END)
+    FROM message
+"#;
+
+/// Changed rows the usage queries no longer select.
+///
+/// The row count is a deletion test, but a row that is rewritten until it stops
+/// being priceable usage -- its role moves off `assistant`, or its `tokens`
+/// object goes away -- leaves the count untouched while dropping out of the
+/// incremental result. The merge only replaces keys it is handed, so without
+/// this probe that row's cached message would stay counted for as long as the
+/// mark survives, and a cold scan would disagree with the cache indefinitely.
+///
+/// Only the ids are read: the caller needs to know whether a *cached* message
+/// came from the row, not what the row says now. Bounded by the same
+/// `time_updated` mark as the usage queries, so it reads the delta rather than
+/// the table -- unlike folding the predicate into the stats query, which costs
+/// a `json_extract` per row on every rescan (measured at +14.6s on a 14 GB
+/// database, against 5.1s for the whole stats pass).
+///
+/// The `COALESCE` matters: `json_extract` returns SQL NULL for an absent
+/// `$.role`, and an unguarded `NOT (NULL = 'assistant' AND ...)` evaluates to
+/// NULL, which `WHERE` drops -- silently exempting exactly the malformed rows
+/// this is meant to catch.
+const OPENCODE_V2_DISQUALIFIED_QUERY: &str = r#"
+    SELECT sm.id, json_extract(sm.data, '$.id')
+    FROM session_message sm
+    WHERE sm.time_updated >= ?1
+      AND NOT (sm.type = 'assistant'
+               AND json_extract(sm.data, '$.tokens') IS NOT NULL)
+"#;
+
+const OPENCODE_V1_DISQUALIFIED_QUERY: &str = r#"
+    SELECT m.id, json_extract(m.data, '$.id')
+    FROM message m
+    WHERE m.time_updated >= ?1
+      AND NOT (COALESCE(json_extract(m.data, '$.role'), '') = 'assistant'
+               AND json_extract(m.data, '$.tokens') IS NOT NULL)
+"#;
+
+/// Incremental support for one entry of [`OpenCodeSchemaConfig::query_groups`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OpenCodeIncrementalGroup {
+    /// One incremental query per full variant in the matching group, in the
+    /// same order, so a variant index resolved against the full list also
+    /// selects the incremental spelling of that same variant.
+    queries: &'static [&'static str],
+    /// Row-population invariants for the group's base table.
+    stats: &'static str,
+    /// Changed rows the group's usage queries no longer select. One query for
+    /// the whole group rather than one per variant: the variants differ only
+    /// in the metadata join, which this does not read.
+    disqualified: &'static str,
+}
+
+/// Incremental support for [`OPENCODE_QUERY_GROUPS`], in the same order.
+const OPENCODE_INCREMENTAL_GROUPS: &[OpenCodeIncrementalGroup] = &[
+    OpenCodeIncrementalGroup {
+        queries: OPENCODE_V2_INCREMENTAL_QUERIES,
+        stats: OPENCODE_V2_STATS_QUERY,
+        disqualified: OPENCODE_V2_DISQUALIFIED_QUERY,
+    },
+    OpenCodeIncrementalGroup {
+        queries: OPENCODE_V1_INCREMENTAL_QUERIES,
+        stats: OPENCODE_V1_STATS_QUERY,
+        disqualified: OPENCODE_V1_DISQUALIFIED_QUERY,
+    },
+];
 
 /// MiMo Code: `message` table, with the `session` join dropped on databases
 /// that predate it.
@@ -586,6 +772,14 @@ struct SchemaAccumulator {
     messages: Vec<UnifiedMessage>,
     fingerprint_indices: HashMap<OpenCodeSchemaFingerprint, Vec<usize>>,
     dedup_states: Vec<SchemaDedupState>,
+    /// Dedup keys of every row that took part in a fingerprint merge, on both
+    /// sides of it.
+    ///
+    /// A merged entry is the only trace two rows left, so a later scan that
+    /// re-reads one of them cannot tell what the other contributed and cannot
+    /// reproduce the collapse. Only collected for a client with an incremental
+    /// lane, which is the only thing that reads it.
+    merged_dedup_keys: std::collections::HashSet<String>,
 }
 
 impl SchemaAccumulator {
@@ -778,6 +972,11 @@ impl SchemaAccumulator {
         };
 
         if let Some(index) = candidate {
+            let absorbed_dedup_key = if cfg.incremental_groups.is_some() {
+                unified.dedup_key.clone()
+            } else {
+                None
+            };
             // A duplicate carrying an authoritative cost upgrades the retained
             // entry's provenance. This is inert for clients that derive
             // provenance from the cost value alone: `cost_bits` is part of the
@@ -794,6 +993,14 @@ impl SchemaAccumulator {
                 self.messages[index].dedup_key = unified.dedup_key;
             }
             merge_duplicate_workspace(&mut self.messages[index], dedup_state, workspace_root);
+            if cfg.incremental_groups.is_some() {
+                if let Some(key) = self.messages[index].dedup_key.clone() {
+                    self.merged_dedup_keys.insert(key);
+                }
+                if let Some(key) = absorbed_dedup_key {
+                    self.merged_dedup_keys.insert(key);
+                }
+            }
             return;
         }
 
@@ -841,6 +1048,66 @@ fn collect_rows(
     scan.prepared()
 }
 
+/// Run `query` with `since` bound to `?1`, handing every row to `on_row`.
+/// Returns whether the statement prepared, matching [`collect_rows`].
+fn collect_rows_since(
+    db_path: &Path,
+    conn: &rusqlite::Connection,
+    query: &str,
+    since: i64,
+    on_row: &mut dyn FnMut(OpenCodeSchemaRow),
+) -> bool {
+    let scan =
+        sqlite_for_each_row_on_with_params(conn, db_path, query, &[&since], None, &mut |row| {
+            let id: String = row.get(0)?;
+            let session_id: String = row.get(1)?;
+            let data_json: String = row.get(2)?;
+            let workspace_root: Option<String> = row.get(3)?;
+            let session_title: Option<String> = row.get(4)?;
+            on_row((id, session_id, data_json, workspace_root, session_title));
+            Ok(())
+        });
+    scan.prepared()
+}
+
+/// Whether any row that stopped qualifying as usage backs a cached message.
+///
+/// Returns `None` if the probe could not run, which the caller treats the same
+/// as a hit: an unverifiable delta is not a safe one.
+///
+/// Both candidate dedup keys are tested for every row -- the embedded id and
+/// the row id -- rather than reproducing [`SchemaAccumulator::ingest`]'s choice
+/// between them. The two spellings cannot collide across different rows in
+/// practice, and the failure directions are not symmetric: an extra key costs
+/// one unnecessary full scan, while a missed one leaves a stale message counted
+/// for the life of the mark.
+fn disqualified_row_backs_cached_message(
+    db_path: &Path,
+    conn: &rusqlite::Connection,
+    query: &str,
+    since: i64,
+    db_namespace: &str,
+    cached_keys: &std::collections::HashSet<&str>,
+) -> Option<bool> {
+    let mut hit = false;
+    let scan =
+        sqlite_for_each_row_on_with_params(conn, db_path, query, &[&since], None, &mut |row| {
+            if hit {
+                return Ok(());
+            }
+            let row_id: String = row.get(0)?;
+            let embedded_id: Option<String> = row.get(1)?;
+            let namespaced = format!("{db_namespace}:{row_id}");
+            hit = cached_keys.contains(row_id.as_str())
+                || cached_keys.contains(namespaced.as_str())
+                || embedded_id
+                    .as_deref()
+                    .is_some_and(|id| cached_keys.contains(id));
+            Ok(())
+        });
+    scan.prepared().then_some(hit)
+}
+
 /// Parse assistant turns out of a SQLite database that uses the OpenCode
 /// message schema, applying `cfg`'s per-client policy.
 ///
@@ -850,8 +1117,146 @@ pub(crate) fn parse_opencode_schema_sqlite(
     db_path: &Path,
     cfg: OpenCodeSchemaConfig,
 ) -> Vec<UnifiedMessage> {
+    scan_opencode_schema_sqlite(db_path, cfg).messages
+}
+
+// =============================================================================
+// Incremental scan
+// =============================================================================
+
+/// What one query group looked like on the scan that filled the cache.
+///
+/// Deliberately keyed on `time_updated` and not on the row id. OpenCode
+/// rewrites a message row long after inserting it -- on a real 14 GB database
+/// 434,851 of 434,955 rows carry `time_updated > time_created`, with lags of up
+/// to 79 days -- so an id high-water would skip the later rewrite of almost
+/// every row and permanently under-report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OpenCodeGroupMark {
+    /// Digest of the full query variant the cached rows came from. Any edit to
+    /// the SQL changes it, which discards the mark rather than pairing new SQL
+    /// with rows the old SQL produced.
+    pub query_digest: u64,
+    /// Rows the group's table held.
+    pub row_count: i64,
+    /// Highest `time_created`. Rows above it on a later scan are exactly the
+    /// inserts, which is what makes the row count a deletion test.
+    pub created_high_water: i64,
+    /// Highest `time_updated`. The incremental scan reads from here.
+    pub updated_high_water: i64,
+}
+
+/// One mark per query group, in [`OpenCodeSchemaConfig::query_groups`] order.
+/// A group whose table this database does not have contributes `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OpenCodeIncrementalState {
+    pub groups: Vec<Option<OpenCodeGroupMark>>,
+    /// Dedup keys of the rows that took part in a fingerprint merge. A rescan
+    /// that re-reads one of them cannot reproduce the collapse -- the merged
+    /// entry is the only trace the other row left -- so it re-parses instead.
+    pub merged_dedup_keys: Vec<String>,
+}
+
+/// Ceiling on the merged-key set a mark will carry.
+///
+/// Forked history is a small fraction of a real database -- 2,711 of 342,927
+/// rows on the 14 GB profile this was measured against -- so a set anywhere
+/// near this size means the assumption does not hold for that database, and
+/// full scans are the honest answer rather than a mark whose bookkeeping is
+/// larger than the delta it saves.
+const MAX_MERGED_DEDUP_KEYS: usize = 250_000;
+
+/// Counts the rescans that stayed incremental, so a test can tell an
+/// incremental scan apart from a full re-parse that happened to agree with it.
+#[cfg(test)]
+pub(crate) static INCREMENTAL_RESCANS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// A scan's messages plus the state a later scan needs to resume from it.
+pub(crate) struct OpenCodeSchemaScan {
+    pub messages: Vec<UnifiedMessage>,
+    /// `None` for a client with no incremental support, and for a database
+    /// that could not be opened.
+    pub incremental: Option<OpenCodeIncrementalState>,
+}
+
+impl OpenCodeSchemaScan {
+    fn empty() -> Self {
+        Self {
+            messages: Vec::new(),
+            incremental: None,
+        }
+    }
+}
+
+/// FNV-1a over a query variant's text.
+///
+/// Only ever compared against itself, so the algorithm matters less than that
+/// it is stable across runs and covers every byte of the SQL.
+fn query_digest(query: &str) -> u64 {
+    let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in query.as_bytes() {
+        digest ^= u64::from(*byte);
+        digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    digest
+}
+
+struct TableStats {
+    row_count: i64,
+    created_high_water: i64,
+    updated_high_water: i64,
+    /// Rows whose `time_created` is above the value bound to `?1`.
+    created_after_mark: i64,
+}
+
+/// Read a group's invariants, or `None` when the group's table is absent.
+///
+/// `MAX` over an empty table is NULL; both high-waters then collapse to
+/// `i64::MIN`, which makes the next incremental scan read everything rather
+/// than nothing.
+fn read_table_stats(
+    db_path: &Path,
+    conn: &rusqlite::Connection,
+    query: &str,
+    created_mark: i64,
+) -> Option<TableStats> {
+    let mut stats = None;
+    let scan = sqlite_for_each_row_on_with_params(
+        conn,
+        db_path,
+        query,
+        &[&created_mark],
+        None,
+        &mut |row| {
+            stats = Some(TableStats {
+                row_count: row.get(0)?,
+                created_high_water: row.get::<_, Option<i64>>(1)?.unwrap_or(i64::MIN),
+                updated_high_water: row.get::<_, Option<i64>>(2)?.unwrap_or(i64::MIN),
+                created_after_mark: row.get(3)?,
+            });
+            Ok(())
+        },
+    );
+    if scan.ran() {
+        stats
+    } else {
+        None
+    }
+}
+
+/// Full scan, also recording the state an incremental rescan resumes from.
+///
+/// The invariants are read *before* the rows on purpose. A mark taken after
+/// the rows could name a row the scan never saw, and the next incremental scan
+/// would then skip that row forever. Taken first, the worst case is a row that
+/// lands between the two reads and gets read twice, which the merge collapses.
+pub(crate) fn scan_opencode_schema_sqlite(
+    db_path: &Path,
+    cfg: OpenCodeSchemaConfig,
+) -> OpenCodeSchemaScan {
     let Some(conn) = open_readonly_sqlite_opt(db_path) else {
-        return Vec::new();
+        return OpenCodeSchemaScan::empty();
     };
 
     let db_namespace = if cfg.namespace_rowid_dedup_key {
@@ -861,15 +1266,287 @@ pub(crate) fn parse_opencode_schema_sqlite(
     };
 
     let mut acc = SchemaAccumulator::default();
-    for group in cfg.query_groups {
-        for query in *group {
+    let mut marks: Vec<Option<OpenCodeGroupMark>> = Vec::with_capacity(cfg.query_groups.len());
+    // A group that produced rows but no invariants -- an older database whose
+    // table predates the `time_updated` column -- has no way to be rescanned
+    // incrementally, and a mark that silently skipped it would serve those rows
+    // stale forever. One such group disqualifies the whole database.
+    let mut resumable = true;
+
+    for (group_index, group) in cfg.query_groups.iter().enumerate() {
+        let incremental = cfg
+            .incremental_groups
+            .and_then(|groups| groups.get(group_index));
+        // `i64::MAX` leaves the insert count at zero: nothing resumes from a
+        // full scan's own reading of it.
+        let stats = incremental
+            .and_then(|incremental| read_table_stats(db_path, &conn, incremental.stats, i64::MAX));
+
+        let mut chosen = None;
+        for (index, query) in group.iter().enumerate() {
             if collect_rows(db_path, &conn, query, &mut |row| {
                 acc.ingest(row, &cfg, &db_namespace)
             }) {
+                chosen = Some(index);
                 break;
+            }
+        }
+
+        marks.push(match (chosen, stats) {
+            (Some(index), Some(stats)) => Some(OpenCodeGroupMark {
+                query_digest: query_digest(group[index]),
+                row_count: stats.row_count,
+                created_high_water: stats.created_high_water,
+                updated_high_water: stats.updated_high_water,
+            }),
+            (Some(_), None) => {
+                resumable = false;
+                None
+            }
+            _ => None,
+        });
+    }
+
+    resumable &= acc.merged_dedup_keys.len() <= MAX_MERGED_DEDUP_KEYS;
+    let merged_dedup_keys = acc.merged_dedup_keys.into_iter().collect();
+
+    OpenCodeSchemaScan {
+        messages: acc.messages,
+        incremental: cfg.incremental_groups.filter(|_| resumable).map(|_| {
+            OpenCodeIncrementalState {
+                groups: marks,
+                merged_dedup_keys,
+            }
+        }),
+    }
+}
+
+/// Re-scan only the rows that changed since `cached_state`, merged into
+/// `cached_messages`.
+///
+/// Returns `None` whenever the cached state cannot be trusted, and the caller
+/// then runs [`scan_opencode_schema_sqlite`] instead. That covers a database
+/// that will not open, a schema variant that no longer matches the one the
+/// mark came from, a query variant whose SQL has since been edited, and -- the
+/// case that matters for correctness -- a table that lost rows. Deletions are
+/// invisible to an incremental scan, so anything short of a clean insert-only
+/// delta re-reads everything.
+pub(crate) fn rescan_opencode_schema_sqlite(
+    db_path: &Path,
+    cfg: OpenCodeSchemaConfig,
+    cached_state: &OpenCodeIncrementalState,
+    cached_messages: Vec<UnifiedMessage>,
+) -> Option<OpenCodeSchemaScan> {
+    let incremental_groups = cfg.incremental_groups?;
+    if cached_state.groups.len() != cfg.query_groups.len() {
+        return None;
+    }
+
+    let conn = open_readonly_sqlite_opt(db_path)?;
+    let db_namespace = if cfg.namespace_rowid_dedup_key {
+        db_path.to_string_lossy().into_owned()
+    } else {
+        String::new()
+    };
+
+    let mut acc = SchemaAccumulator::default();
+    let mut marks: Vec<Option<OpenCodeGroupMark>> = Vec::with_capacity(cached_state.groups.len());
+    // Borrowed for the disqualification probe below; `cached_messages` is not
+    // consumed until the merge at the end of this function.
+    let cached_keys: std::collections::HashSet<&str> = cached_messages
+        .iter()
+        .filter_map(|message| message.dedup_key.as_deref())
+        .collect();
+
+    for (group_index, group) in cfg.query_groups.iter().enumerate() {
+        let incremental = incremental_groups.get(group_index)?;
+        let cached_mark = cached_state.groups[group_index].as_ref();
+        let stats = read_table_stats(
+            db_path,
+            &conn,
+            incremental.stats,
+            cached_mark.map_or(i64::MAX, |mark| mark.created_high_water),
+        );
+
+        let (mark, stats) = match (cached_mark, stats) {
+            (Some(mark), Some(stats)) => (mark, stats),
+            // The group's table was absent when the cache was written and
+            // still is, so it contributed nothing then and contributes
+            // nothing now.
+            (None, None) => {
+                marks.push(None);
+                continue;
+            }
+            // The table appeared or vanished, or no variant prepared when the
+            // cache was written. Either way the cached rows no longer describe
+            // this database.
+            _ => return None,
+        };
+
+        // Deletion guard. Every row added since the mark carries a
+        // `time_created` above it, so a table that is insert-only holds
+        // exactly `row_count + created_after_mark` rows. Anything less is a row
+        // that went away, and an incremental scan has no way to notice it.
+        if Some(stats.row_count) != mark.row_count.checked_add(stats.created_after_mark) {
+            return None;
+        }
+
+        // A full scan takes the first variant that prepares; the cached rows
+        // carry that variant's workspace and title columns, so the mark is
+        // only reusable while the same variant still wins.
+        let chosen = group.iter().position(|query| conn.prepare(query).is_ok())?;
+        if query_digest(group[chosen]) != mark.query_digest {
+            return None;
+        }
+
+        // Rows that stopped being usage are invisible to the query above, so
+        // they are probed for separately. A hit means the cache holds a message
+        // whose row no longer backs it, and only a full scan can drop it.
+        if disqualified_row_backs_cached_message(
+            db_path,
+            &conn,
+            incremental.disqualified,
+            mark.updated_high_water,
+            &db_namespace,
+            &cached_keys,
+        ) != Some(false)
+        {
+            return None;
+        }
+
+        let query = incremental.queries.get(chosen)?;
+        if !collect_rows_since(db_path, &conn, query, mark.updated_high_water, &mut |row| {
+            acc.ingest(row, &cfg, &db_namespace)
+        }) {
+            return None;
+        }
+
+        marks.push(Some(OpenCodeGroupMark {
+            query_digest: mark.query_digest,
+            row_count: stats.row_count,
+            created_high_water: stats.created_high_water,
+            updated_high_water: stats.updated_high_water,
+        }));
+    }
+
+    // A merge among the changed rows themselves is reproducible -- a full scan
+    // sees the same rows and collapses them the same way -- but it still leaves
+    // an entry a later rescan must not re-read piecemeal, so it joins the set.
+    let mut merged_dedup_keys = acc.merged_dedup_keys.clone();
+    merged_dedup_keys.extend(cached_state.merged_dedup_keys.iter().cloned());
+    if merged_dedup_keys.len() > MAX_MERGED_DEDUP_KEYS {
+        return None;
+    }
+
+    let messages = merge_incremental_messages(cached_messages, acc.messages, &merged_dedup_keys)?;
+    #[cfg(test)]
+    INCREMENTAL_RESCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(OpenCodeSchemaScan {
+        messages,
+        incremental: Some(OpenCodeIncrementalState {
+            groups: marks,
+            merged_dedup_keys: merged_dedup_keys.into_iter().collect(),
+        }),
+    })
+}
+
+/// A digest of everything [`OpenCodeSchemaFingerprint`] compares, taken from
+/// the parsed message instead of the row.
+///
+/// Only ever used to ask "could a full scan have collapsed these two?", and it
+/// is deliberately the coarser of the two: `timestamp` and `duration_ms` are
+/// whole milliseconds where the row fingerprint keeps the raw float bits. A
+/// coarser digest can only claim a collapse that would not have happened,
+/// which costs a full re-parse -- the safe direction. It can never miss one.
+fn content_digest(message: &UnifiedMessage) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    message.timestamp.hash(&mut hasher);
+    message.duration_ms.hash(&mut hasher);
+    message.model_id.hash(&mut hasher);
+    message.provider_id.hash(&mut hasher);
+    message.tokens.input.hash(&mut hasher);
+    message.tokens.output.hash(&mut hasher);
+    message.tokens.reasoning.hash(&mut hasher);
+    message.tokens.cache_read.hash(&mut hasher);
+    message.tokens.cache_write.hash(&mut hasher);
+    message.cost.to_bits().hash(&mut hasher);
+    message.agent.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Fold the rows a rescan re-read back into the cached message list.
+///
+/// A changed row replaces the cached message carrying its dedup key and a new
+/// row is appended, so the cached relative order survives and the result holds
+/// one entry per key -- the same set a full scan of the same database state
+/// produces.
+///
+/// The fingerprint dedup is what makes that non-trivial, because it lets one
+/// cached entry stand for more than one row (2,711 of 342,927 rows on the
+/// database this was measured against). Two rules keep the merge faithful to
+/// what a full scan would have produced:
+///
+/// * A row that already took part in a merge forces a full re-parse. The
+///   collapsed entry is the only trace the other row left, so re-reading one
+///   side cannot reconstruct what the other contributed.
+/// * A row whose content matches a cached message it is not itself replacing
+///   forces one too. That is a collapse a full scan would perform and this
+///   merge cannot see -- a forked copy arriving after the mark, or a rewrite
+///   that happens to land on another row's content.
+///
+/// `None` also when any message lacks a dedup key. The OpenCode driver always
+/// sets one, so that cannot happen; if it ever did, appending an unkeyed
+/// message would double count it on the next scan.
+fn merge_incremental_messages(
+    cached: Vec<UnifiedMessage>,
+    changed: Vec<UnifiedMessage>,
+    merged_dedup_keys: &std::collections::HashSet<String>,
+) -> Option<Vec<UnifiedMessage>> {
+    let mut merged = cached;
+    let mut index_by_key: HashMap<String, usize> = HashMap::with_capacity(merged.len());
+    let mut index_by_digest: HashMap<u64, usize> = HashMap::with_capacity(merged.len());
+    for (index, message) in merged.iter().enumerate() {
+        // First index wins, matching the cross-database suppression the caller
+        // applies to this list: it keeps the first message carrying a key and
+        // drops the rest, so refreshing a later one would refresh a message
+        // nothing downstream reads.
+        index_by_key
+            .entry(message.dedup_key.clone()?)
+            .or_insert(index);
+        index_by_digest
+            .entry(content_digest(message))
+            .or_insert(index);
+    }
+
+    for message in changed {
+        let key = message.dedup_key.clone()?;
+        if merged_dedup_keys.contains(&key) {
+            return None;
+        }
+        let digest = content_digest(&message);
+        match index_by_key.get(&key).copied() {
+            Some(index) => {
+                if index_by_digest
+                    .get(&digest)
+                    .is_some_and(|&other| other != index)
+                {
+                    return None;
+                }
+                index_by_digest.insert(digest, index);
+                merged[index] = message;
+            }
+            None => {
+                if index_by_digest.contains_key(&digest) {
+                    return None;
+                }
+                index_by_digest.insert(digest, merged.len());
+                index_by_key.insert(key, merged.len());
+                merged.push(message);
             }
         }
     }
 
-    acc.messages
+    Some(merged)
 }
