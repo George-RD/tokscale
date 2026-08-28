@@ -4433,7 +4433,15 @@ fn validate_priced_messages(
 /// corpus and then retaining over it.
 fn message_passes_report_filter(message: &UnifiedMessage, options: &ReportOptions) -> bool {
     if let Some(year) = &options.year {
-        if !message.date.starts_with(&format!("{}-", year)) {
+        // Matching the prefix in place rather than building `format!("{year}-")`
+        // keeps this predicate allocation-free. The streaming path runs it once
+        // per parsed message, so an allocation here is one heap round-trip per
+        // message on a corpus this change exists to make cheap.
+        if !message
+            .date
+            .strip_prefix(year.as_str())
+            .is_some_and(|rest| rest.starts_with('-'))
+        {
             return false;
         }
     }
@@ -5733,8 +5741,8 @@ mod tests {
         dedupe_latest_trae_messages, exclude_unpriced_submission_messages,
         filter_messages_for_report, generate_graph_with_loaded_pricing, get_home_dir_string,
         is_generic_routing_label, merge_claude_cross_file_duplicate, message_cache,
-        normalize_model_for_grouping, opencode_json_superseded_by_sqlite,
-        parse_all_messages_with_pricing_with_cache_policy,
+        message_passes_report_filter, normalize_model_for_grouping,
+        opencode_json_superseded_by_sqlite, parse_all_messages_with_pricing_with_cache_policy,
         parse_all_messages_with_pricing_with_env_strategy, parse_local_clients, parsed_to_unified,
         paths, pricing, retain_for_requested_clients, scanner, select_local_parse_pricing,
         sessions, unified_to_parsed, validate_priced_messages, ClientId, GraphPricingRequirement,
@@ -15416,5 +15424,51 @@ mod tests {
         // Without verified cross-source dedup, both messages are preserved.
         let filtered = filter_messages_for_report(messages, &ReportOptions::default());
         assert_eq!(filtered.len(), 2);
+    }
+
+    /// The year filter compares the prefix in place rather than allocating
+    /// `format!("{year}-")` per message. The separator is load-bearing: without
+    /// it a truncated year like `202` would swallow every year it prefixes.
+    #[test]
+    fn year_filter_matches_on_the_full_year_and_its_separator() {
+        let dated = |date: &str| {
+            let mut message = UnifiedMessage::new(
+                "synthetic",
+                "gpt-4o",
+                "openai",
+                "session-1",
+                0,
+                TokenBreakdown::default(),
+                0.0,
+            );
+            message.date = date.to_string();
+            message
+        };
+
+        let options = ReportOptions {
+            year: Some("2026".to_string()),
+            ..Default::default()
+        };
+
+        assert!(message_passes_report_filter(&dated("2026-01-01"), &options));
+        assert!(message_passes_report_filter(&dated("2026-12-31"), &options));
+        assert!(!message_passes_report_filter(
+            &dated("2025-12-31"),
+            &options
+        ));
+        assert!(!message_passes_report_filter(
+            &dated("2027-01-01"),
+            &options
+        ));
+
+        // A partial year must not match the years it is a prefix of.
+        let truncated = ReportOptions {
+            year: Some("202".to_string()),
+            ..Default::default()
+        };
+        assert!(!message_passes_report_filter(
+            &dated("2026-01-01"),
+            &truncated
+        ));
     }
 }
