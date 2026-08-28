@@ -18,6 +18,7 @@
 
 use super::utils::{
     open_readonly_sqlite_opt, sqlite_for_each_row_on, sqlite_for_each_row_on_with_params,
+    SqliteScan,
 };
 use super::{
     normalize_opencode_agent_name, normalize_workspace_key, workspace_label_from_key,
@@ -559,6 +560,73 @@ const OPENCODE_V1_DISQUALIFIED_QUERY: &str = r#"
                AND json_extract(m.data, '$.tokens') IS NOT NULL)
 "#;
 
+/// Session metadata that changed since a mark, one query per full variant and
+/// in the same order. An empty entry means that variant joins no metadata
+/// table, so there is nothing that can go stale.
+///
+/// Sessions are touched alongside their messages -- on a real 14 GB database
+/// `session` and `message` high-waters sit 36 ms apart -- so refusing an
+/// incremental scan whenever session metadata moved would refuse essentially
+/// every rescan. Re-reading only the changed session rows is cheap instead: 13
+/// of 23,556 rows changed over a day on that same database.
+const OPENCODE_V2_METADATA_QUERIES: &[&str] = &[
+    "SELECT s.id, NULLIF(s.directory, '') , s.title, s.time_updated FROM session_v2 s WHERE s.time_updated >= ?1",
+    "SELECT s.id, NULLIF(s.directory, '') , NULL, s.time_updated FROM session_v2 s WHERE s.time_updated >= ?1",
+    "SELECT s.id, NULLIF(s.directory, '') , s.title, s.time_updated FROM session s WHERE s.time_updated >= ?1",
+    "SELECT s.id, NULLIF(s.directory, '') , NULL, s.time_updated FROM session s WHERE s.time_updated >= ?1",
+    "",
+];
+
+const OPENCODE_V1_METADATA_QUERIES: &[&str] = &[
+    "SELECT s.id, NULLIF(s.directory, '') , s.title, s.time_updated FROM session s WHERE s.time_updated >= ?1",
+    "SELECT s.id, NULLIF(s.directory, '') , NULL, s.time_updated FROM session s WHERE s.time_updated >= ?1",
+    "",
+];
+
+/// Highest `time_updated` in the metadata table a variant joins.
+const OPENCODE_V2_METADATA_STATS: &[&str] = &[
+    "SELECT MAX(time_updated) FROM session_v2",
+    "SELECT MAX(time_updated) FROM session_v2",
+    "SELECT MAX(time_updated) FROM session",
+    "SELECT MAX(time_updated) FROM session",
+    "",
+];
+
+const OPENCODE_V1_METADATA_STATS: &[&str] = &[
+    "SELECT MAX(time_updated) FROM session",
+    "SELECT MAX(time_updated) FROM session",
+    "",
+];
+
+/// Changed rows that now key themselves by an embedded id different from their
+/// SQLite row id.
+///
+/// The dedup key is the payload's `$.id` when it has one and the row id
+/// otherwise, so a row that *gains* an id changes key. The merge looks the new
+/// key up, does not find it, and appends -- leaving the message keyed by the row
+/// id in place and counting the row twice, while a cold parse counts it once.
+///
+/// The merge's content digest catches this only when the rewrite changed nothing
+/// else; a rewrite that also moved the token counts has a different digest and
+/// slips through. Nothing in a cached message records which row produced it, so
+/// the two cannot be linked after the fact -- the collision is detected here and
+/// answered with a full scan.
+const OPENCODE_V2_REKEYED_QUERY: &str = r#"
+    SELECT sm.id
+    FROM session_message sm
+    WHERE sm.time_updated >= ?1
+      AND json_extract(sm.data, '$.id') IS NOT NULL
+      AND json_extract(sm.data, '$.id') <> sm.id
+"#;
+
+const OPENCODE_V1_REKEYED_QUERY: &str = r#"
+    SELECT m.id
+    FROM message m
+    WHERE m.time_updated >= ?1
+      AND json_extract(m.data, '$.id') IS NOT NULL
+      AND json_extract(m.data, '$.id') <> m.id
+"#;
+
 /// Incremental support for one entry of [`OpenCodeSchemaConfig::query_groups`].
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OpenCodeIncrementalGroup {
@@ -572,6 +640,12 @@ pub(crate) struct OpenCodeIncrementalGroup {
     /// the whole group rather than one per variant: the variants differ only
     /// in the metadata join, which this does not read.
     disqualified: &'static str,
+    /// Changed rows whose dedup key moved off their row id.
+    rekeyed: &'static str,
+    /// Session metadata changed since the mark, per variant.
+    metadata: &'static [&'static str],
+    /// Metadata-table high-water, per variant.
+    metadata_stats: &'static [&'static str],
 }
 
 /// Incremental support for [`OPENCODE_QUERY_GROUPS`], in the same order.
@@ -580,11 +654,17 @@ const OPENCODE_INCREMENTAL_GROUPS: &[OpenCodeIncrementalGroup] = &[
         queries: OPENCODE_V2_INCREMENTAL_QUERIES,
         stats: OPENCODE_V2_STATS_QUERY,
         disqualified: OPENCODE_V2_DISQUALIFIED_QUERY,
+        rekeyed: OPENCODE_V2_REKEYED_QUERY,
+        metadata: OPENCODE_V2_METADATA_QUERIES,
+        metadata_stats: OPENCODE_V2_METADATA_STATS,
     },
     OpenCodeIncrementalGroup {
         queries: OPENCODE_V1_INCREMENTAL_QUERIES,
         stats: OPENCODE_V1_STATS_QUERY,
         disqualified: OPENCODE_V1_DISQUALIFIED_QUERY,
+        rekeyed: OPENCODE_V1_REKEYED_QUERY,
+        metadata: OPENCODE_V1_METADATA_QUERIES,
+        metadata_stats: OPENCODE_V1_METADATA_STATS,
     },
 ];
 
@@ -1033,10 +1113,10 @@ fn collect_rows(
     conn: &rusqlite::Connection,
     query: &str,
     on_row: &mut dyn FnMut(OpenCodeSchemaRow),
-) -> bool {
+) -> SqliteScan {
     // Quiet: these queries are schema probes — the caller tries each spelling
     // in turn, so a query the database does not understand is expected.
-    let scan = sqlite_for_each_row_on(conn, db_path, query, None, &mut |row| {
+    sqlite_for_each_row_on(conn, db_path, query, None, &mut |row| {
         let id: String = row.get(0)?;
         let session_id: String = row.get(1)?;
         let data_json: String = row.get(2)?;
@@ -1044,8 +1124,7 @@ fn collect_rows(
         let session_title: Option<String> = row.get(4)?;
         on_row((id, session_id, data_json, workspace_root, session_title));
         Ok(())
-    });
-    scan.prepared()
+    })
 }
 
 /// Run `query` with `since` bound to `?1`, handing every row to `on_row`.
@@ -1067,7 +1146,11 @@ fn collect_rows_since(
             on_row((id, session_id, data_json, workspace_root, session_title));
             Ok(())
         });
-    scan.prepared()
+    // `ran()`, not `prepared()`: the delta is only complete if the statement
+    // finished. `prepared()` also accepts a statement that failed while
+    // stepping -- json_extract on a malformed payload, say -- and a truncated
+    // delta read as a complete one keeps cached messages a cold parse drops.
+    scan.completed()
 }
 
 /// Whether any row that stopped qualifying as usage backs a cached message.
@@ -1105,7 +1188,119 @@ fn disqualified_row_backs_cached_message(
                     .is_some_and(|id| cached_keys.contains(id));
             Ok(())
         });
-    scan.prepared().then_some(hit)
+    // Completion required for the same reason as the delta: a probe that
+    // stopped early has not proved the absence of a disqualified row.
+    scan.completed().then_some(hit)
+}
+
+/// Highest `time_updated` in a variant's metadata table, or `i64::MIN` when the
+/// variant joins none.
+fn read_metadata_high_water(
+    db_path: &Path,
+    conn: &rusqlite::Connection,
+    query: &str,
+) -> Option<i64> {
+    if query.is_empty() {
+        return Some(i64::MIN);
+    }
+    let mut high_water = i64::MIN;
+    let scan = sqlite_for_each_row_on(conn, db_path, query, None, &mut |row| {
+        high_water = row.get::<_, Option<i64>>(0)?.unwrap_or(i64::MIN);
+        Ok(())
+    });
+    scan.completed().then_some(high_water)
+}
+
+/// Re-apply session metadata that changed since `since` to already-cached
+/// messages, returning the new metadata high-water.
+///
+/// A rename or a moved directory advances the session row's `time_updated`
+/// without touching any message row, so the incremental message scan cannot
+/// see it and the cached messages keep the old title and workspace forever.
+///
+/// Returns `None` when the refresh cannot be trusted -- the statement did not
+/// prepare, or a changed row no longer supplies a directory. The row's
+/// directory is only half the answer in that case: [`SchemaAccumulator::ingest`]
+/// falls back to the payload's own `path.root`, which is not available here
+/// without re-reading the message. A full scan is the honest answer, and it is
+/// rare: 13 of 23,556 session rows changed over a day on a real database.
+fn refresh_changed_session_metadata(
+    db_path: &Path,
+    conn: &rusqlite::Connection,
+    query: &str,
+    stats_query: &str,
+    since: i64,
+    cached: &mut [UnifiedMessage],
+    already_refreshed: &mut std::collections::HashSet<String>,
+) -> Option<i64> {
+    if query.is_empty() {
+        return Some(i64::MIN);
+    }
+
+    let mut changed: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+    let mut usable = true;
+    let scan =
+        sqlite_for_each_row_on_with_params(conn, db_path, query, &[&since], None, &mut |row| {
+            let session_id: String = row.get(0)?;
+            let workspace_root: Option<String> = row.get(1)?;
+            let session_title: Option<String> = row.get(2)?;
+            if workspace_root.is_none() {
+                usable = false;
+            }
+            changed.insert(session_id, (workspace_root, session_title));
+            Ok(())
+        });
+    if !scan.completed() || !usable {
+        return None;
+    }
+
+    // A session already re-stamped by another generation's table would be
+    // overwritten here with a different generation's metadata.
+    if changed.keys().any(|id| already_refreshed.contains(id)) {
+        return None;
+    }
+    already_refreshed.extend(changed.keys().cloned());
+
+    if !changed.is_empty() {
+        for message in cached.iter_mut() {
+            let Some((workspace_root, session_title)) = changed.get(&message.session_id) else {
+                continue;
+            };
+            set_workspace_from_root(message, workspace_root.as_deref());
+            message.session_title = session_title
+                .as_deref()
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map(str::to_string);
+        }
+    }
+
+    read_metadata_high_water(db_path, conn, stats_query)
+}
+
+/// Whether a row that re-keyed itself still has a cached message under its old
+/// row-id key. See [`OPENCODE_V1_REKEYED_QUERY`] for why that is unsafe.
+fn rekeyed_row_backs_cached_message(
+    db_path: &Path,
+    conn: &rusqlite::Connection,
+    query: &str,
+    since: i64,
+    db_namespace: &str,
+    cached_keys: &std::collections::HashSet<&str>,
+) -> Option<bool> {
+    let mut hit = false;
+    let scan =
+        sqlite_for_each_row_on_with_params(conn, db_path, query, &[&since], None, &mut |row| {
+            if hit {
+                return Ok(());
+            }
+            let row_id: String = row.get(0)?;
+            let namespaced = format!("{db_namespace}:{row_id}");
+            hit =
+                cached_keys.contains(row_id.as_str()) || cached_keys.contains(namespaced.as_str());
+            Ok(())
+        });
+    scan.completed().then_some(hit)
 }
 
 /// Parse assistant turns out of a SQLite database that uses the OpenCode
@@ -1144,6 +1339,10 @@ pub(crate) struct OpenCodeGroupMark {
     pub created_high_water: i64,
     /// Highest `time_updated`. The incremental scan reads from here.
     pub updated_high_water: i64,
+    /// Highest `time_updated` in the joined metadata table. A rename moves this
+    /// without touching a single message row, so the message high-water cannot
+    /// stand in for it. `i64::MIN` when the variant joins no metadata.
+    pub metadata_high_water: i64,
 }
 
 /// One mark per query group, in [`OpenCodeSchemaConfig::query_groups`] order.
@@ -1238,7 +1437,9 @@ fn read_table_stats(
             Ok(())
         },
     );
-    if scan.ran() {
+    // A truncated stats read yields a row count and high-waters that describe
+    // a prefix of the table, which is exactly the shape of a silent undercount.
+    if scan.completed() {
         stats
     } else {
         None
@@ -1282,23 +1483,51 @@ pub(crate) fn scan_opencode_schema_sqlite(
         let stats = incremental
             .and_then(|incremental| read_table_stats(db_path, &conn, incremental.stats, i64::MAX));
 
+        // `prepared()` selects the variant -- it is the schema probe, and a
+        // variant that prepared is the one this database understands, so
+        // falling through to an older query would read the wrong columns.
+        // `completed()` is a separate question: a variant that matched but
+        // stopped on a step error read only a prefix, and a mark written over
+        // that prefix would tell the next rescan those rows were already seen.
         let mut chosen = None;
+        let mut read_every_row = false;
         for (index, query) in group.iter().enumerate() {
-            if collect_rows(db_path, &conn, query, &mut |row| {
+            let scan = collect_rows(db_path, &conn, query, &mut |row| {
                 acc.ingest(row, &cfg, &db_namespace)
-            }) {
+            });
+            if scan.prepared() {
                 chosen = Some(index);
+                read_every_row = scan.completed();
                 break;
             }
         }
+        if chosen.is_some() && !read_every_row {
+            resumable = false;
+        }
 
         marks.push(match (chosen, stats) {
-            (Some(index), Some(stats)) => Some(OpenCodeGroupMark {
-                query_digest: query_digest(group[index]),
-                row_count: stats.row_count,
-                created_high_water: stats.created_high_water,
-                updated_high_water: stats.updated_high_water,
-            }),
+            (Some(index), Some(stats)) if read_every_row => {
+                let metadata_high_water = cfg
+                    .incremental_groups
+                    .and_then(|groups| groups.get(group_index))
+                    .and_then(|incremental| incremental.metadata_stats.get(index))
+                    .and_then(|query| read_metadata_high_water(db_path, &conn, query));
+                match metadata_high_water {
+                    Some(metadata_high_water) => Some(OpenCodeGroupMark {
+                        query_digest: query_digest(group[index]),
+                        row_count: stats.row_count,
+                        created_high_water: stats.created_high_water,
+                        updated_high_water: stats.updated_high_water,
+                        metadata_high_water,
+                    }),
+                    // Without a metadata high-water a later rescan cannot tell
+                    // whether a rename happened, so this scan is not resumable.
+                    None => {
+                        resumable = false;
+                        None
+                    }
+                }
+            }
             (Some(_), None) => {
                 resumable = false;
                 None
@@ -1335,7 +1564,7 @@ pub(crate) fn rescan_opencode_schema_sqlite(
     db_path: &Path,
     cfg: OpenCodeSchemaConfig,
     cached_state: &OpenCodeIncrementalState,
-    cached_messages: Vec<UnifiedMessage>,
+    mut cached_messages: Vec<UnifiedMessage>,
 ) -> Option<OpenCodeSchemaScan> {
     let incremental_groups = cfg.incremental_groups?;
     if cached_state.groups.len() != cfg.query_groups.len() {
@@ -1353,6 +1582,8 @@ pub(crate) fn rescan_opencode_schema_sqlite(
     let mut marks: Vec<Option<OpenCodeGroupMark>> = Vec::with_capacity(cached_state.groups.len());
     // Borrowed for the disqualification probe below; `cached_messages` is not
     // consumed until the merge at the end of this function.
+    // (mark index, metadata query, metadata stats query, previous high-water)
+    let mut pending_metadata: Vec<(usize, &'static str, &'static str, i64)> = Vec::new();
     let cached_keys: std::collections::HashSet<&str> = cached_messages
         .iter()
         .filter_map(|message| message.dedup_key.as_deref())
@@ -1370,10 +1601,17 @@ pub(crate) fn rescan_opencode_schema_sqlite(
 
         let (mark, stats) = match (cached_mark, stats) {
             (Some(mark), Some(stats)) => (mark, stats),
-            // The group's table was absent when the cache was written and
-            // still is, so it contributed nothing then and contributes
-            // nothing now.
+            // The group's table was absent when the cache was written, and the
+            // stats query still does not run. That is *usually* the same table
+            // still missing -- but the stats query also fails on a table that
+            // exists without `time_created`/`time_updated`, and the usage
+            // queries do not need those columns. Skipping such a table would
+            // omit its rows from every warm scan while a cold parse reads them,
+            // so the variants are probed before concluding it is absent.
             (None, None) => {
+                if group.iter().any(|query| conn.prepare(query).is_ok()) {
+                    return None;
+                }
                 marks.push(None);
                 continue;
             }
@@ -1414,6 +1652,20 @@ pub(crate) fn rescan_opencode_schema_sqlite(
             return None;
         }
 
+        // A row whose key moved off its row id would be appended beside the
+        // message still keyed by that row id, counting it twice.
+        if rekeyed_row_backs_cached_message(
+            db_path,
+            &conn,
+            incremental.rekeyed,
+            mark.updated_high_water,
+            &db_namespace,
+            &cached_keys,
+        ) != Some(false)
+        {
+            return None;
+        }
+
         let query = incremental.queries.get(chosen)?;
         if !collect_rows_since(db_path, &conn, query, mark.updated_high_water, &mut |row| {
             acc.ingest(row, &cfg, &db_namespace)
@@ -1421,12 +1673,56 @@ pub(crate) fn rescan_opencode_schema_sqlite(
             return None;
         }
 
+        // The metadata refresh needs `cached_messages` mutably, and the
+        // disqualification probe borrows it immutably for the whole loop, so
+        // the refresh is deferred until both borrows can be released.
+        pending_metadata.push((
+            marks.len(),
+            incremental.metadata.get(chosen).copied().unwrap_or(""),
+            incremental
+                .metadata_stats
+                .get(chosen)
+                .copied()
+                .unwrap_or(""),
+            mark.metadata_high_water,
+        ));
+
         marks.push(Some(OpenCodeGroupMark {
             query_digest: mark.query_digest,
             row_count: stats.row_count,
             created_high_water: stats.created_high_water,
             updated_high_water: stats.updated_high_water,
+            metadata_high_water: mark.metadata_high_water,
         }));
+    }
+
+    // `cached_keys` borrowed `cached_messages` for the probe above and is dead
+    // from here, so the refresh can take it mutably.
+    drop(cached_keys);
+    // Both generations are scanned into one message list, and a cached message
+    // does not record which group produced it. So a session id that exists in
+    // more than one generation's metadata table cannot be re-stamped safely:
+    // the later group would overwrite the earlier group's messages with its own
+    // title and workspace, and a cold parse would disagree. Refusing is rare --
+    // it needs the same id in both `session` and `session_v2`, which is the
+    // half-migrated database -- and a full scan is correct there.
+    let mut refreshed_sessions: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for (index, query, stats_query, since) in pending_metadata {
+        // A rename moves session metadata without touching a message row, so
+        // the cached messages are re-stamped rather than left stale.
+        let metadata_high_water = refresh_changed_session_metadata(
+            db_path,
+            &conn,
+            query,
+            stats_query,
+            since,
+            &mut cached_messages,
+            &mut refreshed_sessions,
+        )?;
+        if let Some(Some(mark)) = marks.get_mut(index) {
+            mark.metadata_high_water = metadata_high_water;
+        }
     }
 
     // A merge among the changed rows themselves is reproducible -- a full scan

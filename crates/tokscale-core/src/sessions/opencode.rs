@@ -1791,7 +1791,8 @@ mod tests {
             "CREATE TABLE session (
                 id TEXT PRIMARY KEY,
                 directory TEXT NOT NULL,
-                title TEXT
+                title TEXT,
+                time_updated INTEGER NOT NULL
             );
             CREATE TABLE message (
                 id TEXT PRIMARY KEY,
@@ -1800,8 +1801,8 @@ mod tests {
                 time_updated INTEGER NOT NULL,
                 data TEXT NOT NULL
             );
-            INSERT INTO session (id, directory, title)
-            VALUES ('ses_1', '/tmp/project', 'A session');",
+            INSERT INTO session (id, directory, title, time_updated)
+            VALUES ('ses_1', '/tmp/project', 'A session', 500);",
         )
         .unwrap();
         conn
@@ -1999,6 +2000,149 @@ mod tests {
             )
             .unwrap();
         assert_eq!(changed, 1, "fixture row {id} should exist");
+    }
+
+    /// A rename touches the session row and nothing else, so the message
+    /// high-water does not move and the incremental scan reads no rows. Without
+    /// a metadata refresh the cached messages keep the old title forever, and a
+    /// cold parse disagrees with the cache indefinitely.
+    #[test]
+    fn test_incremental_rescan_picks_up_a_session_renamed_without_new_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = create_timed_v1_db(&db_path);
+        insert_timed_v1_message(&conn, "msg_a", 1_000, 11);
+        insert_timed_v1_message(&conn, "msg_b", 2_000, 22);
+        drop(conn);
+
+        let cold = scan_opencode_sqlite(&db_path);
+        let state = cold.incremental.clone().unwrap();
+        assert_eq!(cold.messages[0].session_title.as_deref(), Some("A session"));
+
+        // Rename the session and move its directory. No message row changes.
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE session SET title = 'Renamed session', directory = '/tmp/moved',
+                    time_updated = 9000 WHERE id = 'ses_1'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let warm = rescan_opencode_sqlite(&db_path, &state, cold.messages)
+            .expect("a rename must not cost a full re-parse");
+        let full = scan_opencode_sqlite(&db_path);
+
+        assert_eq!(
+            by_dedup_key(&warm.messages),
+            by_dedup_key(&full.messages),
+            "a warm rescan must agree with a cold parse after a rename"
+        );
+        for message in &warm.messages {
+            assert_eq!(message.session_title.as_deref(), Some("Renamed session"));
+        }
+    }
+
+    /// Both generations scan into one message list and a cached message does
+    /// not record which produced it, so a session id present in both metadata
+    /// tables cannot be re-stamped without one generation overwriting the
+    /// other's title and workspace. A full scan is the correct answer there.
+    #[test]
+    fn test_incremental_rescan_refuses_a_session_id_shared_by_both_schemas() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = create_timed_v1_db(&db_path);
+        insert_timed_v1_message(&conn, "msg_a", 1_000, 11);
+        // A half-migrated database: the same session id in the v2 table too.
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (
+                id TEXT PRIMARY KEY,
+                directory TEXT NOT NULL,
+                title TEXT,
+                time_updated INTEGER NOT NULL
+            );
+            CREATE TABLE session_message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            INSERT INTO session_v2 (id, directory, title, time_updated)
+            VALUES ('ses_1', '/tmp/v2', 'V2 title', 500);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let cold = scan_opencode_sqlite(&db_path);
+        let Some(state) = cold.incremental.clone() else {
+            // Refusing to mark at all is also a safe answer here.
+            return;
+        };
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE session_v2 SET title = 'V2 renamed', time_updated = 9000 WHERE id = 'ses_1'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE session SET title = 'V1 renamed', time_updated = 9000 WHERE id = 'ses_1'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            rescan_opencode_sqlite(&db_path, &state, cold.messages).is_none(),
+            "a session id in both metadata tables must force a full re-parse"
+        );
+    }
+
+    /// A row that gains an embedded `$.id` changes dedup key, so the merge
+    /// cannot find the message it should replace. Appending instead would count
+    /// the same row twice while a cold parse counts it once.
+    ///
+    /// Two shapes, because the merge's content digest only catches one of them:
+    /// an identity-only rewrite has the same digest as the cached message, but
+    /// one that also changes usage does not.
+    #[test]
+    fn test_incremental_rescan_refuses_a_row_that_gained_an_embedded_id() {
+        for (label, output) in [("identity only", 11), ("identity and usage", 99)] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("opencode.db");
+            let conn = create_timed_v1_db(&db_path);
+            insert_timed_v1_message(&conn, "msg_a", 1_000, 11);
+            drop(conn);
+
+            let cold = scan_opencode_sqlite(&db_path);
+            let state = cold.incremental.clone().unwrap();
+            assert_eq!(cold.messages.len(), 1);
+            assert_eq!(cold.messages[0].dedup_key.as_deref(), Some("msg_a"));
+
+            // The row keeps its SQLite id but starts carrying its own id, which
+            // is the key the parser prefers.
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE message SET data = ?1, time_updated = 9000 WHERE id = 'msg_a'",
+                rusqlite::params![timed_v1_payload("embedded_a", output)],
+            )
+            .unwrap();
+            drop(conn);
+
+            let full = scan_opencode_sqlite(&db_path);
+            assert_eq!(full.messages.len(), 1, "{label}: a cold parse sees one row");
+
+            match rescan_opencode_sqlite(&db_path, &state, cold.messages) {
+                None => {}
+                Some(warm) => assert_eq!(
+                    by_dedup_key(&warm.messages),
+                    by_dedup_key(&full.messages),
+                    "{label}: a warm scan that proceeds must match a cold parse"
+                ),
+            }
+        }
     }
 
     #[test]
