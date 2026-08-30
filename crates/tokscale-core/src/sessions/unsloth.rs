@@ -224,6 +224,10 @@ fn parse_external_api_usage(db_path: &Path, conn: &Connection) -> Vec<UnifiedMes
         let total_tokens: i64 = row.get(5)?;
         let created_at: i64 = row.get(6)?;
 
+        // `api_usage_events` records only prompt/completion/total counts, so
+        // cache_read, cache_write, and reasoning are passed as 0. This is
+        // intentional until Unsloth exposes those columns in the table; the
+        // chat/contextUsage path already carries them when present.
         let Some(tokens) =
             normalized_tokens(prompt_tokens, completion_tokens, total_tokens, 0, 0, 0)
         else {

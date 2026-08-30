@@ -42,6 +42,12 @@ const EXCLUDED_LITELLM_PREFIXES: &[&str] = &["github_copilot/"];
 /// an intercepting proxy, a refused connection and a DNS failure are one
 /// string. #1238 was reported against a Windows firewall with exactly that
 /// line, and neither the reporter nor I could tell which of the three it was.
+///
+/// Callers must not pass errors from clients whose request URLs embed tokens or
+/// credentials in query parameters: `reqwest` includes the request URL verbatim
+/// in its `Display`, and this function prints that string unredacted, so any
+/// secret in the URL would leak into logs and error output. Current callers use
+/// header-based auth with parameter-free URLs, which is safe.
 pub fn describe_error(error: &(dyn std::error::Error + 'static)) -> String {
     let mut parts = vec![error.to_string()];
     let mut source = error.source();
