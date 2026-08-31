@@ -215,7 +215,13 @@ mod tests {
         .expect("valid Limit fixture")
     }
 
-    fn run(limits: &[Limit]) -> (Option<UsageMetric>, Option<UsageMetric>, Option<UsageMetric>) {
+    fn run(
+        limits: &[Limit],
+    ) -> (
+        Option<UsageMetric>,
+        Option<UsageMetric>,
+        Option<UsageMetric>,
+    ) {
         let mut session = None;
         let mut weekly = None;
         let mut search = None;
