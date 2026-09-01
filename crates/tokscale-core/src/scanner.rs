@@ -724,10 +724,13 @@ pub fn built_in_extra_scan_paths_for(
 /// in practice; the cap only bounds pathological files.
 const SENPI_SESSION_HEADER_MAX_BYTES: u64 = 8 * 1024;
 
-/// How many session files per project directory the probe tries before giving
-/// up. Files are probed newest-first; anything beyond a few candidates means
-/// the directory's transcripts are systematically headerless.
-const SENPI_SESSION_HEADER_PROBE_MAX_FILES: usize = 5;
+/// Hard ceiling on how many session files the project-root probe reads per
+/// project directory. Every transcript is probed rather than just the newest
+/// few, because one directory can hold several projects (see
+/// [`senpi_project_cwds_from_session_dir`]); this ceiling only bounds
+/// pathologically large directories, and since files are probed newest-first it
+/// keeps the most recently used projects when it does bite.
+const SENPI_SESSION_HEADER_PROBE_MAX_FILES: usize = 512;
 
 /// Discover OmO task-children scan roots from a Senpi sessions tree.
 ///
@@ -736,10 +739,12 @@ const SENPI_SESSION_HEADER_PROBE_MAX_FILES: usize = 5;
 /// project root. Senpi's sessions dir has one subdirectory per project
 /// (`sessions/<encoded-cwd>/`), but the encoding is lossy — a `-` may be a
 /// separator or a literal character — so instead of decoding the name, read the
-/// `cwd` recorded in each subdirectory's session header. Every discovered
-/// `<cwd>/.omo/senpi-task/children` that exists on disk becomes a scan root;
-/// overlaps with the cwd-derived root are collapsed by the scanner's existing
-/// path dedup.
+/// `cwd`s recorded in that subdirectory's session headers. Because the encoding
+/// is lossy in both directions, one subdirectory can serve several projects, so
+/// every distinct header `cwd` is taken, not just the newest one. Every
+/// discovered `<cwd>/.omo/senpi-task/children` that exists on disk becomes a
+/// scan root; overlaps with the cwd-derived root are collapsed by the scanner's
+/// existing path dedup.
 fn discover_senpi_omo_children_roots(sessions_root: &Path) -> Vec<PathBuf> {
     let entries = match std::fs::read_dir(sessions_root) {
         Ok(entries) => entries,
@@ -749,7 +754,7 @@ fn discover_senpi_omo_children_roots(sessions_root: &Path) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .filter_map(|entry| senpi_project_cwd_from_session_dir(&entry.path()))
+        .flat_map(|entry| senpi_project_cwds_from_session_dir(&entry.path()))
         // A relative `cwd` (corrupt or hand-edited header) would resolve
         // against the tokscale process cwd and could register an unrelated
         // directory as a scan root.
@@ -764,16 +769,27 @@ fn discover_senpi_omo_children_roots(sessions_root: &Path) -> Vec<PathBuf> {
     roots
 }
 
-/// Read the project `cwd` out of one per-project Senpi session directory.
+/// Read every distinct project `cwd` recorded in one per-project Senpi session
+/// directory.
 ///
-/// Probes the newest few `*.jsonl` transcripts (file names are
-/// timestamp-prefixed, so lexicographic order is chronological) and returns the
-/// `cwd` of the first one whose opening line is a `{"type":"session",...}`
-/// header. Only the first line of each candidate is examined: real transcripts
-/// always start with the header, so a non-header first line means a truncated
-/// or foreign file, not a deeper-buried header.
-fn senpi_project_cwd_from_session_dir(session_dir: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(session_dir).ok()?;
+/// `sessions/<encoded-cwd>` names are lossy — a `-` is either a path separator
+/// or a literal character — so two projects can share one directory
+/// (`/a/b-c` and `/a/b/c` both encode to `--a-b-c--`), and their transcripts
+/// then interleave inside it. Returning only the first header's `cwd` would
+/// hide every colliding project but the newest, which is the exact
+/// cross-project omission this discovery exists to fix, so all headers are read
+/// and the distinct `cwd`s collected.
+///
+/// Transcripts are probed newest-first (file names are timestamp-prefixed, so
+/// lexicographic order is chronological) up to
+/// [`SENPI_SESSION_HEADER_PROBE_MAX_FILES`]. Only the first line of each
+/// candidate is examined: real transcripts always start with the
+/// `{"type":"session",...}` header, so a non-header first line means a
+/// truncated or foreign file, not a deeper-buried header.
+fn senpi_project_cwds_from_session_dir(session_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(session_dir) else {
+        return Vec::new();
+    };
     let mut transcripts: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
@@ -786,11 +802,21 @@ fn senpi_project_cwd_from_session_dir(session_dir: &Path) -> Option<PathBuf> {
         .collect();
     transcripts.sort_unstable();
 
-    transcripts
+    let mut cwds: Vec<PathBuf> = Vec::new();
+    for path in transcripts
         .iter()
         .rev()
         .take(SENPI_SESSION_HEADER_PROBE_MAX_FILES)
-        .find_map(|path| senpi_session_header_cwd(path))
+    {
+        if let Some(cwd) = senpi_session_header_cwd(path) {
+            // Directories hold a handful of distinct projects at most, so a
+            // linear membership check beats hashing every path.
+            if !cwds.contains(&cwd) {
+                cwds.push(cwd);
+            }
+        }
+    }
+    cwds
 }
 
 /// Parse the `cwd` field from a Senpi session file's header line, if the first
@@ -7599,6 +7625,55 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn test_senpi_global_discovery_registers_every_project_sharing_one_session_dir() {
+        // Two projects whose paths encode to the same lossy directory name keep
+        // their transcripts side by side in one `sessions/<encoded-cwd>`
+        // directory. Both must contribute their OmO children root — discovering
+        // only the newest is the cross-project omission this feature fixes.
+        let home_dir = TempDir::new().unwrap();
+        let older_project = TempDir::new().unwrap();
+        let newer_project = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let older_child = setup_mock_senpi_omo_child(older_project.path());
+        let newer_child = setup_mock_senpi_omo_child(newer_project.path());
+        let older_session = write_senpi_global_session(
+            home_dir.path(),
+            "--collided--",
+            "2026-01-01T00-00-00-000Z_older.jsonl",
+            older_project.path(),
+        );
+        let newer_session = write_senpi_global_session(
+            home_dir.path(),
+            "--collided--",
+            "2026-08-31T00-00-00-000Z_newer.jsonl",
+            newer_project.path(),
+        );
+        let mut env =
+            EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR", "SENPI_CODING_AGENT_DIR"]);
+        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
+        env.remove("SENPI_CODING_AGENT_DIR");
+        let _current_dir = CurrentDirGuard::set(elsewhere.path());
+
+        let result =
+            scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
+
+        let canonical_files: HashSet<PathBuf> = result
+            .get(ClientId::Senpi)
+            .iter()
+            .map(|path| path.canonicalize().unwrap())
+            .collect();
+        assert!(
+            canonical_files.contains(&older_child),
+            "the older project sharing the encoded directory must still be discovered"
+        );
+        assert!(canonical_files.contains(&newer_child));
+        assert!(canonical_files.contains(&older_session.canonicalize().unwrap()));
+        assert!(canonical_files.contains(&newer_session.canonicalize().unwrap()));
+        assert_eq!(canonical_files.len(), 4);
+    }
+
+    #[test]
     fn test_senpi_project_cwd_probe_skips_headerless_transcripts() {
         let sessions = TempDir::new().unwrap();
         let project_dir = sessions.path().join("--proj--");
@@ -7620,13 +7695,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            senpi_project_cwd_from_session_dir(&project_dir),
-            Some(PathBuf::from("/tmp/real-project"))
+            senpi_project_cwds_from_session_dir(&project_dir),
+            vec![PathBuf::from("/tmp/real-project")]
         );
     }
 
     #[test]
-    fn test_senpi_project_cwd_probe_caps_candidate_files() {
+    fn test_senpi_project_cwd_probe_stops_at_the_file_ceiling() {
         let sessions = TempDir::new().unwrap();
         let project_dir = sessions.path().join("--proj--");
         fs::create_dir_all(&project_dir).unwrap();
@@ -7643,10 +7718,41 @@ mod tests {
             .unwrap();
         }
 
-        assert_eq!(
-            senpi_project_cwd_from_session_dir(&project_dir),
-            None,
+        assert!(
+            senpi_project_cwds_from_session_dir(&project_dir).is_empty(),
             "the probe must stop after {SENPI_SESSION_HEADER_PROBE_MAX_FILES} newest candidates"
+        );
+    }
+
+    #[test]
+    fn test_senpi_project_cwd_probe_collects_every_colliding_project() {
+        // `/tmp/a/b-c` and `/tmp/a/b/c` both encode to `--tmp-a-b-c--`, so their
+        // transcripts share one session directory. Every distinct `cwd` must
+        // survive the probe, not just the newest project's.
+        let sessions = TempDir::new().unwrap();
+        let project_dir = sessions.path().join("--tmp-a-b-c--");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("2026-01-01T00-00-00-000Z_older.jsonl"),
+            "{\"type\":\"session\",\"cwd\":\"/tmp/a/b-c\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            project_dir.join("2026-02-01T00-00-00-000Z_newer.jsonl"),
+            "{\"type\":\"session\",\"cwd\":\"/tmp/a/b/c\"}\n",
+        )
+        .unwrap();
+        // A second transcript of the newest project must not produce a duplicate.
+        fs::write(
+            project_dir.join("2026-03-01T00-00-00-000Z_newest.jsonl"),
+            "{\"type\":\"session\",\"cwd\":\"/tmp/a/b/c\"}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            senpi_project_cwds_from_session_dir(&project_dir),
+            vec![PathBuf::from("/tmp/a/b/c"), PathBuf::from("/tmp/a/b-c")],
+            "every distinct header cwd must be collected, newest first, without duplicates"
         );
     }
 
