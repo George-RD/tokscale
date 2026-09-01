@@ -7916,21 +7916,33 @@ mod tests {
         );
     }
 
+    /// An absolute path the host platform agrees is absolute. A Unix-style
+    /// `/srv/...` is drive-relative on Windows, so `Path::is_absolute` rejects
+    /// it there and the probe would correctly refuse to use it.
+    fn absolute_state_dir(name: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:\{name}"))
+        } else {
+            PathBuf::from(format!("/{name}"))
+        }
+    }
+
     #[test]
     fn test_omo_task_state_dir_reads_jsonc_with_comments() {
         let temp = TempDir::new().unwrap();
         let omo_dir = temp.path().join(".omo");
         fs::create_dir_all(&omo_dir).unwrap();
+        let state_dir = absolute_state_dir("srv-omo-state");
         fs::write(
             omo_dir.join("omo.jsonc"),
-            "{\n  // OmO config\n  \"task\": {\n    \"state_dir\": \"/srv/omo-state\",\n  },\n}\n",
+            format!(
+                "{{\n  // OmO config\n  \"task\": {{\n    \"state_dir\": {},\n  }},\n}}\n",
+                json_path_literal(&state_dir)
+            ),
         )
         .unwrap();
 
-        assert_eq!(
-            omo_task_state_dir(&omo_dir),
-            Some(PathBuf::from("/srv/omo-state"))
-        );
+        assert_eq!(omo_task_state_dir(&omo_dir), Some(state_dir));
     }
 
     #[test]
@@ -7938,16 +7950,17 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let omo_dir = temp.path().join(".omo");
         fs::create_dir_all(&omo_dir).unwrap();
+        let state_dir = absolute_state_dir("srv-legacy");
         fs::write(
             omo_dir.join("omo.json"),
-            "{\"task\":{\"state_dir\":\"/srv/legacy\"}}",
+            format!(
+                "{{\"task\":{{\"state_dir\":{}}}}}",
+                json_path_literal(&state_dir)
+            ),
         )
         .unwrap();
 
-        assert_eq!(
-            omo_task_state_dir(&omo_dir),
-            Some(PathBuf::from("/srv/legacy"))
-        );
+        assert_eq!(omo_task_state_dir(&omo_dir), Some(state_dir));
     }
 
     #[test]
@@ -7985,23 +7998,25 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let omo_dir = temp.path().join(".omo");
         fs::create_dir_all(&omo_dir).unwrap();
+        let project_state = absolute_state_dir("srv-project-state");
+        let user_state = absolute_state_dir("srv-user-state");
         fs::write(
             omo_dir.join("omo.jsonc"),
-            "{\"task\":{\"state_dir\":\"/srv/project-state\"}}",
+            format!(
+                "{{\"task\":{{\"state_dir\":{}}}}}",
+                json_path_literal(&project_state)
+            ),
         )
         .unwrap();
 
         assert_eq!(
-            senpi_omo_children_root(temp.path(), Some(Path::new("/srv/user-state"))),
-            PathBuf::from("/srv/project-state").join("children"),
+            senpi_omo_children_root(temp.path(), Some(&user_state)),
+            project_state.join("children"),
             "the project's own .omo config wins over the user layer"
         );
         assert_eq!(
-            senpi_omo_children_root(
-                &temp.path().join("other"),
-                Some(Path::new("/srv/user-state"))
-            ),
-            PathBuf::from("/srv/user-state").join("children"),
+            senpi_omo_children_root(&temp.path().join("other"), Some(&user_state)),
+            user_state.join("children"),
             "a project without its own config inherits the user layer"
         );
     }
