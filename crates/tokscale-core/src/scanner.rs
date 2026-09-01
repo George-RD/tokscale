@@ -753,7 +753,13 @@ fn discover_senpi_omo_children_roots(sessions_root: &Path) -> Vec<PathBuf> {
 
     let mut roots: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        // A symlinked per-project directory is still a project directory; the
+        // scanner follows those when it walks the sessions tree.
+        .filter(|entry| {
+            entry
+                .file_type()
+                .is_ok_and(|kind| kind.is_dir() || (kind.is_symlink() && entry.path().is_dir()))
+        })
         .flat_map(|entry| senpi_project_cwds_from_session_dir(&entry.path()))
         // A relative `cwd` (corrupt or hand-edited header) would resolve
         // against the tokscale process cwd and could register an unrelated
@@ -792,7 +798,14 @@ fn senpi_project_cwds_from_session_dir(session_dir: &Path) -> Vec<PathBuf> {
     };
     let mut transcripts: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        // Same follow-file rule as `scan_directory`: trust the cheap dirent
+        // type for regular files and pay a following stat only for symlinks,
+        // which the normal scanner counts as transcripts too.
+        .filter(|entry| {
+            entry
+                .file_type()
+                .is_ok_and(|kind| kind.is_file() || (kind.is_symlink() && entry.path().is_file()))
+        })
         .map(|entry| entry.path())
         .filter(|path| {
             path.file_name()
@@ -7753,6 +7766,63 @@ mod tests {
             senpi_project_cwds_from_session_dir(&project_dir),
             vec![PathBuf::from("/tmp/a/b/c"), PathBuf::from("/tmp/a/b-c")],
             "every distinct header cwd must be collected, newest first, without duplicates"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_senpi_project_cwd_probe_follows_symlinked_transcripts() {
+        use std::os::unix::fs::symlink;
+
+        // `scan_directory` counts symlinked transcripts, so skipping them here
+        // would hide their project's OmO children from a tree the scanner reads.
+        let sessions = TempDir::new().unwrap();
+        let real = sessions.path().join("real-transcript.jsonl");
+        fs::write(
+            &real,
+            "{\"type\":\"session\",\"cwd\":\"/tmp/linked-project\"}\n",
+        )
+        .unwrap();
+        let project_dir = sessions.path().join("--proj--");
+        fs::create_dir_all(&project_dir).unwrap();
+        symlink(
+            &real,
+            project_dir.join("2026-01-01T00-00-00-000Z_link.jsonl"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            senpi_project_cwds_from_session_dir(&project_dir),
+            vec![PathBuf::from("/tmp/linked-project")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_discover_senpi_omo_children_roots_follows_symlinked_project_dirs() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        let children = project.join(".omo").join("senpi-task").join("children");
+        fs::create_dir_all(&children).unwrap();
+        let real_session_dir = temp.path().join("real-sessions").join("--project--");
+        fs::create_dir_all(&real_session_dir).unwrap();
+        fs::write(
+            real_session_dir.join("2026-01-01T00-00-00-000Z_a.jsonl"),
+            format!(
+                "{{\"type\":\"session\",\"cwd\":{}}}\n",
+                json_path_literal(&project)
+            ),
+        )
+        .unwrap();
+        let sessions_root = temp.path().join("sessions");
+        fs::create_dir_all(&sessions_root).unwrap();
+        symlink(&real_session_dir, sessions_root.join("--project--")).unwrap();
+
+        assert_eq!(
+            discover_senpi_omo_children_roots(&sessions_root),
+            vec![children]
         );
     }
 
