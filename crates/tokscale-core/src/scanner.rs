@@ -724,23 +724,6 @@ pub fn built_in_extra_scan_paths_for(
 /// in practice; the cap only bounds pathological files.
 const SENPI_SESSION_HEADER_MAX_BYTES: u64 = 8 * 1024;
 
-/// How many of the newest transcripts the project-root probe reads per project
-/// directory. A project that still writes to a shared directory always shows up
-/// here.
-const SENPI_SESSION_HEADER_PROBE_NEWEST: usize = 32;
-
-/// How many of the oldest transcripts the probe reads on top of
-/// [`SENPI_SESSION_HEADER_PROBE_NEWEST`]. A project that stopped writing to a
-/// directory it shares with a busier one survives only at this end.
-///
-/// The two windows together bound the probe at 40 header reads per directory
-/// however many transcripts it holds, which is what keeps discovery off the
-/// critical path of every report: measured over a synthetic tree of 60 projects
-/// x 400 transcripts, probing both ends costs 80ms against 584ms for reading
-/// every header, and any directory at or below 40 transcripts (every real one
-/// measured) is still read in full.
-const SENPI_SESSION_HEADER_PROBE_OLDEST: usize = 8;
-
 /// Discover OmO task-children scan roots from a Senpi sessions tree.
 ///
 /// OmO redirects task child transcripts into project-local
@@ -795,56 +778,49 @@ fn discover_senpi_omo_children_roots(sessions_root: &Path) -> Vec<PathBuf> {
 /// cross-project omission this discovery exists to fix, so all headers are read
 /// and the distinct `cwd`s collected.
 ///
-/// File names are timestamp-prefixed, so lexicographic order is chronological
-/// and both ends of the history are probed: the newest transcripts
-/// ([`SENPI_SESSION_HEADER_PROBE_NEWEST`]) surface every project still writing
-/// here, and the oldest ([`SENPI_SESSION_HEADER_PROBE_OLDEST`]) surface one that
-/// has since gone quiet, which reading only the newest would bury. Directories
-/// no larger than the two windows combined are read in full. Only the first
-/// line of each candidate is examined: real transcripts always start with the
-/// `{"type":"session",...}` header, so a non-header first line means a
-/// truncated or foreign file, not a deeper-buried header.
+/// Every transcript is read, with no window or cap: any sampling scheme can
+/// bury a project whose only header falls outside it, and this discovery exists
+/// precisely so that no project is missed. The cost is one `open` plus one
+/// `read_line` per transcript — 0.3ms over the real sessions tree measured here
+/// (9 projects, 26 transcripts) and ~24us per transcript as the tree grows.
+///
+/// Only the first line of each candidate is examined: real transcripts always
+/// start with the `{"type":"session",...}` header, so a non-header first line
+/// means a truncated or foreign file, not a deeper-buried header. Results are
+/// sorted so the scan order of the directory does not leak into the output.
 fn senpi_project_cwds_from_session_dir(session_dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(session_dir) else {
         return Vec::new();
     };
-    let mut transcripts: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok())
+    let mut cwds: Vec<PathBuf> = Vec::new();
+    for entry in entries.filter_map(|entry| entry.ok()) {
         // Same follow-file rule as `scan_directory`: trust the cheap dirent
         // type for regular files and pay a following stat only for symlinks,
         // which the normal scanner counts as transcripts too.
-        .filter(|entry| {
-            entry
-                .file_type()
-                .is_ok_and(|kind| kind.is_file() || (kind.is_symlink() && entry.path().is_file()))
-        })
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".jsonl"))
-        })
-        .collect();
-    transcripts.sort_unstable();
-
-    let newest = transcripts.len().min(SENPI_SESSION_HEADER_PROBE_NEWEST);
-    // Clamped against the newest window so the two never probe the same file
-    // twice in a directory smaller than both.
-    let oldest = SENPI_SESSION_HEADER_PROBE_OLDEST.min(transcripts.len() - newest);
-    let mut cwds: Vec<PathBuf> = Vec::new();
-    for path in transcripts[transcripts.len() - newest..]
-        .iter()
-        .rev()
-        .chain(transcripts[..oldest].iter())
-    {
-        if let Some(cwd) = senpi_session_header_cwd(path) {
-            // Directories hold a handful of distinct projects at most, so a
-            // linear membership check beats hashing every path.
+        if !entry
+            .file_type()
+            .is_ok_and(|kind| kind.is_file() || (kind.is_symlink() && entry.path().is_file()))
+        {
+            continue;
+        }
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".jsonl"))
+        {
+            continue;
+        }
+        if let Some(cwd) = senpi_session_header_cwd(&path) {
+            // A directory holds a handful of distinct projects at most, so a
+            // linear membership check beats hashing every path, and streaming
+            // the entries avoids materialising one `PathBuf` per transcript.
             if !cwds.contains(&cwd) {
                 cwds.push(cwd);
             }
         }
     }
+    cwds.sort_unstable();
     cwds
 }
 
@@ -7730,10 +7706,10 @@ mod tests {
     }
 
     #[test]
-    fn test_senpi_project_cwd_probe_reads_both_ends_of_a_large_directory() {
-        // A project that stopped writing survives only among the oldest
-        // transcripts; reading just the newest window would bury it behind the
-        // project that took the shared directory over.
+    fn test_senpi_project_cwd_probe_reads_every_header_in_a_large_directory() {
+        // Neither end of the history may be privileged: a project that stopped
+        // writing lives among the oldest transcripts, and the one that took the
+        // shared directory over lives among the newest.
         let sessions = TempDir::new().unwrap();
         let project_dir = sessions.path().join("--proj--");
         fs::create_dir_all(&project_dir).unwrap();
@@ -7742,8 +7718,7 @@ mod tests {
             "{\"type\":\"session\",\"cwd\":\"/tmp/dormant-project\"}\n",
         )
         .unwrap();
-        let filler = SENPI_SESSION_HEADER_PROBE_NEWEST + SENPI_SESSION_HEADER_PROBE_OLDEST + 10;
-        for index in 0..filler {
+        for index in 0..200 {
             fs::write(
                 project_dir.join(format!("2026-02-01T00-00-00-000Z_filler-{index:04}.jsonl")),
                 "{not json",
@@ -7757,23 +7732,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            senpi_project_cwds_from_session_dir(&project_dir),
-            vec![
+            senpi_project_cwds_from_session_dir(&project_dir)
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([
                 PathBuf::from("/tmp/active-project"),
                 PathBuf::from("/tmp/dormant-project"),
-            ],
-            "both ends of a directory larger than the probe windows must be read"
+            ]),
+            "both ends of a large directory must be read"
         );
     }
 
     #[test]
-    fn test_senpi_project_cwd_probe_bounds_work_on_huge_directories() {
-        // The windows are what keep discovery off the critical path of every
-        // report, so a header buried between them stays unread on purpose.
+    fn test_senpi_project_cwd_probe_finds_a_header_buried_between_the_ends() {
+        // The regression that a windowed probe reintroduces: a project whose
+        // only transcript sits in the middle of a busy shared directory must
+        // still contribute its OmO children root.
         let sessions = TempDir::new().unwrap();
         let project_dir = sessions.path().join("--proj--");
         fs::create_dir_all(&project_dir).unwrap();
-        for index in 0..SENPI_SESSION_HEADER_PROBE_OLDEST + 2 {
+        for index in 0..100 {
             fs::write(
                 project_dir.join(format!("2026-01-01T00-00-00-000Z_old-{index:04}.jsonl")),
                 "{not json",
@@ -7785,7 +7763,7 @@ mod tests {
             "{\"type\":\"session\",\"cwd\":\"/tmp/buried-project\"}\n",
         )
         .unwrap();
-        for index in 0..SENPI_SESSION_HEADER_PROBE_NEWEST + 2 {
+        for index in 0..100 {
             fs::write(
                 project_dir.join(format!("2026-03-01T00-00-00-000Z_new-{index:04}.jsonl")),
                 "{not json",
@@ -7793,9 +7771,10 @@ mod tests {
             .unwrap();
         }
 
-        assert!(
-            senpi_project_cwds_from_session_dir(&project_dir).is_empty(),
-            "the probe must read only the newest and oldest windows"
+        assert_eq!(
+            senpi_project_cwds_from_session_dir(&project_dir),
+            vec![PathBuf::from("/tmp/buried-project")],
+            "a header between the ends of the directory must not be skipped"
         );
     }
 
@@ -7825,9 +7804,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            senpi_project_cwds_from_session_dir(&project_dir),
-            vec![PathBuf::from("/tmp/a/b/c"), PathBuf::from("/tmp/a/b-c")],
-            "every distinct header cwd must be collected, newest first, without duplicates"
+            senpi_project_cwds_from_session_dir(&project_dir)
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([PathBuf::from("/tmp/a/b/c"), PathBuf::from("/tmp/a/b-c")]),
+            "every distinct header cwd must be collected, without duplicates"
         );
     }
 
