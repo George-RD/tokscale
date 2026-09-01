@@ -671,6 +671,14 @@ pub fn built_in_extra_scan_paths_for(
     }
 
     if enabled.contains(&ClientId::Senpi) {
+        // The user layer applies to every project that does not override it,
+        // so it is read once rather than per discovered project.
+        // Only a usable user-level `state_dir` propagates; a user `task` block
+        // without one leaves each project on its own default layout.
+        let user_state_dir = match omo_task_state(&Path::new(home_dir).join(".omo")) {
+            OmoTaskState::StateDir(path) => Some(path),
+            OmoTaskState::DefaultLayout | OmoTaskState::Unset => None,
+        };
         if use_env_roots {
             let env_session_dir =
                 std::env::var_os("SENPI_CODING_AGENT_SESSION_DIR").filter(|path| !path.is_empty());
@@ -681,7 +689,7 @@ pub fn built_in_extra_scan_paths_for(
             if let Ok(current_dir) = std::env::current_dir() {
                 paths.push((
                     ClientId::Senpi,
-                    current_dir.join(".omo").join("senpi-task").join("children"),
+                    senpi_omo_children_root(&current_dir, user_state_dir.as_deref()),
                 ));
             }
 
@@ -700,7 +708,7 @@ pub fn built_in_extra_scan_paths_for(
             }
             for sessions_root in sessions_roots {
                 paths.extend(
-                    discover_senpi_omo_children_roots(&sessions_root)
+                    discover_senpi_omo_children_roots(&sessions_root, user_state_dir.as_deref())
                         .into_iter()
                         .map(|path| (ClientId::Senpi, path)),
                 );
@@ -709,10 +717,7 @@ pub fn built_in_extra_scan_paths_for(
 
         paths.push((
             ClientId::Senpi,
-            Path::new(home_dir)
-                .join(".omo")
-                .join("senpi-task")
-                .join("children"),
+            senpi_omo_children_root(Path::new(home_dir), user_state_dir.as_deref()),
         ));
     }
 
@@ -723,6 +728,82 @@ pub fn built_in_extra_scan_paths_for(
 /// `{"type":"session",...}` header is the first line and stays well under 1KB
 /// in practice; the cap only bounds pathological files.
 const SENPI_SESSION_HEADER_MAX_BYTES: u64 = 8 * 1024;
+
+/// What one `.omo` config layer says about OmO's task state directory.
+///
+/// The three cases are deliberately distinct. OmO's merge replaces the whole
+/// `task` block rather than deep-merging it, so a layer that declares `task`
+/// silences the layer above it even when it names no usable `state_dir` — that
+/// is [`OmoTaskState::DefaultLayout`], and it must not fall through.
+#[derive(Debug, PartialEq)]
+enum OmoTaskState {
+    /// No config here, or one that declares no `task` block: the layer above
+    /// still decides.
+    Unset,
+    /// A `task` block naming a state directory this host can use as-is.
+    StateDir(PathBuf),
+    /// A `task` block that overrides the layer above but names no usable
+    /// `state_dir`, so OmO's default `<project>/.omo/senpi-task` applies.
+    DefaultLayout,
+}
+
+/// Read OmO's `task` state-directory setting out of one `.omo` directory.
+///
+/// OmO loads `omo.jsonc` and falls back to `omo.json`
+/// (`omo-config-core/src/loader/paths.ts`), both JSONC, so comments and
+/// trailing commas have to survive the parse. A file that exists but cannot be
+/// parsed is treated as absent rather than as an override, since a syntax error
+/// should not silently redirect the scan.
+///
+/// A relative `state_dir` yields [`OmoTaskState::DefaultLayout`]: OmO resolves
+/// it against its own process cwd, which a later tokscale run cannot
+/// reconstruct, so the default project layout is safer than guessing a base —
+/// but the declaring layer still wins over the one above it.
+fn omo_task_state(omo_dir: &Path) -> OmoTaskState {
+    for filename in ["omo.jsonc", "omo.json"] {
+        let Ok(contents) = std::fs::read_to_string(omo_dir.join(filename)) else {
+            continue;
+        };
+        let Some(config) = crate::opencode_model_name::parse_jsonc(&contents) else {
+            continue;
+        };
+        let Some(task) = config.get("task") else {
+            return OmoTaskState::Unset;
+        };
+        let state_dir = task
+            .get("state_dir")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute());
+        return match state_dir {
+            Some(path) => OmoTaskState::StateDir(path),
+            None => OmoTaskState::DefaultLayout,
+        };
+    }
+    OmoTaskState::Unset
+}
+
+/// The OmO task-children root to scan for one project.
+///
+/// Mirrors `resolveStateDir()` in OmO's `senpi-task` package,
+/// `config.task?.state_dir ?? join(config.project_dir, ".omo", "senpi-task")`,
+/// with the children hanging off it as `<state_dir>/children/<task>/sessions/`
+/// (`tools/output/transcript/session-dir.ts`). The project's own `.omo` config
+/// wins over the user's `~/.omo` one, matching OmO's nearest-config-first merge;
+/// tokscale deliberately does not walk the intermediate directories OmO would,
+/// because a report spans many workspaces and there is no single current project.
+fn senpi_omo_children_root(project_dir: &Path, user_state_dir: Option<&Path>) -> PathBuf {
+    let default_layout = || project_dir.join(".omo").join("senpi-task");
+    let state_dir = match omo_task_state(&project_dir.join(".omo")) {
+        OmoTaskState::StateDir(path) => path,
+        // The project declared `task`, so the user layer is already replaced.
+        OmoTaskState::DefaultLayout => default_layout(),
+        OmoTaskState::Unset => user_state_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(default_layout),
+    };
+    state_dir.join("children")
+}
 
 /// Discover OmO task-children scan roots from a Senpi sessions tree.
 ///
@@ -737,7 +818,10 @@ const SENPI_SESSION_HEADER_MAX_BYTES: u64 = 8 * 1024;
 /// discovered `<cwd>/.omo/senpi-task/children` that exists on disk becomes a
 /// scan root; overlaps with the cwd-derived root are collapsed by the scanner's
 /// existing path dedup.
-fn discover_senpi_omo_children_roots(sessions_root: &Path) -> Vec<PathBuf> {
+fn discover_senpi_omo_children_roots(
+    sessions_root: &Path,
+    user_state_dir: Option<&Path>,
+) -> Vec<PathBuf> {
     let entries = match std::fs::read_dir(sessions_root) {
         Ok(entries) => entries,
         Err(_) => return Vec::new(),
@@ -758,7 +842,7 @@ fn discover_senpi_omo_children_roots(sessions_root: &Path) -> Vec<PathBuf> {
         // directory as a scan root.
         .filter(|cwd| cwd.is_absolute())
         .filter_map(|cwd| {
-            let children = cwd.join(".omo").join("senpi-task").join("children");
+            let children = senpi_omo_children_root(&cwd, user_state_dir);
             children.is_dir().then_some(children)
         })
         .collect();
@@ -7864,9 +7948,198 @@ mod tests {
         symlink(&real_session_dir, sessions_root.join("--project--")).unwrap();
 
         assert_eq!(
-            discover_senpi_omo_children_roots(&sessions_root),
+            discover_senpi_omo_children_roots(&sessions_root, None),
             vec![children]
         );
+    }
+
+    /// An absolute path the host platform agrees is absolute. A Unix-style
+    /// `/srv/...` is drive-relative on Windows, so `Path::is_absolute` rejects
+    /// it there and the probe would correctly refuse to use it.
+    fn absolute_state_dir(name: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:\{name}"))
+        } else {
+            PathBuf::from(format!("/{name}"))
+        }
+    }
+
+    #[test]
+    fn test_omo_task_state_reads_jsonc_with_comments() {
+        let temp = TempDir::new().unwrap();
+        let omo_dir = temp.path().join(".omo");
+        fs::create_dir_all(&omo_dir).unwrap();
+        let state_dir = absolute_state_dir("srv-omo-state");
+        fs::write(
+            omo_dir.join("omo.jsonc"),
+            format!(
+                "{{\n  // OmO config\n  \"task\": {{\n    \"state_dir\": {},\n  }},\n}}\n",
+                json_path_literal(&state_dir)
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(omo_task_state(&omo_dir), OmoTaskState::StateDir(state_dir));
+    }
+
+    #[test]
+    fn test_omo_task_state_falls_back_to_omo_json() {
+        let temp = TempDir::new().unwrap();
+        let omo_dir = temp.path().join(".omo");
+        fs::create_dir_all(&omo_dir).unwrap();
+        let state_dir = absolute_state_dir("srv-legacy");
+        fs::write(
+            omo_dir.join("omo.json"),
+            format!(
+                "{{\"task\":{{\"state_dir\":{}}}}}",
+                json_path_literal(&state_dir)
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(omo_task_state(&omo_dir), OmoTaskState::StateDir(state_dir));
+    }
+
+    #[test]
+    fn test_omo_task_state_separates_an_unset_layer_from_an_overriding_one() {
+        let temp = TempDir::new().unwrap();
+        let omo_dir = temp.path().join(".omo");
+        fs::create_dir_all(&omo_dir).unwrap();
+
+        // A `task` block still replaces the layer above even when its
+        // `state_dir` is unusable, so these must not fall through.
+        fs::write(
+            omo_dir.join("omo.jsonc"),
+            "{\"task\":{\"state_dir\":\"relative/state\"}}",
+        )
+        .unwrap();
+        assert_eq!(omo_task_state(&omo_dir), OmoTaskState::DefaultLayout);
+
+        fs::write(omo_dir.join("omo.jsonc"), "{\"task\":{}}").unwrap();
+        assert_eq!(omo_task_state(&omo_dir), OmoTaskState::DefaultLayout);
+
+        // No `task` block, an unparseable file, and no file at all all leave
+        // the decision to the layer above.
+        fs::write(omo_dir.join("omo.jsonc"), "{\"agents\":{}}").unwrap();
+        assert_eq!(omo_task_state(&omo_dir), OmoTaskState::Unset);
+
+        fs::write(omo_dir.join("omo.jsonc"), "{ not json").unwrap();
+        assert_eq!(omo_task_state(&omo_dir), OmoTaskState::Unset);
+
+        assert_eq!(
+            omo_task_state(&temp.path().join("missing")),
+            OmoTaskState::Unset
+        );
+    }
+
+    #[test]
+    fn test_senpi_omo_children_root_does_not_inherit_user_state_after_a_project_override() {
+        let temp = TempDir::new().unwrap();
+        let omo_dir = temp.path().join(".omo");
+        fs::create_dir_all(&omo_dir).unwrap();
+        let user_state = absolute_state_dir("srv-user-state");
+
+        for config in [
+            "{\"task\":{\"state_dir\":\"relative/state\"}}",
+            "{\"task\":{}}",
+        ] {
+            fs::write(omo_dir.join("omo.jsonc"), config).unwrap();
+            assert_eq!(
+                senpi_omo_children_root(temp.path(), Some(&user_state)),
+                temp.path().join(".omo").join("senpi-task").join("children"),
+                "a project `task` block replaces the user layer even without a usable state_dir: {config}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_senpi_omo_children_root_defaults_to_the_project_layout() {
+        let temp = TempDir::new().unwrap();
+
+        assert_eq!(
+            senpi_omo_children_root(temp.path(), None),
+            temp.path().join(".omo").join("senpi-task").join("children"),
+            "an unconfigured project keeps OmO's default state dir"
+        );
+    }
+
+    #[test]
+    fn test_senpi_omo_children_root_prefers_project_config_over_user_layer() {
+        let temp = TempDir::new().unwrap();
+        let omo_dir = temp.path().join(".omo");
+        fs::create_dir_all(&omo_dir).unwrap();
+        let project_state = absolute_state_dir("srv-project-state");
+        let user_state = absolute_state_dir("srv-user-state");
+        fs::write(
+            omo_dir.join("omo.jsonc"),
+            format!(
+                "{{\"task\":{{\"state_dir\":{}}}}}",
+                json_path_literal(&project_state)
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            senpi_omo_children_root(temp.path(), Some(&user_state)),
+            project_state.join("children"),
+            "the project's own .omo config wins over the user layer"
+        );
+        assert_eq!(
+            senpi_omo_children_root(&temp.path().join("other"), Some(&user_state)),
+            user_state.join("children"),
+            "a project without its own config inherits the user layer"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_senpi_discovers_omo_children_under_a_configured_state_dir() {
+        let home_dir = TempDir::new().unwrap();
+        let project_dir = TempDir::new().unwrap();
+        let state_dir = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        // The project redirects its OmO task state out of `.omo/senpi-task`.
+        let omo_dir = project_dir.path().join(".omo");
+        fs::create_dir_all(&omo_dir).unwrap();
+        fs::write(
+            omo_dir.join("omo.jsonc"),
+            format!(
+                "{{\n  // redirected\n  \"task\": {{ \"state_dir\": {} }},\n}}\n",
+                json_path_literal(state_dir.path())
+            ),
+        )
+        .unwrap();
+        let child_session = state_dir
+            .path()
+            .join("children/task-9/sessions/task-9")
+            .join("child.jsonl");
+        fs::create_dir_all(child_session.parent().unwrap()).unwrap();
+        File::create(&child_session).unwrap();
+        let global_session = write_senpi_global_session(
+            home_dir.path(),
+            "--project--",
+            "2026-08-31T00-00-00-000Z_global.jsonl",
+            project_dir.path(),
+        );
+        let mut env =
+            EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR", "SENPI_CODING_AGENT_DIR"]);
+        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
+        env.remove("SENPI_CODING_AGENT_DIR");
+        let _current_dir = CurrentDirGuard::set(elsewhere.path());
+
+        let result =
+            scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
+
+        let canonical_files: HashSet<PathBuf> = result
+            .get(ClientId::Senpi)
+            .iter()
+            .map(|path| path.canonicalize().unwrap())
+            .collect();
+        assert!(
+            canonical_files.contains(&child_session.canonicalize().unwrap()),
+            "children under a configured task.state_dir must be discovered"
+        );
+        assert!(canonical_files.contains(&global_session.canonicalize().unwrap()));
     }
 
     #[test]
@@ -7903,12 +8176,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            discover_senpi_omo_children_roots(&sessions_root),
+            discover_senpi_omo_children_roots(&sessions_root, None),
             vec![children],
             "same project referenced twice must yield one root; missing and relative projects none"
         );
         assert!(
-            discover_senpi_omo_children_roots(&temp.path().join("no-such-root")).is_empty(),
+            discover_senpi_omo_children_roots(&temp.path().join("no-such-root"), None).is_empty(),
             "a missing sessions root must discover nothing"
         );
     }
