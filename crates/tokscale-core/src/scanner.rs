@@ -673,7 +673,12 @@ pub fn built_in_extra_scan_paths_for(
     if enabled.contains(&ClientId::Senpi) {
         // The user layer applies to every project that does not override it,
         // so it is read once rather than per discovered project.
-        let user_state_dir = omo_task_state_dir(&Path::new(home_dir).join(".omo"));
+        // Only a usable user-level `state_dir` propagates; a user `task` block
+        // without one leaves each project on its own default layout.
+        let user_state_dir = match omo_task_state(&Path::new(home_dir).join(".omo")) {
+            OmoTaskState::StateDir(path) => Some(path),
+            OmoTaskState::DefaultLayout | OmoTaskState::Unset => None,
+        };
         if use_env_roots {
             let env_session_dir =
                 std::env::var_os("SENPI_CODING_AGENT_SESSION_DIR").filter(|path| !path.is_empty());
@@ -724,16 +729,37 @@ pub fn built_in_extra_scan_paths_for(
 /// in practice; the cap only bounds pathological files.
 const SENPI_SESSION_HEADER_MAX_BYTES: u64 = 8 * 1024;
 
-/// Read OmO's `task.state_dir` out of one `.omo` directory's config.
+/// What one `.omo` config layer says about OmO's task state directory.
+///
+/// The three cases are deliberately distinct. OmO's merge replaces the whole
+/// `task` block rather than deep-merging it, so a layer that declares `task`
+/// silences the layer above it even when it names no usable `state_dir` — that
+/// is [`OmoTaskState::DefaultLayout`], and it must not fall through.
+#[derive(Debug, PartialEq)]
+enum OmoTaskState {
+    /// No config here, or one that declares no `task` block: the layer above
+    /// still decides.
+    Unset,
+    /// A `task` block naming a state directory this host can use as-is.
+    StateDir(PathBuf),
+    /// A `task` block that overrides the layer above but names no usable
+    /// `state_dir`, so OmO's default `<project>/.omo/senpi-task` applies.
+    DefaultLayout,
+}
+
+/// Read OmO's `task` state-directory setting out of one `.omo` directory.
 ///
 /// OmO loads `omo.jsonc` and falls back to `omo.json`
 /// (`omo-config-core/src/loader/paths.ts`), both JSONC, so comments and
-/// trailing commas have to survive the parse.
+/// trailing commas have to survive the parse. A file that exists but cannot be
+/// parsed is treated as absent rather than as an override, since a syntax error
+/// should not silently redirect the scan.
 ///
-/// A relative `state_dir` is ignored: OmO resolves it against its own process
-/// cwd, which a later tokscale run cannot reconstruct, so the default project
-/// layout is the safer answer than guessing a base directory.
-fn omo_task_state_dir(omo_dir: &Path) -> Option<PathBuf> {
+/// A relative `state_dir` yields [`OmoTaskState::DefaultLayout`]: OmO resolves
+/// it against its own process cwd, which a later tokscale run cannot
+/// reconstruct, so the default project layout is safer than guessing a base —
+/// but the declaring layer still wins over the one above it.
+fn omo_task_state(omo_dir: &Path) -> OmoTaskState {
     for filename in ["omo.jsonc", "omo.json"] {
         let Ok(contents) = std::fs::read_to_string(omo_dir.join(filename)) else {
             continue;
@@ -741,15 +767,20 @@ fn omo_task_state_dir(omo_dir: &Path) -> Option<PathBuf> {
         let Some(config) = crate::opencode_model_name::parse_jsonc(&contents) else {
             continue;
         };
-        // An `omo.jsonc` that exists but sets no `task` block is authoritative
-        // too: OmO's merge replaces the whole block, so the next layer up is
-        // only consulted when this file declares no `task` at all.
-        let task = config.get("task")?;
-        let state_dir = task.get("state_dir").and_then(Value::as_str)?;
-        let state_dir = PathBuf::from(state_dir);
-        return state_dir.is_absolute().then_some(state_dir);
+        let Some(task) = config.get("task") else {
+            return OmoTaskState::Unset;
+        };
+        let state_dir = task
+            .get("state_dir")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute());
+        return match state_dir {
+            Some(path) => OmoTaskState::StateDir(path),
+            None => OmoTaskState::DefaultLayout,
+        };
     }
-    None
+    OmoTaskState::Unset
 }
 
 /// The OmO task-children root to scan for one project.
@@ -762,9 +793,15 @@ fn omo_task_state_dir(omo_dir: &Path) -> Option<PathBuf> {
 /// tokscale deliberately does not walk the intermediate directories OmO would,
 /// because a report spans many workspaces and there is no single current project.
 fn senpi_omo_children_root(project_dir: &Path, user_state_dir: Option<&Path>) -> PathBuf {
-    let state_dir = omo_task_state_dir(&project_dir.join(".omo"))
-        .or_else(|| user_state_dir.map(PathBuf::from))
-        .unwrap_or_else(|| project_dir.join(".omo").join("senpi-task"));
+    let default_layout = || project_dir.join(".omo").join("senpi-task");
+    let state_dir = match omo_task_state(&project_dir.join(".omo")) {
+        OmoTaskState::StateDir(path) => path,
+        // The project declared `task`, so the user layer is already replaced.
+        OmoTaskState::DefaultLayout => default_layout(),
+        OmoTaskState::Unset => user_state_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(default_layout),
+    };
     state_dir.join("children")
 }
 
@@ -7928,7 +7965,7 @@ mod tests {
     }
 
     #[test]
-    fn test_omo_task_state_dir_reads_jsonc_with_comments() {
+    fn test_omo_task_state_reads_jsonc_with_comments() {
         let temp = TempDir::new().unwrap();
         let omo_dir = temp.path().join(".omo");
         fs::create_dir_all(&omo_dir).unwrap();
@@ -7942,11 +7979,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(omo_task_state_dir(&omo_dir), Some(state_dir));
+        assert_eq!(omo_task_state(&omo_dir), OmoTaskState::StateDir(state_dir));
     }
 
     #[test]
-    fn test_omo_task_state_dir_falls_back_to_omo_json() {
+    fn test_omo_task_state_falls_back_to_omo_json() {
         let temp = TempDir::new().unwrap();
         let omo_dir = temp.path().join(".omo");
         fs::create_dir_all(&omo_dir).unwrap();
@@ -7960,26 +7997,59 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(omo_task_state_dir(&omo_dir), Some(state_dir));
+        assert_eq!(omo_task_state(&omo_dir), OmoTaskState::StateDir(state_dir));
     }
 
     #[test]
-    fn test_omo_task_state_dir_ignores_relative_and_absent_values() {
+    fn test_omo_task_state_separates_an_unset_layer_from_an_overriding_one() {
         let temp = TempDir::new().unwrap();
         let omo_dir = temp.path().join(".omo");
         fs::create_dir_all(&omo_dir).unwrap();
-        // OmO resolves a relative state_dir against its own process cwd, which a
-        // later tokscale run cannot reconstruct.
+
+        // A `task` block still replaces the layer above even when its
+        // `state_dir` is unusable, so these must not fall through.
         fs::write(
             omo_dir.join("omo.jsonc"),
             "{\"task\":{\"state_dir\":\"relative/state\"}}",
         )
         .unwrap();
-        assert_eq!(omo_task_state_dir(&omo_dir), None);
+        assert_eq!(omo_task_state(&omo_dir), OmoTaskState::DefaultLayout);
 
         fs::write(omo_dir.join("omo.jsonc"), "{\"task\":{}}").unwrap();
-        assert_eq!(omo_task_state_dir(&omo_dir), None);
-        assert_eq!(omo_task_state_dir(&temp.path().join("missing")), None);
+        assert_eq!(omo_task_state(&omo_dir), OmoTaskState::DefaultLayout);
+
+        // No `task` block, an unparseable file, and no file at all all leave
+        // the decision to the layer above.
+        fs::write(omo_dir.join("omo.jsonc"), "{\"agents\":{}}").unwrap();
+        assert_eq!(omo_task_state(&omo_dir), OmoTaskState::Unset);
+
+        fs::write(omo_dir.join("omo.jsonc"), "{ not json").unwrap();
+        assert_eq!(omo_task_state(&omo_dir), OmoTaskState::Unset);
+
+        assert_eq!(
+            omo_task_state(&temp.path().join("missing")),
+            OmoTaskState::Unset
+        );
+    }
+
+    #[test]
+    fn test_senpi_omo_children_root_does_not_inherit_user_state_after_a_project_override() {
+        let temp = TempDir::new().unwrap();
+        let omo_dir = temp.path().join(".omo");
+        fs::create_dir_all(&omo_dir).unwrap();
+        let user_state = absolute_state_dir("srv-user-state");
+
+        for config in [
+            "{\"task\":{\"state_dir\":\"relative/state\"}}",
+            "{\"task\":{}}",
+        ] {
+            fs::write(omo_dir.join("omo.jsonc"), config).unwrap();
+            assert_eq!(
+                senpi_omo_children_root(temp.path(), Some(&user_state)),
+                temp.path().join(".omo").join("senpi-task").join("children"),
+                "a project `task` block replaces the user layer even without a usable state_dir: {config}"
+            );
+        }
     }
 
     #[test]
