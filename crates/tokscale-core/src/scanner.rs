@@ -672,9 +672,9 @@ pub fn built_in_extra_scan_paths_for(
 
     if enabled.contains(&ClientId::Senpi) {
         if use_env_roots {
-            if let Some(path) =
-                std::env::var_os("SENPI_CODING_AGENT_SESSION_DIR").filter(|path| !path.is_empty())
-            {
+            let env_session_dir =
+                std::env::var_os("SENPI_CODING_AGENT_SESSION_DIR").filter(|path| !path.is_empty());
+            if let Some(path) = &env_session_dir {
                 paths.push((ClientId::Senpi, PathBuf::from(path)));
             }
 
@@ -683,6 +683,27 @@ pub fn built_in_extra_scan_paths_for(
                     ClientId::Senpi,
                     current_dir.join(".omo").join("senpi-task").join("children"),
                 ));
+            }
+
+            // OmO task children live inside each project (`.omo/senpi-task/children`),
+            // so the cwd- and home-derived roots only cover the project tokscale
+            // happens to run from and the home directory. Recover every other
+            // project root from the global sessions tree, where each per-project
+            // subdirectory's transcripts record the true `cwd` in their header line.
+            let senpi_root = ClientId::Senpi
+                .data()
+                .root
+                .resolve_with_env_strategy(home_dir, use_env_roots);
+            let mut sessions_roots = vec![PathBuf::from(join_native(&senpi_root, "sessions"))];
+            if let Some(path) = &env_session_dir {
+                sessions_roots.push(PathBuf::from(path));
+            }
+            for sessions_root in sessions_roots {
+                paths.extend(
+                    discover_senpi_omo_children_roots(&sessions_root)
+                        .into_iter()
+                        .map(|path| (ClientId::Senpi, path)),
+                );
             }
         }
 
@@ -696,6 +717,129 @@ pub fn built_in_extra_scan_paths_for(
     }
 
     paths
+}
+
+/// How much of a Senpi session file the project-root probe may read. The
+/// `{"type":"session",...}` header is the first line and stays well under 1KB
+/// in practice; the cap only bounds pathological files.
+const SENPI_SESSION_HEADER_MAX_BYTES: u64 = 8 * 1024;
+
+/// Discover OmO task-children scan roots from a Senpi sessions tree.
+///
+/// OmO redirects task child transcripts into project-local
+/// `.omo/senpi-task/children/` (#1112), which is only reachable if you know the
+/// project root. Senpi's sessions dir has one subdirectory per project
+/// (`sessions/<encoded-cwd>/`), but the encoding is lossy — a `-` may be a
+/// separator or a literal character — so instead of decoding the name, read the
+/// `cwd`s recorded in that subdirectory's session headers. Because the encoding
+/// is lossy in both directions, one subdirectory can serve several projects, so
+/// every distinct header `cwd` is taken, not just the newest one. Every
+/// discovered `<cwd>/.omo/senpi-task/children` that exists on disk becomes a
+/// scan root; overlaps with the cwd-derived root are collapsed by the scanner's
+/// existing path dedup.
+fn discover_senpi_omo_children_roots(sessions_root: &Path) -> Vec<PathBuf> {
+    let entries = match std::fs::read_dir(sessions_root) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut roots: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        // A symlinked per-project directory is still a project directory; the
+        // scanner follows those when it walks the sessions tree.
+        .filter(|entry| {
+            entry
+                .file_type()
+                .is_ok_and(|kind| kind.is_dir() || (kind.is_symlink() && entry.path().is_dir()))
+        })
+        .flat_map(|entry| senpi_project_cwds_from_session_dir(&entry.path()))
+        // A relative `cwd` (corrupt or hand-edited header) would resolve
+        // against the tokscale process cwd and could register an unrelated
+        // directory as a scan root.
+        .filter(|cwd| cwd.is_absolute())
+        .filter_map(|cwd| {
+            let children = cwd.join(".omo").join("senpi-task").join("children");
+            children.is_dir().then_some(children)
+        })
+        .collect();
+    roots.sort_unstable();
+    roots.dedup();
+    roots
+}
+
+/// Read every distinct project `cwd` recorded in one per-project Senpi session
+/// directory.
+///
+/// `sessions/<encoded-cwd>` names are lossy — a `-` is either a path separator
+/// or a literal character — so two projects can share one directory
+/// (`/a/b-c` and `/a/b/c` both encode to `--a-b-c--`), and their transcripts
+/// then interleave inside it. Returning only the first header's `cwd` would
+/// hide every colliding project but the newest, which is the exact
+/// cross-project omission this discovery exists to fix, so all headers are read
+/// and the distinct `cwd`s collected.
+///
+/// Every transcript is read, with no window or cap: any sampling scheme can
+/// bury a project whose only header falls outside it, and this discovery exists
+/// precisely so that no project is missed. The cost is one `open` plus one
+/// `read_line` per transcript — 0.3ms over the real sessions tree measured here
+/// (9 projects, 26 transcripts) and ~24us per transcript as the tree grows.
+///
+/// Only the first line of each candidate is examined: real transcripts always
+/// start with the `{"type":"session",...}` header, so a non-header first line
+/// means a truncated or foreign file, not a deeper-buried header. Results are
+/// sorted so the scan order of the directory does not leak into the output.
+fn senpi_project_cwds_from_session_dir(session_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(session_dir) else {
+        return Vec::new();
+    };
+    let mut cwds: Vec<PathBuf> = Vec::new();
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        // Same follow-file rule as `scan_directory`: trust the cheap dirent
+        // type for regular files and pay a following stat only for symlinks,
+        // which the normal scanner counts as transcripts too.
+        if !entry
+            .file_type()
+            .is_ok_and(|kind| kind.is_file() || (kind.is_symlink() && entry.path().is_file()))
+        {
+            continue;
+        }
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".jsonl"))
+        {
+            continue;
+        }
+        if let Some(cwd) = senpi_session_header_cwd(&path) {
+            // A directory holds a handful of distinct projects at most, so a
+            // linear membership check beats hashing every path, and streaming
+            // the entries avoids materialising one `PathBuf` per transcript.
+            if !cwds.contains(&cwd) {
+                cwds.push(cwd);
+            }
+        }
+    }
+    cwds.sort_unstable();
+    cwds
+}
+
+/// Parse the `cwd` field from a Senpi session file's header line, if the first
+/// line is a session header.
+fn senpi_session_header_cwd(path: &Path) -> Option<PathBuf> {
+    use std::io::{BufRead, BufReader, Read};
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut first_line = String::new();
+    BufReader::new(file.take(SENPI_SESSION_HEADER_MAX_BYTES))
+        .read_line(&mut first_line)
+        .ok()?;
+
+    let header: Value = serde_json::from_str(first_line.trim()).ok()?;
+    if header.get("type").and_then(Value::as_str) != Some("session") {
+        return None;
+    }
+    header.get("cwd").and_then(Value::as_str).map(PathBuf::from)
 }
 
 /// Discover Hermes profile databases under a Hermes home directory.
@@ -7356,5 +7500,416 @@ mod tests {
         let files = result.get(ClientId::Senpi);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].canonicalize().unwrap(), child_session);
+    }
+
+    fn write_senpi_global_session(
+        home_dir: &Path,
+        project_key: &str,
+        file_name: &str,
+        cwd: &Path,
+    ) -> PathBuf {
+        let dir = home_dir
+            .join(".senpi")
+            .join("agent")
+            .join("sessions")
+            .join(project_key);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(file_name);
+        fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"test\",\"timestamp\":\"2026-08-31T00:00:00.000Z\",\"cwd\":{}}}\n",
+                json_path_literal(cwd)
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    #[serial]
+    fn test_senpi_discovers_omo_task_children_across_projects_via_global_sessions() {
+        let home_dir = TempDir::new().unwrap();
+        let project_dir = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let child_session = setup_mock_senpi_omo_child(project_dir.path());
+        let global_session = write_senpi_global_session(
+            home_dir.path(),
+            "--project--",
+            "2026-08-31T00-00-00-000Z_global.jsonl",
+            project_dir.path(),
+        );
+        let mut env =
+            EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR", "SENPI_CODING_AGENT_DIR"]);
+        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
+        env.remove("SENPI_CODING_AGENT_DIR");
+        let _current_dir = CurrentDirGuard::set(elsewhere.path());
+
+        let result =
+            scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
+
+        let canonical_files: HashSet<PathBuf> = result
+            .get(ClientId::Senpi)
+            .iter()
+            .map(|path| path.canonicalize().unwrap())
+            .collect();
+        assert!(
+            canonical_files.contains(&child_session),
+            "OmO child sessions of other projects must be discovered via the global sessions tree"
+        );
+        assert!(canonical_files.contains(&global_session.canonicalize().unwrap()));
+        assert_eq!(canonical_files.len(), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn test_senpi_global_sessions_ignore_projects_without_children() {
+        let home_dir = TempDir::new().unwrap();
+        let bare_project = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let global_session = write_senpi_global_session(
+            home_dir.path(),
+            "--bare--",
+            "2026-08-31T00-00-00-000Z_bare.jsonl",
+            bare_project.path(),
+        );
+        let mut env =
+            EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR", "SENPI_CODING_AGENT_DIR"]);
+        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
+        env.remove("SENPI_CODING_AGENT_DIR");
+        let _current_dir = CurrentDirGuard::set(elsewhere.path());
+
+        let result =
+            scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
+
+        let files = result.get(ClientId::Senpi);
+        assert_eq!(
+            files.len(),
+            1,
+            "a project without .omo/senpi-task/children must contribute no extra root"
+        );
+        assert_eq!(
+            files[0].canonicalize().unwrap(),
+            global_session.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_senpi_global_discovery_overlapping_cwd_root_returns_each_file_once() {
+        let home_dir = TempDir::new().unwrap();
+        let project_dir = TempDir::new().unwrap();
+        let child_session = setup_mock_senpi_omo_child(project_dir.path());
+        let global_session = write_senpi_global_session(
+            home_dir.path(),
+            "--project--",
+            "2026-08-31T00-00-00-000Z_global.jsonl",
+            project_dir.path(),
+        );
+        let mut env =
+            EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR", "SENPI_CODING_AGENT_DIR"]);
+        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
+        env.remove("SENPI_CODING_AGENT_DIR");
+        let _current_dir = CurrentDirGuard::set(project_dir.path());
+
+        let result =
+            scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
+
+        let files = result.get(ClientId::Senpi);
+        assert_eq!(
+            files.len(),
+            2,
+            "cwd-derived and globally-discovered children roots must dedup to one copy per file"
+        );
+        let canonical_files: HashSet<PathBuf> = files
+            .iter()
+            .map(|path| path.canonicalize().unwrap())
+            .collect();
+        assert!(canonical_files.contains(&child_session));
+        assert!(canonical_files.contains(&global_session.canonicalize().unwrap()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_senpi_global_discovery_registers_every_project_sharing_one_session_dir() {
+        // Two projects whose paths encode to the same lossy directory name keep
+        // their transcripts side by side in one `sessions/<encoded-cwd>`
+        // directory. Both must contribute their OmO children root — discovering
+        // only the newest is the cross-project omission this feature fixes.
+        let home_dir = TempDir::new().unwrap();
+        let older_project = TempDir::new().unwrap();
+        let newer_project = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let older_child = setup_mock_senpi_omo_child(older_project.path());
+        let newer_child = setup_mock_senpi_omo_child(newer_project.path());
+        let older_session = write_senpi_global_session(
+            home_dir.path(),
+            "--collided--",
+            "2026-01-01T00-00-00-000Z_older.jsonl",
+            older_project.path(),
+        );
+        let newer_session = write_senpi_global_session(
+            home_dir.path(),
+            "--collided--",
+            "2026-08-31T00-00-00-000Z_newer.jsonl",
+            newer_project.path(),
+        );
+        let mut env =
+            EnvGuard::capture(&["SENPI_CODING_AGENT_SESSION_DIR", "SENPI_CODING_AGENT_DIR"]);
+        env.remove("SENPI_CODING_AGENT_SESSION_DIR");
+        env.remove("SENPI_CODING_AGENT_DIR");
+        let _current_dir = CurrentDirGuard::set(elsewhere.path());
+
+        let result =
+            scan_without_extra_dirs(home_dir.path().to_str().unwrap(), &["senpi".to_string()]);
+
+        let canonical_files: HashSet<PathBuf> = result
+            .get(ClientId::Senpi)
+            .iter()
+            .map(|path| path.canonicalize().unwrap())
+            .collect();
+        assert!(
+            canonical_files.contains(&older_child),
+            "the older project sharing the encoded directory must still be discovered"
+        );
+        assert!(canonical_files.contains(&newer_child));
+        assert!(canonical_files.contains(&older_session.canonicalize().unwrap()));
+        assert!(canonical_files.contains(&newer_session.canonicalize().unwrap()));
+        assert_eq!(canonical_files.len(), 4);
+    }
+
+    #[test]
+    fn test_senpi_project_cwd_probe_skips_headerless_transcripts() {
+        let sessions = TempDir::new().unwrap();
+        let project_dir = sessions.path().join("--proj--");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("2026-03-01T00-00-00-000Z_c.jsonl"),
+            "{not json",
+        )
+        .unwrap();
+        fs::write(
+            project_dir.join("2026-02-01T00-00-00-000Z_b.jsonl"),
+            "{\"type\":\"model_change\",\"id\":\"x\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            project_dir.join("2026-01-01T00-00-00-000Z_a.jsonl"),
+            "{\"type\":\"session\",\"cwd\":\"/tmp/real-project\"}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            senpi_project_cwds_from_session_dir(&project_dir),
+            vec![PathBuf::from("/tmp/real-project")]
+        );
+    }
+
+    #[test]
+    fn test_senpi_project_cwd_probe_reads_every_header_in_a_large_directory() {
+        // Neither end of the history may be privileged: a project that stopped
+        // writing lives among the oldest transcripts, and the one that took the
+        // shared directory over lives among the newest.
+        let sessions = TempDir::new().unwrap();
+        let project_dir = sessions.path().join("--proj--");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("2026-01-01T00-00-00-000Z_oldest.jsonl"),
+            "{\"type\":\"session\",\"cwd\":\"/tmp/dormant-project\"}\n",
+        )
+        .unwrap();
+        for index in 0..200 {
+            fs::write(
+                project_dir.join(format!("2026-02-01T00-00-00-000Z_filler-{index:04}.jsonl")),
+                "{not json",
+            )
+            .unwrap();
+        }
+        fs::write(
+            project_dir.join("2026-03-01T00-00-00-000Z_newest.jsonl"),
+            "{\"type\":\"session\",\"cwd\":\"/tmp/active-project\"}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            senpi_project_cwds_from_session_dir(&project_dir)
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                PathBuf::from("/tmp/active-project"),
+                PathBuf::from("/tmp/dormant-project"),
+            ]),
+            "both ends of a large directory must be read"
+        );
+    }
+
+    #[test]
+    fn test_senpi_project_cwd_probe_finds_a_header_buried_between_the_ends() {
+        // The regression that a windowed probe reintroduces: a project whose
+        // only transcript sits in the middle of a busy shared directory must
+        // still contribute its OmO children root.
+        let sessions = TempDir::new().unwrap();
+        let project_dir = sessions.path().join("--proj--");
+        fs::create_dir_all(&project_dir).unwrap();
+        for index in 0..100 {
+            fs::write(
+                project_dir.join(format!("2026-01-01T00-00-00-000Z_old-{index:04}.jsonl")),
+                "{not json",
+            )
+            .unwrap();
+        }
+        fs::write(
+            project_dir.join("2026-02-01T00-00-00-000Z_buried.jsonl"),
+            "{\"type\":\"session\",\"cwd\":\"/tmp/buried-project\"}\n",
+        )
+        .unwrap();
+        for index in 0..100 {
+            fs::write(
+                project_dir.join(format!("2026-03-01T00-00-00-000Z_new-{index:04}.jsonl")),
+                "{not json",
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            senpi_project_cwds_from_session_dir(&project_dir),
+            vec![PathBuf::from("/tmp/buried-project")],
+            "a header between the ends of the directory must not be skipped"
+        );
+    }
+
+    #[test]
+    fn test_senpi_project_cwd_probe_collects_every_colliding_project() {
+        // `/tmp/a/b-c` and `/tmp/a/b/c` both encode to `--tmp-a-b-c--`, so their
+        // transcripts share one session directory. Every distinct `cwd` must
+        // survive the probe, not just the newest project's.
+        let sessions = TempDir::new().unwrap();
+        let project_dir = sessions.path().join("--tmp-a-b-c--");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("2026-01-01T00-00-00-000Z_older.jsonl"),
+            "{\"type\":\"session\",\"cwd\":\"/tmp/a/b-c\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            project_dir.join("2026-02-01T00-00-00-000Z_newer.jsonl"),
+            "{\"type\":\"session\",\"cwd\":\"/tmp/a/b/c\"}\n",
+        )
+        .unwrap();
+        // A second transcript of the newest project must not produce a duplicate.
+        fs::write(
+            project_dir.join("2026-03-01T00-00-00-000Z_newest.jsonl"),
+            "{\"type\":\"session\",\"cwd\":\"/tmp/a/b/c\"}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            senpi_project_cwds_from_session_dir(&project_dir)
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([PathBuf::from("/tmp/a/b/c"), PathBuf::from("/tmp/a/b-c")]),
+            "every distinct header cwd must be collected, without duplicates"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_senpi_project_cwd_probe_follows_symlinked_transcripts() {
+        use std::os::unix::fs::symlink;
+
+        // `scan_directory` counts symlinked transcripts, so skipping them here
+        // would hide their project's OmO children from a tree the scanner reads.
+        let sessions = TempDir::new().unwrap();
+        let real = sessions.path().join("real-transcript.jsonl");
+        fs::write(
+            &real,
+            "{\"type\":\"session\",\"cwd\":\"/tmp/linked-project\"}\n",
+        )
+        .unwrap();
+        let project_dir = sessions.path().join("--proj--");
+        fs::create_dir_all(&project_dir).unwrap();
+        symlink(
+            &real,
+            project_dir.join("2026-01-01T00-00-00-000Z_link.jsonl"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            senpi_project_cwds_from_session_dir(&project_dir),
+            vec![PathBuf::from("/tmp/linked-project")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_discover_senpi_omo_children_roots_follows_symlinked_project_dirs() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        let children = project.join(".omo").join("senpi-task").join("children");
+        fs::create_dir_all(&children).unwrap();
+        let real_session_dir = temp.path().join("real-sessions").join("--project--");
+        fs::create_dir_all(&real_session_dir).unwrap();
+        fs::write(
+            real_session_dir.join("2026-01-01T00-00-00-000Z_a.jsonl"),
+            format!(
+                "{{\"type\":\"session\",\"cwd\":{}}}\n",
+                json_path_literal(&project)
+            ),
+        )
+        .unwrap();
+        let sessions_root = temp.path().join("sessions");
+        fs::create_dir_all(&sessions_root).unwrap();
+        symlink(&real_session_dir, sessions_root.join("--project--")).unwrap();
+
+        assert_eq!(
+            discover_senpi_omo_children_roots(&sessions_root),
+            vec![children]
+        );
+    }
+
+    #[test]
+    fn test_discover_senpi_omo_children_roots_dedups_and_skips_missing() {
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("project");
+        let children = project.join(".omo").join("senpi-task").join("children");
+        fs::create_dir_all(&children).unwrap();
+        let sessions_root = temp.path().join("sessions");
+        for key in ["--project--", "--project-again--", "--gone--"] {
+            let dir = sessions_root.join(key);
+            fs::create_dir_all(&dir).unwrap();
+            let cwd = if key == "--gone--" {
+                temp.path().join("does-not-exist")
+            } else {
+                project.clone()
+            };
+            fs::write(
+                dir.join("2026-08-31T00-00-00-000Z_s.jsonl"),
+                format!(
+                    "{{\"type\":\"session\",\"cwd\":{}}}\n",
+                    json_path_literal(&cwd)
+                ),
+            )
+            .unwrap();
+        }
+        // A relative header cwd must never resolve against the process cwd.
+        let relative_dir = sessions_root.join("--relative--");
+        fs::create_dir_all(&relative_dir).unwrap();
+        fs::write(
+            relative_dir.join("2026-08-31T00-00-00-000Z_s.jsonl"),
+            "{\"type\":\"session\",\"cwd\":\"relative/project\"}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            discover_senpi_omo_children_roots(&sessions_root),
+            vec![children],
+            "same project referenced twice must yield one root; missing and relative projects none"
+        );
+        assert!(
+            discover_senpi_omo_children_roots(&temp.path().join("no-such-root")).is_empty(),
+            "a missing sessions root must discover nothing"
+        );
     }
 }
