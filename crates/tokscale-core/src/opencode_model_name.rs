@@ -72,7 +72,7 @@ impl OpenCodeModelNameResolver {
     }
 }
 
-fn parse_jsonc(contents: &str) -> Option<serde_json::Value> {
+pub(crate) fn parse_jsonc(contents: &str) -> Option<serde_json::Value> {
     serde_json::from_str(contents)
         .ok()
         .or_else(|| serde_json::from_str(&strip_jsonc_syntax(contents)).ok())
