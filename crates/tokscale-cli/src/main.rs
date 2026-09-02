@@ -4,6 +4,7 @@ mod claude_diagnostics;
 mod commands;
 mod cursor;
 mod device;
+mod hindsight;
 mod paths;
 mod process_liveness;
 mod trae;
@@ -354,6 +355,11 @@ enum Commands {
         #[command(subcommand)]
         subcommand: WarpSubcommand,
     },
+    #[command(about = "Hindsight memory backend integration commands")]
+    Hindsight {
+        #[command(subcommand)]
+        subcommand: HindsightSubcommand,
+    },
     #[command(about = "Delete all submitted usage data from the server")]
     DeleteSubmittedData,
     #[command(
@@ -574,6 +580,28 @@ enum WarpSubcommand {
     },
     #[command(about = "Sync Warp aggregate usage into local cache")]
     Sync {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum HindsightSubcommand {
+    #[command(about = "Sync Hindsight LLM request logs into local ledger cache")]
+    Sync {
+        #[arg(
+            long,
+            default_value = "http://127.0.0.1:8888",
+            help = "Hindsight API base URL"
+        )]
+        api: String,
+        #[arg(long, default_value = "default", help = "Tenant identifier")]
+        tenant: String,
+        #[arg(
+            long,
+            help = "Bearer authentication token (or set HINDSIGHT_API_API_TOKEN)"
+        )]
+        token: Option<String>,
         #[arg(long, help = "Output as JSON")]
         json: bool,
     },
@@ -901,6 +929,9 @@ fn main() -> Result<()> {
             reject_unsupported_home_override(&cli.home, "warp")?;
             run_warp_command(subcommand)
         }
+        Some(Commands::Hindsight { subcommand }) => {
+            run_hindsight_command(subcommand, cli.home.as_deref())
+        }
         Some(Commands::DeleteSubmittedData) => {
             reject_unsupported_home_override(&cli.home, "delete-submitted-data")?;
             run_delete_data_command()
@@ -1097,6 +1128,7 @@ pub enum ClientFilter {
     Omp,
     LmStudio,
     Unsloth,
+    Hindsight,
     Synthetic,
 }
 
@@ -1159,6 +1191,7 @@ impl ClientFilter {
             Self::Omp => "omp",
             Self::LmStudio => "lmstudio",
             Self::Unsloth => "unsloth",
+            Self::Hindsight => "hindsight",
             Self::Synthetic => "synthetic",
         }
     }
@@ -1224,6 +1257,7 @@ impl ClientFilter {
             Self::Omp => Some(ClientId::Omp),
             Self::LmStudio => Some(ClientId::LmStudio),
             Self::Unsloth => Some(ClientId::Unsloth),
+            Self::Hindsight => Some(ClientId::Hindsight),
             Self::Synthetic => None,
         }
     }
@@ -1285,6 +1319,7 @@ impl ClientFilter {
             ClientId::Omp => Self::Omp,
             ClientId::LmStudio => Self::LmStudio,
             ClientId::Unsloth => Self::Unsloth,
+            ClientId::Hindsight => Self::Hindsight,
         }
     }
 
@@ -1448,6 +1483,12 @@ fn client_filter_explicitly_requests_warp(clients: &Option<Vec<String>>) -> bool
         .is_some_and(|sources| sources.iter().any(|source| source == "warp"))
 }
 
+fn client_filter_explicitly_requests_hindsight(clients: &Option<Vec<String>>) -> bool {
+    clients
+        .as_ref()
+        .is_some_and(|sources| sources.iter().any(|source| source == "hindsight"))
+}
+
 #[derive(Debug)]
 struct CursorSetupState {
     has_credentials: bool,
@@ -1580,12 +1621,70 @@ fn warp_setup_warnings_for_report(
     )]
 }
 
+fn hindsight_setup_warnings_for_report(
+    home_dir: &Option<String>,
+    clients: &Option<Vec<String>>,
+) -> Vec<String> {
+    if !client_filter_explicitly_requests_hindsight(clients) {
+        return Vec::new();
+    }
+
+    let (home_path, home_override) = match home_dir {
+        Some(home) => (Some(PathBuf::from(home)), true),
+        None => (crate::paths::home_dir(), false),
+    };
+
+    let Some(home_ref) = home_path.as_deref() else {
+        return vec![
+            "Hindsight usage requires Tokscale's Hindsight API cache, but the home directory could not be resolved. Run `tokscale hindsight sync`. Tokscale does not parse local Hindsight database.".to_string(),
+        ];
+    };
+
+    let has_cache = hindsight::has_hindsight_usage_cache_in_home(if home_override {
+        Some(home_ref)
+    } else {
+        None
+    });
+
+    if has_cache {
+        return Vec::new();
+    }
+
+    let cache_glob = if home_override {
+        home_ref
+            .join(".hindsight/usage/*.jsonl")
+            .to_string_lossy()
+            .to_string()
+    } else if let Ok(val) = std::env::var("HINDSIGHT_HOME") {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            format!("{}/usage/*.jsonl", trimmed)
+        } else {
+            "~/.hindsight/usage/*.jsonl".to_string()
+        }
+    } else {
+        "~/.hindsight/usage/*.jsonl".to_string()
+    };
+
+    let action = if home_override {
+        "run `tokscale hindsight sync` or populate that cache before running a report with --home"
+    } else {
+        "run `tokscale hindsight sync`"
+    };
+
+    vec![format!(
+        "Hindsight usage requires Tokscale's Hindsight ledger cache at `{}`; {}. Tokscale does not parse local Hindsight database.",
+        cache_glob, action
+    )]
+}
+
 fn setup_warnings_for_report(
     home_dir: &Option<String>,
     clients: &Option<Vec<String>>,
 ) -> Vec<String> {
     let mut warnings = cursor_setup_warnings_for_report(home_dir, clients);
     warnings.extend(warp_setup_warnings_for_report(home_dir, clients));
+    warnings.extend(hindsight_setup_warnings_for_report(home_dir, clients));
     warnings
 }
 
@@ -5893,6 +5992,7 @@ fn run_submit_command(
 
     let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
     let explicit_warp_filter = client_filter_explicitly_requests_warp(&clients);
+    let explicit_hindsight_filter = client_filter_explicitly_requests_hindsight(&clients);
     let clients = clients.or_else(|| Some(default_submit_clients()));
     let scan_scope = submit_scan_scope(
         clients.as_deref(),
@@ -5922,7 +6022,7 @@ fn run_submit_command(
             }
         }
     }
-    if explicit_cursor_filter || explicit_warp_filter {
+    if explicit_cursor_filter || explicit_warp_filter || explicit_hindsight_filter {
         let cursor_setup_warnings = setup_warnings_for_report(&report_home, &clients);
         emit_cursor_setup_warnings(&cursor_setup_warnings);
     }
@@ -6492,6 +6592,26 @@ fn run_warp_command(subcommand: WarpSubcommand) -> Result<()> {
         WarpSubcommand::Logout { purge_cache } => warp::run_warp_logout(purge_cache),
         WarpSubcommand::Status { json } => warp::run_warp_status(json),
         WarpSubcommand::Sync { json } => warp::run_warp_sync(json),
+    }
+}
+
+fn run_hindsight_command(subcommand: HindsightSubcommand, home: Option<&str>) -> Result<()> {
+    match subcommand {
+        HindsightSubcommand::Sync {
+            api,
+            tenant,
+            token,
+            json,
+        } => {
+            let home_path = home.map(PathBuf::from);
+            hindsight::run_hindsight_sync(hindsight::SyncHindsightOptions {
+                api,
+                tenant,
+                token,
+                json,
+                home: home_path,
+            })
+        }
     }
 }
 
@@ -8874,6 +8994,36 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("tokscale warp"));
         assert!(warnings[0].contains("does not infer tokens from request counts"));
+    }
+
+    #[test]
+    fn client_filter_round_trips_hindsight() {
+        assert_eq!(
+            ClientFilter::from_filter_str("hindsight"),
+            Some(ClientFilter::Hindsight)
+        );
+        assert_eq!(ClientFilter::Hindsight.as_filter_str(), "hindsight");
+        assert_eq!(
+            ClientFilter::Hindsight.to_client_id(),
+            Some(tokscale_core::ClientId::Hindsight)
+        );
+        assert_eq!(
+            ClientFilter::from_client_id(tokscale_core::ClientId::Hindsight),
+            ClientFilter::Hindsight
+        );
+    }
+
+    #[test]
+    fn hindsight_setup_warning_explains_missing_ledger_cache() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let warnings = hindsight_setup_warnings_for_report(
+            &Some(temp.path().to_string_lossy().to_string()),
+            &Some(vec!["hindsight".to_string()]),
+        );
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("tokscale hindsight sync"));
+        assert!(warnings[0].contains("Tokscale does not parse local Hindsight database"));
     }
 
     #[test]

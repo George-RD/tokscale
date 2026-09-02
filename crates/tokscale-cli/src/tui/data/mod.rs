@@ -1709,6 +1709,7 @@ mod tests {
             "Oh My Pi",
             "LM Studio",
             "Unsloth",
+            "Hindsight",
         ];
 
         assert_eq!(expected.len(), ClientId::COUNT);

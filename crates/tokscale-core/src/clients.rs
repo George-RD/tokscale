@@ -1039,6 +1039,23 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // Hindsight persists exact LLM usage metadata from its self-hosted memory
+    // service. The client integration parses a local append-only JSONL mirror
+    // synchronized by `tokscale hindsight sync`.
+    Hindsight = 52 => {
+        id: "hindsight",
+        display: "Hindsight",
+        logo: Some("https://raw.githubusercontent.com/junhoyeo/tokscale/main/.github/assets/client-hindsight.png"),
+        root: PathRoot::EnvVar {
+            var: "HINDSIGHT_HOME",
+            fallback_relative: ".hindsight",
+        },
+        relative: "usage",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -1154,7 +1171,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 52);
+        assert_eq!(ClientId::COUNT, 53);
     }
 
     #[test]
@@ -1806,6 +1823,32 @@ mod tests {
                 ".unsloth/studio/studio.db"
             )
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_hindsight_client_registered_with_home_override() {
+        let mut env = EnvGuard::capture(&["HINDSIGHT_HOME"]);
+        env.set("HINDSIGHT_HOME", "/custom/hindsight");
+
+        let client = ClientId::from_str("hindsight").expect("Hindsight should be registered");
+        assert_eq!(client, ClientId::Hindsight);
+        assert_eq!(client.display_name(), "Hindsight");
+        assert_eq!(client.data().relative_path, "usage");
+        assert_eq!(client.data().pattern, "*.jsonl");
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            native_join(std::path::Path::new("/custom/hindsight"), "usage")
+        );
+        assert_eq!(
+            client
+                .data()
+                .resolve_path_with_env_strategy("/tmp/home", false),
+            native_join(std::path::Path::new("/tmp/home"), ".hindsight/usage")
+        );
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
+        assert!(!client.data().headless);
     }
 
     #[test]

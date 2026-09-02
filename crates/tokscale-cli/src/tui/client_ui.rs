@@ -64,6 +64,8 @@ pub const CLIENT_UI: [ClientUi; ClientId::COUNT] = [
     ClientUi { hotkey: 'L' },
     // Unsloth: uppercase `U` stays mnemonic while lowercase `u` belongs to Grok Build.
     ClientUi { hotkey: 'U' },
+    // Hindsight: uppercase 'H' stays mnemonic while lowercase 'h' belongs to Crush.
+    ClientUi { hotkey: 'H' },
 ];
 
 pub fn display_name(client: ClientId) -> &'static str {

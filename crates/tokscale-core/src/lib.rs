@@ -2698,6 +2698,19 @@ fn parse_all_messages_streaming<S: MessageSink>(
         }
     }
 
+    // Hindsight persists exact LLM usage metadata from its self-hosted memory
+    // service. The client integration parses a local append-only JSONL mirror
+    // synchronized by `tokscale hindsight sync`. Request IDs provide a stable
+    // cross-file dedup key.
+    parse_cached_lane_deduped(
+        &scan_result,
+        &mut source_cache,
+        pricing,
+        &mut all_messages,
+        ClientId::Hindsight,
+        sessions::hindsight::parse_hindsight_file,
+    );
+
     // ZCode (Z.ai GLM-5.2 ADE) JSONL sessions. Token usage may be embedded
     // from the API response; otherwise estimated from content.
     let zcode_messages: Vec<UnifiedMessage> = scan_result
@@ -5409,6 +5422,21 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let unsloth_count = summed_parsed_message_count(&unsloth_msgs);
     counts.set(ClientId::Unsloth, unsloth_count);
     messages.extend(unsloth_msgs);
+
+    let hindsight_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Hindsight)
+        .par_iter()
+        .flat_map(|path| sessions::hindsight::parse_hindsight_file(path))
+        .collect();
+    let mut hindsight_seen: HashSet<String> = HashSet::new();
+    let hindsight_msgs: Vec<ParsedMessage> = hindsight_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut hindsight_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let hindsight_count = summed_parsed_message_count(&hindsight_msgs);
+    counts.set(ClientId::Hindsight, hindsight_count);
+    messages.extend(hindsight_msgs);
 
     let mcode_msgs: Vec<ParsedMessage> = scan_result
         .get(ClientId::Mcode)
