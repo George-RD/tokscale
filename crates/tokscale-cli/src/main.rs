@@ -1636,7 +1636,7 @@ fn hindsight_setup_warnings_for_report(
 
     let Some(home_ref) = home_path.as_deref() else {
         return vec![
-            "Hindsight usage requires Tokscale's Hindsight API cache, but the home directory could not be resolved. Run `tokscale hindsight sync`. Tokscale does not parse local Hindsight database.".to_string(),
+            "Hindsight usage requires Tokscale's Hindsight API cache, but the home directory could not be resolved. Run `tokscale hindsight sync`. Tokscale does not parse the local Hindsight database.".to_string(),
         ];
     };
 
@@ -1673,7 +1673,7 @@ fn hindsight_setup_warnings_for_report(
     };
 
     vec![format!(
-        "Hindsight usage requires Tokscale's Hindsight ledger cache at `{}`; {}. Tokscale does not parse local Hindsight database.",
+        "Hindsight usage requires Tokscale's Hindsight ledger cache at `{}`; {}. Tokscale does not parse the local Hindsight database.",
         cache_glob, action
     )]
 }
@@ -9023,7 +9023,7 @@ mod tests {
 
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("tokscale hindsight sync"));
-        assert!(warnings[0].contains("Tokscale does not parse local Hindsight database"));
+        assert!(warnings[0].contains("Tokscale does not parse the local Hindsight database"));
     }
 
     #[test]
