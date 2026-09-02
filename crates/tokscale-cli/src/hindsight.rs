@@ -57,8 +57,9 @@ pub struct HindsightLedgerRow {
 
 /// Raw LLM request item as returned by Hindsight's HTTP API.
 ///
-/// Deserialized solely to extract token metrics and timing. Content fields
-/// (`input`, `output`, `metadata`) are mapped to `Option<Value>` and discarded.
+/// Deserialized solely to extract token metrics and timing. The content fields
+/// (`input`, `output`, `metadata`) have no counterpart here at all — see the
+/// note at the end of the field list.
 #[derive(Debug, Deserialize)]
 pub struct RawApiLlmRequest {
     pub id: String,
@@ -353,7 +354,7 @@ pub async fn sync_hindsight_ledger(options: &SyncHindsightOptions) -> SyncHindsi
                 .filter(|t| !t.trim().is_empty())
         });
 
-    let client = match reqwest::Client::builder()
+    let client = match tokscale_core::http::client_builder()
         .timeout(HINDSIGHT_HTTP_TIMEOUT)
         .build()
     {
