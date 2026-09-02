@@ -72,6 +72,64 @@ pub fn has_credentials() -> bool {
         .is_ok()
 }
 
+/// Translate Z.ai's limit windows into the session/weekly/web-search metrics
+/// tokscale surfaces.
+///
+/// Z.ai encodes each window as an opaque `(unit, number)` code pair rather than
+/// a name: `(3, 5)` is the 5-hour rolling session window and `(6, 1)` is the
+/// 1-week window. Unrecognized codes are skipped rather than guessed at.
+fn build_metrics(
+    limits: &[Limit],
+    search_reset: Option<String>,
+    session_metric: &mut Option<UsageMetric>,
+    weekly_metric: &mut Option<UsageMetric>,
+    search_metric: &mut Option<UsageMetric>,
+) {
+    for limit in limits.iter() {
+        // Skip limits with no percentage rather than fabricating
+        // "0% used / 100% left" from a missing field.
+        let pct = match limit.percentage {
+            Some(p) => p.clamp(0.0, 100.0),
+            None => continue,
+        };
+
+        match limit.limit_type.as_deref() {
+            // V3 GLM Coding plans report the same (unit, number)
+            // windows as CREDIT_LIMIT instead of TOKENS_LIMIT. Prefer
+            // CREDIT_LIMIT so a plan that ever emits both for one
+            // window cannot silently last-write-wins.
+            Some("TOKENS_LIMIT") | Some("CREDIT_LIMIT") => {
+                let prefer = limit.limit_type.as_deref() == Some("CREDIT_LIMIT");
+                let (target, label) = match (limit.unit, limit.number) {
+                    (Some(3), Some(5)) => (&mut *session_metric, "Session"),
+                    (Some(6), Some(1)) => (&mut *weekly_metric, "Weekly"),
+                    _ => continue,
+                };
+                if target.is_none() || prefer {
+                    *target = Some(UsageMetric {
+                        label: label.to_string(),
+                        used_percent: pct,
+                        remaining_percent: 100.0 - pct,
+                        remaining_label: None,
+                        resets_at: None,
+                    });
+                }
+            }
+            Some("TIME_LIMIT") => {
+                let remaining_label = limit.remaining.map(|r| format!("{:.0} left", r));
+                *search_metric = Some(UsageMetric {
+                    label: "Web Search".into(),
+                    used_percent: pct,
+                    remaining_percent: 100.0 - pct,
+                    remaining_label,
+                    resets_at: search_reset.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
 pub fn fetch() -> Result<UsageOutput> {
     let api_key = std::env::var("ZAI_API_KEY")
         .or_else(|_| std::env::var("GLM_API_KEY"))
@@ -102,54 +160,20 @@ pub fn fetch() -> Result<UsageOutput> {
         let mut weekly_metric = None;
         let mut search_metric = None;
 
-        if let Some(limits) = quota.data.as_ref().and_then(|d| d.limits.as_ref()) {
-            for limit in limits.iter() {
-                // Skip limits with no percentage rather than fabricating
-                // "0% used / 100% left" from a missing field.
-                let pct = match limit.percentage {
-                    Some(p) => p.clamp(0.0, 100.0),
-                    None => continue,
-                };
+        let search_reset = sub
+            .as_ref()
+            .and_then(|s| s.data.as_ref())
+            .and_then(|d| d.first())
+            .and_then(|s| s.next_renew_time.clone());
 
-                match limit.limit_type.as_deref() {
-                    // V3 GLM Coding plans report the same (unit, number)
-                    // windows as CREDIT_LIMIT instead of TOKENS_LIMIT. Prefer
-                    // CREDIT_LIMIT so a plan that ever emits both for one
-                    // window cannot silently last-write-wins.
-                    Some("TOKENS_LIMIT") | Some("CREDIT_LIMIT") => {
-                        let prefer = limit.limit_type.as_deref() == Some("CREDIT_LIMIT");
-                        let (target, label) = match (limit.unit, limit.number) {
-                            (Some(3), Some(5)) => (&mut session_metric, "Session"),
-                            (Some(6), Some(1)) => (&mut weekly_metric, "Weekly"),
-                            _ => continue,
-                        };
-                        if target.is_none() || prefer {
-                            *target = Some(UsageMetric {
-                                label: label.to_string(),
-                                used_percent: pct,
-                                remaining_percent: 100.0 - pct,
-                                remaining_label: None,
-                                resets_at: None,
-                            });
-                        }
-                    }
-                    Some("TIME_LIMIT") => {
-                        let remaining_label = limit.remaining.map(|r| format!("{:.0} left", r));
-                        search_metric = Some(UsageMetric {
-                            label: "Web Search".into(),
-                            used_percent: pct,
-                            remaining_percent: 100.0 - pct,
-                            remaining_label,
-                            resets_at: sub
-                                .as_ref()
-                                .and_then(|s| s.data.as_ref())
-                                .and_then(|d| d.first())
-                                .and_then(|s| s.next_renew_time.clone()),
-                        });
-                    }
-                    _ => {}
-                }
-            }
+        if let Some(limits) = quota.data.as_ref().and_then(|d| d.limits.as_ref()) {
+            build_metrics(
+                limits,
+                search_reset,
+                &mut session_metric,
+                &mut weekly_metric,
+                &mut search_metric,
+            );
         }
 
         let mut metrics = Vec::new();
@@ -175,4 +199,78 @@ pub fn fetch() -> Result<UsageOutput> {
             spend_control: None,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limit(kind: &str, unit: i64, number: i64, percentage: f64) -> Limit {
+        serde_json::from_value(serde_json::json!({
+            "type": kind,
+            "unit": unit,
+            "number": number,
+            "percentage": percentage,
+        }))
+        .expect("valid Limit fixture")
+    }
+
+    fn run(
+        limits: &[Limit],
+    ) -> (
+        Option<UsageMetric>,
+        Option<UsageMetric>,
+        Option<UsageMetric>,
+    ) {
+        let mut session = None;
+        let mut weekly = None;
+        let mut search = None;
+        build_metrics(limits, None, &mut session, &mut weekly, &mut search);
+        (session, weekly, search)
+    }
+
+    #[test]
+    fn credit_limit_session_window_maps_to_session_metric() {
+        let (session, weekly, _) = run(&[limit("CREDIT_LIMIT", 3, 5, 40.0)]);
+        let session = session.expect("session metric present");
+        assert_eq!(session.label, "Session");
+        assert_eq!(session.used_percent, 40.0);
+        assert_eq!(session.remaining_percent, 60.0);
+        assert!(weekly.is_none());
+    }
+
+    #[test]
+    fn credit_limit_weekly_window_maps_to_weekly_metric() {
+        let (session, weekly, _) = run(&[limit("CREDIT_LIMIT", 6, 1, 25.0)]);
+        let weekly = weekly.expect("weekly metric present");
+        assert_eq!(weekly.label, "Weekly");
+        assert_eq!(weekly.used_percent, 25.0);
+        assert!(session.is_none());
+    }
+
+    #[test]
+    fn credit_limit_is_preferred_over_tokens_limit_for_same_window() {
+        // TOKENS_LIMIT first, then CREDIT_LIMIT: credit must win.
+        let (session, _, _) = run(&[
+            limit("TOKENS_LIMIT", 3, 5, 10.0),
+            limit("CREDIT_LIMIT", 3, 5, 90.0),
+        ]);
+        assert_eq!(session.expect("session metric present").used_percent, 90.0);
+
+        // Reversed order: CREDIT_LIMIT must not be clobbered by a later
+        // TOKENS_LIMIT for the same window.
+        let (session, _, _) = run(&[
+            limit("CREDIT_LIMIT", 3, 5, 90.0),
+            limit("TOKENS_LIMIT", 3, 5, 10.0),
+        ]);
+        assert_eq!(session.expect("session metric present").used_percent, 90.0);
+    }
+
+    #[test]
+    fn unrecognized_window_codes_are_skipped() {
+        let (session, weekly, search) = run(&[limit("CREDIT_LIMIT", 9, 9, 50.0)]);
+        assert!(session.is_none());
+        assert!(weekly.is_none());
+        assert!(search.is_none());
+    }
 }
