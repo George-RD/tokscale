@@ -12354,6 +12354,58 @@ mod tests {
     }
 
     #[test]
+    fn cursor_routing_label_with_provider_reported_cost_stays_priced() {
+        // End-to-end guard for #1247. `is_routing_label` still refuses to price
+        // the bare label `auto`, so the only thing keeping Cursor's plan-included
+        // rows out of the unpriced bucket is the authoritative cost the parser
+        // reads from `tokenUsage.totalCents`. If a future change stops marking
+        // those rows provider-reported they fall straight through the branch
+        // above: on a real 5,037-row export that was 515 rows and 65,785,639
+        // tokens zeroed across 42 of 116 dates. Pricing is empty here on
+        // purpose — nothing but the reported cost can rescue the row.
+        let pricing = pricing::PricingService::new_with_custom_and_models_dev(
+            pricing::custom::CustomPricing::default(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let mut auto = UnifiedMessage::new(
+            "cursor",
+            "auto",
+            "cursor",
+            "b92fdbf1-36d4-4d78-bd5b-afcb939eab16",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 10,
+                output: 5,
+                ..Default::default()
+            },
+            0.062,
+        );
+        auto.mark_provider_reported_cost();
+
+        let graph = build_graph_from_messages(
+            vec![auto],
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("provider-reported routing label must not abort submission");
+
+        assert!(
+            graph.incomplete_cost_dates.is_empty(),
+            "a provider-reported cost must not mark the date incomplete"
+        );
+        assert!(
+            graph.unpriced_submission_usage.is_empty(),
+            "a provider-reported cost must not land in the unpriced bucket"
+        );
+        assert_eq!(graph.summary.total_tokens, 15);
+        assert!((graph.summary.total_cost - 0.062).abs() < 1e-9);
+    }
+
+    #[test]
     fn whitespace_padded_routing_label_is_classified_the_same_by_resolver_and_reason() {
         // `lookup::is_routing_label` trims before comparing, so the resolver
         // refuses to price ` auto `. The zeroing reason has to agree, or the

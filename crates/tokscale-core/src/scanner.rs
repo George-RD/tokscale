@@ -496,6 +496,31 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
 
                     true
                 }
+                // Cursor cache: JSON is the current format, CSV is legacy. Both
+                // are matched so a cache written before the JSON switch still
+                // parses; sibling de-duplication (JSON wins) happens after the
+                // scan so a co-existing CSV never double-counts.
+                "usage*.json|usage*.csv" => {
+                    if is_in_archive_dir {
+                        return false;
+                    }
+
+                    if file_name == "usage.json" || file_name == "usage.csv" {
+                        return true;
+                    }
+
+                    if !file_name.starts_with("usage.")
+                        || !(file_name.ends_with(".json") || file_name.ends_with(".csv"))
+                    {
+                        return false;
+                    }
+
+                    if file_name.starts_with("usage.backup") {
+                        return false;
+                    }
+
+                    true
+                }
                 "session-*.json" => {
                     file_name.starts_with("session-") && file_name.ends_with(".json")
                 }
@@ -2681,7 +2706,35 @@ fn scan_all_clients_with_env_strategy_inner(
         }
     }
 
+    // Cursor writes `usage.json` (current) and, before the JSON switch,
+    // `usage.csv` (legacy) into the same cache dir. When both spellings of the
+    // same account exist, keep only the JSON so the account is never counted
+    // twice.
+    prefer_cursor_json_over_csv(result.get_mut(ClientId::Cursor));
+
     result
+}
+
+/// Drop each Cursor `usage[.account].csv` whose `usage[.account].json` sibling
+/// is also present, so an account is parsed from exactly one file.
+fn prefer_cursor_json_over_csv(files: &mut Vec<PathBuf>) {
+    let json_stems: HashSet<PathBuf> = files
+        .iter()
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        })
+        .map(|path| path.with_extension(""))
+        .collect();
+
+    files.retain(|path| {
+        let is_csv = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("csv"));
+        !(is_csv && json_stems.contains(&path.with_extension("")))
+    });
 }
 
 pub fn scan_all_clients(home_dir: &str, clients: &[String]) -> ScanResult {
@@ -3219,6 +3272,72 @@ mod tests {
             .collect();
 
         assert_eq!(names, vec!["usage.account.json", "usage.json"]);
+    }
+
+    #[test]
+    fn test_scan_directory_cursor_combined_pattern_matches_json_and_csv() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+        let archive = path.join("archive");
+        fs::create_dir_all(&archive).unwrap();
+
+        File::create(path.join("usage.json")).unwrap();
+        File::create(path.join("usage.csv")).unwrap();
+        File::create(path.join("usage.team-a.json")).unwrap();
+        File::create(path.join("usage.team-b.csv")).unwrap();
+        File::create(path.join("usage.backup-20240601.csv")).unwrap();
+        File::create(path.join("other.json")).unwrap();
+        File::create(archive.join("usage.json")).unwrap();
+
+        let usage_files = scan_directory(path.to_str().unwrap(), "usage*.json|usage*.csv");
+        let mut names: Vec<_> = usage_files
+            .iter()
+            .map(|path| path.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        names.sort();
+
+        assert_eq!(
+            names,
+            vec![
+                "usage.csv".to_string(),
+                "usage.json".to_string(),
+                "usage.team-a.json".to_string(),
+                "usage.team-b.csv".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_prefer_cursor_json_over_csv_drops_csv_siblings_only() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+
+        // usage.json + usage.csv (same account) -> csv dropped.
+        // usage.team-a.json + usage.team-a.csv -> csv dropped.
+        // usage.team-b.csv alone -> kept (no json sibling).
+        let mut files = vec![
+            path.join("usage.json"),
+            path.join("usage.csv"),
+            path.join("usage.team-a.json"),
+            path.join("usage.team-a.csv"),
+            path.join("usage.team-b.csv"),
+        ];
+
+        prefer_cursor_json_over_csv(&mut files);
+        let mut names: Vec<_> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        names.sort();
+
+        assert_eq!(
+            names,
+            vec![
+                "usage.json".to_string(),
+                "usage.team-a.json".to_string(),
+                "usage.team-b.csv".to_string(),
+            ]
+        );
     }
 
     #[test]

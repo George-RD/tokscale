@@ -442,7 +442,7 @@ define_clients!(
         display: "Cursor IDE",
         logo: Some("https://tokscale.ai/assets/logos/cursor.jpg"),root: PathRoot::Home,
         relative: ".config/tokscale/cursor-cache",
-        pattern: "usage*.csv",
+        pattern: "usage*.json|usage*.csv",
         headless: false,
         parse_local: false,
         submit_default: true

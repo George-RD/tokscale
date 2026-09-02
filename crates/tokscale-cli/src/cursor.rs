@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Timeout for every Cursor HTTP request. Picked to bound the worst case for
 /// auto-sync (which runs synchronously before local reports and the TUI) while
@@ -20,24 +20,6 @@ const CURSOR_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 /// default [`CURSOR_HTTP_TIMEOUT`] to generate and stream (issue #1175); the
 /// user asked for the sync, so waiting longer beats failing fast.
 const CURSOR_EXPLICIT_SYNC_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Ceiling on the usage-CSV response body, enforced *while* the body is read
-/// rather than after it has all arrived. Without it the download buffers
-/// whatever the server sends for as long as the transfer is allowed to run,
-/// and [`CURSOR_EXPLICIT_SYNC_TIMEOUT`] deliberately widens that window to
-/// 120s — so a malformed or runaway response can grow process memory for two
-/// minutes before anything checks that it even looks like CSV.
-///
-/// 64 MiB is generous for a real export and still bounded. The widest row in a
-/// real account export measures 128 bytes including its newline (a fully
-/// quoted `Date,Kind,Model,Max Mode,…` row carrying a long model name), and
-/// the average is ~99 bytes, so the cap admits roughly 524,000 events at
-/// worst-case width and ~680,000 at the average — against 5,038 events
-/// (497 KB) for a heavy personal account with two years of history. That is a
-/// ~130x margin over the largest export actually observed, which leaves room
-/// for a large team account, while holding peak memory for the download to a
-/// fraction of a developer machine's RAM.
-const CURSOR_MAX_CSV_BYTES: usize = 64 * 1024 * 1024;
 
 /// Skip implicit pre-report sync when every expected Cursor account cache file
 /// was modified within this window. Prevents `tokscale models` (and its
@@ -73,15 +55,41 @@ fn old_cursor_cache_dir(home_dir: &Path) -> PathBuf {
     home_dir.join(".tokscale/cursor-cache")
 }
 
-const USAGE_CSV_ENDPOINT: &str =
-    "https://cursor.com/api/dashboard/export-usage-events-csv?strategy=tokens";
+const USAGE_EVENTS_JSON_ENDPOINT: &str =
+    "https://cursor.com/api/dashboard/get-filtered-usage-events";
 const USAGE_SUMMARY_ENDPOINT: &str = "https://cursor.com/api/usage-summary";
+
+/// Number of usage events requested per page from the JSON endpoint. The
+/// endpoint paginates, so the fetcher walks pages until it has collected
+/// `totalUsageEventsCount` events (or a page comes back short/empty).
+const CURSOR_JSON_PAGE_SIZE: usize = 500;
+
+/// Hard ceiling on pages walked in one fetch, so a server that keeps returning
+/// full pages (or a mis-reported total) can't spin forever. At the page size
+/// above this admits up to a quarter-million events.
+const CURSOR_MAX_JSON_PAGES: usize = 500;
+
+/// Cumulative ceiling on the usage-events JSON downloaded in one fetch, enforced
+/// *while* each page is read rather than after it has all arrived, and counted
+/// across every page so a paginated response can't sidestep it. Without it a
+/// download buffers whatever the server sends for as long as the transfer is
+/// allowed to run, and [`CURSOR_EXPLICIT_SYNC_TIMEOUT`] deliberately widens that
+/// window to 120s — so a malformed or runaway response could grow process memory
+/// for two minutes.
+///
+/// 64 MiB is generous for a full usage history and still bounded, holding peak
+/// memory for the download to a fraction of a developer machine's RAM.
+const CURSOR_MAX_JSON_BYTES: usize = 64 * 1024 * 1024;
 
 /// Marker file touched at the end of every `sync_cursor_cache` run (even when
 /// some accounts fail). Its mtime gates secondary-account freshness checks so
 /// a permanently-stale secondary (expired token, removed account, network
 /// partition) does not force an implicit sync on every invocation.
 const CURSOR_SYNC_ATTEMPT_MARKER: &str = "usage.last-sync-attempt";
+
+/// Cache-file extensions tokscale recognizes, in preference order: JSON is the
+/// current format, CSV is the legacy export still read for pre-switch caches.
+const CURSOR_CACHE_EXTENSIONS: [&str; 2] = ["json", "csv"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CursorCredentials {
@@ -183,12 +191,30 @@ fn build_cursor_headers(session_token: &str) -> reqwest::header::HeaderMap {
     headers
 }
 
-fn count_cursor_csv_rows(csv_text: &str) -> usize {
-    let mut reader = csv::ReaderBuilder::new()
-        .has_headers(true)
-        .flexible(true)
-        .from_reader(csv_text.as_bytes());
-    reader.records().filter_map(|r| r.ok()).count()
+/// Headers for the JSON dashboard endpoints. Adds a JSON `Content-Type` and the
+/// `Origin` header the `get-filtered-usage-events` CSRF check requires on top of
+/// the shared cookie/UA headers.
+fn build_cursor_json_headers(session_token: &str) -> reqwest::header::HeaderMap {
+    use reqwest::header::HeaderValue;
+
+    let mut headers = build_cursor_headers(session_token);
+    headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+    headers.insert("Origin", HeaderValue::from_static("https://cursor.com"));
+    headers
+}
+
+/// Count events in an aggregated usage-events JSON document. Invalid JSON or a
+/// missing `usageEventsDisplay` array counts as zero.
+fn count_cursor_json_events(json_text: &str) -> usize {
+    serde_json::from_str::<serde_json::Value>(json_text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("usageEventsDisplay")
+                .and_then(|events| events.as_array())
+                .map(|events| events.len())
+        })
+        .unwrap_or(0)
 }
 
 fn atomic_write_file(path: &std::path::Path, contents: &str) -> Result<()> {
@@ -456,6 +482,19 @@ fn upsert_credentials(token: &str, label: Option<&str>) -> Result<String> {
     };
 
     store.accounts.insert(account_id.clone(), credentials);
+
+    // Switching the active account must also move the cache files, exactly like
+    // `set_active_account`. `usage.json` always belongs to the active account, so
+    // when the desktop login points at a different account than the stored one we
+    // rename the current `usage.json` back under the old account and promote the
+    // incoming account's per-account cache to `usage.json`. Without this the sync
+    // reconciliation would treat the previous account's `usage.json` as the new
+    // active account's and could drop the new account's only cache.
+    let old_active_id = store.active_account_id.clone();
+    if old_active_id != account_id {
+        let _ = reconcile_cache_files(&old_active_id, &account_id);
+    }
+
     store.active_account_id = account_id.clone();
     save_credentials_store(&store)?;
     Ok(account_id)
@@ -670,24 +709,27 @@ pub fn remove_account(name_or_id: &str, purge_cache: bool) -> Result<()> {
 
     let cache_dir = get_cursor_cache_dir()?;
     if cache_dir.exists() {
-        let per_account = cache_dir.join(format!(
-            "usage.{}.csv",
-            sanitize_account_id_for_filename(&resolved)
-        ));
-        if per_account.exists() {
-            if purge_cache {
-                let _ = fs::remove_file(&per_account);
-            } else {
-                let _ = archive_cache_file(&per_account, &format!("usage.{}", resolved));
-            }
-        }
-        if was_active {
-            let active_file = cache_dir.join("usage.csv");
-            if active_file.exists() {
+        for ext in CURSOR_CACHE_EXTENSIONS {
+            let per_account = cache_dir.join(format!(
+                "usage.{}.{ext}",
+                sanitize_account_id_for_filename(&resolved)
+            ));
+            if per_account.exists() {
                 if purge_cache {
-                    let _ = fs::remove_file(&active_file);
+                    let _ = fs::remove_file(&per_account);
                 } else {
-                    let _ = archive_cache_file(&active_file, &format!("usage.active.{}", resolved));
+                    let _ = archive_cache_file(&per_account, &format!("usage.{}", resolved));
+                }
+            }
+            if was_active {
+                let active_file = cache_dir.join(format!("usage.{ext}"));
+                if active_file.exists() {
+                    if purge_cache {
+                        let _ = fs::remove_file(&active_file);
+                    } else {
+                        let _ =
+                            archive_cache_file(&active_file, &format!("usage.active.{}", resolved));
+                    }
                 }
             }
         }
@@ -705,13 +747,15 @@ pub fn remove_account(name_or_id: &str, purge_cache: bool) -> Result<()> {
 
     if was_active {
         if let Some(first_id) = store.accounts.keys().next().cloned() {
-            let new_account_file = cache_dir.join(format!(
-                "usage.{}.csv",
-                sanitize_account_id_for_filename(&first_id)
-            ));
-            let active_file = cache_dir.join("usage.csv");
-            if new_account_file.exists() {
-                let _ = fs::rename(&new_account_file, &active_file);
+            for ext in CURSOR_CACHE_EXTENSIONS {
+                let new_account_file = cache_dir.join(format!(
+                    "usage.{}.{ext}",
+                    sanitize_account_id_for_filename(&first_id)
+                ));
+                let active_file = cache_dir.join(format!("usage.{ext}"));
+                if new_account_file.exists() {
+                    let _ = fs::rename(&new_account_file, &active_file);
+                }
             }
             store.active_account_id = first_id;
         }
@@ -727,7 +771,8 @@ pub fn remove_all_accounts(purge_cache: bool) -> Result<()> {
         if let Ok(entries) = fs::read_dir(&cache_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with("usage") && name.ends_with(".csv") {
+                if name.starts_with("usage") && (name.ends_with(".json") || name.ends_with(".csv"))
+                {
                     if purge_cache {
                         let _ = fs::remove_file(entry.path());
                     } else {
@@ -770,28 +815,32 @@ fn reconcile_cache_files(old_account_id: &str, new_account_id: &str) -> Result<(
         return Ok(());
     }
 
-    let active_file = cache_dir.join("usage.csv");
-    let old_account_file = cache_dir.join(format!(
-        "usage.{}.csv",
-        sanitize_account_id_for_filename(old_account_id)
-    ));
-    let new_account_file = cache_dir.join(format!(
-        "usage.{}.csv",
-        sanitize_account_id_for_filename(new_account_id)
-    ));
+    // Move both the current JSON cache and any legacy CSV cache so a switch
+    // never strands one format under the wrong account.
+    for ext in CURSOR_CACHE_EXTENSIONS {
+        let active_file = cache_dir.join(format!("usage.{ext}"));
+        let old_account_file = cache_dir.join(format!(
+            "usage.{}.{ext}",
+            sanitize_account_id_for_filename(old_account_id)
+        ));
+        let new_account_file = cache_dir.join(format!(
+            "usage.{}.{ext}",
+            sanitize_account_id_for_filename(new_account_id)
+        ));
 
-    if active_file.exists() {
-        if old_account_file.exists() {
-            let _ = archive_cache_file(&old_account_file, old_account_id);
-        }
-        fs::rename(&active_file, &old_account_file)?;
-    }
-
-    if new_account_file.exists() {
         if active_file.exists() {
-            let _ = archive_cache_file(&active_file, "usage.active");
+            if old_account_file.exists() {
+                let _ = archive_cache_file(&old_account_file, old_account_id);
+            }
+            fs::rename(&active_file, &old_account_file)?;
         }
-        fs::rename(&new_account_file, &active_file)?;
+
+        if new_account_file.exists() {
+            if active_file.exists() {
+                let _ = archive_cache_file(&active_file, "usage.active");
+            }
+            fs::rename(&new_account_file, &active_file)?;
+        }
     }
 
     Ok(())
@@ -808,17 +857,19 @@ pub fn has_active_credentials_in_home(home_dir: &Path) -> bool {
         .is_some()
 }
 
-fn is_cursor_usage_csv_filename(name: &str) -> bool {
-    if name == "usage.csv" {
+fn is_cursor_usage_cache_filename(name: &str) -> bool {
+    if name == "usage.csv" || name == "usage.json" {
         return true;
-    }
-    if !name.starts_with("usage.") || !name.ends_with(".csv") {
-        return false;
     }
     if name.starts_with("usage.backup") {
         return false;
     }
-    let stem = name.trim_start_matches("usage.").trim_end_matches(".csv");
+    let Some(stem) = name.strip_prefix("usage.").and_then(|rest| {
+        rest.strip_suffix(".json")
+            .or_else(|| rest.strip_suffix(".csv"))
+    }) else {
+        return false;
+    };
     !stem.is_empty()
         && stem
             .chars()
@@ -836,7 +887,7 @@ pub fn has_cursor_usage_cache_in_home(home_dir: &Path) -> bool {
         Ok(entries) => entries
             .filter_map(|entry| entry.ok())
             .filter_map(|entry| entry.file_name().into_string().ok())
-            .any(|name| is_cursor_usage_csv_filename(&name)),
+            .any(|name| is_cursor_usage_cache_filename(&name)),
         Err(_) => false,
     }
 }
@@ -859,10 +910,10 @@ fn expected_cursor_usage_cache_paths_in(home_dir: &Path) -> Vec<PathBuf> {
                 .keys()
                 .map(|account_id| {
                     if account_id == &store.active_account_id {
-                        cache_dir.join("usage.csv")
+                        cache_dir.join("usage.json")
                     } else {
                         cache_dir.join(format!(
-                            "usage.{}.csv",
+                            "usage.{}.json",
                             sanitize_account_id_for_filename(account_id)
                         ))
                     }
@@ -874,7 +925,7 @@ fn expected_cursor_usage_cache_paths_in(home_dir: &Path) -> Vec<PathBuf> {
         }
     }
 
-    vec![cache_dir.join("usage.csv")]
+    vec![cache_dir.join("usage.json")]
 }
 
 fn cursor_usage_cache_file_is_fresh(path: &Path, max_age: Duration) -> bool {
@@ -897,8 +948,10 @@ fn cursor_usage_cache_is_fresh_in(home_dir: &Path, max_age: Duration) -> bool {
     }
 
     // The active account's cache is non-negotiable: if it is stale or missing,
-    // implicit sync must run so reports read current data.
-    let active_path = cache_dir.join("usage.csv");
+    // implicit sync must run so reports read current data. A legacy `usage.csv`
+    // with no `usage.json` counts as stale so the first run after upgrade
+    // migrates the account to the JSON cache.
+    let active_path = cache_dir.join("usage.json");
     if !cursor_usage_cache_file_is_fresh(&active_path, max_age) {
         return false;
     }
@@ -916,7 +969,7 @@ fn cursor_usage_cache_is_fresh_in(home_dir: &Path, max_age: Duration) -> bool {
         .all(|p| cursor_usage_cache_file_is_fresh(p, max_age) || marker_fresh)
 }
 
-/// True when the active cursor usage cache (`usage.csv`) was refreshed within
+/// True when the active cursor usage cache (`usage.json`) was refreshed within
 /// `max_age` AND every secondary account cache is either fresh or a recent
 /// sync-attempt marker exists. The active cache is unconditionally required —
 /// a stale active means reports would show out-of-date data. Secondaries are
@@ -1034,59 +1087,165 @@ pub async fn validate_cursor_session(token: &str) -> ValidateSessionResult {
     }
 }
 
-pub async fn fetch_cursor_usage_csv(
+pub async fn fetch_cursor_usage_events_json(
     session_token: &str,
     timeout_override: Option<Duration>,
 ) -> Result<String> {
-    fetch_cursor_usage_csv_from(
-        USAGE_CSV_ENDPOINT,
+    fetch_cursor_usage_events_json_from(
+        USAGE_EVENTS_JSON_ENDPOINT,
         session_token,
         timeout_override,
-        CURSOR_MAX_CSV_BYTES,
+        CURSOR_MAX_JSON_BYTES,
+        CURSOR_JSON_PAGE_SIZE,
     )
     .await
 }
 
-/// Body of [`fetch_cursor_usage_csv`] with the endpoint and the byte ceiling
-/// injected, so tests can drive the real path against a local server without
-/// having to move [`CURSOR_MAX_CSV_BYTES`] of data to reach the cap.
-async fn fetch_cursor_usage_csv_from(
+/// Body of [`fetch_cursor_usage_events_json`] with the endpoint, byte ceiling,
+/// and page size injected so tests can drive the real paginating path against a
+/// local server.
+///
+/// Walks pages of `get-filtered-usage-events` (a POST endpoint carrying an
+/// `Origin` header for its CSRF check) until it has collected every event, then
+/// returns the dashboard response shape with all pages' `usageEventsDisplay`
+/// aggregated into one array. `max_body_bytes` is a cumulative ceiling spanning
+/// every page, and a page that omits the `usageEventsDisplay` array is an error
+/// so a malformed 200 never masquerades as an empty result.
+async fn fetch_cursor_usage_events_json_from(
     url: &str,
     session_token: &str,
     timeout_override: Option<Duration>,
     max_body_bytes: usize,
+    page_size: usize,
 ) -> Result<String> {
     let client = build_cursor_http_client()?;
-    let mut req = client.get(url).headers(build_cursor_headers(session_token));
+    let mut all_events: Vec<serde_json::Value> = Vec::new();
+    let mut total_count: Option<u64> = None;
+    let mut bytes_read: usize = 0;
 
-    if let Some(timeout) = timeout_override {
-        req = req.timeout(timeout);
+    // Overall wall-clock budget for the entire paginated walk. Without it the
+    // per-page timeout would multiply across every page, so a slow server could
+    // stall report startup (auto-sync runs first) for that timeout times the page
+    // count. Each page's timeout is clamped to what remains of this budget below,
+    // and the walk aborts once it is spent.
+    let per_page_timeout = timeout_override.unwrap_or(CURSOR_HTTP_TIMEOUT);
+    let fetch_deadline = Instant::now() + per_page_timeout;
+
+    let mut completed = false;
+    for page in 1..=CURSOR_MAX_JSON_PAGES {
+        let remaining_budget = fetch_deadline.saturating_duration_since(Instant::now());
+        if remaining_budget.is_zero() {
+            anyhow::bail!(
+                "Cursor usage events fetch exceeded its overall time budget before the full history was collected"
+            );
+        }
+
+        let body = serde_json::json!({
+            "teamId": 0,
+            "page": page,
+            "pageSize": page_size,
+        });
+
+        let req = client
+            .post(url)
+            .headers(build_cursor_json_headers(session_token))
+            .json(&body)
+            .timeout(per_page_timeout.min(remaining_budget));
+
+        let response = req.send().await?;
+
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            || response.status() == reqwest::StatusCode::FORBIDDEN
+        {
+            anyhow::bail!(
+                "Cursor session expired. Please run 'bunx tokscale@latest cursor login' to re-authenticate."
+            );
+        }
+
+        if !response.status().is_success() {
+            anyhow::bail!("Cursor API returned status {}", response.status());
+        }
+
+        // The byte ceiling is cumulative across pages: each page may read only
+        // what earlier pages left of the budget, so a paginated response can't
+        // sidestep the cap by spreading a huge payload over many pages.
+        let remaining = match max_body_bytes.checked_sub(bytes_read).filter(|r| *r > 0) {
+            Some(remaining) => remaining,
+            None => anyhow::bail!(
+                "Cursor usage events JSON exceeded the {max_body_bytes} byte limit across pages"
+            ),
+        };
+        let text = read_cursor_body_with_cap(response, remaining, "usage events JSON").await?;
+        bytes_read += text.len();
+
+        let page_value: serde_json::Value = serde_json::from_str(&text)
+            .context("Invalid response from Cursor API - expected usage events JSON")?;
+
+        if total_count.is_none() {
+            total_count = page_value
+                .get("totalUsageEventsCount")
+                .and_then(|value| value.as_u64());
+        }
+
+        // A well-formed page always carries a `usageEventsDisplay` array. A 200
+        // that omits it (a WAF challenge, an API change) is a failure, not a
+        // silent zero-event result, so the caller never overwrites a good cache
+        // with nothing.
+        let page_events = match page_value
+            .get("usageEventsDisplay")
+            .map(|events| events.as_array())
+        {
+            Some(Some(events)) => events.clone(),
+            _ => {
+                anyhow::bail!("Invalid response from Cursor API - missing usageEventsDisplay array")
+            }
+        };
+        let received = page_events.len();
+        all_events.extend(page_events);
+
+        // Once the advertised total is known, keep paging until it is reached so
+        // a server that clamps `pageSize` (a short page while more events remain)
+        // doesn't stop the walk early. An empty page before the total is reached
+        // means the server truncated the history mid-walk, so it is an error
+        // rather than a silently partial cache. Fall back to the short/empty-page
+        // heuristic only when no total was reported.
+        let done = match total_count {
+            Some(total) => {
+                if all_events.len() as u64 >= total {
+                    true
+                } else if received == 0 {
+                    anyhow::bail!(
+                        "Cursor API returned an empty page before its advertised total of {total} events; refusing to cache a partial history"
+                    );
+                } else {
+                    false
+                }
+            }
+            None => received == 0 || received < page_size,
+        };
+        if done {
+            completed = true;
+            break;
+        }
     }
 
-    let response = req.send().await?;
-
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED
-        || response.status() == reqwest::StatusCode::FORBIDDEN
-    {
+    // Exhausting the page cap without a clean stop means only part of the history
+    // was collected; caching it would masquerade as a full sync, so fail instead.
+    if !completed {
         anyhow::bail!(
-            "Cursor session expired. Please run 'bunx tokscale@latest cursor login' to re-authenticate."
+            "Cursor usage events exceeded the {CURSOR_MAX_JSON_PAGES}-page fetch limit before the full history was collected; refusing to cache a partial history"
         );
     }
 
-    if !response.status().is_success() {
-        anyhow::bail!("Cursor API returned status {}", response.status());
-    }
-
-    let text = read_cursor_csv_with_cap(response, max_body_bytes).await?;
-
-    if !text.starts_with("Date,") {
-        anyhow::bail!("Invalid response from Cursor API - expected CSV format");
-    }
-
-    Ok(text)
+    let aggregated = serde_json::json!({
+        "totalUsageEventsCount": all_events.len(),
+        "usageEventsDisplay": all_events,
+    });
+    serde_json::to_string(&aggregated).context("Failed to serialize Cursor usage events cache")
 }
 
-/// Reads the usage-CSV body, never holding more than `max_body_bytes` of it.
+/// Reads a Cursor response body (`label` names it for errors, e.g. "usage CSV"
+/// or "usage events JSON"), never holding more than `max_body_bytes` of it.
 ///
 /// `Content-Length` is consulted first so an oversized body is refused before a
 /// single byte of it is read, but it is never the only check: the header is
@@ -1101,14 +1260,15 @@ async fn fetch_cursor_usage_csv_from(
 /// does without the `charset` feature — the bytes a valid export produces are
 /// unchanged, and a malformed one still degrades the way it always did rather
 /// than turning into a new error.
-async fn read_cursor_csv_with_cap(
+async fn read_cursor_body_with_cap(
     mut response: reqwest::Response,
     max_body_bytes: usize,
+    label: &str,
 ) -> Result<String> {
     if let Some(advertised) = response.content_length() {
         if advertised > max_body_bytes as u64 {
             anyhow::bail!(
-                "Cursor usage CSV is {advertised} bytes, over the {max_body_bytes} byte limit"
+                "Cursor {label} is {advertised} bytes, over the {max_body_bytes} byte limit"
             );
         }
     }
@@ -1117,12 +1277,12 @@ async fn read_cursor_csv_with_cap(
     while let Some(chunk) = response
         .chunk()
         .await
-        .context("Failed to read the Cursor usage CSV response")?
+        .with_context(|| format!("Failed to read the Cursor {label} response"))?
     {
         let read_so_far = body.len().saturating_add(chunk.len());
         if read_so_far > max_body_bytes {
             anyhow::bail!(
-                "Cursor usage CSV exceeds the {max_body_bytes} byte limit (aborted at {read_so_far} bytes)"
+                "Cursor {label} exceeds the {max_body_bytes} byte limit (aborted at {read_so_far} bytes)"
             );
         }
         body.extend_from_slice(&chunk);
@@ -1131,7 +1291,7 @@ async fn read_cursor_csv_with_cap(
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
-async fn sync_cursor_cache_with_fetcher<F, Fut>(fetch_usage_csv: F) -> SyncCursorResult
+async fn sync_cursor_cache_with_fetcher<F, Fut>(fetch_usage_json: F) -> SyncCursorResult
 where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
@@ -1147,12 +1307,12 @@ where
         }
     };
 
-    sync_cursor_cache_with_fetcher_in_home(&home_dir, fetch_usage_csv).await
+    sync_cursor_cache_with_fetcher_in_home(&home_dir, fetch_usage_json).await
 }
 
 async fn sync_cursor_cache_with_fetcher_in_home<F, Fut>(
     home_dir: &Path,
-    fetch_usage_csv: F,
+    fetch_usage_json: F,
 ) -> SyncCursorResult
 where
     F: Fn(String) -> Fut,
@@ -1193,14 +1353,6 @@ where
         let _ = fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700));
     }
 
-    let active_dup = cache_dir.join(format!(
-        "usage.{}.csv",
-        sanitize_account_id_for_filename(&store.active_account_id)
-    ));
-    if active_dup.exists() {
-        let _ = fs::remove_file(&active_dup);
-    }
-
     let mut total_rows = 0;
     let mut success_count = 0;
     let mut errors: Vec<String> = Vec::new();
@@ -1208,24 +1360,47 @@ where
     for (account_id, credentials) in &store.accounts {
         let is_active = account_id == &store.active_account_id;
 
-        match fetch_usage_csv(credentials.session_token.clone()).await {
-            Ok(csv_text) => {
+        match fetch_usage_json(credentials.session_token.clone()).await {
+            Ok(json_text) => {
                 let file_path = if is_active {
-                    cache_dir.join("usage.csv")
+                    cache_dir.join("usage.json")
                 } else {
                     cache_dir.join(format!(
-                        "usage.{}.csv",
+                        "usage.{}.json",
                         sanitize_account_id_for_filename(account_id)
                     ))
                 };
 
-                let row_count = count_cursor_csv_rows(&csv_text);
+                let event_count = count_cursor_json_events(&json_text);
+                let legacy_csv = file_path.with_extension("csv");
 
-                if let Err(e) = atomic_write_file(&file_path, &csv_text) {
+                // A zero-event result is suspicious once cached history exists:
+                // overwriting `usage.json` with nothing and archiving the legacy
+                // CSV would strip real usage from reports. Keep both caches intact
+                // and record it so the next sync can recover instead.
+                if event_count == 0 && (file_path.exists() || legacy_csv.exists()) {
+                    errors.push(format!(
+                        "{}: sync returned zero events; keeping existing cache",
+                        account_id
+                    ));
+                    continue;
+                }
+
+                if let Err(e) = atomic_write_file(&file_path, &json_text) {
                     errors.push(format!("{}: {}", account_id, e));
                 } else {
-                    total_rows += row_count;
+                    total_rows += event_count;
                     success_count += 1;
+                    // Archive (don't delete) the legacy CSV counterpart now that
+                    // JSON is authoritative: pre-migration history survives and
+                    // the scanner never parses both and double-counts this account.
+                    if legacy_csv.exists() {
+                        let label = legacy_csv
+                            .file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .unwrap_or("usage");
+                        let _ = archive_cache_file_in_dir(&cache_dir, &legacy_csv, label);
+                    }
                 }
             }
             Err(e) => {
@@ -1234,12 +1409,38 @@ where
         }
     }
 
+    // Reconcile the active account's leftover per-account duplicate. The active
+    // account is cached as `usage.json`; a `usage.<active_id>.json` copy left
+    // over from when it was a secondary is only safe to drop once `usage.json`
+    // actually exists on disk — whether this run just wrote it or a prior run
+    // did. Gating on that existence keeps the duplicate when a failed first-time
+    // fetch leaves no `usage.json` (it is then the only data we have), while a
+    // failed fetch that still has a good `usage.json` clears the duplicate so the
+    // scanner never reads both JSON caches and double-counts the active account.
+    // The JSON dup is a stale copy (removed); the legacy CSV dup is archived so
+    // pre-migration history survives.
+    if cache_dir.join("usage.json").exists() {
+        let active_sanitized = sanitize_account_id_for_filename(&store.active_account_id);
+        let dup_json = cache_dir.join(format!("usage.{active_sanitized}.json"));
+        if dup_json.exists() {
+            let _ = fs::remove_file(&dup_json);
+        }
+        let dup_csv = cache_dir.join(format!("usage.{active_sanitized}.csv"));
+        if dup_csv.exists() {
+            let label = dup_csv
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("usage");
+            let _ = archive_cache_file_in_dir(&cache_dir, &dup_csv, label);
+        }
+    }
+
     // Touch the sync-attempt marker unconditionally after the per-account loop
     // (regardless of partial failures). The marker's mtime short-circuits the
     // secondary-account freshness check so a permanently-stale secondary
     // doesn't force an implicit sync on every invocation. We ignore errors
     // here — if the marker can't be written (e.g. disk full) the gate simply
-    // falls through to the CSV-freshness check as before.
+    // falls through to the cache-freshness check as before.
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -1274,9 +1475,9 @@ where
     }
 }
 
-/// Timeout override for the usage-CSV download: explicit syncs get the longer
+/// Timeout override for the usage download: explicit syncs get the longer
 /// [`CURSOR_EXPLICIT_SYNC_TIMEOUT`]; implicit syncs keep the client default.
-fn csv_timeout_override(explicit: bool) -> Option<Duration> {
+fn sync_timeout_override(explicit: bool) -> Option<Duration> {
     explicit.then_some(CURSOR_EXPLICIT_SYNC_TIMEOUT)
 }
 
@@ -1286,13 +1487,27 @@ pub async fn sync_cursor_cache(explicit: bool) -> SyncCursorResult {
     let _ = ensure_credentials_from_local_cursor();
 
     sync_cursor_cache_with_fetcher(move |session_token| async move {
-        fetch_cursor_usage_csv(&session_token, csv_timeout_override(explicit)).await
+        fetch_cursor_usage_events_json(&session_token, sync_timeout_override(explicit)).await
     })
     .await
 }
 
 fn archive_cache_file(file_path: &std::path::Path, label: &str) -> Result<()> {
     let cache_dir = get_cursor_cache_dir()?;
+    archive_cache_file_in_dir(&cache_dir, file_path, label)
+}
+
+/// Moves `file_path` into `<cache_dir>/archive/` under a timestamped, sanitized
+/// name so a legacy cache is preserved rather than deleted during migration.
+///
+/// Kept `cache_dir`-relative (rather than resolving the real cache dir itself)
+/// so callers inside a synced-home flow archive into the same directory they are
+/// operating on and tests can point it at a temporary home.
+fn archive_cache_file_in_dir(
+    cache_dir: &std::path::Path,
+    file_path: &std::path::Path,
+    label: &str,
+) -> Result<()> {
     let archive_dir = cache_dir.join("archive");
     if !archive_dir.exists() {
         fs::create_dir_all(&archive_dir)?;
@@ -1305,7 +1520,11 @@ fn archive_cache_file(file_path: &std::path::Path, label: &str) -> Result<()> {
 
     let safe_label = sanitize_account_id_for_filename(label);
     let ts = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-    let dest = archive_dir.join(format!("{}-{}.csv", safe_label, ts));
+    let ext = file_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("csv");
+    let dest = archive_dir.join(format!("{}-{}.{}", safe_label, ts, ext));
     fs::rename(file_path, dest)?;
     Ok(())
 }
@@ -1770,69 +1989,108 @@ mod tests {
     }
 
     #[test]
-    fn test_csv_timeout_override_only_for_explicit_sync() {
-        assert_eq!(csv_timeout_override(true), Some(Duration::from_secs(120)));
-        assert_eq!(csv_timeout_override(false), None);
-    }
-
-    /// Byte ceiling the usage-CSV download tests run against. Small on purpose:
-    /// the production [`CURSOR_MAX_CSV_BYTES`] would have to be moved over a
-    /// socket to reach it, which is exactly the allocation these tests exist to
-    /// prove never happens.
-    const TEST_CSV_CAP: usize = 64 * 1024;
-
-    /// Minimal one-shot HTTP/1.1 server for the usage-CSV download.
-    ///
-    /// `headers_extra` is written verbatim after the status line so a test can
-    /// advertise a `Content-Length` independently of what it actually sends —
-    /// or omit the header entirely. The thread lingers briefly before dropping
-    /// the socket so a client that rejects a response on its headers alone is
-    /// not racing a FIN, and it ignores write errors: a client that aborts
-    /// mid-transfer resets the connection, which is the behaviour under test.
-    fn serve_csv_once(headers_extra: String, body: Vec<u8>) -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0u8; 4096];
-            let _ = std::io::Read::read(&mut stream, &mut request);
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\n{headers_extra}Connection: close\r\n\r\n"
-            );
-            let _ = stream.write_all(head.as_bytes());
-            let _ = stream.write_all(&body);
-            let _ = stream.flush();
-            std::thread::sleep(Duration::from_millis(500));
-        });
-        format!("http://{addr}/api/dashboard/export-usage-events-csv")
+    fn test_sync_timeout_override_only_for_explicit_sync() {
+        assert_eq!(sync_timeout_override(true), Some(Duration::from_secs(120)));
+        assert_eq!(sync_timeout_override(false), None);
     }
 
     #[test]
-    fn test_usage_csv_over_the_cap_is_rejected_while_streaming() {
-        // The regression this guards: the body used to be read to the end with
-        // `response.text()`, so a runaway export grew process memory for the
-        // whole (now 120s) explicit-sync window before anything looked at it.
-        let mut body = b"Date,Model,Tokens\n".to_vec();
+    fn test_count_cursor_json_events() {
+        let json = r#"{"usageEventsDisplay":[{"model":"a"},{"model":"b"}]}"#;
+        assert_eq!(count_cursor_json_events(json), 2);
+        assert_eq!(count_cursor_json_events(r#"{"usageEventsDisplay":[]}"#), 0);
+        assert_eq!(count_cursor_json_events("{}"), 0);
+        assert_eq!(count_cursor_json_events("not json"), 0);
+    }
+
+    /// Byte ceiling the usage-events download tests run against. Small on
+    /// purpose: the production [`CURSOR_MAX_JSON_BYTES`] would have to be moved
+    /// over a socket to reach it, which is exactly the allocation these tests
+    /// exist to prove never happens.
+    const TEST_JSON_CAP: usize = 64 * 1024;
+
+    /// Minimal HTTP/1.1 server that serves a queue of usage-events pages.
+    ///
+    /// Each queued `(headers_extra, body)` is returned for one connection in
+    /// order, so a test can drive the paginating fetcher across several pages.
+    /// `headers_extra` is written verbatim after the status line so a test can
+    /// advertise a `Content-Length` independently of what it actually sends. The
+    /// captured request heads (returned via the shared handle) let a test assert
+    /// the method, the `Origin` CSRF header, and the requested page numbers. The
+    /// thread lingers briefly before dropping each socket so a client that
+    /// rejects a response on its headers alone is not racing a FIN.
+    fn serve_json_pages(
+        pages: Vec<(String, Vec<u8>)>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let requests_thread = std::sync::Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for (headers_extra, body) in pages {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = [0u8; 8192];
+                let read = std::io::Read::read(&mut stream, &mut request).unwrap_or(0);
+                requests_thread
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request[..read]).into_owned());
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{headers_extra}Connection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        (
+            format!("http://{addr}/api/dashboard/get-filtered-usage-events"),
+            requests,
+        )
+    }
+
+    fn json_page(total: u64, events: &[&str]) -> Vec<u8> {
+        let events = events.join(",");
+        format!(r#"{{"totalUsageEventsCount":{total},"usageEventsDisplay":[{events}]}}"#)
+            .into_bytes()
+    }
+
+    fn json_event(conversation_id: &str, ts_ms: &str) -> String {
+        format!(
+            r#"{{"conversationId":"{conversation_id}","timestamp":"{ts_ms}","model":"gpt-5","chargedCents":1,"tokenUsage":{{"inputTokens":10,"outputTokens":5}}}}"#
+        )
+    }
+
+    #[test]
+    fn test_usage_events_json_over_the_cap_is_rejected_while_streaming() {
+        // The body used to be read to the end, so a runaway response grew
+        // process memory for the whole (now 120s) explicit-sync window before
+        // anything looked at it. The cap must abort mid-stream instead.
+        let mut body = b"{\"usageEventsDisplay\":[".to_vec();
         while body.len() < 4 * 1024 * 1024 {
-            body.extend_from_slice(b"2026-01-01T00:00:00.000Z,gpt-5,1000\n");
+            body.extend_from_slice(br#"{"conversationId":"x","timestamp":"1","model":"m"},"#);
         }
         let sent = body.len();
         // No Content-Length: the ceiling has to hold on what actually arrives.
-        let url = serve_csv_once(String::new(), body);
+        let (url, _requests) = serve_json_pages(vec![(String::new(), body)]);
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let err = runtime
-            .block_on(fetch_cursor_usage_csv_from(
+            .block_on(fetch_cursor_usage_events_json_from(
                 &url,
                 "session-token",
                 None,
-                TEST_CSV_CAP,
+                TEST_JSON_CAP,
+                500,
             ))
             .expect_err("a body past the ceiling must not be buffered");
         let message = format!("{err:#}");
 
         assert!(
-            message.contains(&TEST_CSV_CAP.to_string()),
+            message.contains(&TEST_JSON_CAP.to_string()),
             "the error must name the limit: {message}"
         );
         let aborted_at: usize = message
@@ -1843,67 +2101,255 @@ mod tests {
             .unwrap_or_else(|| panic!("the error must report where it stopped: {message}"));
         assert!(
             aborted_at < sent / 2,
-            "the read must stop near the {TEST_CSV_CAP} byte ceiling rather than buffer all \
+            "the read must stop near the {TEST_JSON_CAP} byte ceiling rather than buffer all \
              {sent} bytes, but it held {aborted_at}"
         );
     }
 
     #[test]
-    fn test_usage_csv_over_advertised_content_length_is_rejected_before_reading() {
-        // Headers only: the server promises half a gigabyte and then sends
-        // nothing at all. Touching the body would fail as a truncated
-        // response, so surfacing the ceiling error proves the read never
-        // started.
+    fn test_usage_events_json_over_advertised_content_length_is_rejected_before_reading() {
+        // Headers only: the server promises half a gigabyte and sends nothing.
+        // Surfacing the ceiling error proves the read never started.
         const ADVERTISED: usize = 512 * 1024 * 1024;
-        let url = serve_csv_once(format!("Content-Length: {ADVERTISED}\r\n"), Vec::new());
+        let (url, _requests) = serve_json_pages(vec![(
+            format!("Content-Length: {ADVERTISED}\r\n"),
+            Vec::new(),
+        )]);
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let err = runtime
-            .block_on(fetch_cursor_usage_csv_from(
+            .block_on(fetch_cursor_usage_events_json_from(
                 &url,
                 "session-token",
                 None,
-                TEST_CSV_CAP,
+                TEST_JSON_CAP,
+                500,
             ))
             .expect_err("an oversized advertised length must be refused up front");
         let message = format!("{err:#}");
 
         assert!(
             message.contains(&ADVERTISED.to_string())
-                && message.contains(&TEST_CSV_CAP.to_string()),
+                && message.contains(&TEST_JSON_CAP.to_string()),
             "the error must name both the advertised size and the limit: {message}"
         );
     }
 
     #[test]
-    fn test_usage_csv_under_the_cap_is_returned_unchanged() {
-        let csv = concat!(
-            "Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),",
-            "Cache Read,Output Tokens,Total Tokens,Cost\n",
-            "\"2026-01-01T00:00:00.000Z\",\"Included\",\"claude-4.5-opus\",\"No\",\"862\",",
-            "\"8\",\"37204\",\"662\",\"38736\",\"0.04\"\n",
-            "\"2026-01-02T00:00:00.000Z\",\"Included\",\"gpt-5\",\"Yes\",\"12\",",
-            "\"3\",\"400\",\"55\",\"470\",\"0.01\"\n",
+    fn test_usage_events_json_sends_origin_and_aggregates_single_page() {
+        // A single short page (fewer than page_size events) stops after page 1.
+        let body = json_page(
+            2,
+            &[
+                &json_event("aaaa", "1788171994838"),
+                &json_event("bbbb", "1788171000000"),
+            ],
         );
-        let url = serve_csv_once(
-            format!("Content-Length: {}\r\n", csv.len()),
-            csv.as_bytes().to_vec(),
-        );
+        let (url, requests) =
+            serve_json_pages(vec![(format!("Content-Length: {}\r\n", body.len()), body)]);
 
-        // Production configuration: the real ceiling and the explicit-sync
-        // timeout, so a normal export is proven to survive the bounded read.
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let text = runtime
-            .block_on(fetch_cursor_usage_csv_from(
+            .block_on(fetch_cursor_usage_events_json_from(
                 &url,
                 "session-token",
-                csv_timeout_override(true),
-                CURSOR_MAX_CSV_BYTES,
+                sync_timeout_override(true),
+                CURSOR_MAX_JSON_BYTES,
+                500,
             ))
-            .expect("a normal export must still sync");
+            .expect("a normal page must sync");
 
-        assert_eq!(text, csv, "the bounded read must return the body verbatim");
-        assert_eq!(count_cursor_csv_rows(&text), 2);
+        assert_eq!(count_cursor_json_events(&text), 2);
+
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 1, "a short page must not request a second");
+        let head = &captured[0];
+        assert!(head.starts_with("POST "), "endpoint must be POSTed: {head}");
+        assert!(
+            head.to_lowercase().contains("origin: https://cursor.com"),
+            "the CSRF Origin header must be sent: {head}"
+        );
+    }
+
+    #[test]
+    fn test_usage_events_json_walks_all_pages() {
+        // page_size 2, total 5: two full pages then a short final page.
+        let (url, requests) = serve_json_pages(vec![
+            (
+                String::new(),
+                json_page(
+                    5,
+                    &[
+                        &json_event("c1", "1788171994001"),
+                        &json_event("c2", "1788171994002"),
+                    ],
+                ),
+            ),
+            (
+                String::new(),
+                json_page(
+                    5,
+                    &[
+                        &json_event("c3", "1788171994003"),
+                        &json_event("c4", "1788171994004"),
+                    ],
+                ),
+            ),
+            (
+                String::new(),
+                json_page(5, &[&json_event("c5", "1788171994005")]),
+            ),
+        ]);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let text = runtime
+            .block_on(fetch_cursor_usage_events_json_from(
+                &url,
+                "session-token",
+                None,
+                CURSOR_MAX_JSON_BYTES,
+                2,
+            ))
+            .expect("pagination must collect every page");
+
+        assert_eq!(count_cursor_json_events(&text), 5);
+
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 3, "must walk exactly three pages");
+        assert!(captured[0].contains("\"page\":1"));
+        assert!(captured[1].contains("\"page\":2"));
+        assert!(captured[2].contains("\"page\":3"));
+    }
+
+    #[test]
+    fn test_usage_events_json_keeps_paging_when_server_clamps_page_size() {
+        // page_size 5 is requested, but the server clamps and returns a short
+        // first page (2 of an advertised 3). The advertised total must win so the
+        // walk continues instead of stopping on the short page and dropping rows.
+        let (url, requests) = serve_json_pages(vec![
+            (
+                String::new(),
+                json_page(
+                    3,
+                    &[
+                        &json_event("c1", "1788171994001"),
+                        &json_event("c2", "1788171994002"),
+                    ],
+                ),
+            ),
+            (
+                String::new(),
+                json_page(3, &[&json_event("c3", "1788171994003")]),
+            ),
+        ]);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let text = runtime
+            .block_on(fetch_cursor_usage_events_json_from(
+                &url,
+                "session-token",
+                None,
+                CURSOR_MAX_JSON_BYTES,
+                5,
+            ))
+            .expect("a clamped short page must not stop pagination early");
+
+        assert_eq!(count_cursor_json_events(&text), 3);
+        assert_eq!(requests.lock().unwrap().len(), 2, "must walk both pages");
+    }
+
+    #[test]
+    fn test_usage_events_json_missing_display_array_is_an_error() {
+        // A 200 that omits the usageEventsDisplay array (a WAF challenge or API
+        // change) must surface as an error, not a silent zero-event result, so a
+        // good cache is never overwritten with nothing.
+        let (url, _requests) = serve_json_pages(vec![(
+            String::new(),
+            br#"{"totalUsageEventsCount":0,"message":"blocked"}"#.to_vec(),
+        )]);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let err = runtime
+            .block_on(fetch_cursor_usage_events_json_from(
+                &url,
+                "session-token",
+                None,
+                CURSOR_MAX_JSON_BYTES,
+                500,
+            ))
+            .expect_err("a response without usageEventsDisplay must fail");
+        assert!(
+            format!("{err:#}").contains("usageEventsDisplay"),
+            "the error must name the missing array: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_usage_events_json_empty_page_before_total_is_an_error() {
+        // The server advertises 5 events but returns an empty second page before
+        // the total is reached. That is a truncated history, not a clean end, so
+        // it must fail rather than cache the two events as a full sync.
+        let (url, _requests) = serve_json_pages(vec![
+            (
+                String::new(),
+                json_page(
+                    5,
+                    &[
+                        &json_event("c1", "1788171994001"),
+                        &json_event("c2", "1788171994002"),
+                    ],
+                ),
+            ),
+            (String::new(), json_page(5, &[])),
+        ]);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let err = runtime
+            .block_on(fetch_cursor_usage_events_json_from(
+                &url,
+                "session-token",
+                None,
+                CURSOR_MAX_JSON_BYTES,
+                5,
+            ))
+            .expect_err("an empty page before the advertised total must fail");
+        assert!(
+            format!("{err:#}").contains("empty page before its advertised total"),
+            "the error must explain the truncated history: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_usage_events_json_forbidden_surfaces_login_hint() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 4096];
+                let _ = std::io::Read::read(&mut stream, &mut request);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = stream.flush();
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        let url = format!("http://{addr}/api/dashboard/get-filtered-usage-events");
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let err = runtime
+            .block_on(fetch_cursor_usage_events_json_from(
+                &url,
+                "session-token",
+                None,
+                CURSOR_MAX_JSON_BYTES,
+                500,
+            ))
+            .expect_err("a 403 must surface the re-auth hint");
+        assert!(
+            format!("{err:#}").contains("cursor login"),
+            "the error should tell the user to re-authenticate: {err:#}"
+        );
     }
 
     #[test]
@@ -1921,7 +2367,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cache_dir = cursor_cache_dir(temp.path());
         fs::create_dir_all(&cache_dir).unwrap();
-        // Unrelated file present, but no usage*.csv.
+        // Unrelated file present, but no usage*.json.
         fs::write(cache_dir.join("README.txt"), "noise").unwrap();
         assert!(!cursor_usage_cache_is_fresh_in(
             temp.path(),
@@ -1934,7 +2380,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cache_dir = cursor_cache_dir(temp.path());
         fs::create_dir_all(&cache_dir).unwrap();
-        fs::write(cache_dir.join("usage.csv"), "Date,Model\n").unwrap();
+        fs::write(cache_dir.join("usage.json"), "Date,Model\n").unwrap();
         // Just-written file is fresh under any reasonable window.
         assert!(cursor_usage_cache_is_fresh_in(
             temp.path(),
@@ -1947,7 +2393,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cache_dir = cursor_cache_dir(temp.path());
         fs::create_dir_all(&cache_dir).unwrap();
-        let path = cache_dir.join("usage.csv");
+        let path = cache_dir.join("usage.json");
         fs::write(&path, "Date,Model\n").unwrap();
         // Backdate the mtime by an hour. Skip the test if the platform refuses
         // to set mtime (rare on POSIX/Windows but possible on exotic FS).
@@ -1966,11 +2412,11 @@ mod tests {
     fn test_cursor_usage_cache_is_fresh_requires_active_usage_csv_when_secondary_is_fresh() {
         // A recently-synced secondary account must not mask a stale active
         // account cache. The implicit sync gate should refresh the cache that
-        // local reports read from `usage.csv`.
+        // local reports read from `usage.json`.
         let temp = tempfile::tempdir().unwrap();
         let cache_dir = cursor_cache_dir(temp.path());
         fs::create_dir_all(&cache_dir).unwrap();
-        let stale_path = cache_dir.join("usage.csv");
+        let stale_path = cache_dir.join("usage.json");
         fs::write(&stale_path, "Date,Model\n").unwrap();
         let stale = std::fs::OpenOptions::new()
             .write(true)
@@ -1981,7 +2427,7 @@ mod tests {
         };
         drop(stale);
         // Secondary account written just now.
-        fs::write(cache_dir.join("usage.team-a.csv"), "Date,Model\n").unwrap();
+        fs::write(cache_dir.join("usage.team-a.json"), "Date,Model\n").unwrap();
         assert!(!cursor_usage_cache_is_fresh_in(
             temp.path(),
             Duration::from_secs(300)
@@ -1991,12 +2437,12 @@ mod tests {
     #[test]
     fn test_cursor_usage_cache_is_fresh_returns_false_when_active_cache_missing() {
         // A fresh secondary account cache alone is not enough: without the
-        // active account's `usage.csv`, the next report would use stale/missing
+        // active account's `usage.json`, the next report would use stale/missing
         // active data unless the implicit sync runs.
         let temp = tempfile::tempdir().unwrap();
         let cache_dir = cursor_cache_dir(temp.path());
         fs::create_dir_all(&cache_dir).unwrap();
-        fs::write(cache_dir.join("usage.team-a.csv"), "Date,Model\n").unwrap();
+        fs::write(cache_dir.join("usage.team-a.json"), "Date,Model\n").unwrap();
         assert!(!cursor_usage_cache_is_fresh_in(
             temp.path(),
             Duration::from_secs(300)
@@ -2038,14 +2484,14 @@ mod tests {
 
         let cache_dir = cursor_cache_dir(temp_dir.path());
         fs::create_dir_all(&cache_dir)?;
-        fs::write(cache_dir.join("usage.csv"), "Date,Model\n")?;
+        fs::write(cache_dir.join("usage.json"), "Date,Model\n")?;
 
         assert!(!cursor_usage_cache_is_fresh_in(
             temp_dir.path(),
             Duration::from_secs(300)
         ));
 
-        fs::write(cache_dir.join("usage.team-account.csv"), "Date,Model\n")?;
+        fs::write(cache_dir.join("usage.team-account.json"), "Date,Model\n")?;
         assert!(cursor_usage_cache_is_fresh_in(
             temp_dir.path(),
             Duration::from_secs(300)
@@ -2101,40 +2547,10 @@ mod tests {
         let paths = expected_cursor_usage_cache_paths_in(temp_dir.path());
         let cache_dir = cursor_cache_dir(temp_dir.path());
         let expected = vec![
-            cache_dir.join("usage.csv"),
-            cache_dir.join("usage.team-account-a.csv"),
+            cache_dir.join("usage.json"),
+            cache_dir.join("usage.team-account-a.json"),
         ];
         assert_eq!(paths, expected);
-    }
-
-    #[test]
-    fn test_count_cursor_csv_rows_valid() {
-        // Valid CSV with header
-        let csv = "Date,Model,Tokens\n2024-01-01,gpt-4,100\n2024-01-02,gpt-4,200\n";
-        assert_eq!(count_cursor_csv_rows(csv), 2);
-
-        // Single row
-        let csv = "Date,Model,Tokens\n2024-01-01,gpt-4,100\n";
-        assert_eq!(count_cursor_csv_rows(csv), 1);
-    }
-
-    #[test]
-    fn test_count_cursor_csv_rows_empty() {
-        // Header only
-        let csv = "Date,Model,Tokens\n";
-        assert_eq!(count_cursor_csv_rows(csv), 0);
-
-        // Empty string
-        let csv = "";
-        assert_eq!(count_cursor_csv_rows(csv), 0);
-    }
-
-    #[test]
-    fn test_count_cursor_csv_rows_malformed() {
-        // CSV reader with flexible=true accepts rows with different column counts
-        // This test verifies the actual behavior: all parseable rows are counted
-        let csv = "Date,Model,Tokens\n2024-01-01,gpt-4,100\ninvalid,row\n2024-01-02,gpt-4,200\n";
-        assert_eq!(count_cursor_csv_rows(csv), 3);
     }
 
     #[test]
@@ -2171,19 +2587,31 @@ mod tests {
             },
         )?;
 
+        // Seed legacy CSV caches from before the JSON switch; the sync must
+        // replace them with JSON and archive (not delete) the stale CSVs.
+        let cache_dir = cursor_cache_dir(temp_dir.path());
+        fs::create_dir_all(&cache_dir)?;
+        fs::write(cache_dir.join("usage.csv"), "Date,Model\nold\n")?;
+        fs::write(
+            cache_dir.join("usage.team-account.csv"),
+            "Date,Model\nold\n",
+        )?;
+
         let runtime = tokio::runtime::Runtime::new()?;
         let result = runtime.block_on(sync_cursor_cache_with_fetcher_in_home(
             temp_dir.path(),
             |session_token| {
-                let csv = match session_token.as_str() {
-                    "token-active" => "Date,Model,Tokens\n2026-01-01,gpt-5,100\n",
-                    "token-secondary" => {
-                        "Date,Model,Tokens\n2026-01-02,gpt-5,200\n2026-01-03,gpt-5,300\n"
+                let json = match session_token.as_str() {
+                    "token-active" => {
+                        r#"{"usageEventsDisplay":[{"conversationId":"s1","timestamp":"1","model":"gpt-5","chargedCents":1}]}"#
                     }
-                    _ => "Date,Model,Tokens\n",
+                    "token-secondary" => {
+                        r#"{"usageEventsDisplay":[{"conversationId":"s2","timestamp":"2","model":"gpt-5","chargedCents":2},{"conversationId":"s3","timestamp":"3","model":"gpt-5","chargedCents":3}]}"#
+                    }
+                    _ => r#"{"usageEventsDisplay":[]}"#,
                 }
                 .to_string();
-                async move { Ok(csv) }
+                async move { Ok(json) }
             },
         ));
 
@@ -2191,16 +2619,136 @@ mod tests {
         assert_eq!(result.rows, 3);
         assert_eq!(result.error, None);
 
+        // JSON caches are written for each account and key by conversationId.
+        assert_eq!(
+            count_cursor_json_events(&fs::read_to_string(cache_dir.join("usage.json"))?),
+            1
+        );
+        assert_eq!(
+            count_cursor_json_events(&fs::read_to_string(
+                cache_dir.join("usage.team-account.json")
+            )?),
+            2
+        );
+        // The active account is never duplicated as a per-account file.
+        assert!(!cache_dir.join("usage.active-account.json").exists());
+        // Legacy CSVs are moved out of the scan path so they can't double-count,
+        // but they are archived rather than deleted so history survives.
+        assert!(!cache_dir.join("usage.csv").exists());
+        assert!(!cache_dir.join("usage.team-account.csv").exists());
+        let archived: Vec<_> = fs::read_dir(cache_dir.join("archive"))?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "csv"))
+            .collect();
+        assert_eq!(
+            archived.len(),
+            2,
+            "both legacy CSVs must be archived, not deleted"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sync_keeps_existing_cache_when_fetch_returns_zero_events() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            "active-account".to_string(),
+            CursorCredentials {
+                session_token: "token-active".to_string(),
+                user_id: Some("active-account".to_string()),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                expires_at: None,
+                label: Some("work".to_string()),
+            },
+        );
+        save_credentials_store_in_home(
+            temp_dir.path(),
+            &CursorCredentialsStore {
+                version: 1,
+                active_account_id: "active-account".to_string(),
+                accounts,
+            },
+        )?;
+
+        // Seed a good existing JSON cache. A later sync that comes back empty
+        // must not overwrite it with nothing.
         let cache_dir = cursor_cache_dir(temp_dir.path());
+        fs::create_dir_all(&cache_dir)?;
+        let seeded = r#"{"usageEventsDisplay":[{"conversationId":"keep","timestamp":"1","model":"gpt-5","chargedCents":1}]}"#;
+        fs::write(cache_dir.join("usage.json"), seeded)?;
+
+        let runtime = tokio::runtime::Runtime::new()?;
+        let result = runtime.block_on(sync_cursor_cache_with_fetcher_in_home(
+            temp_dir.path(),
+            |_session_token| async move { Ok(r#"{"usageEventsDisplay":[]}"#.to_string()) },
+        ));
+
+        // The empty result is refused; the seeded cache is left untouched.
+        assert!(!result.synced);
         assert_eq!(
-            fs::read_to_string(cache_dir.join("usage.csv"))?,
-            "Date,Model,Tokens\n2026-01-01,gpt-5,100\n"
+            fs::read_to_string(cache_dir.join("usage.json"))?,
+            seeded,
+            "a zero-event sync must not clobber existing cached usage"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sync_clears_active_duplicate_even_when_fetch_fails() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            "active-account".to_string(),
+            CursorCredentials {
+                session_token: "token-active".to_string(),
+                user_id: Some("active-account".to_string()),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                expires_at: None,
+                label: Some("work".to_string()),
+            },
+        );
+        save_credentials_store_in_home(
+            temp_dir.path(),
+            &CursorCredentialsStore {
+                version: 1,
+                active_account_id: "active-account".to_string(),
+                accounts,
+            },
+        )?;
+
+        // A good `usage.json` already exists alongside a stale per-account
+        // duplicate left over from when this account was a secondary. If the
+        // fetch fails, both JSON caches would otherwise remain and the scanner
+        // would double-count the active account.
+        let cache_dir = cursor_cache_dir(temp_dir.path());
+        fs::create_dir_all(&cache_dir)?;
+        let good = r#"{"usageEventsDisplay":[{"conversationId":"keep","timestamp":"1","model":"gpt-5","chargedCents":1}]}"#;
+        fs::write(cache_dir.join("usage.json"), good)?;
+        fs::write(cache_dir.join("usage.active-account.json"), good)?;
+
+        let runtime = tokio::runtime::Runtime::new()?;
+        let result = runtime.block_on(sync_cursor_cache_with_fetcher_in_home(
+            temp_dir.path(),
+            |_session_token| async move { Err(anyhow::anyhow!("network down")) },
+        ));
+
+        // The fetch failed, but the good cache survives and the duplicate is
+        // reconciled so the scanner reads only one JSON cache for the account.
+        assert!(!result.synced);
         assert_eq!(
-            fs::read_to_string(cache_dir.join("usage.team-account.csv"))?,
-            "Date,Model,Tokens\n2026-01-02,gpt-5,200\n2026-01-03,gpt-5,300\n"
+            fs::read_to_string(cache_dir.join("usage.json"))?,
+            good,
+            "a failed fetch must not clobber the existing active cache"
         );
-        assert!(!cache_dir.join("usage.active-account.csv").exists());
+        assert!(
+            !cache_dir.join("usage.active-account.json").exists(),
+            "the stale active duplicate must be cleared so it can't double-count"
+        );
 
         Ok(())
     }
@@ -2422,10 +2970,10 @@ mod tests {
         fs::create_dir_all(&cache_dir)?;
 
         // Fresh active cache.
-        fs::write(cache_dir.join("usage.csv"), "Date,Model\n")?;
+        fs::write(cache_dir.join("usage.json"), "Date,Model\n")?;
 
         // Stale secondary cache.
-        let secondary = cache_dir.join("usage.team-account.csv");
+        let secondary = cache_dir.join("usage.team-account.json");
         fs::write(&secondary, "Date,Model\n")?;
         if !backdate_file(&secondary, 3600) {
             return Ok(()); // platform can't set mtime — skip
@@ -2452,9 +3000,9 @@ mod tests {
         let cache_dir = cursor_cache_dir(temp_dir.path());
         fs::create_dir_all(&cache_dir)?;
 
-        fs::write(cache_dir.join("usage.csv"), "Date,Model\n")?;
+        fs::write(cache_dir.join("usage.json"), "Date,Model\n")?;
 
-        let secondary = cache_dir.join("usage.team-account.csv");
+        let secondary = cache_dir.join("usage.team-account.json");
         fs::write(&secondary, "Date,Model\n")?;
         if !backdate_file(&secondary, 3600) {
             return Ok(());
@@ -2481,14 +3029,14 @@ mod tests {
         fs::create_dir_all(&cache_dir)?;
 
         // Stale active cache.
-        let active = cache_dir.join("usage.csv");
+        let active = cache_dir.join("usage.json");
         fs::write(&active, "Date,Model\n")?;
         if !backdate_file(&active, 3600) {
             return Ok(());
         }
 
         // Fresh secondary and fresh marker.
-        fs::write(cache_dir.join("usage.team-account.csv"), "Date,Model\n")?;
+        fs::write(cache_dir.join("usage.team-account.json"), "Date,Model\n")?;
         fs::write(cache_dir.join(CURSOR_SYNC_ATTEMPT_MARKER), "")?;
 
         assert!(
