@@ -87,12 +87,13 @@ impl PricingService {
     ) -> Self {
         Self {
             custom,
-            lookup: PricingLookup::new_with_models_dev(
+            lookup: PricingLookup::new_with_archive(
                 litellm_data,
                 openrouter_data,
                 Self::build_cursor_overrides(),
                 Self::build_sakana_overrides(),
                 models_dev_data,
+                Self::build_archive_overrides(),
             ),
         }
     }
@@ -240,6 +241,86 @@ impl PricingService {
                 ..Default::default()
             },
         );
+        overrides
+    }
+
+    // @keep: a snapshot of last-known published rates for Anthropic models that
+    // upstream will eventually stop carrying. LiteLLM, OpenRouter and models.dev
+    // all describe the CURRENT catalogue: once a provider retires a model those
+    // rows are dropped, and every historical session that used it silently loses
+    // its price. This archive is the only place that memory lives.
+    //
+    // Precedence is the same slot as the Cursor/Sakana overrides in
+    // PricingLookup - after every upstream exact/normalized/prefix match, before
+    // the fuzzy stage - so while a row is still live upstream the archive never
+    // answers, and once upstream drops it the archive answers with that model's
+    // own last rate instead of letting fuzzy elect a neighbouring row.
+    //
+    // Keys are provider-qualified on purpose. Anthropic bills these rates on its
+    // own API; a request routed through Vertex or Bedrock is a different tariff.
+    // With an `anthropic/` root, an anthropic hint resolves ProviderScoped with
+    // matching provider identity (submission-safe), and a `vertex`/`vertex_ai`
+    // hint is recognised as a cross-provider alias and stays an estimate.
+    //
+    // Rates verified 2026-09-02 against both live datasets: models.dev keys them
+    // exactly as written here, LiteLLM keys them bare (`claude-haiku-4-5`, ...)
+    // at the same numbers. Cache read is 0.1x input and cache creation 1.25x
+    // input, matching Anthropic's published multipliers.
+    //
+    // NOTE: there is deliberately NO `openai/codex-auto-review` entry, and no
+    // entry for any other routing label. OpenAI publishes no tariff for it -
+    // all three datasets carry zero `auto-review` keys (checked 2026-09-02), so
+    // the number an earlier draft archived was not a published rate but
+    // Tokscale's own fuzzy election of a neighbouring `gpt-5.1-codex-mini` row,
+    // which the lookup path deliberately reports as not submission-safe.
+    // Archiving it would promote that guess to authoritative and let it
+    // overwrite real cost on the server. Leaving it unpriced is the intended
+    // outcome: its date joins `incomplete_cost_dates` and the previously stored
+    // cost is preserved.
+    fn build_archive_overrides() -> HashMap<String, ModelPricing> {
+        /// `(model id, input, output, cache read, cache creation)`, per token.
+        type ArchivedRateRow = (&'static str, f64, f64, f64, f64);
+
+        // Every first-party Claude row the narrowest dataset still carries, so
+        // whichever one is retired next already has its last published rate
+        // here. models.dev is that dataset: as of 2026-09-02 it lists
+        // haiku-4-5, sonnet-4-5, sonnet-4-6, opus-4-5, opus-4-6, opus-4-7,
+        // opus-4-8, opus-5, sonnet-5 and the two fable-5 rows. The current
+        // flagships (opus-5, sonnet-5, fable-5*) are left out on purpose --
+        // nothing retires the model that is shipping.
+        let entries: &[ArchivedRateRow] = &[
+            // Claude Haiku 4.5: $1.00/$5.00 per 1M, $0.10 cache read, $1.25 cache write.
+            ("anthropic/claude-haiku-4-5", 1e-6, 5e-6, 1e-7, 1.25e-6),
+            // Claude Sonnet 4.5 / 4.6: $3.00/$15.00 per 1M, $0.30 cache read,
+            // $3.75 cache write. 4.5 is the oldest Sonnet any of the three
+            // still carries.
+            ("anthropic/claude-sonnet-4-5", 3e-6, 1.5e-5, 3e-7, 3.75e-6),
+            ("anthropic/claude-sonnet-4-6", 3e-6, 1.5e-5, 3e-7, 3.75e-6),
+            // Claude Opus 4.5 / 4.6 / 4.7 / 4.8: $5.00/$25.00 per 1M, $0.50
+            // cache read, $6.25 cache write. 4.5 is the oldest Opus carried by
+            // all three, so it is the next one due to fall off -- LiteLLM and
+            // OpenRouter still list opus-4 and opus-4-1 (and LiteLLM
+            // claude-3-opus), but models.dev has already dropped them, so
+            // their rates cannot be cross-checked and they are not archived.
+            ("anthropic/claude-opus-4-5", 5e-6, 2.5e-5, 5e-7, 6.25e-6),
+            ("anthropic/claude-opus-4-6", 5e-6, 2.5e-5, 5e-7, 6.25e-6),
+            ("anthropic/claude-opus-4-7", 5e-6, 2.5e-5, 5e-7, 6.25e-6),
+            ("anthropic/claude-opus-4-8", 5e-6, 2.5e-5, 5e-7, 6.25e-6),
+        ];
+
+        let mut overrides = HashMap::with_capacity(entries.len());
+        for (model_id, input, output, cache_read, cache_creation) in entries {
+            overrides.insert(
+                model_id.to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(*input),
+                    output_cost_per_token: Some(*output),
+                    cache_read_input_token_cost: Some(*cache_read),
+                    cache_creation_input_token_cost: Some(*cache_creation),
+                    ..Default::default()
+                },
+            );
+        }
         overrides
     }
 
@@ -550,6 +631,257 @@ mod tests {
             openrouter,
             models_dev,
         )
+    }
+
+    fn all_bucket_usage() -> TokenBreakdown {
+        TokenBreakdown {
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_read: 1_000_000,
+            cache_write: 1_000_000,
+            reasoning: 0,
+        }
+    }
+
+    fn assert_retired_anthropic_price(
+        model: &str,
+        input: f64,
+        output: f64,
+        cache_read: f64,
+        cache_write: f64,
+    ) {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let usage = all_bucket_usage();
+        let resolved = service
+            .resolve_for_usage_with_provider(model, Some("anthropic"), &usage)
+            .unwrap_or_else(|| panic!("{model} must retain its archived price"));
+        assert_eq!(resolved.source, "Tokscale Archive", "model: {model}");
+        assert!(resolved.evidence.is_submission_safe(), "model: {model}");
+
+        let expected = input + output + cache_read + cache_write;
+        let actual = service.calculate_cost_with_provider(model, Some("anthropic"), &usage);
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "model: {model}, expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn retired_claude_haiku_4_5_keeps_its_last_known_price() {
+        assert_retired_anthropic_price("claude-haiku-4-5", 1.0, 5.0, 0.1, 1.25);
+    }
+
+    #[test]
+    fn retired_claude_sonnet_4_5_keeps_its_last_known_price() {
+        assert_retired_anthropic_price("claude-sonnet-4-5", 3.0, 15.0, 0.3, 3.75);
+    }
+
+    #[test]
+    fn retired_claude_opus_4_5_keeps_its_last_known_price() {
+        assert_retired_anthropic_price("claude-opus-4-5", 5.0, 25.0, 0.5, 6.25);
+    }
+
+    #[test]
+    fn retired_claude_opus_4_6_keeps_its_last_known_price() {
+        assert_retired_anthropic_price("claude-opus-4-6", 5.0, 25.0, 0.5, 6.25);
+    }
+
+    #[test]
+    fn retired_claude_opus_4_7_keeps_its_last_known_price() {
+        assert_retired_anthropic_price("claude-opus-4-7", 5.0, 25.0, 0.5, 6.25);
+    }
+
+    #[test]
+    fn retired_claude_opus_4_8_keeps_its_last_known_price() {
+        assert_retired_anthropic_price("claude-opus-4-8", 5.0, 25.0, 0.5, 6.25);
+    }
+
+    #[test]
+    fn retired_claude_sonnet_4_6_keeps_its_last_known_price() {
+        assert_retired_anthropic_price("claude-sonnet-4-6", 3.0, 15.0, 0.3, 3.75);
+    }
+
+    /// A hosted endpoint publishes its own tariff, so an Anthropic-keyed
+    /// archive row may not stand in for one.
+    ///
+    /// Bedrock shares no provider tag with an `anthropic/` key, so the archive
+    /// never answers for it at all -- which is the correct outcome, because the
+    /// live datasets price Bedrock's regional Claude rows 10% above first-party
+    /// and its GovCloud rows 20% above.
+    #[test]
+    fn retired_anthropic_price_is_not_offered_to_bedrock() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let usage = all_bucket_usage();
+
+        assert!(service
+            .resolve_for_usage_with_provider("claude-opus-4-8", Some("bedrock"), &usage)
+            .is_none());
+        assert!(!service.covers_usage_with_provider("claude-opus-4-8", Some("bedrock"), &usage));
+    }
+
+    /// An embedded provider root authorises the tariff exactly as a hint does.
+    ///
+    /// A reseller root is not first-party Anthropic, so the archive refuses it
+    /// on the qualified id. The outer resolver then peels the unknown vendor
+    /// prefix and retries the bare model, which the archive does answer -- but
+    /// with nothing naming the publishing endpoint it is ModelPart evidence, so
+    /// it is priced for display and never submission-safe.
+    #[test]
+    fn reseller_rooted_id_gets_an_archive_estimate_but_not_submission_safety() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let usage = all_bucket_usage();
+
+        let resold = service
+            .resolve_for_usage_with_provider("openrouter/anthropic/claude-haiku-4.5", None, &usage)
+            .expect("the peeled bare id still carries an estimate");
+        assert_eq!(resold.source, "Tokscale Archive");
+        assert_eq!(
+            resold.evidence.submission_safety_gap(),
+            Some(lookup::SubmissionSafetyGap::UnverifiedProviderIdentity),
+            "a reseller-rooted id must not be submission-safe"
+        );
+
+        // The same id under its own root is submission-safe, so the gap above
+        // is the reseller segment and not a normalization failure.
+        let first_party = service
+            .resolve_for_usage_with_provider("anthropic/claude-haiku-4.5", None, &usage)
+            .expect("the first-party root must still resolve");
+        assert_eq!(first_party.source, "Tokscale Archive");
+        assert_eq!(first_party.matched_key, "anthropic/claude-haiku-4-5");
+        assert!(first_party.evidence.is_submission_safe());
+    }
+
+    /// Vertex canonicalises to `anthropic`, so the archive stays reachable as an
+    /// estimate -- but only as an estimate. Reaching a first-party row through a
+    /// cross-provider alias proves nothing about what Vertex billed, so the
+    /// result must not be submission-safe.
+    #[test]
+    fn retired_anthropic_price_reaches_vertex_only_as_an_estimate() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let usage = all_bucket_usage();
+
+        for provider in ["vertex", "vertex_ai", "Vertex"] {
+            let resolved = service
+                .resolve_for_usage_with_provider("claude-opus-4-7", Some(provider), &usage)
+                .unwrap_or_else(|| panic!("{provider} should still receive an estimate"));
+            assert_eq!(resolved.source, "Tokscale Archive", "provider: {provider}");
+            assert_eq!(
+                resolved.evidence.submission_safety_gap(),
+                Some(lookup::SubmissionSafetyGap::UnverifiedProviderIdentity),
+                "provider: {provider} must not be submission-safe"
+            );
+        }
+    }
+
+    #[test]
+    fn live_upstream_price_wins_over_the_retired_model_archive() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "anthropic/claude-opus-4-8".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(4e-6),
+                output_cost_per_token: Some(20e-6),
+                cache_read_input_token_cost: Some(4e-7),
+                cache_creation_input_token_cost: Some(5e-6),
+                ..Default::default()
+            },
+        );
+        let service = PricingService::new(litellm, HashMap::new());
+        let usage = all_bucket_usage();
+
+        let resolved = service
+            .resolve_for_usage_with_provider("claude-opus-4-8", Some("anthropic"), &usage)
+            .expect("live upstream row must resolve");
+        assert_eq!(resolved.source, "LiteLLM");
+        assert!(
+            (service.calculate_cost_with_provider("claude-opus-4-8", Some("anthropic"), &usage,)
+                - 29.4)
+                .abs()
+                < 1e-9
+        );
+    }
+
+    /// The shared normalizer folds reasoning-effort suffixes, so the archive
+    /// needs no suffix stripper of its own.
+    #[test]
+    fn retired_claude_reasoning_suffix_uses_the_archived_base_price() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let usage = all_bucket_usage();
+
+        let resolved = service
+            .resolve_for_usage_with_provider(
+                "claude-opus-4-7-thinking-xhigh",
+                Some("anthropic"),
+                &usage,
+            )
+            .expect("reasoning suffix must retain the base model price");
+        assert_eq!(resolved.source, "Tokscale Archive");
+        assert_eq!(resolved.matched_key, "anthropic/claude-opus-4-7");
+    }
+
+    /// Regression: the archive may only carry published rates.
+    ///
+    /// No dataset publishes a tariff for `codex-auto-review` -- LiteLLM,
+    /// OpenRouter and models.dev all carry zero `auto-review` keys. Its price
+    /// on this path has always been a fuzzy election of a neighbouring
+    /// `gpt-5.1-codex-mini` row, which the lookup reports as an estimate.
+    /// Archiving that number would stamp it authoritative and let a guess
+    /// overwrite real recorded cost on the server, so no such row exists.
+    #[test]
+    fn codex_auto_review_is_never_served_from_the_archive() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let usage = TokenBreakdown {
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_read: 1_000_000,
+            cache_write: 0,
+            reasoning: 0,
+        };
+
+        let resolved =
+            service.resolve_for_usage_with_provider("codex-auto-review", Some("openai"), &usage);
+        assert!(
+            resolved
+                .as_ref()
+                .is_none_or(|result| result.source != "Tokscale Archive"),
+            "codex-auto-review has no published rate to archive"
+        );
+        assert!(
+            resolved.is_none_or(|result| !result.evidence.is_submission_safe()),
+            "an estimated price must never become submission-safe"
+        );
+    }
+
+    /// Regression: real clients emit dated and suffixed ids, so an archive
+    /// matched by bare-string equality would silently miss every model it
+    /// exists to cover. The archive must go through the same normalization the
+    /// live lookup path applies.
+    #[test]
+    fn archived_price_survives_the_id_spellings_clients_actually_emit() {
+        let service = PricingService::new(HashMap::new(), HashMap::new());
+        let usage = all_bucket_usage();
+
+        for (model, expected_key) in [
+            // Anthropic's dated release ids.
+            ("claude-haiku-4-5-20251001", "anthropic/claude-haiku-4-5"),
+            ("claude-sonnet-4-6-20260115", "anthropic/claude-sonnet-4-6"),
+            // Long-context and reasoning-effort suffixes.
+            ("claude-opus-4-8[1m]", "anthropic/claude-opus-4-8"),
+            (
+                "claude-opus-4-7-thinking-xhigh",
+                "anthropic/claude-opus-4-7",
+            ),
+            // Dotted minor versions and an embedded provider root.
+            ("claude-haiku-4.5", "anthropic/claude-haiku-4-5"),
+            ("anthropic/claude-haiku-4.5", "anthropic/claude-haiku-4-5"),
+        ] {
+            let resolved = service
+                .resolve_for_usage_with_provider(model, Some("anthropic"), &usage)
+                .unwrap_or_else(|| panic!("{model} must retain its archived price"));
+            assert_eq!(resolved.source, "Tokscale Archive", "model: {model}");
+            assert_eq!(resolved.matched_key, expected_key, "model: {model}");
+            assert!(resolved.evidence.is_submission_safe(), "model: {model}");
+        }
     }
 
     /// The same Grok request must cost the same whichever dataset priced it.
